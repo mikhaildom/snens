@@ -1,6 +1,7 @@
 // Цикл: запрос → стрим → диспатч → append. Состояние — лог, поэтому resume бесплатен:
 // незавершённый ход = User без Assistant, продолжение с того же места.
 use serde_json::{json, Value};
+use std::path::Path;
 
 use crate::{
     cfg::Config,
@@ -43,7 +44,13 @@ pub async fn prepare(cfg: &Config) -> R<(Vec<Value>, Vec<registry::Tool>, String
 
 /// Ошибки инструмента не прерывают ход: они возвращаются как результат,
 /// чтобы модель могла исправиться.
-pub async fn dispatch(call: &Call, cfg: &Config, tools: &[registry::Tool], path: &str) -> exec::Out {
+pub async fn dispatch(
+    call: &Call,
+    cfg: &Config,
+    tools: &[registry::Tool],
+    path: &str,
+    out_dir: &Path,
+) -> exec::Out {
     let fail = |msg: String| exec::Out {
         exit: -1,
         text: msg,
@@ -67,6 +74,8 @@ pub async fn dispatch(call: &Call, cfg: &Config, tools: &[registry::Tool], path:
         let mut sp = exec::Spawn::sh(command, t, cfg.max_process_chars);
         sp.cwd = a.get("cwd").and_then(|c| c.as_str());
         sp.path = Some(path);
+        sp.reduce = cfg.reduce_output;
+        sp.dump_dir = Some(out_dir);
         return match exec::spawn(sp).await {
             Ok(o) => o,
             Err(e) => fail(format!("run: {e}")),
@@ -101,6 +110,9 @@ pub async fn dispatch(call: &Call, cfg: &Config, tools: &[registry::Tool], path:
         .and_then(|t| t.as_u64())
         .unwrap_or(cfg.timeout_seconds);
     sp.path = Some(path);
+    // Тулы отдают точный контракт (файл, JSON-событие) — повторы в них схлопывать
+    // нельзя, это исказило бы содержимое. Сокращение живёт только на shell-выводе.
+    sp.dump_dir = Some(out_dir);
     match exec::spawn(sp).await {
         Ok(o) => o,
         Err(e) => fail(format!("{}: {e}", call.name)),
@@ -109,19 +121,32 @@ pub async fn dispatch(call: &Call, cfg: &Config, tools: &[registry::Tool], path:
 
 pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
     let (defs, reg, path) = prepare(cfg).await?;
+    // Полные выводы обрезанных команд: модель получает путь и может дочитать.
+    let out_dir = sess.path().with_extension("out");
     let mut turn = 0u32;
     loop {
         turn += 1;
         let log = sess.read()?;
-        // ponytail: компакция (элизия → саммари) вставляется здесь, перед вызовом модели (M3)
-        let msgs = project::msgs(&log, cfg);
+        let (msgs, report) = project::project(&log, cfg);
         let approx = project::estimate_tokens(&msgs);
         // Оба порога пока только сигналят: это точки, где должна сработать компакция (M3).
         let ratio = approx as f64 / cfg.ctx_window as f64;
         if ratio > cfg.hard {
-            eprintln!("[snens] ~{approx} токенов — пройден порог саммаризации ({:.0}%), компакции ещё нет", cfg.hard * 100.0);
+            eprintln!("[snens] ~{approx} токенов — пройден порог саммаризации ({:.0}%), саммари ещё нет", cfg.hard * 100.0);
         } else if ratio > cfg.soft {
-            eprintln!("[snens] ~{approx} токенов — пройден порог элизии ({:.0}%), компакции ещё нет", cfg.soft * 100.0);
+            eprintln!("[snens] ~{approx} токенов — пройден порог элизии ({:.0}%)", cfg.soft * 100.0);
+        }
+        if report.elided > last_elided(&log) {
+            eprintln!(
+                "[snens] компакция: вырезано результатов {}, освобождено {} Б",
+                report.elided, report.freed_bytes
+            );
+            sess.append(Rec::Ctx {
+                ts: log::now(),
+                action: "elide".into(),
+                elided: report.elided,
+                freed_bytes: report.freed_bytes,
+            })?;
         }
 
         let reply: Reply = llm
@@ -155,7 +180,7 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
         }
 
         for call in &reply.calls {
-            let out = dispatch(call, cfg, &reg, &path).await;
+            let out = dispatch(call, cfg, &reg, &path, &out_dir).await;
             eprintln!(
                 "[{}] exit={} {} Б {} мс{}",
                 call.name,
@@ -180,6 +205,17 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
             return Err("цикл прерван: больше 50 ходов на один запуск".into());
         }
     }
+}
+
+/// Сколько результатов проекция уже вырезала по последней записи журнала.
+fn last_elided(log: &[Rec]) -> usize {
+    log.iter()
+        .rev()
+        .find_map(|r| match r {
+            Rec::Ctx { elided, .. } => Some(*elided),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// Единственная проверка, которая падает, если цикл сломан: ход с tool_call →
@@ -315,6 +351,72 @@ pub async fn selftest() -> R<()> {
     let a = serde_json::to_string(&project::msgs(&recs, &cfg))?;
     let b = serde_json::to_string(&project::msgs(&sess.read()?, &cfg))?;
     assert_eq!(a, b, "проекция недетерминирована");
+
+    // --- компакция: элизия старых результатов при переполнении окна ---
+    let mut cfg2 = cfg.clone();
+    cfg2.ctx_window = 400; // крошечное окно: мягкий порог пройден сразу
+    cfg2.keep_results = 1;
+    let sess2 = Session::open(&dir, "t2")?;
+    sess2.append(Rec::User {
+        ts: log::now(),
+        text: "два больших вывода".into(),
+        source: "selftest".into(),
+    })?;
+    let big = || Reply {
+        text: String::new(),
+        calls: vec![Call {
+            id: "b".into(),
+            name: "run".into(),
+            args: r#"{"command":"seq 1 3000"}"#.into(),
+        }],
+        usage: Usage::default(),
+    };
+    let fake2 = Fake::new(vec![
+        big(),
+        big(),
+        Reply {
+            text: "готово".into(),
+            calls: vec![],
+            usage: Usage::default(),
+        },
+    ]);
+    run_agent(&sess2, &cfg2, &fake2).await?;
+    let recs2 = sess2.read()?;
+    assert!(
+        recs2.iter().any(|r| matches!(r, Rec::Ctx { .. })),
+        "компакция не записала Ctx в журнал"
+    );
+    let msgs2 = project::msgs(&recs2, &cfg2);
+    let tool_msgs: Vec<&Value> = msgs2.iter().filter(|m| m["role"] == "tool").collect();
+    assert_eq!(
+        tool_msgs.len(),
+        2,
+        "элизия не должна выбрасывать сообщения: assistant с tool_calls обязан иметь ответы"
+    );
+    let first = tool_msgs[0]["content"].as_str().unwrap_or_default();
+    let last = tool_msgs[1]["content"].as_str().unwrap_or_default();
+    assert!(first.contains("вырезан при компакции"), "старый результат не вырезан: {first}");
+    assert!(last.starts_with('1'), "последний результат должен остаться как есть");
+    let raw_bytes: usize = recs2
+        .iter()
+        .filter_map(|r| match r {
+            Rec::ToolResult {
+                body: Body::Inline { text },
+                ..
+            } => Some(text.len()),
+            _ => None,
+        })
+        .sum();
+    assert!(
+        project::estimate_tokens(&msgs2) * 3 < raw_bytes as u64,
+        "элизия не уменьшила проекцию: {} Б против {raw_bytes} Б в логе",
+        project::estimate_tokens(&msgs2) * 3
+    );
+    assert_eq!(
+        serde_json::to_string(&project::msgs(&recs2, &cfg2))?,
+        serde_json::to_string(&project::msgs(&sess2.read()?, &cfg2))?,
+        "проекция с элизией недетерминирована"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
     println!(

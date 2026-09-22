@@ -45,6 +45,14 @@ pub enum Rec {
         out_tok: u64,
         cost_micro: u64,
     },
+    /// Что проекция сделала с контекстом. Лог остаётся неизменным: это журнал
+    /// действий над ним, а не новая версия истории.
+    Ctx {
+        ts: u64,
+        action: String,
+        elided: usize,
+        freed_bytes: usize,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -59,8 +67,6 @@ pub struct Call {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Body {
     Inline { text: String },
-    /// Результат вырезан компакцией; байты исходника известны.
-    Elided { bytes: usize },
 }
 
 pub struct Session {

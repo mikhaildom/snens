@@ -46,6 +46,12 @@ pub struct Config {
     /// Каталог тулов: подкаталог = тул. Рядом с ним создаётся bin/ с симлинками.
     #[serde(default = "d_tools")]
     pub tools_dir: String,
+    /// Сколько последних результатов тулов проекция отдаёт как есть при компакции.
+    #[serde(default = "d_keep")]
+    pub keep_results: usize,
+    /// Сокращать вывод shell-команд (ANSI, длинные строки, повторы) до отправки модели.
+    #[serde(default = "d_true")]
+    pub reduce_output: bool,
 }
 
 fn d_base_url() -> String { "https://inference-api.nousresearch.com/v1".into() }
@@ -60,6 +66,7 @@ fn d_timeout() -> u64 { 120 }
 fn d_max_proc() -> usize { 40_000 }
 fn d_sessions() -> String { format!("{}/.local/share/snens/sessions", home()) }
 fn d_tools() -> String { format!("{}/.local/share/snens/tools", home()) }
+fn d_keep() -> usize { 5 }
 
 pub fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| ".".into())
