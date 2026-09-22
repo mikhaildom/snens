@@ -106,9 +106,15 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
     let recs = sess.read()?;
 
     let (mut calls, mut in_tok, mut cached, mut out_tok, mut cost) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut biggest: Option<(usize, &str)> = None;
     for r in &recs {
         match r {
-            log::Rec::ToolResult { .. } => calls += 1,
+            log::Rec::ToolResult { tool, bytes, .. } => {
+                calls += 1;
+                if biggest.map_or(true, |(b, _)| *bytes > b) {
+                    biggest = Some((*bytes, tool.as_str()));
+                }
+            }
             log::Rec::Usage {
                 in_tok: i,
                 cached_tok: c,
@@ -128,6 +134,9 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
     println!("файл:    {}", sess.path().display());
     println!("записей: {}", recs.len());
     println!("тулов:   {calls}");
+    if let Some((b, name)) = biggest {
+        println!("макс. результат: {b} Б ({name})");
+    }
     println!("токены:  вход {in_tok} (из них кеш {cached}), выход {out_tok}");
     if cost > 0 {
         println!("цена:    ${:.4}", cost as f64 / 1e6);
