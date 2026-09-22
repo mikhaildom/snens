@@ -4,6 +4,7 @@ mod exec;
 mod llm;
 mod log;
 mod project;
+mod registry;
 
 use std::{collections::BTreeMap, error::Error};
 
@@ -16,6 +17,7 @@ snens — узкое ядро агента
   snens show [--session ID]
   snens log  [--session ID]
   snens sessions
+  snens tools
   snens selftest
 ";
 
@@ -34,6 +36,7 @@ async fn main() -> R<()> {
             }
             Ok(())
         }
+        Some("tools") => cmd_tools(&flags).await,
         Some("selftest") => agent::selftest().await,
         _ => {
             print!("{USAGE}");
@@ -137,5 +140,21 @@ fn cmd_log(flags: &BTreeMap<String, String>) -> R<()> {
     let id = session_id(&cfg, flags)?;
     let path = cfg.sessions_path().join(format!("{id}.jsonl"));
     print!("{}", std::fs::read_to_string(&path)?);
+    Ok(())
+}
+
+/// Что видит модель: те же summary/usage, что уезжают в определения тулов.
+async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let tools = registry::discover(&cfg).await;
+    let bin = registry::sync_bin_dir(&cfg, &tools)?;
+    println!("каталог тулов: {}", cfg.tools_path().display());
+    println!("PATH (дети и человек): {}\n", bin.display());
+    if tools.is_empty() {
+        println!("(пусто)");
+    }
+    for t in &tools {
+        println!("{}\n  {}\n  {}", t.name, t.summary, t.usage);
+    }
     Ok(())
 }

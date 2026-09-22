@@ -1,22 +1,23 @@
 // Цикл: запрос → стрим → диспатч → append. Состояние — лог, поэтому resume бесплатен:
 // незавершённый ход = User без Assistant, продолжение с того же места.
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{
     cfg::Config,
     exec, log,
     log::{Body, Call, Rec, Session},
     llm::{Fake, Llm, Reply, Usage},
-    project,
+    project, registry,
     R,
 };
 
-pub fn tools() -> Vec<serde_json::Value> {
+/// Вшитый инструмент. Всё остальное — процессы из реестра.
+pub fn builtin_defs() -> Vec<Value> {
     vec![json!({
         "type": "function",
         "function": {
             "name": "run",
-            "description": "Выполнить shell-команду (sh -c) и получить вывод: stdout, затем stderr, и код возврата.",
+            "description": "Выполнить shell-команду (sh -c) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -30,9 +31,19 @@ pub fn tools() -> Vec<serde_json::Value> {
     })]
 }
 
+/// Определения тулов для модели + сами тулы + PATH дочерних процессов.
+pub async fn prepare(cfg: &Config) -> R<(Vec<Value>, Vec<registry::Tool>, String)> {
+    let tools = registry::discover(cfg).await;
+    let bin = registry::sync_bin_dir(cfg, &tools)?;
+    let path = registry::child_path(&bin);
+    let mut defs = builtin_defs();
+    defs.extend(registry::definitions(&tools));
+    Ok((defs, tools, path))
+}
+
 /// Ошибки инструмента не прерывают ход: они возвращаются как результат,
 /// чтобы модель могла исправиться.
-pub async fn dispatch(call: &Call, cfg: &Config) -> exec::Out {
+pub async fn dispatch(call: &Call, cfg: &Config, tools: &[registry::Tool], path: &str) -> exec::Out {
     let fail = |msg: String| exec::Out {
         exit: -1,
         text: msg,
@@ -40,32 +51,64 @@ pub async fn dispatch(call: &Call, cfg: &Config) -> exec::Out {
         ms: 0,
         timed_out: false,
     };
-    match call.name.as_str() {
-        "run" => {
-            let a: serde_json::Value =
-                serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
-            let Some(command) = a.get("command").and_then(|c| c.as_str()) else {
-                return fail("run: не передан command".into());
-            };
-            if command.trim().is_empty() {
-                return fail("run: пустая команда".into());
-            }
-            let cwd = a.get("cwd").and_then(|c| c.as_str());
-            let t = a
-                .get("timeout_seconds")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(cfg.timeout_seconds);
-            match exec::run(command, cwd, t, cfg.max_process_chars).await {
-                Ok(o) => o,
-                Err(e) => fail(format!("run: {e}")),
-            }
+    let a: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
+
+    if call.name == "run" {
+        let Some(command) = a.get("command").and_then(|c| c.as_str()) else {
+            return fail("run: не передан command".into());
+        };
+        if command.trim().is_empty() {
+            return fail("run: пустая команда".into());
         }
-        other => fail(format!("неизвестный инструмент: {other}")),
+        let t = a
+            .get("timeout_seconds")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(cfg.timeout_seconds);
+        let mut sp = exec::Spawn::sh(command, t, cfg.max_process_chars);
+        sp.cwd = a.get("cwd").and_then(|c| c.as_str());
+        sp.path = Some(path);
+        return match exec::spawn(sp).await {
+            Ok(o) => o,
+            Err(e) => fail(format!("run: {e}")),
+        };
+    }
+
+    let Some(tool) = tools.iter().find(|t| t.name == call.name) else {
+        return fail(format!(
+            "неизвестный инструмент: {} — его нет в реестре. Список: snens tools",
+            call.name
+        ));
+    };
+    let args: Vec<String> = match a.get("args") {
+        Some(Value::Array(v)) => v
+            .iter()
+            .map(|x| match x {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect(),
+        Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
+        None => Vec::new(),
+        Some(other) => return fail(format!("args: ожидался массив или строка, получено {other}")),
+    };
+    let bin = tool.bin.to_string_lossy().into_owned();
+    let mut sp = exec::Spawn::argv(&bin, args);
+    sp.stdin = a.get("stdin").and_then(|s| s.as_str()).map(str::to_string);
+    sp.cwd = a.get("cwd").and_then(|c| c.as_str());
+    sp.cap = cfg.max_process_chars;
+    sp.timeout_s = a
+        .get("timeout_seconds")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(cfg.timeout_seconds);
+    sp.path = Some(path);
+    match exec::spawn(sp).await {
+        Ok(o) => o,
+        Err(e) => fail(format!("{}: {e}", call.name)),
     }
 }
 
 pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
-    let tools = tools();
+    let (defs, reg, path) = prepare(cfg).await?;
     let mut turn = 0u32;
     loop {
         turn += 1;
@@ -82,7 +125,7 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
         }
 
         let reply: Reply = llm
-            .reply(cfg, msgs, tools.clone(), &mut |d| {
+            .reply(cfg, msgs, defs.clone(), &mut |d| {
                 use std::io::Write;
                 print!("{d}");
                 let _ = std::io::stdout().flush();
@@ -112,7 +155,7 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
         }
 
         for call in &reply.calls {
-            let out = dispatch(call, cfg).await;
+            let out = dispatch(call, cfg, &reg, &path).await;
             eprintln!(
                 "[{}] exit={} {} Б {} мс{}",
                 call.name,
@@ -139,20 +182,60 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
     }
 }
 
-/// Единственная проверка, которая падает, если цикл сломан:
-/// ход с tool_call → результат → финальный ответ, плюс корректная проекция.
+/// Единственная проверка, которая падает, если цикл сломан: ход с tool_call →
+/// результат → финальный ответ, плюс реестр (хелп-контракт, argv, stdin, PATH)
+/// и корректная проекция.
 pub async fn selftest() -> R<()> {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = std::env::temp_dir().join(format!("snens-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
+    // Фальшивый тул: реестр, хелп-контракт, argv, stdin, PATH — всё настоящее.
+    let tdir = dir.join("tools/probe");
+    std::fs::create_dir_all(&tdir)?;
+    let probe = tdir.join("probe");
+    std::fs::write(
+        &probe,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--help\" ]; then\n\
+         \x20 echo \"probe — тестовый тул: печатает argv и stdin.\"\n\
+         \x20 echo \"probe [args...]\"\n\
+         \x20 exit 0\n\
+         fi\n\
+         echo \"args:$*\"\n\
+         cat\n",
+    )?;
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))?;
+
     let mut cfg = Config::default();
     cfg.sessions_dir = dir.to_string_lossy().into_owned();
+    cfg.tools_dir = dir.join("tools").to_string_lossy().into_owned();
+
+    let (defs, reg, path) = prepare(&cfg).await?;
+    assert!(reg.iter().any(|t| t.name == "probe"), "реестр не нашёл тул");
+    let pd = defs
+        .iter()
+        .find(|d| d["function"]["name"] == "probe")
+        .expect("нет определения probe");
+    let desc = pd["function"]["description"].as_str().unwrap_or_default();
+    assert!(desc.starts_with("probe —"), "описание не из --help: {desc}");
+    assert!(desc.contains("probe [args...]"), "в описание не попал usage");
+    assert!(
+        std::fs::symlink_metadata(cfg.bin_path().join("probe")).is_ok(),
+        "нет симлинка в PATH-каталоге"
+    );
+    let bin_s = cfg.bin_path().to_string_lossy().into_owned();
+    assert!(
+        path.starts_with(&bin_s),
+        "PATH детей не начинается с каталога симлинков: {path}"
+    );
 
     let sess = Session::open(&dir, "t")?;
     sess.append(Rec::User {
         ts: log::now(),
-        text: "выполни echo hi и скажи готово".into(),
+        text: "проверь тулы".into(),
         source: "selftest".into(),
     })?;
 
@@ -161,8 +244,26 @@ pub async fn selftest() -> R<()> {
             text: String::new(),
             calls: vec![Call {
                 id: "c1".into(),
+                name: "probe".into(),
+                args: r#"{"args":["a","b"],"stdin":"привет"}"#.into(),
+            }],
+            usage: Usage::default(),
+        },
+        Reply {
+            text: String::new(),
+            calls: vec![Call {
+                id: "c2".into(),
+                name: "nosuch".into(),
+                args: r#"{"args":[]}"#.into(),
+            }],
+            usage: Usage::default(),
+        },
+        Reply {
+            text: String::new(),
+            calls: vec![Call {
+                id: "c3".into(),
                 name: "run".into(),
-                args: r#"{"command": "echo hi"}"#.into(),
+                args: r#"{"command":"probe via-path"}"#.into(),
             }],
             usage: Usage::default(),
         },
@@ -175,18 +276,28 @@ pub async fn selftest() -> R<()> {
 
     run_agent(&sess, &cfg, &fake).await?;
     let recs = sess.read()?;
+    let tool_text = |call: &str| -> Option<String> {
+        recs.iter().find_map(|r| match r {
+            Rec::ToolResult {
+                tool,
+                body: Body::Inline { text },
+                ..
+            } if tool == call => Some(text.clone()),
+            _ => None,
+        })
+    };
 
+    let probe_out = tool_text("probe").expect("нет результата probe");
+    assert!(probe_out.contains("args:a b"), "argv не доехал: {probe_out}");
+    assert!(probe_out.contains("привет"), "stdin не доехал: {probe_out}");
     assert!(
-        recs.iter()
-            .any(|r| matches!(r, Rec::Assistant { tool_calls, .. } if tool_calls.len() == 1)),
-        "нет хода с tool_call"
+        tool_text("nosuch").unwrap_or_default().contains("нет в реестре"),
+        "неизвестный тул не дал понятной ошибки"
     );
+    let via_path = tool_text("run").unwrap_or_default();
     assert!(
-        recs.iter().any(|r| matches!(
-            r,
-            Rec::ToolResult { body: Body::Inline { text }, exit: 0, .. } if text.contains("hi")
-        )),
-        "нет результата run с выводом команды"
+        via_path.contains("args:via-path"),
+        "тул не виден из PATH внутри run: {via_path}"
     );
     assert!(
         recs.iter().rev().any(|r| matches!(
@@ -197,10 +308,7 @@ pub async fn selftest() -> R<()> {
     );
 
     let msgs = project::msgs(&recs, &cfg);
-    assert!(
-        msgs.iter().any(|m| m["role"] == "tool"),
-        "проекция потеряла tool-сообщение"
-    );
+    assert!(msgs.iter().any(|m| m["role"] == "tool"), "проекция потеряла tool-сообщение");
     assert_eq!(msgs[0]["role"], "system", "проекция должна начинаться с system");
 
     // повторная проекция обязана быть байт-в-байт той же (иначе кеш промахивается)
@@ -210,7 +318,8 @@ pub async fn selftest() -> R<()> {
 
     std::fs::remove_dir_all(&dir).ok();
     println!(
-        "selftest ok: {} записей, {} сообщений в проекции, ~{} токенов",
+        "selftest ok: {} тулов в реестре, {} записей, {} сообщений в проекции, ~{} токенов",
+        reg.len(),
         recs.len(),
         msgs.len(),
         project::estimate_tokens(&msgs)

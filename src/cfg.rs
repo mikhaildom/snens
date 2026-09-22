@@ -43,6 +43,9 @@ pub struct Config {
     pub system_prompt: Option<String>,
     #[serde(default = "d_sessions")]
     pub sessions_dir: String,
+    /// Каталог тулов: подкаталог = тул. Рядом с ним создаётся bin/ с симлинками.
+    #[serde(default = "d_tools")]
+    pub tools_dir: String,
 }
 
 fn d_base_url() -> String { "https://inference-api.nousresearch.com/v1".into() }
@@ -56,6 +59,7 @@ fn d_max_chars() -> usize { 24_000 }
 fn d_timeout() -> u64 { 120 }
 fn d_max_proc() -> usize { 40_000 }
 fn d_sessions() -> String { format!("{}/.local/share/snens/sessions", home()) }
+fn d_tools() -> String { format!("{}/.local/share/snens/tools", home()) }
 
 pub fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| ".".into())
@@ -90,11 +94,24 @@ impl Config {
         // ponytail: путь к сессиям из конфига может содержать ~, разворачиваем один раз здесь
         let mut cfg = cfg;
         cfg.sessions_dir = cfg.sessions_dir.replace('~', &home());
+        cfg.tools_dir = cfg.tools_dir.replace('~', &home());
         Ok(cfg)
     }
 
     pub fn sessions_path(&self) -> PathBuf {
         PathBuf::from(&self.sessions_dir)
+    }
+
+    pub fn tools_path(&self) -> PathBuf {
+        PathBuf::from(&self.tools_dir)
+    }
+
+    /// Каталог симлинков на тулы — сосед каталога тулов, чтобы всё жило в одном месте.
+    pub fn bin_path(&self) -> PathBuf {
+        self.tools_path()
+            .parent()
+            .map(|p| p.join("bin"))
+            .unwrap_or_else(|| PathBuf::from("bin"))
     }
 
     pub fn api_key(&self) -> R<String> {
@@ -111,7 +128,9 @@ pub fn system_prompt(cfg: &Config) -> String {
 }
 
 fn default_system() -> String {
-    "Ты агент. Работаешь через инструменты. Инструмент run исполняет shell-команду и возвращает её вывод.\n\
-     Отвечай кратко. Перед изменением файла сначала прочитай его. Не выдумывай результат команды — сначала выполни."
+    "Ты агент. Работаешь через инструменты. `run` исполняет shell-команду. \
+     Остальные инструменты — программы в PATH: у каждой есть `--help` с описанием и примерами.\n\
+     Отвечай кратко. Перед изменением файла сначала прочитай его. \
+     Не выдумывай результат команды — сначала выполни."
         .into()
 }
