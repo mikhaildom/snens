@@ -85,7 +85,7 @@ pub fn definitions(tools: &[Tool]) -> Vec<Value> {
                             "args": {
                                 "type": ["array", "string"],
                                 "items": {"type": "string"},
-                                "description": "Аргументы argv. Строкой — разбивается по пробелам"
+                                "description": "Аргументы argv. Предпочитай массив: строка разбивается по пробелам и пробел внутри аргумента так не передать"
                             },
                             "stdin": {"type": "string", "description": "Что подать на stdin"},
                             "timeout_seconds": {"type": "integer"}

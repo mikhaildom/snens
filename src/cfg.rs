@@ -150,10 +150,18 @@ impl Config {
 }
 
 pub fn system_prompt(cfg: &Config) -> String {
-    match &cfg.system_prompt {
+    let mut s = match &cfg.system_prompt {
         Some(p) => std::fs::read_to_string(p).unwrap_or_else(|_| default_system()),
         None => default_system(),
-    }
+    };
+    // Без этого модель угадывает, где она: относительные пути работают случайно.
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    s.push_str(&format!(
+        "\nРабочий каталог: {cwd} — инструменты и команды выполняются в нём."
+    ));
+    s
 }
 
 fn default_system() -> String {
