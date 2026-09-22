@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::Deserialize;
 
-use crate::{R, log};
+use crate::R;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
@@ -114,9 +114,4 @@ fn default_system() -> String {
     "Ты агент. Работаешь через инструменты. Инструмент run исполняет shell-команду и возвращает её вывод.\n\
      Отвечай кратко. Перед изменением файла сначала прочитай его. Не выдумывай результат команды — сначала выполни."
         .into()
-}
-
-/// Текущая сессия по умолчанию: последняя изменённая, иначе — ошибка.
-pub fn latest_session_id(cfg: &Config) -> R<String> {
-    log::latest(&cfg.sessions_path())
 }

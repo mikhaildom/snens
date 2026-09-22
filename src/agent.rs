@@ -73,13 +73,12 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
         // ponytail: компакция (элизия → саммари) вставляется здесь, перед вызовом модели (M3)
         let msgs = project::msgs(&log, cfg);
         let approx = project::estimate_tokens(&msgs);
-        // Порог мягкий: это момент, когда компакция должна была бы сработать (M3).
-        if approx as f64 > cfg.ctx_window as f64 * cfg.soft {
-            eprintln!(
-                "[snens] контекст ~{approx} токенов при окне {} — порог {:.0}% пройден, компакция ещё не реализована",
-                cfg.ctx_window,
-                cfg.soft * 100.0
-            );
+        // Оба порога пока только сигналят: это точки, где должна сработать компакция (M3).
+        let ratio = approx as f64 / cfg.ctx_window as f64;
+        if ratio > cfg.hard {
+            eprintln!("[snens] ~{approx} токенов — пройден порог саммаризации ({:.0}%), компакции ещё нет", cfg.hard * 100.0);
+        } else if ratio > cfg.soft {
+            eprintln!("[snens] ~{approx} токенов — пройден порог элизии ({:.0}%), компакции ещё нет", cfg.soft * 100.0);
         }
 
         let reply: Reply = llm
