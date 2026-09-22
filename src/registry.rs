@@ -27,7 +27,7 @@ pub async fn discover(cfg: &Config) -> Vec<Tool> {
         let Some(name) = d.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
             continue;
         };
-        let bin = d.join(&name);
+        let bin = d.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         if !bin.is_file() {
             eprintln!("[snens] тул {name}: нет исполняемого файла {}", bin.display());
             continue;
@@ -103,23 +103,44 @@ pub fn definitions(tools: &[Tool]) -> Vec<Value> {
 pub fn sync_bin_dir(cfg: &Config, tools: &[Tool]) -> R<PathBuf> {
     let bin = cfg.bin_path();
     std::fs::create_dir_all(&bin)?;
+    // Каталог наш; чистим только то, что сами и создали — на unix симлинки,
+    // на Windows копии (симлинк там требует прав).
+    let names: Vec<String> = tools
+        .iter()
+        .map(|t| format!("{}{}", t.name, std::env::consts::EXE_SUFFIX))
+        .collect();
     for e in std::fs::read_dir(&bin)?.flatten() {
         let p = e.path();
-        let is_link = p
+        let own_link = p
             .symlink_metadata()
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
-        if is_link {
+        let own_copy = !own_link
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| !names.iter().any(|x| x == n))
+                .unwrap_or(false);
+        if own_link || own_copy {
             let _ = std::fs::remove_file(&p);
         }
     }
-    for t in tools {
-        std::os::unix::fs::symlink(&t.bin, bin.join(&t.name))?;
+    for (t, name) in tools.iter().zip(&names) {
+        let to = bin.join(name);
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&t.bin, &to);
+        #[cfg(not(unix))]
+        std::fs::copy(&t.bin, &to)?;
     }
     Ok(bin)
 }
 
+/// PATH детей: разделитель путей свой у каждой платформы, склеиваем им.
 pub fn child_path(bin: &Path) -> String {
-    let cur = std::env::var("PATH").unwrap_or_default();
-    format!("{}:{}", bin.display(), cur)
+    let mut parts = vec![bin.to_path_buf()];
+    if let Some(cur) = std::env::var_os("PATH") {
+        parts.extend(std::env::split_paths(&cur));
+    }
+    std::env::join_paths(parts)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }

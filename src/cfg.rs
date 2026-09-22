@@ -52,6 +52,10 @@ pub struct Config {
     /// Сокращать вывод shell-команд (ANSI, длинные строки, повторы) до отправки модели.
     #[serde(default = "d_true")]
     pub reduce_output: bool,
+    /// Оболочка для `run`: программа и её флаги. `sh -c` в коде не зашит —
+    /// на Windows это `cmd /C`.
+    #[serde(default = "d_shell")]
+    pub shell: Vec<String>,
 }
 
 fn d_base_url() -> String { "https://inference-api.nousresearch.com/v1".into() }
@@ -64,19 +68,54 @@ fn d_hard() -> f64 { 0.85 }
 fn d_max_chars() -> usize { 24_000 }
 fn d_timeout() -> u64 { 120 }
 fn d_max_proc() -> usize { 40_000 }
-fn d_sessions() -> String { format!("{}/.local/share/snens/sessions", home()) }
-fn d_tools() -> String { format!("{}/.local/share/snens/tools", home()) }
+fn d_sessions() -> String { format!("{}/sessions", data_dir()) }
+fn d_tools() -> String { format!("{}/tools", data_dir()) }
 fn d_keep() -> usize { 5 }
+fn d_shell() -> Vec<String> {
+    if cfg!(windows) {
+        vec!["cmd".into(), "/C".into()]
+    } else {
+        vec!["sh".into(), "-c".into()]
+    }
+}
 
+/// Windows: USERPROFILE. unix (Linux, macOS, Termux): HOME.
 pub fn home() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| ".".into())
+    for k in ["HOME", "USERPROFILE"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    ".".into()
+}
+
+/// XDG на unix, APPDATA на Windows. macOS — тоже unix-ветка: `~/.local/share`
+/// не маковская конвенция, но своя раскладка на каждую ОС дороже, чем ноль.
+pub fn data_dir() -> String {
+    if cfg!(windows) {
+        if let Ok(a) = std::env::var("APPDATA") {
+            return format!("{a}/snens");
+        }
+    }
+    format!("{}/.local/share/snens", home())
+}
+
+fn config_dir() -> String {
+    if cfg!(windows) {
+        if let Ok(a) = std::env::var("APPDATA") {
+            return format!("{a}/snens");
+        }
+    }
+    format!("{}/.config/snens", home())
 }
 
 pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("SNENS_CONFIG") {
         return PathBuf::from(p);
     }
-    PathBuf::from(format!("{}/.config/snens/config.toml", home()))
+    PathBuf::from(format!("{}/config.toml", config_dir()))
 }
 
 impl Default for Config {

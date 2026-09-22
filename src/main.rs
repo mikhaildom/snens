@@ -18,6 +18,7 @@ snens — узкое ядро агента
   snens log  [--session ID]
   snens sessions
   snens tools
+  snens build
   snens selftest
 ";
 
@@ -37,6 +38,7 @@ async fn main() -> R<()> {
             Ok(())
         }
         Some("tools") => cmd_tools(&flags).await,
+        Some("build") => cmd_build(&flags),
         Some("selftest") => agent::selftest().await,
         _ => {
             print!("{USAGE}");
@@ -166,4 +168,66 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
         println!("{}\n  {}\n  {}", t.name, t.summary, t.usage);
     }
     Ok(())
+}
+
+/// Собрать вшитые тулы и положить бинарники туда, откуда их берёт реестр:
+/// `tools/<имя>/<имя>[.exe]`. Шаг входит в дефолтную установку, поэтому он в
+/// харнессе, а не в sh-скрипте: на Windows sh нет.
+fn cmd_build(flags: &BTreeMap<String, String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let tools_dir = cfg.tools_path();
+    let root = tools_dir
+        .parent()
+        .ok_or("у tools_dir нет родителя — негде запускать cargo")?;
+
+    let ok = std::process::Command::new("cargo")
+        .args(["build", "--release", "--workspace"])
+        .current_dir(root)
+        .status()?;
+    if !ok.success() {
+        return Err("cargo build завершился с ошибкой".into());
+    }
+
+    let release = cargo_target_dir(root)?.join("release");
+    let mut built = 0;
+    for e in std::fs::read_dir(&tools_dir)?.flatten() {
+        let dir = e.path();
+        if !dir.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            continue;
+        };
+        let from = release.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if !from.is_file() {
+            eprintln!("[snens] {name}: нет {} — пропускаю", from.display());
+            continue;
+        }
+        let to = dir.join(from.file_name().unwrap());
+        // Через симлинк (наследие сборки скриптом) копирование записало бы
+        // бинарник сам в себя и обнулило его.
+        let _ = std::fs::remove_file(&to);
+        std::fs::copy(&from, &to)?;
+        println!("{name} → {}", to.display());
+        built += 1;
+    }
+    println!("собрано тулов: {built}");
+    Ok(())
+}
+
+/// target может быть перенесён (`.cargo/config.toml`) — спрашиваем cargo, а не угадываем.
+fn cargo_target_dir(root: &std::path::Path) -> R<std::path::PathBuf> {
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(root)
+        .output()?;
+    if !out.status.success() {
+        return Err("cargo metadata упал".into());
+    }
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let dir = j
+        .get("target_directory")
+        .and_then(|v| v.as_str())
+        .ok_or("cargo metadata без target_directory")?;
+    Ok(std::path::PathBuf::from(dir))
 }

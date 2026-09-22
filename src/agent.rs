@@ -71,7 +71,7 @@ pub async fn dispatch(
             .get("timeout_seconds")
             .and_then(|t| t.as_u64())
             .unwrap_or(cfg.timeout_seconds);
-        let mut sp = exec::Spawn::sh(command, t, cfg.max_process_chars);
+        let mut sp = exec::Spawn::sh(&cfg.shell, command, t, cfg.max_process_chars);
         sp.cwd = a.get("cwd").and_then(|c| c.as_str());
         sp.path = Some(path);
         sp.reduce = cfg.reduce_output;

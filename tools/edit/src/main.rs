@@ -1,7 +1,8 @@
 // edit — заменить точный фрагмент файла (exact match, как Edit/str_replace).
 // Требует ровно одного совпадения old_string: молчаливая замена не того места
 // дороже отказа. Пишет атомарно, потому что обрыв на середине съедает файл.
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::exit;
 
@@ -100,7 +101,28 @@ fn abs(p: &str) -> String {
         .unwrap_or_else(|_| p.to_string())
 }
 
-fn atomic_write(path: &str, data: &[u8], mode: u32) {
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> Option<u32> {
+    Some(meta.permissions().mode())
+}
+
+/// Windows прав файла не знает — сохранять нечего.
+#[cfg(not(unix))]
+fn mode_of(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn set_mode(p: &std::path::Path, mode: Option<u32>) {
+    if let Some(m) = mode {
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+    }
+}
+
+#[cfg(not(unix))]
+fn set_mode(_p: &std::path::Path, _mode: Option<u32>) {}
+
+fn atomic_write(path: &str, data: &[u8], mode: Option<u32>) {
     let p = std::path::Path::new(path);
     let dir = p
         .parent()
@@ -112,7 +134,7 @@ fn atomic_write(path: &str, data: &[u8], mode: u32) {
         .unwrap_or(0);
     let tmp = dir.join(format!(".snens-edit-{}-{nanos}", std::process::id()));
     std::fs::write(&tmp, data).unwrap_or_else(|e| die(format!("edit: {}: {e}", tmp.display())));
-    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    set_mode(&tmp, mode);
     if let Err(e) = std::fs::rename(&tmp, p) {
         let _ = std::fs::remove_file(&tmp);
         die(format!("edit: {path}: {e}"));
@@ -216,7 +238,7 @@ fn main() {
             eprintln!("+ {l}");
         }
     } else {
-        atomic_write(&path, out_text.as_bytes(), meta.permissions().mode());
+        atomic_write(&path, out_text.as_bytes(), mode_of(&meta));
     }
 
     println!(

@@ -22,9 +22,8 @@ pub struct Out {
 }
 
 pub struct Spawn<'a> {
-    /// true — program это строка для `sh -c`; false — путь к исполняемому файлу.
-    pub shell: bool,
-    pub program: &'a str,
+    /// Путь к исполняемому файлу или имя программы: и тул, и оболочка — процесс.
+    pub program: String,
     pub args: Vec<String>,
     /// Что подать на stdin. None — stdin закрывается сразу (иначе тул, читающий
     /// stdin, будет ждать до таймаута).
@@ -44,11 +43,15 @@ pub struct Spawn<'a> {
 }
 
 impl<'a> Spawn<'a> {
-    pub fn sh(cmd: &'a str, timeout_s: u64, cap: usize) -> Self {
+    /// Команда строкой через оболочку из конфига: на unix `sh -c`, на Windows
+    /// `cmd /C`. Платформа в коде не зашита, и `sh` ищется в PATH — на Android
+    /// он в /system/bin, а не в /bin.
+    pub fn sh(shell: &[String], cmd: &str, timeout_s: u64, cap: usize) -> Self {
+        let mut args: Vec<String> = shell.iter().skip(1).cloned().collect();
+        args.push(cmd.to_string());
         Spawn {
-            shell: true,
-            program: cmd,
-            args: Vec::new(),
+            program: shell.first().cloned().unwrap_or_else(|| "sh".into()),
+            args,
             stdin: None,
             cwd: None,
             timeout_s,
@@ -59,10 +62,9 @@ impl<'a> Spawn<'a> {
         }
     }
 
-    pub fn argv(program: &'a str, args: Vec<String>) -> Self {
+    pub fn argv(program: &str, args: Vec<String>) -> Self {
         Spawn {
-            shell: false,
-            program,
+            program: program.to_string(),
             args,
             stdin: None,
             cwd: None,
@@ -77,13 +79,7 @@ impl<'a> Spawn<'a> {
 
 pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     let started = Instant::now();
-    let mut c = if sp.shell {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(sp.program);
-        c
-    } else {
-        Command::new(sp.program)
-    };
+    let mut c = Command::new(&sp.program);
     c.args(&sp.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -290,7 +286,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snens-dump-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let mut sp = Spawn::sh("seq 1 20000", 20, 500);
+        let mut sp = Spawn::sh(&["sh".into(), "-c".into()], "seq 1 20000", 20, 500);
         sp.reduce = true;
         sp.dump_dir = Some(dir.as_path());
         let out = spawn(sp).await.expect("спавн упал");
