@@ -86,6 +86,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "edit"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -617,6 +624,10 @@ checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core",
 ]
+
+[[package]]
+name = "read"
+version = "0.1.0"
 
 [[package]]
 name = "reqwest"
@@ -1317,6 +1328,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "write"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

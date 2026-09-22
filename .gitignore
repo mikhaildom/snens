@@ -1,2 +1,8 @@
 target/
-*.jsonlbin/
+*.jsonl
+bin/
+# бинарники тулов — сборка, не исходники
+tools/*/read
+tools/*/edit
+tools/*/write
+tools/*/audit
