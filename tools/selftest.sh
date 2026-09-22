@@ -105,6 +105,31 @@ chmod 600 "$TMP/dry.txt"
 ti edit '{"old_string":"one","new_string":"one2"}' "$TMP/dry.txt"
 want "600" "$(stat -c %a "$TMP/dry.txt")" "edit: права файла сохраняются"
 
+printf 'one\ntwo\nthree\n' >"$TMP/multi.txt"
+ti edit '{"edits":[{"old_string":"one","new_string":"1"},{"old_string":"three","new_string":"3"}]}' "$TMP/multi.txt"
+want 0 "$rc" "edit: пачка правок — код 0"
+has '"edits":2' "$out" "edit: пачка — число правок в событии"
+has '"replaced":2' "$out" "edit: пачка — счётчик замен"
+want "1
+two
+3" "$(cat "$TMP/multi.txt")" "edit: пачка — обе правки применены"
+
+printf 'one\ntwo\nthree\n' >"$TMP/multi.txt"
+ti edit '{"edits":[{"old_string":"one","new_string":"1"},{"old_string":"нетакого","new_string":"3"}]}' "$TMP/multi.txt"
+want 1 "$rc" "edit: пачка с промахом — код 1"
+has "правка 2" "$err" "edit: пачка — номер несовпавшей правки"
+want "one
+two
+three" "$(cat "$TMP/multi.txt")" "edit: пачка с промахом — файл не тронут (атомарность)"
+
+ti edit '{"edits":[]}' "$TMP/multi.txt"
+want 1 "$rc" "edit: пустая пачка — код 1"
+
+printf 'x\nx\n' >"$TMP/multi2.txt"
+ti edit '{"edits":[{"old_string":"x","new_string":"y"}]}' "$TMP/multi2.txt"
+want 1 "$rc" "edit: пачка — неоднозначность внутри правки"
+has "правка 1" "$err" "edit: пачка — номер в ошибке неоднозначности"
+
 ti edit '{"old_string":"","new_string":"x"}' "$TMP/dry.txt"
 want 1 "$rc" "edit: пустой old_string — код 1"
 has "write" "$err" "edit: пустой old_string — подсказка про write"

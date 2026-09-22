@@ -86,12 +86,7 @@ fn ticket_list(dir: &Path) -> String {
         let Ok(text) = std::fs::read_to_string(&p) else {
             continue;
         };
-        let field = |k: &str| {
-            text.lines()
-                .find_map(|l| l.strip_prefix(&format!("{k}:")))
-                .map(|v| v.trim().to_string())
-                .unwrap_or_default()
-        };
+        let field = |k: &str| fm(&text, k);
         if field("status") != "open" {
             continue;
         }
@@ -116,6 +111,54 @@ fn ticket_list(dir: &Path) -> String {
         "(открытых тикетов нет)".into()
     } else {
         rows.join("\n")
+    }
+}
+
+/// Поле front-matter тикета.
+fn fm(text: &str, key: &str) -> String {
+    text.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}:")))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Снимок каталога тикетов: равен до ревью и после — значит ревью ничего не
+/// записало, и улучшение звать нечего.
+pub fn tickets_state(cfg: &Config) -> R<Vec<(String, u64, std::time::SystemTime)>> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(cfg.tickets_path()).into_iter().flatten().flatten() {
+        let md = e.metadata()?;
+        v.push((
+            e.file_name().to_string_lossy().into_owned(),
+            md.len(),
+            md.modified()?,
+        ));
+    }
+    v.sort();
+    Ok(v)
+}
+
+/// Полные тела открытых тикетов: improve разбирает их без хождения по файлам.
+pub fn tickets_full(cfg: &Config) -> String {
+    let mut out = String::new();
+    for e in std::fs::read_dir(cfg.tickets_path()).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        if fm(&text, "status") != "open" {
+            continue;
+        }
+        let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+        out.push_str(&format!("=== {name} ===\n{text}\n"));
+    }
+    if out.is_empty() {
+        "(открытых тикетов нет)".into()
+    } else {
+        out
     }
 }
 
@@ -144,7 +187,7 @@ fn clip(s: &str, n: usize) -> String {
 }
 
 /// Дата из unix-времени: без зависимостей и без внешней `date` (её нет на Windows).
-fn ymd(secs: u64) -> String {
+pub fn ymd(secs: u64) -> String {
     let z = (secs / 86_400) as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

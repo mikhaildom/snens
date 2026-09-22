@@ -1,6 +1,7 @@
 mod agent;
 mod cfg;
 mod exec;
+mod improve;
 mod llm;
 mod log;
 mod project;
@@ -21,6 +22,7 @@ snens — узкое ядро агента
   snens tools
   snens build
   snens review [--session ID]
+  snens improve
   snens selftest
 ";
 
@@ -42,6 +44,7 @@ async fn main() -> R<()> {
         Some("tools") => cmd_tools(&flags).await,
         Some("build") => cmd_build(&flags),
         Some("review") => review::cmd(&flags).await,
+        Some("improve") => improve::cmd(&flags).await,
         Some("selftest") => agent::selftest().await,
         _ => {
             print!("{USAGE}");
@@ -102,15 +105,21 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
     eprintln!("[snens] {id} → {} ({})", cfg.base_url, cfg.model);
     agent::run_agent(&sess, &cfg, &llm).await?;
 
-    // Порог по длине, а не по цене: цена слишком разбросана, чтобы быть сигналом.
+    // Автономный цикл: длинная сессия → ревью; ревью тронуло тикеты → улучшение.
+    // Порог по длине, не по цене: цена слишком разбросана, чтобы быть сигналом.
     let turns = log::read_file(sess.path())?
         .iter()
         .filter(|r| matches!(r, log::Rec::Assistant { .. }))
         .count();
-    if turns >= cfg.review_min_turns {
-        eprintln!(
-            "[snens] сессия длинная ({turns} ходов) — повод для ревью: snens review --session {id}"
-        );
+    if turns < cfg.review_min_turns {
+        return Ok(());
+    }
+    eprintln!("[snens] {turns} ходов ≥ {} — ревью", cfg.review_min_turns);
+    let before = review::tickets_state(&cfg)?;
+    review::run(&cfg, &id, &llm).await?;
+    if review::tickets_state(&cfg)? != before {
+        eprintln!("[snens] тикеты изменились — улучшение");
+        improve::run(&cfg, &llm).await?;
     }
     Ok(())
 }

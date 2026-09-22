@@ -1,6 +1,6 @@
 // Конфиг: один TOML, ничего больше. Провайдерские квирки — через body_patch/headers,
 // чтобы новый провайдер не требовал кода.
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::Path, path::PathBuf};
 
 use serde::Deserialize;
 
@@ -160,6 +160,23 @@ impl Config {
         PathBuf::from(&self.sessions_dir)
     }
 
+    /// Репозиторий исходников харнесса: improve правит код здесь. Инсталляция из
+    /// исходников — это каталог над tools_dir; иначе конфигурация неполная.
+    pub fn repo_path(&self) -> R<PathBuf> {
+        let repo = PathBuf::from(&self.tools_dir)
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or("не могу определить репозиторий из tools_dir")?;
+        if !repo.join(".git").exists() {
+            return Err(format!(
+                "в {} нет .git — улучшению нужен репозиторий исходников",
+                repo.display()
+            )
+            .into());
+        }
+        Ok(repo)
+    }
+
     pub fn tickets_path(&self) -> PathBuf {
         PathBuf::from(&self.tickets_dir)
     }
@@ -220,8 +237,14 @@ pub fn system_prompt(cfg: &Config) -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "?".into());
+    // Дешёвый канал самоулучшения: неудобство фиксируется сразу, пока факт жив.
+    let tickets = cfg.tickets_path().display().to_string();
     s.push_str(&format!(
-        "\nРабочий каталог: {cwd} — инструменты и команды выполняются в нём."
+        "\nРабочий каталог: {cwd} — инструменты и команды выполняются в нём.\n\
+         Заметил неудобство по ходу работы — тул путает контракт, вызов пришлось \
+         повторять, вывод пришлось дочитывать — сразу допиши тикет в {tickets}: \
+         markdown-файл с front-matter (status: open, kind, target, hits) и секциями \
+         Симптом / Гипотеза / История. Не откладывай на потом."
     ));
     s
 }

@@ -1,6 +1,12 @@
 // edit — заменить точный фрагмент файла (exact match, как Edit/str_replace).
 // Требует ровно одного совпадения old_string: молчаливая замена не того места
 // дороже отказа. Пишет атомарно, потому что обрыв на середине съедает файл.
+//
+// Правок может быть несколько: одна логическая правка часто разнесена по
+// нескольким местам файла, и гонять её по одному фрагменту — рутина. Правки
+// применяются последовательно (текст под следующую — результат предыдущей) и
+// атомарно: не совпал хоть один фрагмент — файл не переписывается вовсе.
+use serde_json::Value;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -9,8 +15,11 @@ use std::process::exit;
 const HELP: &str = "\
 edit — заменить точный фрагмент файла (exact match, как Edit/str_replace).
 edit <путь>   — JSON на stdin: {\"old_string\": \"...\", \"new_string\": \"...\", \"replace_all\": false}
+edit <путь>   — либо {\"edits\": [{\"old_string\", \"new_string\", \"replace_all\"}, ...]}
 
 Требует ровно одного совпадения old_string, иначе ошибка со списком строк.
+Несколько правок одного файла — одним вызовом (поле edits): применяются по
+порядку, и если хоть одна не совпала, файл не трогается, а в ошибке — её номер.
 Пишет атомарно (temp + rename). --dry-run показывает затронутый участок и не пишет.
 В stdout — одна строка JSON-события.";
 
@@ -141,6 +150,85 @@ fn atomic_write(path: &str, data: &[u8], mode: Option<u32>) {
     }
 }
 
+/// Один фрагмент правки. `n` — номер в пачке для сообщений об отказе (0 —
+/// одиночная правка, её и без номера видно).
+struct Edit {
+    n: usize,
+    old: String,
+    new: String,
+    all: bool,
+}
+
+impl Edit {
+    fn parse(j: &Value, n: usize) -> Edit {
+        let need = |k: &str| -> String {
+            j.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    die(format!(
+                        "edit: нужны строковые \"old_string\" и \"new_string\"{}",
+                        where_n(n)
+                    ))
+                })
+                .to_string()
+        };
+        let old = need("old_string");
+        let new = need("new_string");
+        let all = j.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        if old.is_empty() {
+            die(format!(
+                "edit: пустой old_string{} — для полной перезаписи есть write",
+                where_n(n)
+            ));
+        }
+        if old == new {
+            die(format!(
+                "edit: old_string и new_string совпадают{},
+                менять нечего",
+                where_n(n)
+            ));
+        }
+        Edit { n, old, new, all }
+    }
+}
+
+/// « (правка 2)» — часть сообщения, которой у одиночной правки нет.
+fn where_n(n: usize) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!(" (правка {n})")
+    }
+}
+
+fn apply_one(text: &str, e: &Edit, path: &str) -> (String, usize) {
+    let count = text.matches(&e.old).count();
+    if count == 0 {
+        die(format!(
+            "edit: old_string не найден в {path}{}\n{}",
+            where_n(e.n),
+            hint(text, &e.old)
+        ));
+    }
+    if count > 1 && !e.all {
+        let spots: Vec<String> = text
+            .match_indices(&e.old)
+            .take(20)
+            .map(|(i, _)| line_of(text, i).to_string())
+            .collect();
+        die(format!(
+            "edit: old_string встречается {count} раз (строки {}){} — уточни контекст или поставь replace_all: true",
+            spots.join(", "),
+            where_n(e.n)
+        ));
+    }
+    if e.all {
+        (text.replace(&e.old, &e.new), count)
+    } else {
+        (text.replacen(&e.old, &e.new, 1), 1)
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() || argv[0] == "-h" || argv[0] == "--help" {
@@ -168,22 +256,30 @@ fn main() {
         .map(|s| (*s).clone())
         .or_else(|| j.get("path").and_then(|p| p.as_str()).map(str::to_string))
         .unwrap_or_else(|| die("edit: не указан путь (аргументом или полем path)".into()));
-    let str_field = |k: &str| -> String {
-        j.get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| die("edit: нужны строковые \"old_string\" и \"new_string\"".into()))
-            .to_string()
+    // Один фрагмент или пачка: разбор обеих форм приводит к общему списку.
+    // Пачка — это одна логическая правка, разнесённая по месту файла, поэтому
+    // её части носят номер: по нему видно, какая не совпала.
+    let edits: Vec<Edit> = match j.get("edits") {
+        None => vec![Edit::parse(&j, 0)],
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                die("edit: пустой edits — нечего менять".into());
+            }
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| match item {
+                    Value::Object(o) => Edit::parse(&Value::Object(o.clone()), i + 1),
+                    other => die(format!(
+                        "edit: edits[{i}] — ожидался объект, получено {other}"
+                    )),
+                })
+                .collect()
+        }
+        Some(other) => die(format!(
+            "edit: edits — ожидался массив, получено {other}"
+        )),
     };
-    let old = str_field("old_string");
-    let new = str_field("new_string");
-    let all = j.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    if old.is_empty() {
-        die("edit: пустой old_string — для полной перезаписи есть write".into());
-    }
-    if old == new {
-        die("edit: old_string и new_string совпадают, менять нечего".into());
-    }
 
     let meta = std::fs::metadata(&path).unwrap_or_else(|e| match e.kind() {
         std::io::ErrorKind::NotFound => die(format!("edit: файл не найден: {path}")),
@@ -201,41 +297,31 @@ fn main() {
     }
     let text = String::from_utf8_lossy(&data).into_owned();
 
-    let count = text.matches(&old).count();
-    if count == 0 {
-        die(format!(
-            "edit: old_string не найден в {path}\n{}",
-            hint(&text, &old)
-        ));
+    // Все правки считаются по промежуточному тексту: вторая видит результат
+    // первой. Файл пишется один раз — только если сошлись все фрагменты.
+    let mut out_text = text.clone();
+    let mut replaced = 0usize;
+    for e in &edits {
+        match apply_one(&out_text, e, &path) {
+            (t, n) => {
+                out_text = t;
+                replaced += n;
+            }
+        }
     }
-    if count > 1 && !all {
-        let spots: Vec<String> = text
-            .match_indices(&old)
-            .take(20)
-            .map(|(i, _)| line_of(&text, i).to_string())
-            .collect();
-        die(format!(
-            "edit: old_string встречается {count} раз (строки {}) — уточни контекст или поставь replace_all: true",
-            spots.join(", ")
-        ));
-    }
-
-    let out_text = if all {
-        text.replace(&old, &new)
-    } else {
-        text.replacen(&old, &new, 1)
-    };
 
     if dry {
         // Полноценный unified diff не нужен: git даёт его точнее, а здесь важно
-        // показать затронутый участок до записи.
-        let at = text.find(&old).unwrap_or(0);
-        eprintln!("--- {path} (строка {})", line_of(&text, at));
-        for l in old.lines() {
-            eprintln!("- {l}");
-        }
-        for l in new.lines() {
-            eprintln!("+ {l}");
+        // показать затронутый участок до записи. Для пачки — каждый фрагмент.
+        for e in &edits {
+            let at = text.find(&e.old).unwrap_or(0);
+            eprintln!("--- {path}{} (строка {})", where_n(e.n), line_of(&text, at));
+            for l in e.old.lines() {
+                eprintln!("- {l}");
+            }
+            for l in e.new.lines() {
+                eprintln!("+ {l}");
+            }
         }
     } else {
         atomic_write(&path, out_text.as_bytes(), mode_of(&meta));
@@ -245,7 +331,8 @@ fn main() {
         "{}",
         serde_json::json!({
             "path": abs(&path),
-            "replaced": if all { count } else { 1 },
+            "edits": edits.len(),
+            "replaced": replaced,
             "bytes_before": data.len(),
             "bytes_after": out_text.len(),
             "dry_run": dry,
@@ -269,5 +356,28 @@ mod tests {
         let text = "let value = compute(alpha);\n";
         let h = hint(text, "let value = compute(beta);");
         assert!(h.contains("ближайшее"), "нет подсказки о близком: {h}");
+    }
+
+    fn e(n: usize, old: &str, new: &str) -> Edit {
+        Edit {
+            n,
+            old: old.into(),
+            new: new.into(),
+            all: false,
+        }
+    }
+
+    #[test]
+    fn second_hunk_sees_result_of_first() {
+        let (a, n1) = apply_one("let a = 1;\nlet b = 2;\n", &e(1, "let a = 1;", "let a = 10;"), "f");
+        let (b, n2) = apply_one(&a, &e(2, "let b = 2;", "let b = a + 1;"), "f");
+        assert_eq!(n1 + n2, 2);
+        assert_eq!(b, "let a = 10;\nlet b = a + 1;\n");
+    }
+
+    #[test]
+    fn hunk_number_lands_in_messages() {
+        assert_eq!(where_n(0), "");
+        assert!(where_n(2).contains("2"));
     }
 }
