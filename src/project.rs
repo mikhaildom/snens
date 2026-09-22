@@ -46,7 +46,16 @@ pub fn soft_limit(cfg: &Config) -> u64 {
 }
 
 fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
-    let mut out = vec![json!({"role": "system", "content": cfg::system_prompt(cfg)})];
+    // Промпт сессии — из лога. Пересборка из файлов только как запасной путь для
+    // логов, записанных до появления записи System.
+    let system = log
+        .iter()
+        .find_map(|r| match r {
+            Rec::System { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| cfg::system_prompt(cfg));
+    let mut out = vec![json!({"role": "system", "content": system})];
     let mut report = Report::default();
     // Последние keep_results остаются как есть при любом размере: модель работает
     // именно с ними. Всё, что раньше, — уже переваренный материал.
@@ -151,7 +160,7 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
                 };
                 out.push(json!({"role": "tool", "tool_call_id": call_id, "content": text}));
             }
-            Rec::Meta { .. } | Rec::Usage { .. } | Rec::Ctx { .. } => {}
+            Rec::System { .. } | Rec::Meta { .. } | Rec::Usage { .. } | Rec::Ctx { .. } => {}
         }
     }
     (out, report)
@@ -231,6 +240,26 @@ mod tests {
             "пометка не нужна, когда транскрипта нет"
         );
         assert_eq!(msgs[1]["role"], "system", "рамка улучшения — системная");
+    }
+
+    /// Промпт сессии берётся из лога, а не собирается заново: иначе правка файлов
+    /// инстанса по ходу сессии сдвинула бы начало промпта и убила префикс-кеш.
+    #[test]
+    fn system_prompt_is_read_from_log() {
+        let cfg = Config::default();
+        let log = vec![
+            Rec::System {
+                ts: 0,
+                text: "ПРОМПТ ИЗ ЛОГА".into(),
+            },
+            user("привет", "cli"),
+        ];
+        assert_eq!(msgs(&log, &cfg)[0]["content"], "ПРОМПТ ИЗ ЛОГА");
+        // Лог без записи System (записанный до неё) — собираем, иначе сессия мертва.
+        assert!(msgs(&[user("привет", "cli")], &cfg)[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Ты агент"));
     }
 
     /// Оборванный ход (Ctrl+C, падение) не должен уезжать провайдеру как

@@ -120,6 +120,20 @@ pub async fn dispatch(
 }
 
 pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
+    // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
+    // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
+    // ходу промахивалась бы мимо префикс-кеша. Здесь — единственная точка, через
+    // которую проходят все сессии, поэтому и запись здесь.
+    if !sess
+        .read()?
+        .iter()
+        .any(|r| matches!(r, Rec::System { .. }))
+    {
+        sess.append(Rec::System {
+            ts: log::now(),
+            text: crate::cfg::system_prompt(cfg),
+        })?;
+    }
     let (defs, reg, path) = prepare(cfg).await?;
     // Полные выводы обрезанных команд: модель получает путь и может дочитать.
     let out_dir = sess.path().with_extension("out");
@@ -418,6 +432,22 @@ pub async fn selftest() -> R<()> {
     let msgs = project::msgs(&recs, &cfg);
     assert!(msgs.iter().any(|m| m["role"] == "tool"), "проекция потеряла tool-сообщение");
     assert_eq!(msgs[0]["role"], "system", "проекция должна начинаться с system");
+    // Промпт сессии записан в лог один раз и проекция берёт его оттуда, а не
+    // собирает заново: иначе правка файлов инстанса по ходу сессии сдвинула бы
+    // начало промпта и убила префикс-кеш.
+    let systems: Vec<&str> = recs
+        .iter()
+        .filter_map(|r| match r {
+            Rec::System { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(systems.len(), 1, "запись System должна быть ровно одна");
+    assert_eq!(
+        msgs[0]["content"].as_str().unwrap_or_default(),
+        systems[0],
+        "проекция собрала промпт заново вместо чтения из лога"
+    );
 
     // повторная проекция обязана быть байт-в-байт той же (иначе кеш промахивается)
     let a = serde_json::to_string(&project::msgs(&recs, &cfg))?;
