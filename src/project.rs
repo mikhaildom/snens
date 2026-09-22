@@ -3,6 +3,8 @@
 //
 // Компакция — правило проекции, а не перезапись лога: лог неизменяем, элизия
 // обратима, потому что исходные результаты по-прежнему лежат в файле сессии.
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use crate::{
@@ -58,6 +60,15 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
     // рамка — это ревью/улучшение поверх транскрипта, и транскрипт надо пометить.
     let mut had_work = false;
     let mut replay_marked = false;
+    // Какие вызовы получили результат. Нужно, чтобы оборванный ход не уехал
+    // провайдеру как assistant с tool_calls без ответов.
+    let answered: HashSet<&str> = log
+        .iter()
+        .filter_map(|r| match r {
+            Rec::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
 
     for r in log {
         match r {
@@ -99,6 +110,18 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
                     m["tool_calls"] = json!(calls);
                 }
                 out.push(m);
+                // Ход, оборванный на середине (Ctrl+C, падение, убитый процесс),
+                // оставляет assistant с tool_calls без ответов, и провайдер такой
+                // запрос отвергает. Ремонт живёт здесь, а не в обработчике Ctrl+C:
+                // лог обязан остаться правдой, а проекция — быть валидной при любом
+                // хвосте, откуда бы обрыв ни взялся.
+                for c in tool_calls.iter().filter(|c| !answered.contains(c.id.as_str())) {
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": c.id,
+                        "content": "[вызов не завершён: ход прерван]"
+                    }));
+                }
             }
             Rec::ToolResult {
                 call_id,
@@ -208,5 +231,49 @@ mod tests {
             "пометка не нужна, когда транскрипта нет"
         );
         assert_eq!(msgs[1]["role"], "system", "рамка улучшения — системная");
+    }
+
+    /// Оборванный ход (Ctrl+C, падение) не должен уезжать провайдеру как
+    /// assistant с tool_calls без ответов — он такой запрос отвергает.
+    #[test]
+    fn interrupted_turn_is_closed_in_projection() {
+        let cfg = Config::default();
+        let call = |id: &str| crate::log::Call {
+            id: id.into(),
+            name: "read".into(),
+            args: "{}".into(),
+        };
+        let log = vec![
+            user("почини", "tui"),
+            Rec::Assistant {
+                ts: 0,
+                text: None,
+                tool_calls: vec![call("c1"), call("c2")],
+            },
+            Rec::ToolResult {
+                ts: 0,
+                call_id: "c1".into(),
+                tool: "read".into(),
+                argv: vec![],
+                exit: 0,
+                bytes: 1,
+                ms: 1,
+                body: crate::log::Body::Inline { text: "ok".into() },
+            },
+        ];
+        let first = msgs(&log, &cfg);
+        let second = msgs(&log, &cfg);
+        let answered: Vec<&str> = first
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap_or_default())
+            .collect();
+        assert!(answered.contains(&"c1"), "настоящий результат потерян");
+        assert!(answered.contains(&"c2"), "оборванный вызов остался без ответа");
+        // Ремонт детерминирован — иначе промахнётся префикс-кеш.
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
     }
 }

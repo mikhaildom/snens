@@ -7,6 +7,7 @@ mod log;
 mod project;
 mod registry;
 mod review;
+mod tui;
 
 use std::{collections::BTreeMap, error::Error};
 
@@ -16,6 +17,7 @@ const USAGE: &str = "\
 snens — узкое ядро агента
 
   snens run [--new] [--session ID] [--config PATH] \"запрос\"
+  snens tui [--session ID] [--config PATH]
   snens show [--session ID]
   snens log  [--session ID]
   snens sessions
@@ -32,6 +34,7 @@ async fn main() -> R<()> {
     let (cmd, flags, positional) = parse_args(&argv);
     match cmd.as_deref() {
         Some("run") => cmd_run(&flags, positional).await,
+        Some("tui") => tui::cmd(&flags).await,
         Some("show") => cmd_show(&flags),
         Some("log") => cmd_log(&flags),
         Some("sessions") => {
@@ -104,10 +107,15 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
     let llm = llm::OpenAi::new(key)?;
     eprintln!("[snens] {id} → {} ({})", cfg.base_url, cfg.model);
     agent::run_agent(&sess, &cfg, &llm).await?;
+    autopilot(&cfg, &id, &llm).await
+}
 
-    // Автономный цикл: длинная сессия → ревью; ревью тронуло тикеты → улучшение.
-    // Порог по длине, не по цене: цена слишком разбросана, чтобы быть сигналом.
-    let turns = log::read_file(sess.path())?
+/// Автономный цикл: длинная сессия → ревью; ревью тронуло тикеты → улучшение.
+/// Порог по длине, не по цене: цена слишком разбросана, чтобы быть сигналом.
+/// Общий у `run` и `tui` — оба заканчиваются одинаково.
+pub async fn autopilot(cfg: &cfg::Config, id: &str, llm: &llm::OpenAi) -> R<()> {
+    let path = cfg.sessions_path().join(format!("{id}.jsonl"));
+    let turns = log::read_file(&path)?
         .iter()
         .filter(|r| matches!(r, log::Rec::Assistant { .. }))
         .count();
@@ -115,11 +123,11 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
         return Ok(());
     }
     eprintln!("[snens] {turns} ходов ≥ {} — ревью", cfg.review_min_turns);
-    let before = review::tickets_state(&cfg)?;
-    review::run(&cfg, &id, &llm).await?;
-    if review::tickets_state(&cfg)? != before {
+    let before = review::tickets_state(cfg)?;
+    review::run(cfg, id, llm).await?;
+    if review::tickets_state(cfg)? != before {
         eprintln!("[snens] тикеты изменились — улучшение");
-        improve::run(&cfg, &llm).await?;
+        improve::run(cfg, llm).await?;
     }
     Ok(())
 }

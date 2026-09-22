@@ -174,6 +174,19 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
             out_tok: reply.usage.out_tok,
             cost_micro: reply.usage.cost_micro,
         })?;
+        // Расход по ходу, а не только в `show` после сессии: в терминале видно,
+        // какой ход чего стоил.
+        if reply.usage.in_tok + reply.usage.out_tok > 0 {
+            let cost = if reply.usage.cost_micro > 0 {
+                format!(" ${:.4}", reply.usage.cost_micro as f64 / 1e6)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[snens] ход {turn}: ↑{} (кеш {}) ↓{}{cost}",
+                reply.usage.in_tok, reply.usage.cached_tok, reply.usage.out_tok
+            );
+        }
 
         if reply.calls.is_empty() {
             return Ok(());
@@ -182,13 +195,21 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
         for call in &reply.calls {
             let out = dispatch(call, cfg, &reg, &path, &out_dir).await;
             eprintln!(
-                "[{}] exit={} {} Б {} мс{}",
+                "[{}] {} → exit={} {} Б {} мс{}",
                 call.name,
+                hint(&call.args),
                 out.exit,
                 out.bytes,
                 out.ms,
                 if out.timed_out { " (таймаут)" } else { "" }
             );
+            // Модель видит результат целиком, человек — голову: без этого в
+            // терминале не понять, что агент делает, пока он делает.
+            if let Some(p) = preview(&out.text) {
+                use std::io::Write;
+                println!("{p}");
+                let _ = std::io::stdout().flush();
+            }
             sess.append(Rec::ToolResult {
                 ts: log::now(),
                 call_id: call.id.clone(),
@@ -205,6 +226,57 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
             return Err("цикл прерван: больше 50 ходов на один запуск".into());
         }
     }
+}
+
+/// Сколько строк результата показывать человеку в терминале.
+const PREVIEW_LINES: usize = 15;
+
+/// Что именно вызвано — одной строкой. Аргументы знает и модель; это для того,
+/// кто смотрит в терминал.
+fn hint(args: &str) -> String {
+    let a: Value = serde_json::from_str(args).unwrap_or(Value::Null);
+    let raw = match a.get("command").and_then(|c| c.as_str()) {
+        Some(c) => c.to_string(),
+        None => match a.get("args") {
+            Some(Value::Array(v)) => v
+                .iter()
+                .map(|x| {
+                    x.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| x.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            Some(Value::String(s)) => s.clone(),
+            _ => String::new(),
+        },
+    };
+    // Многострочную команду в одну строку: статус — это одна строка.
+    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s: String = flat.chars().take(120).collect();
+    if flat.chars().count() > 120 {
+        format!("{s}…")
+    } else {
+        s
+    }
+}
+
+/// Живой поток для человека: модель видит полный результат, человек — голову.
+fn preview(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut s = lines
+        .iter()
+        .take(PREVIEW_LINES)
+        .map(|l| format!("  {}", crate::exec::truncate(l, 300)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.len() > PREVIEW_LINES {
+        s.push_str(&format!("\n  … ещё {} строк", lines.len() - PREVIEW_LINES));
+    }
+    Some(s)
 }
 
 /// Сколько результатов проекция уже вырезала по последней записи журнала.
