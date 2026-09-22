@@ -63,17 +63,7 @@ pub enum Body {
     Elided { bytes: usize },
 }
 
-impl Body {
-    pub fn text(&self) -> &str {
-        match self {
-            Body::Inline { text } => text,
-            Body::Elided { .. } => "[elided]",
-        }
-    }
-}
-
 pub struct Session {
-    pub id: String,
     path: PathBuf,
     file: std::cell::RefCell<File>,
     lines: Cell<u64>,
@@ -87,7 +77,6 @@ impl Session {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let lines = Cell::new(count_lines(&path)?.max(1));
         let s = Session {
-            id: id.to_string(),
             path,
             file: std::cell::RefCell::new(file),
             lines,
@@ -119,11 +108,6 @@ impl Session {
 
     pub fn read(&self) -> R<Vec<Rec>> {
         read_file(&self.path)
-    }
-
-    /// Транскрипт для API: то же, что read, но с номерами строк (seq).
-    pub fn read_seq(&self) -> R<Vec<(u64, Rec)>> {
-        Ok(self.read()?.into_iter().enumerate().map(|(i, r)| (i as u64 + 1, r)).collect())
     }
 }
 
