@@ -63,6 +63,39 @@ impl Llm for OpenAi {
         tools: Vec<Value>,
         on_delta: &mut (dyn FnMut(&str) + Send),
     ) -> R<Reply> {
+        // Оборванный стрим до первых данных — это транспорт (провайдер закрыл
+        // соединение), и повтор стоит дёшево: наружу ещё ничего не ушло.
+        // После первых данных повтор не делаем — он бы напечатал ответ дважды.
+        let mut seen = false;
+        let mut last: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        for attempt in 1..=2 {
+            match self
+                .stream_once(cfg, &msgs, &tools, on_delta, &mut seen)
+                .await
+            {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    if seen {
+                        return Err(e);
+                    }
+                    eprintln!("[snens] запрос сорвался до первых данных ({e}), повтор {attempt}");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| "запрос не удался".into()))
+    }
+}
+
+impl OpenAi {
+    async fn stream_once(
+        &self,
+        cfg: &Config,
+        msgs: &[Value],
+        tools: &[Value],
+        on_delta: &mut (dyn FnMut(&str) + Send),
+        seen: &mut bool,
+    ) -> R<Reply> {
         let mut body = json!({
             "model": cfg.model,
             "messages": msgs,
@@ -97,7 +130,13 @@ impl Llm for OpenAi {
         let mut usage = Usage::default();
 
         'outer: while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
+            let chunk = chunk.map_err(|e| {
+                format!(
+                    "стрим оборван после {} символов: {e}",
+                    text.len() + parts.values().map(|p| p.2.len()).sum::<usize>()
+                )
+            })?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buf.find('\n') {
                 let line: String = buf.drain(..=pos).collect();
                 let line = line.trim();
@@ -120,11 +159,13 @@ impl Llm for OpenAi {
                 if let Some(c) = d.get("content").and_then(|c| c.as_str()) {
                     if !c.is_empty() {
                         text.push_str(c);
+                        *seen = true;
                         on_delta(c);
                     }
                 }
                 if let Some(tcs) = d.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tcs {
+                        *seen = true;
                         let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                         let e = parts.entry(idx).or_default();
                         if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {

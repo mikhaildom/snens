@@ -114,9 +114,38 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("bin"))
     }
 
+    /// Ключ: сначала переменная окружения, потом `.env` рядом с конфигом —
+    /// чтобы snens мог стоять сам, без оболочки с экспортами.
     pub fn api_key(&self) -> R<String> {
-        std::env::var(&self.key_env)
-            .map_err(|_| format!("переменная окружения {} не задана", self.key_env).into())
+        if let Ok(k) = std::env::var(&self.key_env) {
+            if !k.trim().is_empty() {
+                return Ok(k);
+            }
+        }
+        let path = config_path().with_file_name(".env");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    if k.trim() == self.key_env {
+                        let v = v.trim().trim_matches('"').trim_matches('\'');
+                        if !v.is_empty() {
+                            return Ok(v.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "ключ не найден: ни ${}, ни {} в {}",
+            self.key_env,
+            self.key_env,
+            path.display()
+        )
+        .into())
     }
 }
 
