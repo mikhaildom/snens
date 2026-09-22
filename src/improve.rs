@@ -18,6 +18,7 @@ pub async fn run(cfg: &Config, llm: &llm::OpenAi) -> R<()> {
         .replace("{{REPO}}", &repo.display().to_string())
         .replace("{{TICKETS}}", &review::tickets_full(cfg))
         .replace("{{TICKETS_DIR}}", &cfg.tickets_path().display().to_string())
+        .replace("{{INSTANCE}}", &cfg.data_path().display().to_string())
         .replace("{{DATE}}", &review::ymd(log::now()));
 
     // Дети наследуют текущий каталог процесса: переносим его в репозиторий.
@@ -45,6 +46,7 @@ mod tests {
             .replace("{{REPO}}", "/r")
             .replace("{{TICKETS}}", "t")
             .replace("{{TICKETS_DIR}}", "/t")
+            .replace("{{INSTANCE}}", "/i")
             .replace("{{DATE}}", "d");
         assert!(!text.contains("{{"), "незамещённый плейсхолдер: {text}");
     }
