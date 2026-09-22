@@ -177,7 +177,7 @@ pub async fn selftest() -> R<()> {
 
     assert!(
         recs.iter()
-            .any(|r| matches!(r, Rec::Assistant { calls, .. } if calls.len() == 1)),
+            .any(|r| matches!(r, Rec::Assistant { tool_calls, .. } if tool_calls.len() == 1)),
         "нет хода с tool_call"
     );
     assert!(
@@ -190,7 +190,7 @@ pub async fn selftest() -> R<()> {
     assert!(
         recs.iter().rev().any(|r| matches!(
             r,
-            Rec::Assistant { text: Some(t), calls, .. } if calls.is_empty() && t.contains("готово")
+            Rec::Assistant { text: Some(t), tool_calls, .. } if tool_calls.is_empty() && t.contains("готово")
         )),
         "нет финального ответа"
     );

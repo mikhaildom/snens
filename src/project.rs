@@ -13,7 +13,7 @@ pub fn msgs(log: &[Rec], cfg: &Config) -> Vec<Value> {
     for r in log {
         match r {
             Rec::User { text, .. } => out.push(json!({"role": "user", "content": text})),
-            Rec::Assistant { text, tool_calls } => {
+            Rec::Assistant { text, tool_calls, .. } => {
                 let content = match text {
                     Some(t) if !t.is_empty() => json!(t),
                     _ => Value::Null,
