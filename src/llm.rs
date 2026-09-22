@@ -46,7 +46,10 @@ pub struct OpenAi {
 impl OpenAi {
     pub fn new(key: String) -> R<Self> {
         Ok(OpenAi {
-            client: reqwest::Client::builder().build()?,
+            // Некоторые провайдеры (в т.ч. Nous Portal) отдают 403 без User-Agent.
+            client: reqwest::Client::builder()
+                .user_agent(concat!("snens/", env!("CARGO_PKG_VERSION")))
+                .build()?,
             key,
         })
     }
