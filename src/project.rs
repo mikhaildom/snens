@@ -50,7 +50,12 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
 
     for r in log {
         match r {
-            Rec::User { text, .. } => out.push(json!({"role": "user", "content": text})),
+            Rec::User { text, source, .. } => {
+                // Инструкция ревью — системная по смыслу: это не запрос пользователя,
+                // а рамка задачи. Меняем роль в проекции; лог остаётся как есть.
+                let role = if source == "review" { "system" } else { "user" };
+                out.push(json!({"role": role, "content": text}));
+            }
             Rec::Assistant { text, tool_calls, .. } => {
                 let content = match text {
                     Some(t) if !t.is_empty() => json!(t),

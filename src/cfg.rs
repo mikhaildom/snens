@@ -56,6 +56,15 @@ pub struct Config {
     /// на Windows это `cmd /C`.
     #[serde(default = "d_shell")]
     pub shell: Vec<String>,
+    /// Каталог тикетов инстанса: публикуется код, а не история улучшений.
+    #[serde(default = "d_tickets")]
+    pub tickets_dir: String,
+    /// Сессия длиннее этого числа ходов — повод для ревью (порог по длине, не по цене).
+    #[serde(default = "d_review_min")]
+    pub review_min_turns: usize,
+    /// Свой файл промпта ревью вместо вкомпилированного (для опытов).
+    #[serde(default)]
+    pub review_prompt: Option<String>,
 }
 
 fn d_base_url() -> String { "https://inference-api.nousresearch.com/v1".into() }
@@ -71,6 +80,8 @@ fn d_max_proc() -> usize { 40_000 }
 fn d_sessions() -> String { format!("{}/sessions", data_dir()) }
 fn d_tools() -> String { format!("{}/tools", data_dir()) }
 fn d_keep() -> usize { 5 }
+fn d_tickets() -> String { format!("{}/tickets", data_dir()) }
+fn d_review_min() -> usize { 20 }
 fn d_shell() -> Vec<String> {
     if cfg!(windows) {
         vec!["cmd".into(), "/C".into()]
@@ -141,11 +152,16 @@ impl Config {
         let mut cfg = cfg;
         cfg.sessions_dir = cfg.sessions_dir.replace('~', &home());
         cfg.tools_dir = cfg.tools_dir.replace('~', &home());
+        cfg.tickets_dir = cfg.tickets_dir.replace('~', &home());
         Ok(cfg)
     }
 
     pub fn sessions_path(&self) -> PathBuf {
         PathBuf::from(&self.sessions_dir)
+    }
+
+    pub fn tickets_path(&self) -> PathBuf {
+        PathBuf::from(&self.tickets_dir)
     }
 
     pub fn tools_path(&self) -> PathBuf {

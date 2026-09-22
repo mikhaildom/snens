@@ -5,6 +5,7 @@ mod llm;
 mod log;
 mod project;
 mod registry;
+mod review;
 
 use std::{collections::BTreeMap, error::Error};
 
@@ -19,6 +20,7 @@ snens — узкое ядро агента
   snens sessions
   snens tools
   snens build
+  snens review [--session ID]
   snens selftest
 ";
 
@@ -39,6 +41,7 @@ async fn main() -> R<()> {
         }
         Some("tools") => cmd_tools(&flags).await,
         Some("build") => cmd_build(&flags),
+        Some("review") => review::cmd(&flags).await,
         Some("selftest") => agent::selftest().await,
         _ => {
             print!("{USAGE}");
@@ -98,6 +101,17 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
     let llm = llm::OpenAi::new(key)?;
     eprintln!("[snens] {id} → {} ({})", cfg.base_url, cfg.model);
     agent::run_agent(&sess, &cfg, &llm).await?;
+
+    // Порог по длине, а не по цене: цена слишком разбросана, чтобы быть сигналом.
+    let turns = log::read_file(sess.path())?
+        .iter()
+        .filter(|r| matches!(r, log::Rec::Assistant { .. }))
+        .count();
+    if turns >= cfg.review_min_turns {
+        eprintln!(
+            "[snens] сессия длинная ({turns} ходов) — повод для ревью: snens review --session {id}"
+        );
+    }
     Ok(())
 }
 

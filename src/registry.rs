@@ -134,9 +134,16 @@ pub fn sync_bin_dir(cfg: &Config, tools: &[Tool]) -> R<PathBuf> {
     Ok(bin)
 }
 
-/// PATH детей: разделитель путей свой у каждой платформы, склеиваем им.
+/// PATH детей: разделитель путей свой у каждой платформы, склеиваем им. Каталог
+/// самого харнесса тоже в PATH — иначе изнутри сессии не позвать `snens sessions`.
 pub fn child_path(bin: &Path) -> String {
     let mut parts = vec![bin.to_path_buf()];
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        parts.push(dir);
+    }
     if let Some(cur) = std::env::var_os("PATH") {
         parts.extend(std::env::split_paths(&cur));
     }
