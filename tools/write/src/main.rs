@@ -71,7 +71,10 @@ fn main() {
     let append = argv.iter().any(|a| a == "--append");
     let rest: Vec<&String> = argv.iter().filter(|a| *a != "--append").collect();
     if rest.len() != 1 {
-        die(format!("write: ожидается ровно один путь, получено {}", rest.len()));
+        die(format!(
+            "write: ожидается ровно один путь, получено {}",
+            rest.len()
+        ));
     }
     let path = rest[0].as_str();
 

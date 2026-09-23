@@ -79,6 +79,10 @@ pub struct Config {
     /// Сессия длиннее этого числа ходов — повод для ревью (порог по длине, не по цене).
     #[serde(default = "d_review_min")]
     pub review_min_turns: usize,
+    /// Потолок ходов на один запуск цикла. Не бюджет по токенам, а защита от
+    /// разгона; при достижении цикл не падает, а просит у модели промежуточный итог.
+    #[serde(default = "d_max_turns")]
+    pub max_turns: u32,
     /// Свой файл промпта ревью вместо вкомпилированного (для опытов).
     #[serde(default)]
     pub review_prompt: Option<String>,
@@ -102,25 +106,66 @@ pub struct Memory {
     pub tag: Vec<String>,
 }
 
-fn d_base_url() -> String { "https://inference-api.nousresearch.com/v1".into() }
-fn d_model() -> String { "deepseek/deepseek-v4.1-flash".into() }
-fn d_key_env() -> String { "SNENS_API_KEY".into() }
-fn d_true() -> bool { true }
-fn d_ctx() -> u64 { 1_000_000 }
-fn d_soft() -> f64 { 0.60 }
-fn d_hard() -> f64 { 0.85 }
-fn d_max_chars() -> usize { 24_000 }
-fn d_timeout() -> u64 { 120 }
-fn d_max_proc() -> usize { 40_000 }
-fn d_sessions() -> String { format!("{}/sessions", data_dir()) }
-fn d_tools() -> String { format!("{}/tools", data_dir()) }
-fn d_keep() -> usize { 5 }
-fn d_max_attach() -> usize { 32 * 1024 * 1024 }
-fn d_keep_attach() -> usize { 3 }
-fn d_tickets() -> String { format!("{}/tickets", data_dir()) }
-fn d_skills() -> String { format!("{}/skills", data_dir()) }
-fn d_review_min() -> usize { 20 }
-fn d_mem_timeout() -> u64 { 60 }
+fn d_base_url() -> String {
+    "https://inference-api.nousresearch.com/v1".into()
+}
+fn d_model() -> String {
+    "deepseek/deepseek-v4.1-flash".into()
+}
+fn d_key_env() -> String {
+    "SNENS_API_KEY".into()
+}
+fn d_true() -> bool {
+    true
+}
+fn d_ctx() -> u64 {
+    1_000_000
+}
+fn d_soft() -> f64 {
+    0.60
+}
+fn d_hard() -> f64 {
+    0.85
+}
+fn d_max_chars() -> usize {
+    24_000
+}
+fn d_timeout() -> u64 {
+    120
+}
+fn d_max_proc() -> usize {
+    40_000
+}
+fn d_sessions() -> String {
+    format!("{}/sessions", data_dir())
+}
+fn d_tools() -> String {
+    format!("{}/tools", data_dir())
+}
+fn d_keep() -> usize {
+    5
+}
+fn d_max_attach() -> usize {
+    32 * 1024 * 1024
+}
+fn d_keep_attach() -> usize {
+    3
+}
+fn d_tickets() -> String {
+    format!("{}/tickets", data_dir())
+}
+fn d_skills() -> String {
+    format!("{}/skills", data_dir())
+}
+fn d_review_min() -> usize {
+    20
+}
+fn d_max_turns() -> u32 {
+    200
+}
+fn d_mem_timeout() -> u64 {
+    60
+}
 fn d_shell() -> Vec<String> {
     if cfg!(windows) {
         vec!["cmd".into(), "/C".into()]
@@ -181,8 +226,7 @@ impl Config {
             None => config_path(),
         };
         let cfg: Config = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text)
-                .map_err(|e| format!("{}: {e}", path.display()))?,
+            Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
             // Нет файла — работаем на дефолтах, это не ошибка.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
             Err(e) => return Err(format!("{}: {e}", path.display()).into()),
@@ -426,7 +470,11 @@ mod tests {
             "---\nname: harness\ndescription: как работать над snens\n---\n\nтело скилла\n",
         )
         .unwrap();
-        std::fs::write(dir.join("data/skills/harness/references/portability.md"), "детали").unwrap();
+        std::fs::write(
+            dir.join("data/skills/harness/references/portability.md"),
+            "детали",
+        )
+        .unwrap();
 
         let mut cfg = Config::default();
         cfg.sessions_dir = dir.join("data/sessions").to_string_lossy().into_owned();

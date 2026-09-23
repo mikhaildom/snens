@@ -86,9 +86,9 @@ fn slurp(path: &str) -> Vec<u8> {
         Err(e) => match e.kind() {
             std::io::ErrorKind::NotFound => die(format!("read: файл не найден: {path}")),
             std::io::ErrorKind::PermissionDenied => die(format!("read: нет доступа: {path}")),
-            std::io::ErrorKind::IsADirectory => {
-                die(format!("read: {path} — это каталог, для списка используй `run ls`"))
-            }
+            std::io::ErrorKind::IsADirectory => die(format!(
+                "read: {path} — это каталог, для списка используй `run ls`"
+            )),
             _ => die(format!("read: {path}: {e}")),
         },
     }
@@ -126,7 +126,11 @@ fn main() {
         ));
     }
 
-    let end = a.offset.saturating_sub(1).saturating_add(a.limit).min(total);
+    let end = a
+        .offset
+        .saturating_sub(1)
+        .saturating_add(a.limit)
+        .min(total);
     let chunk = &lines[a.offset - 1..end];
     let width = std::cmp::max(6, (a.offset + chunk.len() - 1).to_string().len());
 

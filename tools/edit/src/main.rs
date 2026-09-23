@@ -174,7 +174,10 @@ impl Edit {
         };
         let old = need("old_string");
         let new = need("new_string");
-        let all = j.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let all = j
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if old.is_empty() {
             die(format!(
                 "edit: пустой old_string{} — для полной перезаписи есть write",
@@ -276,9 +279,7 @@ fn main() {
                 })
                 .collect()
         }
-        Some(other) => die(format!(
-            "edit: edits — ожидался массив, получено {other}"
-        )),
+        Some(other) => die(format!("edit: edits — ожидался массив, получено {other}")),
     };
 
     let meta = std::fs::metadata(&path).unwrap_or_else(|e| match e.kind() {
@@ -302,12 +303,9 @@ fn main() {
     let mut out_text = text.clone();
     let mut replaced = 0usize;
     for e in &edits {
-        match apply_one(&out_text, e, &path) {
-            (t, n) => {
-                out_text = t;
-                replaced += n;
-            }
-        }
+        let (t, n) = apply_one(&out_text, e, &path);
+        out_text = t;
+        replaced += n;
     }
 
     if dry {
@@ -369,7 +367,11 @@ mod tests {
 
     #[test]
     fn second_hunk_sees_result_of_first() {
-        let (a, n1) = apply_one("let a = 1;\nlet b = 2;\n", &e(1, "let a = 1;", "let a = 10;"), "f");
+        let (a, n1) = apply_one(
+            "let a = 1;\nlet b = 2;\n",
+            &e(1, "let a = 1;", "let a = 10;"),
+            "f",
+        );
         let (b, n2) = apply_one(&a, &e(2, "let b = 2;", "let b = a + 1;"), "f");
         assert_eq!(n1 + n2, 2);
         assert_eq!(b, "let a = 10;\nlet b = a + 1;\n");

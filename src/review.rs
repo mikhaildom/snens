@@ -31,8 +31,7 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
     let audit = audit_report(cfg, &src).await?;
     let tickets = ticket_list(&cfg.tickets_path());
     let template = match &cfg.review_prompt {
-        Some(p) => std::fs::read_to_string(p)
-            .map_err(|e| format!("review_prompt {p}: {e}"))?,
+        Some(p) => std::fs::read_to_string(p).map_err(|e| format!("review_prompt {p}: {e}"))?,
         None => PROMPT.to_string(),
     };
     let text = render_prompt(
@@ -51,7 +50,7 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
         source: "review".into(),
     })?;
     eprintln!("[snens] ревью {rid} → {} ({})", cfg.base_url, cfg.model);
-    agent::run_agent(&sess, cfg, llm).await
+    agent::run_agent(&sess, cfg, llm, &crate::render::Ui::plain()).await
 }
 
 /// Разбор сессии делает тул, а не ядро: он живёт в реестре, у него свой репозиторий,
@@ -122,26 +121,14 @@ fn fm(text: &str, key: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Снимок каталога тикетов: равен до ревью и после — значит ревью ничего не
-/// записало, и улучшение звать нечего.
-pub fn tickets_state(cfg: &Config) -> R<Vec<(String, u64, std::time::SystemTime)>> {
-    let mut v = Vec::new();
-    for e in std::fs::read_dir(cfg.tickets_path()).into_iter().flatten().flatten() {
-        let md = e.metadata()?;
-        v.push((
-            e.file_name().to_string_lossy().into_owned(),
-            md.len(),
-            md.modified()?,
-        ));
-    }
-    v.sort();
-    Ok(v)
-}
-
 /// Полные тела открытых тикетов: improve разбирает их без хождения по файлам.
 pub fn tickets_full(cfg: &Config) -> String {
     let mut out = String::new();
-    for e in std::fs::read_dir(cfg.tickets_path()).into_iter().flatten().flatten() {
+    for e in std::fs::read_dir(cfg.tickets_path())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("md") {
             continue;
@@ -196,7 +183,11 @@ pub fn ymd(secs: u64) -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 };
+    let y = if m <= 2 {
+        yoe + era * 400 + 1
+    } else {
+        yoe + era * 400
+    };
     format!("{y:04}-{m:02}-{d:02}")
 }
 
@@ -215,9 +206,19 @@ mod tests {
 
     #[test]
     fn prompt_gets_no_placeholders_left() {
-        let text = render_prompt(PROMPT, "123-45", "## Таймлайн\n  1. run ls\n", "- t | x | y", "/tmp/t", "2026-09-22");
+        let text = render_prompt(
+            PROMPT,
+            "123-45",
+            "## Таймлайн\n  1. run ls\n",
+            "- t | x | y",
+            "/tmp/t",
+            "2026-09-22",
+        );
         assert!(!text.contains("{{"), "незамещённый плейсхолдер: {text}");
-        assert!(text.contains("1. run ls"), "разбор сессии не попал в промпт");
+        assert!(
+            text.contains("1. run ls"),
+            "разбор сессии не попал в промпт"
+        );
         assert!(text.contains("/tmp/t/2026-09-22"), "путь тикета не собран");
     }
 
@@ -239,7 +240,10 @@ mod tests {
         let list = ticket_list(&dir);
         assert!(list.contains("2026-09-22-read"), "{list}");
         assert!(list.contains("Отказ без подсказки"), "{list}");
-        assert!(!list.contains("2026-09-22-old"), "закрытый тикет в списке: {list}");
+        assert!(
+            !list.contains("2026-09-22-old"),
+            "закрытый тикет в списке: {list}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

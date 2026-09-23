@@ -6,6 +6,7 @@ mod llm;
 mod log;
 mod project;
 mod registry;
+mod render;
 mod review;
 mod tui;
 
@@ -106,14 +107,17 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
     let key = cfg.api_key()?;
     let llm = llm::OpenAi::new(key)?;
     eprintln!("[snens] {id} → {} ({})", cfg.base_url, cfg.model);
-    agent::run_agent(&sess, &cfg, &llm).await?;
-    autopilot(&cfg, &id, &llm).await
+    agent::run_agent(&sess, &cfg, &llm, &render::Ui::default()).await?;
+    autopilot(&cfg, &id).await
 }
 
-/// Автономный цикл: длинная сессия → ревью; ревью тронуло тикеты → улучшение.
-/// Порог по длине, не по цене: цена слишком разбросана, чтобы быть сигналом.
-/// Общий у `run` и `tui` — оба заканчиваются одинаково.
-pub async fn autopilot(cfg: &cfg::Config, id: &str, llm: &llm::OpenAi) -> R<()> {
+/// Автономный цикл: длинная сессия → ревью. Порог по длине, не по цене: цена
+/// слишком разбросана, чтобы быть сигналом. Общий у `run` и `tui` — оба
+/// заканчиваются одинаково.
+///
+/// Улучшение здесь намеренно не запускается: это слишком расточительно после
+/// каждого ревью. `snens improve` пока зовётся руками — так видно, когда он нужен.
+pub async fn autopilot(cfg: &cfg::Config, id: &str) -> R<()> {
     let path = cfg.sessions_path().join(format!("{id}.jsonl"));
     let turns = log::read_file(&path)?
         .iter()
@@ -122,13 +126,49 @@ pub async fn autopilot(cfg: &cfg::Config, id: &str, llm: &llm::OpenAi) -> R<()> 
     if turns < cfg.review_min_turns {
         return Ok(());
     }
-    eprintln!("[snens] {turns} ходов ≥ {} — ревью", cfg.review_min_turns);
-    let before = review::tickets_state(cfg)?;
-    review::run(cfg, id, llm).await?;
-    if review::tickets_state(cfg)? != before {
-        eprintln!("[snens] тикеты изменились — улучшение");
-        improve::run(cfg, llm).await?;
+    eprintln!(
+        "[snens] {turns} ходов ≥ {} — ревью в фоне",
+        cfg.review_min_turns
+    );
+    spawn_review(cfg, id)
+}
+
+/// Ревью уезжает отдельным процессом и не держит поверхность: TUI можно закрыть,
+/// а `snens review --session <id>` доработает и допишет тикеты. Жизнь агента не
+/// должна быть привязана к жизни окна — это первый шаг к демону (M5).
+///
+/// Ждём только факт запуска, не завершения. Вывод — в файл `<id>-review.log`
+/// рядом с сессией: там видно, чем кончилось фоновое ревью.
+fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
+    let exe = std::env::current_exe()?;
+    let log_path = cfg.sessions_path().join(format!("{id}-review.log"));
+    let out = std::fs::File::create(&log_path)?;
+    let err = out.try_clone()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("review")
+        .arg("--session")
+        .arg(id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err));
+    // Своя сессия процесса: Ctrl+C в терминале не должен дострелить до фонового
+    // ревью, а SIGHUP при закрытии окна — убить его.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
     }
+    let child = cmd.spawn()?;
+    eprintln!(
+        "[snens] ревью {id}: pid {}, лог {}",
+        child.id(),
+        log_path.display()
+    );
+    // Дочерний процесс не ждём: TUI и run выходят сразу. Дети переподвешиваются
+    // к init и работают сами — именно этого и хочет пользователь.
     Ok(())
 }
 
@@ -140,11 +180,15 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
 
     let (mut calls, mut in_tok, mut cached, mut out_tok, mut cost) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut biggest: Option<(usize, &str)> = None;
+    // Для диагностики кеша: сколько ходов пришло без кеша и менялся ли апстрим
+    // провайдера. Смена бэкенда объясняет промах, который иначе искать в проекции.
+    let (mut uncached_turns, mut usages) = (0u64, 0u64);
+    let mut upstreams: Vec<&str> = Vec::new();
     for r in &recs {
         match r {
             log::Rec::ToolResult { tool, bytes, .. } => {
                 calls += 1;
-                if biggest.map_or(true, |(b, _)| *bytes > b) {
+                if biggest.is_none_or(|(b, _)| *bytes > b) {
                     biggest = Some((*bytes, tool.as_str()));
                 }
             }
@@ -153,12 +197,20 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
                 cached_tok: c,
                 out_tok: o,
                 cost_micro: m,
+                upstream_id,
                 ..
             } => {
                 in_tok += i;
                 cached += c;
                 out_tok += o;
                 cost += m;
+                usages += 1;
+                if *c == 0 {
+                    uncached_turns += 1;
+                }
+                if !upstream_id.is_empty() {
+                    upstreams.push(upstream_id.as_str());
+                }
             }
             _ => {}
         }
@@ -171,6 +223,17 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
         println!("макс. результат: {b} Б ({name})");
     }
     println!("токены:  вход {in_tok} (из них кеш {cached}), выход {out_tok}");
+    if usages > 0 {
+        // Ходы без кеша — норма для первого хода и после смены апстрима. Если их
+        // много подряд на одном апстриме — тогда промах наш, искать в проекции.
+        println!("кеш:     ходов без кеша {uncached_turns} из {usages}");
+        let distinct: std::collections::BTreeSet<&str> = upstreams.iter().copied().collect();
+        if distinct.len() > 1 {
+            println!("апстримы: {} (роутер мог увести запрос)", distinct.len());
+        } else if let Some(u) = upstreams.first() {
+            println!("апстрим: {u}");
+        }
+    }
     if cost > 0 {
         println!("цена:    ${:.4}", cost as f64 / 1e6);
     }

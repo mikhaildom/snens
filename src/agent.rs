@@ -5,11 +5,11 @@ use std::path::Path;
 
 use crate::{
     cfg::Config,
-    exec, log,
-    log::{Body, Call, Rec, Session},
+    exec,
     llm::{Fake, Llm, Reply, Usage},
-    project, registry,
-    R,
+    log,
+    log::{Body, Call, Rec, Session},
+    project, registry, R,
 };
 
 /// Вшитый инструмент. Всё остальное — процессы из реестра.
@@ -62,7 +62,9 @@ pub async fn dispatch(
     let a: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
     // Канал вложений — свой каталог на вызов: файлы разных вызовов не смешиваются,
     // а имя каталога (= id вызова) делает сбор детерминированным.
-    let attach_dir = cfg.attachments.then(|| out_dir.join("attach").join(&call.id));
+    let attach_dir = cfg
+        .attachments
+        .then(|| out_dir.join("attach").join(&call.id));
 
     if call.name == "run" {
         let Some(command) = a.get("command").and_then(|c| c.as_str()) else {
@@ -104,7 +106,11 @@ pub async fn dispatch(
             .collect(),
         Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
         None => Vec::new(),
-        Some(other) => return fail(format!("args: ожидался массив или строка, получено {other}")),
+        Some(other) => {
+            return fail(format!(
+                "args: ожидался массив или строка, получено {other}"
+            ))
+        }
     };
     let bin = tool.bin.to_string_lossy().into_owned();
     let mut sp = exec::Spawn::argv(&bin, args);
@@ -127,16 +133,17 @@ pub async fn dispatch(
     }
 }
 
-pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
+pub async fn run_agent<L: Llm>(
+    sess: &Session,
+    cfg: &Config,
+    llm: &L,
+    ui: &crate::render::Ui,
+) -> R<()> {
     // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
     // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
     // ходу промахивалась бы мимо префикс-кеша. Здесь — единственная точка, через
     // которую проходят все сессии, поэтому и запись здесь.
-    if !sess
-        .read()?
-        .iter()
-        .any(|r| matches!(r, Rec::System { .. }))
-    {
+    if !sess.read()?.iter().any(|r| matches!(r, Rec::System { .. })) {
         sess.append(Rec::System {
             ts: log::now(),
             text: crate::cfg::system_prompt(cfg),
@@ -157,9 +164,15 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
         // Оба порога пока только сигналят: это точки, где должна сработать компакция (M3).
         let ratio = approx as f64 / cfg.ctx_window as f64;
         if ratio > cfg.hard {
-            eprintln!("[snens] ~{approx} токенов — пройден порог саммаризации ({:.0}%), саммари ещё нет", cfg.hard * 100.0);
+            eprintln!(
+                "[snens] ~{approx} токенов — пройден порог саммаризации ({:.0}%), саммари ещё нет",
+                cfg.hard * 100.0
+            );
         } else if ratio > cfg.soft {
-            eprintln!("[snens] ~{approx} токенов — пройден порог элизии ({:.0}%)", cfg.soft * 100.0);
+            eprintln!(
+                "[snens] ~{approx} токенов — пройден порог элизии ({:.0}%)",
+                cfg.soft * 100.0
+            );
         }
         if report.elided > last_elided(&log) {
             eprintln!(
@@ -174,14 +187,7 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
             })?;
         }
 
-        let reply: Reply = llm
-            .reply(cfg, msgs, defs.clone(), &mut |d| {
-                use std::io::Write;
-                print!("{d}");
-                let _ = std::io::stdout().flush();
-            })
-            .await?;
-        println!();
+        let reply: Reply = stream_reply(cfg, msgs, defs.clone(), llm, ui).await?;
 
         sess.append(Rec::Assistant {
             ts: log::now(),
@@ -191,14 +197,13 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
                 Some(reply.text.clone())
             },
             tool_calls: reply.calls.clone(),
+            reasoning: if reply.reasoning.is_empty() {
+                None
+            } else {
+                Some(reply.reasoning.clone())
+            },
         })?;
-        sess.append(Rec::Usage {
-            ts: log::now(),
-            in_tok: reply.usage.in_tok,
-            cached_tok: reply.usage.cached_tok,
-            out_tok: reply.usage.out_tok,
-            cost_micro: reply.usage.cost_micro,
-        })?;
+        sess.append(usage_rec(&reply))?;
         // Расход по ходу, а не только в `show` после сессии: в терминале видно,
         // какой ход чего стоил.
         if reply.usage.in_tok + reply.usage.out_tok > 0 {
@@ -220,27 +225,33 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
 
         for call in &reply.calls {
             let out = dispatch(call, cfg, &reg, &path, &out_dir).await;
-            eprintln!(
-                "[{}] {} → exit={} {} Б {} мс{}",
-                call.name,
-                hint(&call.args),
+            ui.tool_call(
+                &call.name,
+                &hint(&call.args),
                 out.exit,
                 out.bytes,
                 out.ms,
-                if out.timed_out { " (таймаут)" } else { "" }
+                if out.timed_out {
+                    " (таймаут)"
+                } else {
+                    ""
+                },
             );
             // Модель видит результат целиком, человек — голову: без этого в
             // терминале не понять, что агент делает, пока он делает.
             if let Some(p) = preview(&out.text) {
+                ui.tool_result(&p);
                 use std::io::Write;
-                println!("{p}");
                 let _ = std::io::stdout().flush();
             }
             // Человеку в терминал: вложение не покажешь текстом, поэтому говорим,
             // что оно есть и откуда его взять.
             if !out.parts.is_empty() {
                 for p in &out.parts {
-                    println!("  [вложение] {} {}x{} {} Б — {}", p.kind, p.width, p.height, p.bytes, p.path);
+                    println!(
+                        "  [вложение] {} {}x{} {} Б — {}",
+                        p.kind, p.width, p.height, p.bytes, p.path
+                    );
                 }
             }
             sess.append(Rec::ToolResult {
@@ -256,9 +267,102 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
             })?;
         }
 
-        if turn > 50 {
-            return Err("цикл прерван: больше 50 ходов на один запуск".into());
+        // Лимит исчерпан — не падаем и не закрываем поверхность: просим
+        // промежуточный итог и на этом заканчиваем запуск (см. final_answer).
+        if turn >= cfg.max_turns {
+            final_answer(sess, cfg, llm, ui, &path, turn).await?;
+            return Ok(());
         }
+    }
+}
+
+/// Просьба к модели при исчерпании лимита: инструменты уже не исполняются.
+const LIMIT_NOTE: &str = "Достигнут лимит вызова инструментов — инструменты больше не \
+исполняются. Напиши промежуточный итог: что уже сделано и что осталось сделать. \
+Просто ответь текстом, не вызывай инструменты.";
+
+/// Достойный выход по лимиту ходов: один запрос без инструментов, ответ модели
+/// ложится обычной записью assistant. Если она всё же прислала вызовы, они
+/// отбрасываются — лог обязан остаться валидным (assistant с tool_calls без
+/// ответов провайдер отвергает).
+async fn final_answer<L: Llm>(
+    sess: &Session,
+    cfg: &Config,
+    llm: &L,
+    ui: &crate::render::Ui,
+    path: &str,
+    turn: u32,
+) -> R<()> {
+    sess.append(Rec::User {
+        ts: log::now(),
+        text: LIMIT_NOTE.into(),
+        source: "limit".into(),
+    })?;
+    let log = sess.read()?;
+    let (msgs, _) = project::project(&log, cfg);
+    let reply = stream_reply(cfg, msgs, Vec::new(), llm, ui).await?;
+    sess.append(Rec::Assistant {
+        ts: log::now(),
+        text: if reply.text.is_empty() {
+            None
+        } else {
+            Some(reply.text.clone())
+        },
+        tool_calls: Vec::new(),
+        reasoning: if reply.reasoning.is_empty() {
+            None
+        } else {
+            Some(reply.reasoning.clone())
+        },
+    })?;
+    sess.append(usage_rec(&reply))?;
+    ui.notice(&format!("лимит {turn} ходов: запрошен промежуточный итог"));
+    retain_turn(sess, cfg, path, &reply.text).await;
+    Ok(())
+}
+
+/// Один запрос к модели с живым рендером: ответ и рассуждение стримятся через
+/// `Stream`, таблицы склеиваются в рамку. Здесь же — единственное место, где
+/// решение «показывать ли рассуждение» спрашивается у `Ui`.
+async fn stream_reply<L: Llm>(
+    cfg: &Config,
+    msgs: Vec<Value>,
+    tools: Vec<Value>,
+    llm: &L,
+    ui: &crate::render::Ui,
+) -> R<Reply> {
+    let mut stream = crate::render::Stream::new(ui.color);
+    let show = ui.show_reasoning();
+    let mut reason_on = false;
+    let reply = llm
+        .reply(cfg, msgs, tools, &mut |d| match d {
+            crate::llm::Delta::Reasoning(r) => {
+                if !reason_on {
+                    reason_on = true;
+                    stream.reasoning(show);
+                }
+                if show {
+                    stream.reasoning_chunk(r);
+                }
+            }
+            crate::llm::Delta::Content(c) => stream.content(c),
+        })
+        .await?;
+    stream.finish();
+    Ok(reply)
+}
+
+/// Запись расхода хода. Отпечаток апстрима кладём рядом с токенами: промах
+/// кеша ищется по тому, сменился ли между ходами бэкенд провайдера.
+fn usage_rec(reply: &Reply) -> Rec {
+    Rec::Usage {
+        ts: log::now(),
+        in_tok: reply.usage.in_tok,
+        cached_tok: reply.usage.cached_tok,
+        out_tok: reply.usage.out_tok,
+        cost_micro: reply.usage.cost_micro,
+        upstream_id: reply.upstream.id.clone(),
+        fingerprint: reply.upstream.fingerprint.clone(),
     }
 }
 
@@ -405,6 +509,75 @@ fn preview(text: &str) -> Option<String> {
     Some(s)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::Fake;
+
+    /// Исчерпание лимита ходов — не ошибка и не закрытие поверхности: цикл
+    /// просит у модели промежуточный итог (запись `limit`) и возвращает Ok,
+    /// а вызовы, которые модель всё равно прислала, не исполняются.
+    #[tokio::test]
+    async fn turn_limit_asks_for_summary_instead_of_failing() -> R<()> {
+        let dir = std::env::temp_dir().join(format!("snens-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let cfg = Config {
+            sessions_dir: dir.to_string_lossy().into_owned(),
+            tools_dir: dir.join("tools").to_string_lossy().into_owned(),
+            max_turns: 2,
+            ..Config::default()
+        };
+        let sess = Session::open(&dir, "t")?;
+        sess.append(Rec::User {
+            ts: log::now(),
+            text: "поработай".into(),
+            source: "test".into(),
+        })?;
+        let run_once = || Reply {
+            reasoning: String::new(),
+            upstream: Default::default(),
+            text: String::new(),
+            calls: vec![Call {
+                id: "c".into(),
+                name: "run".into(),
+                args: r#"{"command":"true"}"#.into(),
+            }],
+            usage: Usage::default(),
+        };
+        let fake = Fake::new(vec![
+            run_once(),
+            run_once(),
+            // Ответ на просьбу о промежуточном итоге.
+            Reply {
+                reasoning: String::new(),
+                upstream: Default::default(),
+                text: "сделал половину".into(),
+                calls: vec![],
+                usage: Usage::default(),
+            },
+        ]);
+        // Ok, а не Err: поверхность остаётся жива.
+        run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await?;
+        let recs = sess.read()?;
+        assert!(
+            recs.iter()
+                .any(|r| matches!(r, Rec::User { source, .. } if source == "limit")),
+            "нет записи о лимите"
+        );
+        assert!(
+            recs.iter().rev().any(|r| matches!(
+                r,
+                Rec::Assistant { text: Some(t), tool_calls, .. }
+                    if tool_calls.is_empty() && t.contains("сделал половину")
+            )),
+            "промежуточный итог не записан"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}
+
 /// Сколько результатов проекция уже вырезала по последней записи журнала.
 fn last_elided(log: &[Rec]) -> usize {
     log.iter()
@@ -443,9 +616,11 @@ pub async fn selftest() -> R<()> {
     )?;
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))?;
 
-    let mut cfg = Config::default();
-    cfg.sessions_dir = dir.to_string_lossy().into_owned();
-    cfg.tools_dir = dir.join("tools").to_string_lossy().into_owned();
+    let cfg = Config {
+        sessions_dir: dir.to_string_lossy().into_owned(),
+        tools_dir: dir.join("tools").to_string_lossy().into_owned(),
+        ..Config::default()
+    };
 
     let (defs, reg, path) = prepare(&cfg).await?;
     assert!(reg.iter().any(|t| t.name == "probe"), "реестр не нашёл тул");
@@ -455,11 +630,22 @@ pub async fn selftest() -> R<()> {
         .expect("нет определения probe");
     let desc = pd["function"]["description"].as_str().unwrap_or_default();
     assert!(desc.starts_with("probe —"), "описание не из --help: {desc}");
-    assert!(desc.contains("probe [args...]"), "в описание не попал usage");
+    assert!(
+        desc.contains("probe [args...]"),
+        "в описание не попал usage"
+    );
     // usage со словом «stdin» → требование stdin доезжает в схему, а не через exit=1.
-    assert!(desc.contains("stdin обязателен"), "в описание не попал признак stdin: {desc}");
-    let req = pd["function"]["parameters"]["required"].as_array().expect("required не массив");
-    assert!(req.iter().any(|v| v == "stdin"), "stdin не помечен обязательным");
+    assert!(
+        desc.contains("stdin обязателен"),
+        "в описание не попал признак stdin: {desc}"
+    );
+    let req = pd["function"]["parameters"]["required"]
+        .as_array()
+        .expect("required не массив");
+    assert!(
+        req.iter().any(|v| v == "stdin"),
+        "stdin не помечен обязательным"
+    );
     assert!(
         std::fs::symlink_metadata(cfg.bin_path().join("probe")).is_ok(),
         "нет симлинка в PATH-каталоге"
@@ -479,6 +665,8 @@ pub async fn selftest() -> R<()> {
 
     let fake = Fake::new(vec![
         Reply {
+            reasoning: String::new(),
+            upstream: Default::default(),
             text: String::new(),
             calls: vec![Call {
                 id: "c1".into(),
@@ -488,6 +676,8 @@ pub async fn selftest() -> R<()> {
             usage: Usage::default(),
         },
         Reply {
+            reasoning: String::new(),
+            upstream: Default::default(),
             text: String::new(),
             calls: vec![Call {
                 id: "c2".into(),
@@ -497,6 +687,8 @@ pub async fn selftest() -> R<()> {
             usage: Usage::default(),
         },
         Reply {
+            reasoning: String::new(),
+            upstream: Default::default(),
             text: String::new(),
             calls: vec![Call {
                 id: "c3".into(),
@@ -506,13 +698,15 @@ pub async fn selftest() -> R<()> {
             usage: Usage::default(),
         },
         Reply {
+            reasoning: String::new(),
+            upstream: Default::default(),
             text: "готово".into(),
             calls: vec![],
             usage: Usage::default(),
         },
     ]);
 
-    run_agent(&sess, &cfg, &fake).await?;
+    run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await?;
     let recs = sess.read()?;
     let tool_text = |call: &str| -> Option<String> {
         recs.iter().find_map(|r| match r {
@@ -526,10 +720,15 @@ pub async fn selftest() -> R<()> {
     };
 
     let probe_out = tool_text("probe").expect("нет результата probe");
-    assert!(probe_out.contains("args:a b"), "argv не доехал: {probe_out}");
+    assert!(
+        probe_out.contains("args:a b"),
+        "argv не доехал: {probe_out}"
+    );
     assert!(probe_out.contains("привет"), "stdin не доехал: {probe_out}");
     assert!(
-        tool_text("nosuch").unwrap_or_default().contains("нет в реестре"),
+        tool_text("nosuch")
+            .unwrap_or_default()
+            .contains("нет в реестре"),
         "неизвестный тул не дал понятной ошибки"
     );
     let via_path = tool_text("run").unwrap_or_default();
@@ -546,8 +745,14 @@ pub async fn selftest() -> R<()> {
     );
 
     let msgs = project::msgs(&recs, &cfg);
-    assert!(msgs.iter().any(|m| m["role"] == "tool"), "проекция потеряла tool-сообщение");
-    assert_eq!(msgs[0]["role"], "system", "проекция должна начинаться с system");
+    assert!(
+        msgs.iter().any(|m| m["role"] == "tool"),
+        "проекция потеряла tool-сообщение"
+    );
+    assert_eq!(
+        msgs[0]["role"], "system",
+        "проекция должна начинаться с system"
+    );
     // Промпт сессии записан в лог один раз и проекция берёт его оттуда, а не
     // собирает заново: иначе правка файлов инстанса по ходу сессии сдвинула бы
     // начало промпта и убила префикс-кеш.
@@ -581,6 +786,8 @@ pub async fn selftest() -> R<()> {
         source: "selftest".into(),
     })?;
     let big = || Reply {
+        reasoning: String::new(),
+        upstream: Default::default(),
         text: String::new(),
         calls: vec![Call {
             id: "b".into(),
@@ -593,12 +800,14 @@ pub async fn selftest() -> R<()> {
         big(),
         big(),
         Reply {
+            reasoning: String::new(),
+            upstream: Default::default(),
             text: "готово".into(),
             calls: vec![],
             usage: Usage::default(),
         },
     ]);
-    run_agent(&sess2, &cfg2, &fake2).await?;
+    run_agent(&sess2, &cfg2, &fake2, &crate::render::Ui::plain()).await?;
     let recs2 = sess2.read()?;
     assert!(
         recs2.iter().any(|r| matches!(r, Rec::Ctx { .. })),
@@ -613,8 +822,14 @@ pub async fn selftest() -> R<()> {
     );
     let first = tool_msgs[0]["content"].as_str().unwrap_or_default();
     let last = tool_msgs[1]["content"].as_str().unwrap_or_default();
-    assert!(first.contains("вырезан при компакции"), "старый результат не вырезан: {first}");
-    assert!(last.starts_with('1'), "последний результат должен остаться как есть");
+    assert!(
+        first.contains("вырезан при компакции"),
+        "старый результат не вырезан: {first}"
+    );
+    assert!(
+        last.starts_with('1'),
+        "последний результат должен остаться как есть"
+    );
     let raw_bytes: usize = recs2
         .iter()
         .filter_map(|r| match r {
@@ -664,11 +879,13 @@ pub async fn selftest() -> R<()> {
         source: "selftest".into(),
     })?;
     let fake_off = Fake::new(vec![Reply {
+        reasoning: String::new(),
+        upstream: Default::default(),
         text: "готово".into(),
         calls: vec![],
         usage: Usage::default(),
     }]);
-    run_agent(&sess_off, &cfg3, &fake_off).await?;
+    run_agent(&sess_off, &cfg3, &fake_off, &crate::render::Ui::plain()).await?;
     assert!(
         !sess_off
             .read()?
@@ -685,11 +902,13 @@ pub async fn selftest() -> R<()> {
         source: "selftest".into(),
     })?;
     let fake3 = Fake::new(vec![Reply {
+        reasoning: String::new(),
+        upstream: Default::default(),
         text: "готово".into(),
         calls: vec![],
         usage: Usage::default(),
     }]);
-    run_agent(&sess3, &cfg3, &fake3).await?;
+    run_agent(&sess3, &cfg3, &fake3, &crate::render::Ui::plain()).await?;
     let recs3 = sess3.read()?;
     let recall = recs3
         .iter()

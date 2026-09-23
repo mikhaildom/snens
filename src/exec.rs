@@ -213,7 +213,11 @@ fn collect_attachments(dir: &Path, max_bytes: usize, text: &mut String) -> Vec<P
     let Ok(rd) = std::fs::read_dir(dir) else {
         return parts;
     };
-    let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+    let mut files: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
     // Порядок чтения каталога произволен — сортируем, иначе проекция недетерминирована.
     files.sort();
     for p in files {
@@ -447,7 +451,11 @@ mod tests {
         assert!(r.contains("конец"));
         let long = "x".repeat(1000);
         let r2 = reduce(&long, 10_000);
-        assert!(r2.contains("симв."), "длинная строка без пометки: {}", r2.len());
+        assert!(
+            r2.contains("симв."),
+            "длинная строка без пометки: {}",
+            r2.len()
+        );
     }
 
     /// Канал вложений: процесс получает SNENS_ATTACH_DIR и кладёт туда картинку,
@@ -460,7 +468,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Пишем валидный PNG-заголовок и мусорный файл.
         let png = dir.join("bad-source");
-        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01").unwrap();
+        std::fs::write(
+            &png,
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01",
+        )
+        .unwrap();
         let sh = format!(
             "cp '{}' \"$SNENS_ATTACH_DIR/pic.png\"; printf 'x' > \"$SNENS_ATTACH_DIR/note.txt\"",
             png.display()
@@ -468,7 +480,12 @@ mod tests {
         let mut sp = Spawn::sh(&["sh".into(), "-c".into()], &sh, 10, 10_000);
         sp.attach_dir = Some(dir.as_path());
         let out = spawn(sp).await.expect("спавн упал");
-        assert_eq!(out.parts.len(), 1, "должна быть одна картинка: {:?}", out.parts);
+        assert_eq!(
+            out.parts.len(),
+            1,
+            "должна быть одна картинка: {:?}",
+            out.parts
+        );
         assert_eq!(out.parts[0].mime, "image/png");
         assert_eq!(out.parts[0].kind, "image");
         assert_eq!((out.parts[0].width, out.parts[0].height), (1, 1));
@@ -491,7 +508,11 @@ mod tests {
         sp.max_attachment_bytes = 1000;
         let out = spawn(sp).await.expect("спавн упал");
         assert!(out.parts.is_empty(), "большой файл не должен уехать");
-        assert!(out.text.contains("вложение отброшено"), "нет пометки: {}", out.text);
+        assert!(
+            out.text.contains("вложение отброшено"),
+            "нет пометки: {}",
+            out.text
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

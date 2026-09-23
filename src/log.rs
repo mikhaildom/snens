@@ -34,6 +34,11 @@ pub enum Rec {
         ts: u64,
         text: Option<String>,
         tool_calls: Vec<Call>,
+        /// Рассуждение модели, если провайдер его отдал. В логе хранится целиком
+        /// (это файл сессии, не только контекст), но в проекцию не уезжает —
+        /// провайдеры reasoning обратно не принимают.
+        #[serde(default)]
+        reasoning: Option<String>,
     },
     ToolResult {
         ts: u64,
@@ -55,6 +60,13 @@ pub enum Rec {
         cached_tok: u64,
         out_tok: u64,
         cost_micro: u64,
+        /// Идентификатор ответа провайдера (`gen-…`) и отпечаток бэкенда, если
+        /// были. Старые логи читаются как есть (serde default). Нужны, чтобы
+        /// отличить наш промах кеша от переключения апстрима роутером.
+        #[serde(default)]
+        upstream_id: String,
+        #[serde(default)]
+        fingerprint: String,
     },
     /// Что проекция сделала с контекстом. Лог остаётся неизменным: это журнал
     /// действий над ним, а не новая версия истории.
@@ -193,7 +205,11 @@ pub fn latest(dir: &Path) -> R<String> {
             continue;
         }
         let mt = entry.metadata().and_then(|m| m.modified())?;
-        let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        let id = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
         if best.as_ref().map(|(t, _)| mt > *t).unwrap_or(true) {
             best = Some((mt, id));
         }

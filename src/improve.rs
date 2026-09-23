@@ -33,7 +33,7 @@ pub async fn run(cfg: &Config, llm: &llm::OpenAi) -> R<()> {
         source: "improve".into(),
     })?;
     eprintln!("[snens] улучшение {id} → {} ({})", cfg.base_url, cfg.model);
-    agent::run_agent(&sess, cfg, llm).await
+    agent::run_agent(&sess, cfg, llm, &crate::render::Ui::plain()).await
 }
 
 #[cfg(test)]

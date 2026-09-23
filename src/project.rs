@@ -109,7 +109,9 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
                 let role = if frame { "system" } else { "user" };
                 out.push(json!({"role": role, "content": text}));
             }
-            Rec::Assistant { text, tool_calls, .. } => {
+            Rec::Assistant {
+                text, tool_calls, ..
+            } => {
                 let content = match text {
                     Some(t) if !t.is_empty() => json!(t),
                     _ => Value::Null,
@@ -134,7 +136,10 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
                 // запрос отвергает. Ремонт живёт здесь, а не в обработчике Ctrl+C:
                 // лог обязан остаться правдой, а проекция — быть валидной при любом
                 // хвосте, откуда бы обрыв ни взялся.
-                for c in tool_calls.iter().filter(|c| !answered.contains(c.id.as_str())) {
+                for c in tool_calls
+                    .iter()
+                    .filter(|c| !answered.contains(c.id.as_str()))
+                {
                     out.push(json!({
                         "role": "tool",
                         "tool_call_id": c.id,
@@ -304,6 +309,7 @@ mod tests {
         let log = vec![
             user("добавь строку и собери", "cli"),
             Rec::Assistant {
+                reasoning: None,
                 ts: 0,
                 text: Some("готово".into()),
                 tool_calls: vec![],
@@ -313,12 +319,25 @@ mod tests {
         let msgs = msgs(&log, &cfg);
         let note = msgs
             .iter()
-            .position(|m| m["content"].as_str().unwrap_or_default().contains("транскрипт уже закрытой сессии"))
+            .position(|m| {
+                m["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("транскрипт уже закрытой сессии")
+            })
             .expect("нет пометки о реплее");
-        assert_eq!(msgs[note]["role"], "system", "пометка должна быть системной");
+        assert_eq!(
+            msgs[note]["role"], "system",
+            "пометка должна быть системной"
+        );
         let frame = msgs
             .iter()
-            .position(|m| m["content"].as_str().unwrap_or_default().contains("# Ревью сессии"))
+            .position(|m| {
+                m["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("# Ревью сессии")
+            })
             .unwrap();
         assert!(note < frame, "пометка должна стоять перед рамкой ревью");
         // Префикс до пометки — это транскрипт как есть: кеш провайдера не промахнётся.
@@ -331,7 +350,10 @@ mod tests {
         let log = vec![user("разбери тикеты", "improve")];
         let msgs = msgs(&log, &cfg);
         assert!(
-            !msgs.iter().any(|m| m["content"].as_str().unwrap_or_default().contains("транскрипт")),
+            !msgs.iter().any(|m| m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("транскрипт")),
             "пометка не нужна, когда транскрипта нет"
         );
         assert_eq!(msgs[1]["role"], "system", "рамка улучшения — системная");
@@ -366,8 +388,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // 1x1 PNG: заголовок + пустой IDAT достаточно, чтобы base64 собрать.
         let png: Vec<u8> = vec![
-            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H',
-            b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1,
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+            0, 0, 0, 1, 0, 0, 0, 1,
         ];
         let img = dir.join("px.png");
         std::fs::write(&img, &png).unwrap();
@@ -375,6 +397,7 @@ mod tests {
         let log = vec![
             user("посмотри", "cli"),
             Rec::Assistant {
+                reasoning: None,
                 ts: 0,
                 text: None,
                 tool_calls: vec![crate::log::Call {
@@ -391,7 +414,9 @@ mod tests {
                 exit: 0,
                 bytes: png.len(),
                 ms: 1,
-                body: Body::Inline { text: "px.png".into() },
+                body: Body::Inline {
+                    text: "px.png".into(),
+                },
                 parts: vec![Part {
                     kind: "image".into(),
                     path: img.to_string_lossy().into_owned(),
@@ -404,7 +429,9 @@ mod tests {
         ];
         let projected = msgs(&log, &cfg);
         let tool = projected.iter().find(|m| m["role"] == "tool").unwrap();
-        let content = tool["content"].as_array().expect("вложение не собралось в части");
+        let content = tool["content"]
+            .as_array()
+            .expect("вложение не собралось в части");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image_url");
         assert!(content[1]["image_url"]["url"]
@@ -426,7 +453,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snens-attach-elide-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1];
+        let png: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+            0, 0, 0, 1, 0, 0, 0, 1,
+        ];
         let mut cfg = Config::default();
         // Крошечное окно: элизия срабатывает сразу.
         cfg.ctx_window = 400;
@@ -446,18 +476,65 @@ mod tests {
         std::fs::write(&img2, &png).unwrap();
         let log = vec![
             user("две картинки", "cli"),
-            Rec::Assistant { ts: 0, text: None, tool_calls: vec![crate::log::Call { id: "c1".into(), name: "view".into(), args: "{}".into() }] },
-            Rec::ToolResult { ts: 0, call_id: "c1".into(), tool: "view".into(), argv: vec![], exit: 0, bytes: 1, ms: 1, body: Body::Inline { text: "a".into() }, parts: vec![part(&img1)] },
-            Rec::Assistant { ts: 0, text: None, tool_calls: vec![crate::log::Call { id: "c2".into(), name: "view".into(), args: "{}".into() }] },
-            Rec::ToolResult { ts: 0, call_id: "c2".into(), tool: "view".into(), argv: vec![], exit: 0, bytes: 1, ms: 1, body: Body::Inline { text: "b".into() }, parts: vec![part(&img2)] },
+            Rec::Assistant {
+                reasoning: None,
+                ts: 0,
+                text: None,
+                tool_calls: vec![crate::log::Call {
+                    id: "c1".into(),
+                    name: "view".into(),
+                    args: "{}".into(),
+                }],
+            },
+            Rec::ToolResult {
+                ts: 0,
+                call_id: "c1".into(),
+                tool: "view".into(),
+                argv: vec![],
+                exit: 0,
+                bytes: 1,
+                ms: 1,
+                body: Body::Inline { text: "a".into() },
+                parts: vec![part(&img1)],
+            },
+            Rec::Assistant {
+                reasoning: None,
+                ts: 0,
+                text: None,
+                tool_calls: vec![crate::log::Call {
+                    id: "c2".into(),
+                    name: "view".into(),
+                    args: "{}".into(),
+                }],
+            },
+            Rec::ToolResult {
+                ts: 0,
+                call_id: "c2".into(),
+                tool: "view".into(),
+                argv: vec![],
+                exit: 0,
+                bytes: 1,
+                ms: 1,
+                body: Body::Inline { text: "b".into() },
+                parts: vec![part(&img2)],
+            },
         ];
         let projected = msgs(&log, &cfg);
         let tools: Vec<&Value> = projected.iter().filter(|m| m["role"] == "tool").collect();
         let first = serde_json::to_string(&tools[0]["content"]).unwrap();
         let last = serde_json::to_string(&tools[1]["content"]).unwrap();
-        assert!(first.contains("вырезаны при компакции"), "старое вложение не вырезано: {first}");
-        assert!(!first.contains("image_url"), "старое вложение уехало как картинка: {first}");
-        assert!(last.contains("image_url"), "последнее вложение потеряно: {last}");
+        assert!(
+            first.contains("вырезаны при компакции"),
+            "старое вложение не вырезано: {first}"
+        );
+        assert!(
+            !first.contains("image_url"),
+            "старое вложение уехало как картинка: {first}"
+        );
+        assert!(
+            last.contains("image_url"),
+            "последнее вложение потеряно: {last}"
+        );
         assert_eq!(
             serde_json::to_string(&projected).unwrap(),
             serde_json::to_string(&msgs(&log, &cfg)).unwrap()
@@ -471,32 +548,49 @@ mod tests {
     fn attachments_off_keeps_placeholder() {
         let mut cfg = Config::default();
         cfg.attachments = false;
-        let log = vec![user("посмотри", "cli"), Rec::Assistant {
-            ts: 0,
-            text: None,
-            tool_calls: vec![crate::log::Call { id: "c1".into(), name: "view".into(), args: "{}".into() }],
-        }, Rec::ToolResult {
-            ts: 0,
-            call_id: "c1".into(),
-            tool: "view".into(),
-            argv: vec![],
-            exit: 0,
-            bytes: 1,
-            ms: 1,
-            body: Body::Inline { text: "px.png".into() },
-            parts: vec![Part {
-                kind: "image".into(),
-                path: "/нет/такого".into(),
-                mime: "image/png".into(),
+        let log = vec![
+            user("посмотри", "cli"),
+            Rec::Assistant {
+                reasoning: None,
+                ts: 0,
+                text: None,
+                tool_calls: vec![crate::log::Call {
+                    id: "c1".into(),
+                    name: "view".into(),
+                    args: "{}".into(),
+                }],
+            },
+            Rec::ToolResult {
+                ts: 0,
+                call_id: "c1".into(),
+                tool: "view".into(),
+                argv: vec![],
+                exit: 0,
                 bytes: 1,
-                width: 1,
-                height: 1,
-            }],
-        }];
-        let tool = msgs(&log, &cfg).into_iter().find(|m| m["role"] == "tool").unwrap();
+                ms: 1,
+                body: Body::Inline {
+                    text: "px.png".into(),
+                },
+                parts: vec![Part {
+                    kind: "image".into(),
+                    path: "/нет/такого".into(),
+                    mime: "image/png".into(),
+                    bytes: 1,
+                    width: 1,
+                    height: 1,
+                }],
+            },
+        ];
+        let tool = msgs(&log, &cfg)
+            .into_iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap();
         let s = serde_json::to_string(&tool["content"]).unwrap();
         assert!(s.contains("attachments выключены"), "нет пометки: {s}");
-        assert!(!s.contains("image_url"), "картинка уехала при выключенном канале");
+        assert!(
+            !s.contains("image_url"),
+            "картинка уехала при выключенном канале"
+        );
     }
 
     /// Оборванный ход (Ctrl+C, падение) не должен уезжать провайдеру как
@@ -512,6 +606,7 @@ mod tests {
         let log = vec![
             user("почини", "tui"),
             Rec::Assistant {
+                reasoning: None,
                 ts: 0,
                 text: None,
                 tool_calls: vec![call("c1"), call("c2")],
@@ -536,7 +631,10 @@ mod tests {
             .map(|m| m["tool_call_id"].as_str().unwrap_or_default())
             .collect();
         assert!(answered.contains(&"c1"), "настоящий результат потерян");
-        assert!(answered.contains(&"c2"), "оборванный вызов остался без ответа");
+        assert!(
+            answered.contains(&"c2"),
+            "оборванный вызов остался без ответа"
+        );
         // Ремонт детерминирован — иначе промахнётся префикс-кеш.
         assert_eq!(
             serde_json::to_string(&first).unwrap(),

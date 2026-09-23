@@ -52,8 +52,8 @@ fn main() {
         }
     }
     let path = path.unwrap_or_else(|| die("audit: не указан лог".into()));
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| die(format!("audit: {path}: {e}")));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| die(format!("audit: {path}: {e}")));
     print!("{}", render(&analyze(&path, &text), huge));
 }
 
@@ -106,9 +106,11 @@ fn cmd_of(raw: &str) -> String {
     if let Some(stdin) = v.get("stdin").and_then(Value::as_str) {
         // У тулов правки payload приходит на stdin, а не в args: без разбора
         // stdin два разных `edit` одного файла неотличимы.
-        let old = serde_json::from_str::<Value>(stdin)
-            .ok()
-            .and_then(|s| s.get("old_string").and_then(Value::as_str).map(str::to_string));
+        let old = serde_json::from_str::<Value>(stdin).ok().and_then(|s| {
+            s.get("old_string")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
         match old {
             Some(o) => s.push_str(&format!("  ⟵ «{}»", clip(&o, 40))),
             None => s.push_str(&format!("  ⇐ {} Б на stdin", stdin.len())),
@@ -159,15 +161,27 @@ fn analyze(path: &str, text: &str) -> Report {
                     .and_then(Value::as_array)
                     .unwrap_or(&Vec::new())
                 {
-                    let id = c.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                    let name = c.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let id = c
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let name = c
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     let cmd = cmd_of(c.get("args").and_then(Value::as_str).unwrap_or(""));
                     pending.push((id, name, cmd));
                 }
             }
             "tool_result" => {
                 let id = v.get("call_id").and_then(Value::as_str).unwrap_or("");
-                let tool = v.get("tool").and_then(Value::as_str).unwrap_or("?").to_string();
+                let tool = v
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
                 let argv0 = v
                     .get("argv")
                     .and_then(Value::as_array)
@@ -252,9 +266,10 @@ fn suspects(rows: &[Row], huge: usize) -> Vec<String> {
         if r.exit == 0 {
             continue;
         }
-        let retried_ok = rows.iter().skip(i + 1).any(|n| {
-            n.exit == 0 && n.tool == r.tool && n.cmd == r.cmd
-        });
+        let retried_ok = rows
+            .iter()
+            .skip(i + 1)
+            .any(|n| n.exit == 0 && n.tool == r.tool && n.cmd == r.cmd);
         if !retried_ok {
             out.push(format!(
                 "failed-abandoned exit={:<4} ход {}  {}  {}",
@@ -346,9 +361,7 @@ mod tests {
             s.push_str(&v.to_string());
             s.push('\n');
         };
-        let call = |id: &str, tool: &str, args: &str| {
-            serde_json::json!({"kind":"assistant","ts":1,"text":null,"tool_calls":[{"id":id,"name":tool,"args":args}]})
-        };
+        let call = |id: &str, tool: &str, args: &str| serde_json::json!({"kind":"assistant","ts":1,"text":null,"tool_calls":[{"id":id,"name":tool,"args":args}]});
         let result = |id: &str, tool: &str, exit: i32, bytes: usize| {
             serde_json::json!({"kind":"tool_result","ts":2,"call_id":id,"tool":tool,
                 "argv":[format!("{{\"args\":\"{tool} x\"}}")],"exit":exit,"bytes":bytes,"ms":7,
@@ -358,16 +371,24 @@ mod tests {
         add(serde_json::json!({"kind":"user","ts":0,"text":"сделай","source":"cli"}));
         for (id, n) in [("c1", 1), ("c2", 2), ("c3", 3)] {
             if n == 3 {
-                add(serde_json::json!({"kind":"ctx","ts":1,"action":"elide","elided":2,"freed_bytes":5000}));
+                add(
+                    serde_json::json!({"kind":"ctx","ts":1,"action":"elide","elided":2,"freed_bytes":5000}),
+                );
             }
-            add(call(id, "run", "{\"args\":[\"grep\",\"-n\",\"Rec\",\"src/*.rs\"]}"));
+            add(call(
+                id,
+                "run",
+                "{\"args\":[\"grep\",\"-n\",\"Rec\",\"src/*.rs\"]}",
+            ));
             add(result(id, "run", 0, 400));
         }
         add(call("c4", "read", "{\"args\":\"src/main.rs\"}"));
         add(result("c4", "read", 0, 30_000));
         add(call("c5", "run", "{\"args\":[\"cargo\",\"test\"]}"));
         add(result("c5", "run", 101, 900));
-        add(serde_json::json!({"kind":"usage","ts":3,"in_tok":1000,"cached_tok":800,"out_tok":50,"cost_micro":300}));
+        add(
+            serde_json::json!({"kind":"usage","ts":3,"in_tok":1000,"cached_tok":800,"out_tok":50,"cost_micro":300}),
+        );
         s
     }
 
@@ -387,13 +408,19 @@ mod tests {
     fn counters_name_what_happened() {
         let r = analyze("t.jsonl", &fixture());
         let text = render(&r, HUGE);
-        assert!(text.contains("retry-storm"), "три одинаковых вызова: {text}");
+        assert!(
+            text.contains("retry-storm"),
+            "три одинаковых вызова: {text}"
+        );
         assert!(text.contains("huge"), "результат 30 КБ: {text}");
         assert!(
             text.contains("failed-abandoned"),
             "провал без успешного повтора: {text}"
         );
-        assert!(!text.contains("duplicate"), "retry-storm и duplicate не дублируются");
+        assert!(
+            !text.contains("duplicate"),
+            "retry-storm и duplicate не дублируются"
+        );
         assert!(
             text.contains("вырезано результатов 2"),
             "журнал компакции: {text}"
@@ -431,7 +458,10 @@ mod tests {
             s.push('\n');
         }
         let out = render(&analyze("t.jsonl", &s), HUGE);
-        assert!(!out.contains("duplicate"), "разные правки — не повтор: {out}");
+        assert!(
+            !out.contains("duplicate"),
+            "разные правки — не повтор: {out}"
+        );
         assert!(out.contains("«alpha»"), "текст правки виден: {out}");
     }
 

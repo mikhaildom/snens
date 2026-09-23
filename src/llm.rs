@@ -5,12 +5,7 @@ use std::{collections::BTreeMap, sync::Mutex};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::{
-    cfg::Config,
-    exec::truncate,
-    log::Call,
-    R,
-};
+use crate::{cfg::Config, exec::truncate, log::Call, R};
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Usage {
@@ -22,8 +17,30 @@ pub struct Usage {
 
 pub struct Reply {
     pub text: String,
+    /// Ход рассуждения модели (провайдер присылает его отдельным полем `reasoning`).
+    /// В лог пишется как есть, но провайдеру обратно не отдаётся.
+    pub reasoning: String,
     pub calls: Vec<Call>,
     pub usage: Usage,
+    /// Идентификатор ответа (`gen-…`) и отпечаток инференс-бэкенда, если их
+    /// прислал провайдер. Нужны для диагностики кеша: роутер (OpenRouter за
+    /// Nous) может увести запрос к другому апстриму, и тогда промах кеша — не
+    /// наша вина, а его. По смене `id`/`fingerprint` между ходами это видно.
+    pub upstream: Upstream,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct Upstream {
+    pub id: String,
+    pub fingerprint: String,
+}
+
+/// Что стрим отдаёт наружу: ответ (content) или рассуждение — разные роли для
+/// рендера, поэтому одним колбэком с тегом, а не двумя: второй mutable-колбэк
+/// заставил бы держать два заимствования рендера одновременно.
+pub enum Delta<'a> {
+    Content(&'a str),
+    Reasoning(&'a str),
 }
 
 pub trait Llm {
@@ -32,7 +49,7 @@ pub trait Llm {
         cfg: &Config,
         msgs: Vec<Value>,
         tools: Vec<Value>,
-        on_delta: &mut (dyn FnMut(&str) + Send),
+        on_delta: &mut (dyn FnMut(Delta) + Send),
     ) -> R<Reply>;
 }
 
@@ -61,7 +78,7 @@ impl Llm for OpenAi {
         cfg: &Config,
         msgs: Vec<Value>,
         tools: Vec<Value>,
-        on_delta: &mut (dyn FnMut(&str) + Send),
+        on_delta: &mut (dyn FnMut(Delta) + Send),
     ) -> R<Reply> {
         // Оборванный стрим до первых данных — это транспорт (провайдер закрыл
         // соединение), и повтор стоит дёшево: наружу ещё ничего не ушло.
@@ -93,7 +110,7 @@ impl OpenAi {
         cfg: &Config,
         msgs: &[Value],
         tools: &[Value],
-        on_delta: &mut (dyn FnMut(&str) + Send),
+        on_delta: &mut (dyn FnMut(Delta) + Send),
         seen: &mut bool,
     ) -> R<Reply> {
         let mut body = json!({
@@ -125,9 +142,15 @@ impl OpenAi {
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut text = String::new();
+        // Рассуждение — отдельное поле стрима (`delta.reasoning`); держим его в
+        // Reply и в логе, но провайдеру обратно не отдаём: контекст он не хранит.
+        let mut reasoning = String::new();
         // index -> (id, name, arguments) — стрим приходит фрагментами
         let mut parts: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
         let mut usage = Usage::default();
+        // Отпечаток апстрима для диагностики кеша: id виден в каждом кадре,
+        // fingerprint (vLLM) — только когда провайдер его пришлёт.
+        let mut upstream = Upstream::default();
 
         'outer: while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
@@ -150,17 +173,34 @@ impl OpenAi {
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                    if !id.is_empty() {
+                        upstream.id = id.to_string();
+                    }
+                }
+                if let Some(fp) = v.get("system_fingerprint").and_then(|x| x.as_str()) {
+                    if !fp.is_empty() {
+                        upstream.fingerprint = fp.to_string();
+                    }
+                }
                 if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                     usage = parse_usage(u);
                 }
                 let Some(d) = v.pointer("/choices/0/delta") else {
                     continue;
                 };
+                if let Some(r) = d.get("reasoning").and_then(|c| c.as_str()) {
+                    if !r.is_empty() {
+                        reasoning.push_str(r);
+                        *seen = true;
+                        on_delta(Delta::Reasoning(r));
+                    }
+                }
                 if let Some(c) = d.get("content").and_then(|c| c.as_str()) {
                     if !c.is_empty() {
                         text.push_str(c);
                         *seen = true;
-                        on_delta(c);
+                        on_delta(Delta::Content(c));
                     }
                 }
                 if let Some(tcs) = d.get("tool_calls").and_then(|t| t.as_array()) {
@@ -176,7 +216,8 @@ impl OpenAi {
                         if let Some(n) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
                             e.1 = format!("{}{}", e.1, n);
                         }
-                        if let Some(a) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                        if let Some(a) = tc.pointer("/function/arguments").and_then(|a| a.as_str())
+                        {
                             e.2.push_str(a);
                         }
                     }
@@ -187,13 +228,23 @@ impl OpenAi {
         let calls = parts
             .into_iter()
             .map(|(i, (id, name, args))| Call {
-                id: if id.is_empty() { format!("call_{i}") } else { id },
+                id: if id.is_empty() {
+                    format!("call_{i}")
+                } else {
+                    id
+                },
                 name,
                 args: if args.is_empty() { "{}".into() } else { args },
             })
             .collect();
 
-        Ok(Reply { text, calls, usage })
+        Ok(Reply {
+            text,
+            reasoning,
+            calls,
+            usage,
+            upstream,
+        })
     }
 }
 
@@ -236,7 +287,7 @@ impl Llm for Fake {
         _cfg: &Config,
         _msgs: Vec<Value>,
         _tools: Vec<Value>,
-        on_delta: &mut (dyn FnMut(&str) + Send),
+        on_delta: &mut (dyn FnMut(Delta) + Send),
     ) -> R<Reply> {
         let mut s = self
             .script
@@ -246,8 +297,11 @@ impl Llm for Fake {
             return Err("Fake: скрипт исчерпан".into());
         }
         let r = s.remove(0);
+        if !r.reasoning.is_empty() {
+            on_delta(Delta::Reasoning(&r.reasoning));
+        }
         if !r.text.is_empty() {
-            on_delta(&r.text);
+            on_delta(Delta::Content(&r.text));
         }
         Ok(r)
     }

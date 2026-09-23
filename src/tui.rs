@@ -5,13 +5,16 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use rustyline::{error::ReadlineError, DefaultEditor};
 
-use crate::{agent, cfg::Config, llm, log, R};
+use crate::{agent, cfg::Config, llm, log, render::Ui, R};
 
-const HELP: &str = "/new — новая сессия · /help · /quit (или Ctrl+D) · Ctrl+C — отменить ход";
+const HELP: &str = "/new — новая сессия · /reasoning — скрыть/показать рассуждение · \
+/help · /quit (или Ctrl+D) · Ctrl+C — отменить ход";
 
 pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
     let cfg = Config::load(flags.get("config").map(|s| s.as_str()))?;
     let llm = llm::OpenAi::new(cfg.api_key()?)?;
+    // Рендер один на поверхность: переключатель рассуждения живёт между ходами.
+    let ui = Ui::default();
 
     let mut id = match flags.get("session") {
         Some(s) => s.clone(),
@@ -54,6 +57,18 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
                 println!("сессия {id}");
                 continue;
             }
+            "/reasoning" => {
+                let on = ui.toggle_reasoning();
+                println!(
+                    "рассуждение: {}",
+                    if on {
+                        "показано"
+                    } else {
+                        "скрыто"
+                    }
+                );
+                continue;
+            }
             _ => {}
         }
 
@@ -66,18 +81,16 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
         // Ход отменяем, а не роняем процесс: будущее снимается, а kill_on_drop
         // в exec.rs добивает детей. Незавершённый ход проекция достроит сама.
         tokio::select! {
-            r = agent::run_agent(&sess, &cfg, &llm) => r?,
+            r = agent::run_agent(&sess, &cfg, &llm, &ui) => r?,
             _ = tokio::signal::ctrl_c() => eprintln!("[snens] ход отменён"),
         }
     }
 
     let _ = rl.save_history(&hist);
-    // Автономный цикл — тот же, что у `run`. Ctrl+C здесь тоже отмена: раз
-    // SIGINT перехвачен для отмены хода, без этого его нечем прервать.
-    tokio::select! {
-        r = crate::autopilot(&cfg, &id, &llm) => r?,
-        _ = tokio::signal::ctrl_c() => eprintln!("[snens] автопрогон прерван"),
-    }
+    // Ревью уезжает фоновым процессом (см. main::spawn_review): окно можно
+    // закрывать, ревью доработает само. Ctrl+C тут не нужен — autopilot только
+    // запускает процесс и сразу возвращается.
+    crate::autopilot(&cfg, &id).await?;
     Ok(())
 }
 

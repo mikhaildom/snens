@@ -93,10 +93,7 @@ fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
 /// Имя в канале: базовое имя источника, при коллизии — с индексом. Расширение
 /// сохраняем: по нему ядро выбирает mime вложения.
 fn dest(dir: &Path, src: &Path) -> PathBuf {
-    let name = src
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("image");
+    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("image");
     let mut dest = dir.join(name);
     let stem = Path::new(name)
         .file_stem()
