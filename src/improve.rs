@@ -33,7 +33,17 @@ pub async fn run(cfg: &Config, llm: &llm::OpenAi) -> R<()> {
         source: "improve".into(),
     })?;
     eprintln!("[snens] улучшение {id} → {} ({})", cfg.base_url, cfg.model);
-    agent::run_agent(&sess, cfg, llm, &crate::render::Ui::plain()).await
+    // Рендер как у TUI: `Ui::default()` сам включает цвет только на tty, поэтому
+    // улучшение, запущенное руками в терминале, выглядит тем же потоком, что и
+    // живая сессия (рассуждение, цвет), а перенаправленное в файл — без цвета.
+    let outcome = agent::run_agent(&sess, cfg, llm, &crate::render::Ui::default()).await;
+    // Улучшение — единственный, кто правит код харнесса: пересобираем ядро и
+    // кладём бинарник на место, чтобы новая сборка вступила в силу без ручного
+    // `cargo build`. Ошибка пересборки не отменяет уже сделанную работу.
+    if let Err(e) = crate::rebuild_and_install(&repo) {
+        eprintln!("[snens] пересборка ядра не удалась: {e}");
+    }
+    outcome
 }
 
 #[cfg(test)]

@@ -309,6 +309,52 @@ fn cmd_build(flags: &BTreeMap<String, String>) -> R<()> {
     Ok(())
 }
 
+/// Пересобрать ядро и положить бинарник на место — туда, откуда его берёт PATH
+/// (симлинк `~/.local/bin/snens` → debug-сборка). Зовётся в конце `snens improve`:
+/// улучшение правит собственный код, и новая сборка должна вступить в силу без
+/// ручного `cargo build`. Если `snens` в PATH — это сама debug-сборка (симлинк на
+/// тот же файл), копировать нечего, cargo пишет прямо туда.
+///
+/// `fs::copy` поверх симлинка обнулил бы источник (назначение — симлинк на
+/// копируемый файл): поэтому назначение сначала резолвим и, если это тот же файл,
+/// копию не делаем.
+pub fn rebuild_and_install(repo: &std::path::Path) -> R<()> {
+    let ok = std::process::Command::new("cargo")
+        .arg("build")
+        .current_dir(repo)
+        .status()?;
+    if !ok.success() {
+        return Err("cargo build завершился с ошибкой".into());
+    }
+    let built = cargo_target_dir(repo)?.join(format!(
+        "debug/snens{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let Some(dest) = on_path("snens") else {
+        eprintln!("[snens] snens не найден в PATH — бинарник только пересобран");
+        return Ok(());
+    };
+    // Симлинк на саму сборку (обычная установка из исходников): cargo уже
+    // записал новый файл, копировать в него же нельзя.
+    if std::fs::canonicalize(&dest).ok().as_deref() == Some(built.as_path()) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&dest);
+    std::fs::copy(&built, &dest)?;
+    eprintln!("[snens] бинарник обновлён: {}", dest.display());
+    Ok(())
+}
+
+/// Найти исполняемый файл по имени в PATH (аналог `which`, без сабпроцесса).
+fn on_path(name: &str) -> Option<std::path::PathBuf> {
+    let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join(&exe))
+            .find(|c| c.is_file())
+    })
+}
+
 /// target может быть перенесён (`.cargo/config.toml`) — спрашиваем cargo, а не угадываем.
 fn cargo_target_dir(root: &std::path::Path) -> R<std::path::PathBuf> {
     let out = std::process::Command::new("cargo")
