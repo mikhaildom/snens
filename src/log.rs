@@ -60,6 +60,13 @@ pub enum Rec {
         elided: usize,
         freed_bytes: usize,
     },
+    /// Справка из долгой памяти, впрыснутая перед ходом. В логе, а не только на
+    /// проводе: проекция обязана собираться байт-в-байт одинаково и после
+    /// рестарта, а resume не должен впрыскивать её второй раз.
+    Recall {
+        ts: u64,
+        text: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

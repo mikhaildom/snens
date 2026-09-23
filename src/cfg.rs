@@ -70,6 +70,24 @@ pub struct Config {
     /// Свой файл промпта ревью вместо вкомпилированного (для опытов).
     #[serde(default)]
     pub review_prompt: Option<String>,
+    /// Долгая память: программа-провайдер, вызываемая как `<cmd> recall <текст>`
+    /// и `<cmd> retain` (JSON хода на stdin). Пусто — канала нет: чистая
+    /// установка за модуль не платит, а ядро о нём ничего не знает.
+    #[serde(default)]
+    pub memory: Memory,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct Memory {
+    /// Имя программы в каталоге тулов (или путь, если со слэшем).
+    #[serde(default)]
+    pub cmd: String,
+    /// Таймаут одного вызова, секунды: канал вспомогательный, ход его не ждёт.
+    #[serde(default = "d_mem_timeout")]
+    pub timeout_seconds: u64,
+    /// Теги записи — свой канал в общем банке (у Гермеса свой).
+    #[serde(default)]
+    pub tag: Vec<String>,
 }
 
 fn d_base_url() -> String { "https://inference-api.nousresearch.com/v1".into() }
@@ -88,6 +106,7 @@ fn d_keep() -> usize { 5 }
 fn d_tickets() -> String { format!("{}/tickets", data_dir()) }
 fn d_skills() -> String { format!("{}/skills", data_dir()) }
 fn d_review_min() -> usize { 20 }
+fn d_mem_timeout() -> u64 { 60 }
 fn d_shell() -> Vec<String> {
     if cfg!(windows) {
         vec!["cmd".into(), "/C".into()]
@@ -210,6 +229,24 @@ impl Config {
             .parent()
             .map(|p| p.join("bin"))
             .unwrap_or_else(|| PathBuf::from("bin"))
+    }
+
+    /// Программа долгой памяти: имя — из каталога тулов (там же, где `bin/`),
+    /// путь со слэшем — как задан. Пусто — канала нет.
+    pub fn memory_bin(&self) -> Option<PathBuf> {
+        let cmd = self.memory.cmd.trim();
+        if cmd.is_empty() {
+            return None;
+        }
+        let named = Path::new(cmd);
+        let exe = self
+            .bin_path()
+            .join(format!("{cmd}{}", std::env::consts::EXE_SUFFIX));
+        if named.components().count() == 1 && exe.is_file() {
+            Some(exe)
+        } else {
+            Some(PathBuf::from(cmd))
+        }
     }
 
     /// Ключ: сначала переменная окружения, потом `.env` рядом с конфигом —

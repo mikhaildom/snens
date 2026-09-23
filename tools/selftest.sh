@@ -155,6 +155,34 @@ want "ещё" "$(cat "$newf")" "write: перезапись"
 ti write "!" "$newf" --append
 want "ещё!" "$(cat "$newf")" "write: --append"
 
+# ---- memory ----
+# Живого сервера тесты не требуют: контракт проверяется на мёртвом адресе.
+t memory --help
+want 0 "$rc" "memory: --help — код 0"
+has "memory —" "$out" "memory: --help, строка 1 = суть"
+has "memory recall" "$out" "memory: --help, строка 2 = usage"
+
+t memory nosuch
+want 2 "$rc" "memory: неизвестная команда — код 2"
+has "memory recall <запрос>" "$err" "memory: неизвестная команда — usage в stderr"
+
+t memory recall
+want 2 "$rc" "memory: recall без запроса — код 2"
+
+ti memory "" --context c
+want 2 "$rc" "memory: retain без текста — код 2"
+
+SNENS_MEMORY_URL=http://127.0.0.1:1
+export SNENS_MEMORY_URL
+t memory recall "что-нибудь"
+want 1 "$rc" "memory: сервер недоступен (recall) — код 1"
+has "Hindsight" "$err" "memory: сервер недоступен — текст ошибки"
+ti memory '{"user":"q","assistant":"a"}' retain --context c
+want 1 "$rc" "memory: сервер недоступен (retain) — код 1"
+t memory stats
+want 1 "$rc" "memory: сервер недоступен (stats) — код 1"
+unset SNENS_MEMORY_URL
+
 if [ "$fails" -ne 0 ]; then
   echo
   echo "провалено проверок: $fails"

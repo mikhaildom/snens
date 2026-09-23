@@ -160,6 +160,9 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
                 };
                 out.push(json!({"role": "tool", "tool_call_id": call_id, "content": text}));
             }
+            // Справка памяти — системная роль: это контекст, а не запрос
+            // пользователя, и второй `user` подряд ломает чередование ролей.
+            Rec::Recall { text, .. } => out.push(json!({"role": "system", "content": text})),
             Rec::System { .. } | Rec::Meta { .. } | Rec::Usage { .. } | Rec::Ctx { .. } => {}
         }
     }
