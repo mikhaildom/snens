@@ -67,6 +67,11 @@ t read --help
 has "read —" "$out" "read: --help, строка 1 = суть"
 
 # ---- edit ----
+# Реестр читает из хелпа признак «нужен stdin» по слову stdin в сути/usage.
+# Потеряется — требование stdin пропадёт из схемы тула.
+t edit --help
+t has "stdin" "$out" "edit: хелп объявляет stdin (признак для реестра)"
+
 JSON='{"old_string":"beta","new_string":"BETA"}'
 ti edit "$JSON" "$f"
 want 0 "$rc" "edit: код 0"
@@ -142,6 +147,10 @@ t edit "$f"
 want 1 "$rc" "edit: пустой stdin — код 1"
 
 # ---- write ----
+# Суть «содержимое берётся со stdin» — тот же признак для реестра.
+t write --help
+t has "stdin" "$out" "write: хелп объявляет stdin (признак для реестра)"
+
 newf=$TMP/sub/n.txt
 ti write "привет" "$newf"
 want 0 "$rc" "write: код 0"

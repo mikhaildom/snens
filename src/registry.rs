@@ -12,6 +12,10 @@ pub struct Tool {
     pub bin: PathBuf,
     pub summary: String,
     pub usage: String,
+    /// Usage-строка хелпа несёт признак «нужен stdin»: тогда определение тула
+    /// помечает stdin обязательным, и модель узнаёт контракт заранее, а не
+    /// тратит ход на exit=1 при первом вызове.
+    pub uses_stdin: bool,
 }
 
 pub async fn discover(cfg: &Config) -> Vec<Tool> {
@@ -20,7 +24,11 @@ pub async fn discover(cfg: &Config) -> Vec<Tool> {
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return out;
     };
-    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    let mut dirs: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
     dirs.sort();
 
     for d in dirs {
@@ -29,7 +37,10 @@ pub async fn discover(cfg: &Config) -> Vec<Tool> {
         };
         let bin = d.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         if !bin.is_file() {
-            eprintln!("[snens] тул {name}: нет исполняемого файла {}", bin.display());
+            eprintln!(
+                "[snens] тул {name}: нет исполняемого файла {}",
+                bin.display()
+            );
             continue;
         }
         let bin_s = bin.to_string_lossy().into_owned();
@@ -51,11 +62,13 @@ pub async fn discover(cfg: &Config) -> Vec<Tool> {
             eprintln!("[snens] тул {name}: пустой --help");
             continue;
         }
+        let uses_stdin = stdin_required(&summary, &usage);
         out.push(Tool {
             name,
             bin,
             summary,
             usage,
+            uses_stdin,
         });
     }
     out
@@ -69,16 +82,32 @@ fn split_help(text: &str) -> (String, String) {
     (summary, usage)
 }
 
+/// Нужен ли тулу stdin — видно из сути и usage-строки хелпа (`<путь>   — JSON на
+/// stdin`, `содержимое берётся со stdin`). Признак ставит сам тул, и он же в
+/// `--help`: отдельной схемы на тип тула не заводим.
+fn stdin_required(summary: &str, usage: &str) -> bool {
+    summary.contains("stdin") || usage.contains("stdin")
+}
+
 /// Одна generic-схема на все тулы: аргументы — argv, документация — хелп.
 pub fn definitions(tools: &[Tool]) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
+            let mut desc = format!("{}\n{}", t.summary, t.usage);
+            // Требование stdin доезжает до модели из описания, а не из exit=1
+            // на первом вызове: это часть контракта тула, не сюрприз.
+            let required: Vec<&str> = if t.uses_stdin {
+                desc.push_str("\nstdin обязателен: JSON правки / содержимое файла.");
+                vec!["args", "stdin"]
+            } else {
+                vec!["args"]
+            };
             json!({
                 "type": "function",
                 "function": {
                     "name": t.name,
-                    "description": format!("{}\n{}", t.summary, t.usage),
+                    "description": desc,
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -90,7 +119,7 @@ pub fn definitions(tools: &[Tool]) -> Vec<Value> {
                             "stdin": {"type": "string", "description": "Что подать на stdin"},
                             "timeout_seconds": {"type": "integer"}
                         },
-                        "required": ["args"]
+                        "required": required
                     }
                 }
             })

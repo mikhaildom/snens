@@ -435,7 +435,7 @@ pub async fn selftest() -> R<()> {
         "#!/bin/sh\n\
          if [ \"$1\" = \"--help\" ]; then\n\
          \x20 echo \"probe — тестовый тул: печатает argv и stdin.\"\n\
-         \x20 echo \"probe [args...]\"\n\
+         \x20 echo \"probe [args...] (stdin)\"\n\
          \x20 exit 0\n\
          fi\n\
          echo \"args:$*\"\n\
@@ -456,6 +456,10 @@ pub async fn selftest() -> R<()> {
     let desc = pd["function"]["description"].as_str().unwrap_or_default();
     assert!(desc.starts_with("probe —"), "описание не из --help: {desc}");
     assert!(desc.contains("probe [args...]"), "в описание не попал usage");
+    // usage со словом «stdin» → требование stdin доезжает в схему, а не через exit=1.
+    assert!(desc.contains("stdin обязателен"), "в описание не попал признак stdin: {desc}");
+    let req = pd["function"]["parameters"]["required"].as_array().expect("required не массив");
+    assert!(req.iter().any(|v| v == "stdin"), "stdin не помечен обязательным");
     assert!(
         std::fs::symlink_metadata(cfg.bin_path().join("probe")).is_ok(),
         "нет симлинка в PATH-каталоге"
