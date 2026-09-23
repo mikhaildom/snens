@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::R;
+use crate::{log::Part, R};
 
 /// Строку такой длины модель всё равно не читает, а контекст она съедает.
 const MAX_LINE: usize = 400;
@@ -19,6 +19,8 @@ pub struct Out {
     pub bytes: usize,
     pub ms: u64,
     pub timed_out: bool,
+    /// Вложения, принесённые процессом через `SNENS_ATTACH_DIR`.
+    pub parts: Vec<Part>,
 }
 
 pub struct Spawn<'a> {
@@ -40,6 +42,12 @@ pub struct Spawn<'a> {
     /// Куда положить полный вывод, если он не влез в cap. Модель получает путь
     /// и может дочитать или grep'нуть вместо повторного запуска команды.
     pub dump_dir: Option<&'a Path>,
+    /// Каталог вложений вызова: если задан, процесс получает его в
+    /// `SNENS_ATTACH_DIR` и может оставить там файлы. Ядро подберёт их после
+    /// выхода и вернёт как `Out::parts` — одинаково для тулов и для `run`.
+    pub attach_dir: Option<&'a Path>,
+    /// Сколько байт вложения допускаем; больше — файл отбрасывается с пометкой.
+    pub max_attachment_bytes: usize,
 }
 
 impl<'a> Spawn<'a> {
@@ -59,6 +67,8 @@ impl<'a> Spawn<'a> {
             path: None,
             reduce: false,
             dump_dir: None,
+            attach_dir: None,
+            max_attachment_bytes: MAX_ATTACHMENT_BYTES,
         }
     }
 
@@ -73,8 +83,38 @@ impl<'a> Spawn<'a> {
             path: None,
             reduce: false,
             dump_dir: None,
+            attach_dir: None,
+            max_attachment_bytes: MAX_ATTACHMENT_BYTES,
         }
     }
+}
+
+/// Потолок вложения: больше — это уже не картинка «посмотреть», а файл для инструмента.
+/// Задаётся в конфиге, здесь — только дефолт для прямых вызовов `Spawn`.
+pub const MAX_ATTACHMENT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Что именно считается вложением — по расширению файла (mime выводится из него).
+/// Набор и порядок — часть контракта канала, поэтому он один, а не в каждом туле.
+const ATTACH_EXTS: &[(&str, &str, &str)] = &[
+    ("png", "image", "image/png"),
+    ("jpg", "image", "image/jpeg"),
+    ("jpeg", "image", "image/jpeg"),
+    ("gif", "image", "image/gif"),
+    ("webp", "image", "image/webp"),
+    ("mp3", "audio", "audio/mpeg"),
+    ("wav", "audio", "audio/wav"),
+    ("ogg", "audio", "audio/ogg"),
+    ("mp4", "video", "video/mp4"),
+    ("webm", "video", "video/webm"),
+    ("pdf", "file", "application/pdf"),
+];
+
+fn attach_kind(path: &Path) -> Option<(&'static str, &'static str)> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    ATTACH_EXTS
+        .iter()
+        .find(|(e, _, _)| *e == ext)
+        .map(|(_, k, m)| (*k, *m))
 }
 
 pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
@@ -91,6 +131,12 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     }
     if let Some(p) = sp.path {
         c.env("PATH", p);
+    }
+    // Каталог вложений: переменная сама сообщает процессу, что канал есть, и
+    // сразу исключает мусор — команда, не знающая про неё, ничего туда не кладёт.
+    if let Some(d) = sp.attach_dir {
+        std::fs::create_dir_all(d)?;
+        c.env("SNENS_ATTACH_DIR", d);
     }
 
     let mut child = c.spawn().map_err(|e| format!("spawn failed: {e}"))?;
@@ -144,13 +190,137 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
         }
     }
 
+    let parts = match sp.attach_dir {
+        Some(d) => collect_attachments(d, sp.max_attachment_bytes, &mut text),
+        None => Vec::new(),
+    };
+
     Ok(Out {
         exit,
         text,
         bytes,
         ms,
         timed_out,
+        parts,
     })
+}
+
+/// Вложения вызова: файлы whitelisted-типов из каталога канала. Слишком большие
+/// отбрасываются с пометкой в тексте — лучше отказ, чем транскрипт с 50 МБ base64.
+/// Незнакомые расширения игнорируются: канал не должен превращаться в свалку.
+fn collect_attachments(dir: &Path, max_bytes: usize, text: &mut String) -> Vec<Part> {
+    let mut parts = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return parts;
+    };
+    let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+    // Порядок чтения каталога произволен — сортируем, иначе проекция недетерминирована.
+    files.sort();
+    for p in files {
+        let Some((kind, mime)) = attach_kind(&p) else {
+            continue;
+        };
+        let Ok(meta) = p.metadata() else { continue };
+        if meta.len() as usize > max_bytes {
+            text.push_str(&format!(
+                "\n[вложение отброшено: {} Б > потолка {} Б — {}]",
+                meta.len(),
+                max_bytes,
+                p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+            ));
+            continue;
+        }
+        let (width, height) = if kind == "image" {
+            std::fs::read(&p)
+                .ok()
+                .map(|b| image_dims(&b, mime))
+                .unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+        if kind == "image" && width == 0 {
+            // Не распознали как картинку — не отправляем: провайдер ответит 400.
+            text.push_str(&format!(
+                "\n[вложение не распознано как изображение: {}]",
+                p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+            ));
+            continue;
+        }
+        parts.push(Part {
+            kind: kind.to_string(),
+            path: p.to_string_lossy().into_owned(),
+            mime: mime.to_string(),
+            bytes: meta.len() as usize,
+            width,
+            height,
+        });
+    }
+    parts
+}
+
+/// Размеры картинки из заголовка: без декодирования форматы и без картинных крейтов
+/// (ядро тащит только std + rustls + serde). Не распознали — (0, 0), и вызывающий решает.
+fn image_dims(b: &[u8], mime: &str) -> (u32, u32) {
+    match mime {
+        "image/png" if b.len() >= 24 && b.starts_with(b"\x89PNG\r\n\x1a\n") => (
+            u32::from_be_bytes(b[16..20].try_into().unwrap()),
+            u32::from_be_bytes(b[20..24].try_into().unwrap()),
+        ),
+        "image/gif" if b.len() >= 10 && (b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a")) => (
+            u16::from_le_bytes(b[6..8].try_into().unwrap()) as u32,
+            u16::from_le_bytes(b[8..10].try_into().unwrap()) as u32,
+        ),
+        "image/jpeg" => jpeg_dims(b),
+        "image/webp" if b.len() >= 30 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" => {
+            match &b[12..16] {
+                b"VP8 " => (
+                    (u16::from_le_bytes(b[26..28].try_into().unwrap()) & 0x3fff) as u32,
+                    (u16::from_le_bytes(b[28..30].try_into().unwrap()) & 0x3fff) as u32,
+                ),
+                b"VP8L" => {
+                    let bits = u32::from_le_bytes(b[21..25].try_into().unwrap());
+                    ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+                }
+                b"VP8X" => (
+                    (u32::from_le_bytes([b[24], b[25], b[26], 0]) & 0xffffff) + 1,
+                    (u32::from_le_bytes([b[27], b[28], b[29], 0]) & 0xffffff) + 1,
+                ),
+                _ => (0, 0),
+            }
+        }
+        _ => (0, 0),
+    }
+}
+
+/// Рамки JPEG по маркерам: идём по сегментам до SOF (кроме SOF4/SOF8/SOF12).
+fn jpeg_dims(b: &[u8]) -> (u32, u32) {
+    let mut i = 2; // пропускаем SOI
+    while i + 9 < b.len() {
+        if b[i] != 0xff {
+            i += 1;
+            continue;
+        }
+        let marker = b[i + 1];
+        // Паддинг из нескольких 0xff.
+        if marker == 0xff {
+            i += 1;
+            continue;
+        }
+        // Сегменты без длины.
+        if marker == 0x01 || (0xd0..=0xd9).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        // SOF0..SOF15, исключая DHT(0xc4), JPG(0xc8), DAC(0xcc).
+        if (0xc0..=0xcf).contains(&marker) && marker != 0xc4 && marker != 0xc8 && marker != 0xcc {
+            let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+            let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+            return (w, h);
+        }
+        i += 2 + len;
+    }
+    (0, 0)
 }
 
 /// Полный вывод на диск; имя — от содержимого, поэтому одинаковые дампы не плодятся.
@@ -278,6 +448,51 @@ mod tests {
         let long = "x".repeat(1000);
         let r2 = reduce(&long, 10_000);
         assert!(r2.contains("симв."), "длинная строка без пометки: {}", r2.len());
+    }
+
+    /// Канал вложений: процесс получает SNENS_ATTACH_DIR и кладёт туда картинку,
+    /// ядро подбирает её как Part. Незнакомые типы игнорируются, большие —
+    /// отбрасываются с пометкой.
+    #[tokio::test]
+    async fn attach_dir_collects_images() {
+        let dir = std::env::temp_dir().join(format!("snens-attach-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Пишем валидный PNG-заголовок и мусорный файл.
+        let png = dir.join("bad-source");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01").unwrap();
+        let sh = format!(
+            "cp '{}' \"$SNENS_ATTACH_DIR/pic.png\"; printf 'x' > \"$SNENS_ATTACH_DIR/note.txt\"",
+            png.display()
+        );
+        let mut sp = Spawn::sh(&["sh".into(), "-c".into()], &sh, 10, 10_000);
+        sp.attach_dir = Some(dir.as_path());
+        let out = spawn(sp).await.expect("спавн упал");
+        assert_eq!(out.parts.len(), 1, "должна быть одна картинка: {:?}", out.parts);
+        assert_eq!(out.parts[0].mime, "image/png");
+        assert_eq!(out.parts[0].kind, "image");
+        assert_eq!((out.parts[0].width, out.parts[0].height), (1, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Потолок вложения: слишком большой файл не едет, но и не теряется молча.
+    #[tokio::test]
+    async fn oversized_attachment_is_reported() {
+        let dir = std::env::temp_dir().join(format!("snens-attach-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sp = Spawn::sh(
+            &["sh".into(), "-c".into()],
+            "head -c 5000 /dev/zero > \"$SNENS_ATTACH_DIR/big.png\"",
+            10,
+            10_000,
+        );
+        sp.attach_dir = Some(dir.as_path());
+        sp.max_attachment_bytes = 1000;
+        let out = spawn(sp).await.expect("спавн упал");
+        assert!(out.parts.is_empty(), "большой файл не должен уехать");
+        assert!(out.text.contains("вложение отброшено"), "нет пометки: {}", out.text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Обрезанное не теряется: полный вывод лежит в файле, путь уходит модели.

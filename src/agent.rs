@@ -57,8 +57,12 @@ pub async fn dispatch(
         bytes: 0,
         ms: 0,
         timed_out: false,
+        parts: Vec::new(),
     };
     let a: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
+    // Канал вложений — свой каталог на вызов: файлы разных вызовов не смешиваются,
+    // а имя каталога (= id вызова) делает сбор детерминированным.
+    let attach_dir = cfg.attachments.then(|| out_dir.join("attach").join(&call.id));
 
     if call.name == "run" {
         let Some(command) = a.get("command").and_then(|c| c.as_str()) else {
@@ -76,6 +80,8 @@ pub async fn dispatch(
         sp.path = Some(path);
         sp.reduce = cfg.reduce_output;
         sp.dump_dir = Some(out_dir);
+        sp.attach_dir = attach_dir.as_deref();
+        sp.max_attachment_bytes = cfg.max_attachment_bytes;
         return match exec::spawn(sp).await {
             Ok(o) => o,
             Err(e) => fail(format!("run: {e}")),
@@ -113,6 +119,8 @@ pub async fn dispatch(
     // Тулы отдают точный контракт (файл, JSON-событие) — повторы в них схлопывать
     // нельзя, это исказило бы содержимое. Сокращение живёт только на shell-выводе.
     sp.dump_dir = Some(out_dir);
+    sp.attach_dir = attach_dir.as_deref();
+    sp.max_attachment_bytes = cfg.max_attachment_bytes;
     match exec::spawn(sp).await {
         Ok(o) => o,
         Err(e) => fail(format!("{}: {e}", call.name)),
@@ -228,6 +236,13 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
                 println!("{p}");
                 let _ = std::io::stdout().flush();
             }
+            // Человеку в терминал: вложение не покажешь текстом, поэтому говорим,
+            // что оно есть и откуда его взять.
+            if !out.parts.is_empty() {
+                for p in &out.parts {
+                    println!("  [вложение] {} {}x{} {} Б — {}", p.kind, p.width, p.height, p.bytes, p.path);
+                }
+            }
             sess.append(Rec::ToolResult {
                 ts: log::now(),
                 call_id: call.id.clone(),
@@ -237,6 +252,7 @@ pub async fn run_agent<L: Llm>(sess: &Session, cfg: &Config, llm: &L) -> R<()> {
                 bytes: out.bytes,
                 ms: out.ms,
                 body: Body::Inline { text: out.text },
+                parts: out.parts,
             })?;
         }
 

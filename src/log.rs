@@ -44,6 +44,10 @@ pub enum Rec {
         bytes: usize,
         ms: u64,
         body: Body,
+        /// Вложения, которые тул положил в канал (`SNENS_ATTACH_DIR`). Пусто у
+        /// текстовых тулов; старые логи читаются как есть (serde default).
+        #[serde(default)]
+        parts: Vec<Part>,
     },
     Usage {
         ts: u64,
@@ -81,6 +85,23 @@ pub struct Call {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Body {
     Inline { text: String },
+}
+
+/// Вложение сообщения: файл в хранилище инстанса плюс то, что нужно, чтобы
+/// собрать часть контента для провайдера. Вид (`kind`) — нейтральный, а не
+/// провайдерский: мапинг в конкретный формат живёт в проекции.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Part {
+    /// `image` | `audio` | `video` | `file` — расширяется без ломки старых логов.
+    pub kind: String,
+    /// Абсолютный путь в каталоге сессии: файл неизменяем, проекция детерминирована.
+    pub path: String,
+    pub mime: String,
+    pub bytes: usize,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
 }
 
 pub struct Session {

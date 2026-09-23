@@ -3,14 +3,15 @@
 //
 // Компакция — правило проекции, а не перезапись лога: лог неизменяем, элизия
 // обратима, потому что исходные результаты по-прежнему лежат в файле сессии.
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Mutex};
 
+use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::{
     cfg::{self, Config},
     exec::truncate,
-    log::{Body, Rec},
+    log::{Body, Part, Rec},
 };
 
 /// Пометка перед рамкой ревью/улучшения: выше лежит транскрипт уже закрытой
@@ -24,6 +25,8 @@ const REPLAY_NOTE: &str = "Всё выше — транскрипт уже за�
 pub struct Report {
     pub elided: usize,
     pub freed_bytes: usize,
+    /// Сколько вложений вырезано при компакции (они дороже текста в разы).
+    pub elided_attachments: usize,
 }
 
 /// Проекция с учётом переполнения: если она не влезает в мягкий порог,
@@ -65,6 +68,13 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
         .count();
     let keep_from = total_results.saturating_sub(cfg.keep_results);
     let mut seen_results = 0usize;
+    // Вложения дороже текста в разы, поэтому у них свой, более строгий порог.
+    let total_with_parts = log
+        .iter()
+        .filter(|r| matches!(r, Rec::ToolResult { parts, .. } if !parts.is_empty()))
+        .count();
+    let keep_from_attach = total_with_parts.saturating_sub(cfg.keep_attachments);
+    let mut seen_with_parts = 0usize;
     // Есть ли выше рамки настоящий ход (запрос пользователя и/или вызовы): тогда
     // рамка — это ревью/улучшение поверх транскрипта, и транскрипт надо пометить.
     let mut had_work = false;
@@ -139,6 +149,7 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
                 exit,
                 bytes,
                 body,
+                parts,
                 ..
             } => {
                 let idx = seen_results;
@@ -158,7 +169,23 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
                 } else {
                     text
                 };
-                out.push(json!({"role": "tool", "tool_call_id": call_id, "content": text}));
+                let part_idx = if parts.is_empty() {
+                    None
+                } else {
+                    let i = seen_with_parts;
+                    seen_with_parts += 1;
+                    Some(i)
+                };
+                // Вложения вырезаются по своему порогу: держим последние
+                // keep_attachments, остальные — уже просмотренный материал.
+                let drop_parts = elide && part_idx.is_some_and(|i| i < keep_from_attach);
+                let kept: &[Part] = if drop_parts { &[] } else { parts };
+                if drop_parts {
+                    report.elided_attachments += parts.len();
+                    report.freed_bytes += parts.iter().map(|p| p.bytes).sum::<usize>();
+                }
+                let content = content_value(&text, kept, cfg, drop_parts);
+                out.push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
             }
             // Справка памяти — системная роль: это контекст, а не запрос
             // пользователя, и второй `user` подряд ломает чередование ролей.
@@ -167,6 +194,72 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
         }
     }
     (out, report)
+}
+
+/// Контент сообщения: плоская строка, если вложений нет (как раньше), иначе
+/// массив частей в формате openai-compatible. Картинки едут data-URL-ом;
+/// видео/аудио/файлы ядро пока не умеет отдавать — они остаются пометкой.
+///
+/// Ссылку на путь не подставляем вместо base64: у провайдера нет доступа к
+/// нашей файловой системе, он запросит URL и получит 400.
+fn content_value(text: &str, parts: &[Part], cfg: &Config, elided: bool) -> Value {
+    if parts.is_empty() {
+        let mut t = text.to_string();
+        if elided {
+            t.push_str("\n[вложения вырезаны при компакции: перечитай файл, если нужны]");
+        }
+        return json!(t);
+    }
+    let mut arr = vec![json!({"type": "text", "text": text})];
+    for p in parts {
+        // Канал есть, а модель вложений не понимает — не шлём и говорим прямо.
+        if !cfg.attachments {
+            arr.push(json!({
+                "type": "text",
+                "text": format!("[вложение не отправлено: attachments выключены — {} {} Б]", p.mime, p.bytes)
+            }));
+            continue;
+        }
+        if p.kind != "image" {
+            arr.push(json!({
+                "type": "text",
+                "text": format!("[вложение {} не поддерживается провайдером (пока): {} Б]", p.kind, p.bytes)
+            }));
+            continue;
+        }
+        match data_url(&p.path, &p.mime) {
+            Some(url) => arr.push(json!({"type": "image_url", "image_url": {"url": url}})),
+            None => arr.push(json!({
+                "type": "text",
+                "text": format!("[вложение недоступно: {}]", p.path)
+            })),
+        }
+    }
+    Value::Array(arr)
+}
+
+/// base64 файла, закешированный по пути: проекция строится каждый ход, а файл
+/// в хранилище неизменяем — иначе мегабайтная картинка кодировалась бы впустую.
+/// Кеш не влияет на результат, только на цену, поэтому детерминизм не страдает.
+static B64_CACHE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+const B64_CACHE_MAX: usize = 16;
+
+fn data_url(path: &str, mime: &str) -> Option<String> {
+    if let Ok(c) = B64_CACHE.lock() {
+        if let Some((_, url)) = c.iter().find(|(p, _)| p == path) {
+            return Some(url.clone());
+        }
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let url = format!("data:{mime};base64,{b64}");
+    if let Ok(mut c) = B64_CACHE.lock() {
+        if c.len() >= B64_CACHE_MAX {
+            c.remove(0);
+        }
+        c.push((path.to_string(), url.clone()));
+    }
+    Some(url)
 }
 
 /// Команду из лога оставляем в пометке: без неё модель не знает, что именно
@@ -182,7 +275,6 @@ fn command_hint(argv: &[String]) -> String {
 
 /// Грубая оценка токенов проекции: точные числа берём из usage провайдера,
 /// а это — только для порога компакции.
-
 pub fn estimate_tokens(msgs: &[Value]) -> u64 {
     let bytes: usize = msgs
         .iter()
@@ -265,6 +357,148 @@ mod tests {
             .contains("Ты агент"));
     }
 
+    /// Вложение из канала едет как image-часть; без него — плоская строка, как
+    /// раньше (совместимость со старыми логами и текстовыми тулами).
+    #[test]
+    fn attachment_becomes_image_part() {
+        let dir = std::env::temp_dir().join(format!("snens-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1x1 PNG: заголовок + пустой IDAT достаточно, чтобы base64 собрать.
+        let png: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H',
+            b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1,
+        ];
+        let img = dir.join("px.png");
+        std::fs::write(&img, &png).unwrap();
+        let cfg = Config::default();
+        let log = vec![
+            user("посмотри", "cli"),
+            Rec::Assistant {
+                ts: 0,
+                text: None,
+                tool_calls: vec![crate::log::Call {
+                    id: "c1".into(),
+                    name: "view".into(),
+                    args: "{}".into(),
+                }],
+            },
+            Rec::ToolResult {
+                ts: 0,
+                call_id: "c1".into(),
+                tool: "view".into(),
+                argv: vec![],
+                exit: 0,
+                bytes: png.len(),
+                ms: 1,
+                body: Body::Inline { text: "px.png".into() },
+                parts: vec![Part {
+                    kind: "image".into(),
+                    path: img.to_string_lossy().into_owned(),
+                    mime: "image/png".into(),
+                    bytes: png.len(),
+                    width: 1,
+                    height: 1,
+                }],
+            },
+        ];
+        let projected = msgs(&log, &cfg);
+        let tool = projected.iter().find(|m| m["role"] == "tool").unwrap();
+        let content = tool["content"].as_array().expect("вложение не собралось в части");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        // Детерминизм: кеш base64 не влияет на результат.
+        assert_eq!(
+            serde_json::to_string(&projected).unwrap(),
+            serde_json::to_string(&msgs(&log, &cfg)).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Вложения вырезаются при компакции по своему порогу: они дороже текста.
+    /// Пометка вместо картинки, последняя остаётся, проекция детерминирована.
+    #[test]
+    fn attachments_are_elided_on_compaction() {
+        let dir = std::env::temp_dir().join(format!("snens-attach-elide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1];
+        let mut cfg = Config::default();
+        // Крошечное окно: элизия срабатывает сразу.
+        cfg.ctx_window = 400;
+        cfg.keep_results = 1;
+        cfg.keep_attachments = 1;
+        let part = |path: &std::path::Path| Part {
+            kind: "image".into(),
+            path: path.to_string_lossy().into_owned(),
+            mime: "image/png".into(),
+            bytes: png.len(),
+            width: 1,
+            height: 1,
+        };
+        let img1 = dir.join("a.png");
+        std::fs::write(&img1, &png).unwrap();
+        let img2 = dir.join("b.png");
+        std::fs::write(&img2, &png).unwrap();
+        let log = vec![
+            user("две картинки", "cli"),
+            Rec::Assistant { ts: 0, text: None, tool_calls: vec![crate::log::Call { id: "c1".into(), name: "view".into(), args: "{}".into() }] },
+            Rec::ToolResult { ts: 0, call_id: "c1".into(), tool: "view".into(), argv: vec![], exit: 0, bytes: 1, ms: 1, body: Body::Inline { text: "a".into() }, parts: vec![part(&img1)] },
+            Rec::Assistant { ts: 0, text: None, tool_calls: vec![crate::log::Call { id: "c2".into(), name: "view".into(), args: "{}".into() }] },
+            Rec::ToolResult { ts: 0, call_id: "c2".into(), tool: "view".into(), argv: vec![], exit: 0, bytes: 1, ms: 1, body: Body::Inline { text: "b".into() }, parts: vec![part(&img2)] },
+        ];
+        let projected = msgs(&log, &cfg);
+        let tools: Vec<&Value> = projected.iter().filter(|m| m["role"] == "tool").collect();
+        let first = serde_json::to_string(&tools[0]["content"]).unwrap();
+        let last = serde_json::to_string(&tools[1]["content"]).unwrap();
+        assert!(first.contains("вырезаны при компакции"), "старое вложение не вырезано: {first}");
+        assert!(!first.contains("image_url"), "старое вложение уехало как картинка: {first}");
+        assert!(last.contains("image_url"), "последнее вложение потеряно: {last}");
+        assert_eq!(
+            serde_json::to_string(&projected).unwrap(),
+            serde_json::to_string(&msgs(&log, &cfg)).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// attachments=false: канал есть, но модель вложений не понимает — не шлём
+    /// картинку (провайдер ответит 400) и говорим об этом текстом.
+    #[test]
+    fn attachments_off_keeps_placeholder() {
+        let mut cfg = Config::default();
+        cfg.attachments = false;
+        let log = vec![user("посмотри", "cli"), Rec::Assistant {
+            ts: 0,
+            text: None,
+            tool_calls: vec![crate::log::Call { id: "c1".into(), name: "view".into(), args: "{}".into() }],
+        }, Rec::ToolResult {
+            ts: 0,
+            call_id: "c1".into(),
+            tool: "view".into(),
+            argv: vec![],
+            exit: 0,
+            bytes: 1,
+            ms: 1,
+            body: Body::Inline { text: "px.png".into() },
+            parts: vec![Part {
+                kind: "image".into(),
+                path: "/нет/такого".into(),
+                mime: "image/png".into(),
+                bytes: 1,
+                width: 1,
+                height: 1,
+            }],
+        }];
+        let tool = msgs(&log, &cfg).into_iter().find(|m| m["role"] == "tool").unwrap();
+        let s = serde_json::to_string(&tool["content"]).unwrap();
+        assert!(s.contains("attachments выключены"), "нет пометки: {s}");
+        assert!(!s.contains("image_url"), "картинка уехала при выключенном канале");
+    }
+
     /// Оборванный ход (Ctrl+C, падение) не должен уезжать провайдеру как
     /// assistant с tool_calls без ответов — он такой запрос отвергает.
     #[test]
@@ -291,6 +525,7 @@ mod tests {
                 bytes: 1,
                 ms: 1,
                 body: crate::log::Body::Inline { text: "ok".into() },
+                parts: vec![],
             },
         ];
         let first = msgs(&log, &cfg);

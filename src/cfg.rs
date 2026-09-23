@@ -52,6 +52,18 @@ pub struct Config {
     /// Сокращать вывод shell-команд (ANSI, длинные строки, повторы) до отправки модели.
     #[serde(default = "d_true")]
     pub reduce_output: bool,
+    /// Мультимодальные вложения (канал `SNENS_ATTACH_DIR`). Выключено — ядро не
+    /// даёт тулам канал и не отправляет части провайдеру: модель на тексте не
+    /// должна получать 400 из-за картинки, которую заведомо не понимает.
+    #[serde(default = "d_true")]
+    pub attachments: bool,
+    /// Потолок одного вложения, байты.
+    #[serde(default = "d_max_attach")]
+    pub max_attachment_bytes: usize,
+    /// Сколько последних вложений проекция отдаёт провайдеру как есть; более
+    /// ранние вырезаются при компакции — они дороже текста в разы.
+    #[serde(default = "d_keep_attach")]
+    pub keep_attachments: usize,
     /// Оболочка для `run`: программа и её флаги. `sh -c` в коде не зашит —
     /// на Windows это `cmd /C`.
     #[serde(default = "d_shell")]
@@ -103,6 +115,8 @@ fn d_max_proc() -> usize { 40_000 }
 fn d_sessions() -> String { format!("{}/sessions", data_dir()) }
 fn d_tools() -> String { format!("{}/tools", data_dir()) }
 fn d_keep() -> usize { 5 }
+fn d_max_attach() -> usize { 32 * 1024 * 1024 }
+fn d_keep_attach() -> usize { 3 }
 fn d_tickets() -> String { format!("{}/tickets", data_dir()) }
 fn d_skills() -> String { format!("{}/skills", data_dir()) }
 fn d_review_min() -> usize { 20 }
@@ -317,6 +331,15 @@ pub fn system_prompt(cfg: &Config) -> String {
          по ходу дела; долгий факт, нужный в любой сессии, — строка в {memory} \
          (дописывая, сжимай, а не удлиняй)."
     ));
+    // Вложение — не текст: его не видно через read и не приносит run. Единственный
+    // канал к модели — тул view, поэтому о нём надо сказать там, где модель ищет.
+    if cfg.attachments {
+        s.push_str(
+            "\nИзображения (PNG/JPEG/GIF/WebP) смотри через тул view — он отправляет файл \
+             модели картинкой; read и run картинок не передают. Скриншот или кадр сперва \
+             сохрани в файл командой через run.",
+        );
+    }
     s
 }
 

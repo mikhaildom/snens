@@ -8,3 +8,5 @@ tools/*/read
 tools/*/edit
 tools/*/write
 tools/*/audit
+tools/*/view
+tools/*/memory

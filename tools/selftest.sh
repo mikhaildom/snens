@@ -183,6 +183,42 @@ t memory stats
 want 1 "$rc" "memory: сервер недоступен (stats) — код 1"
 unset SNENS_MEMORY_URL
 
+# ---- view ----
+t view --help
+has "view —" "$out" "view: --help, строка 1 = суть"
+
+# 1x1 PNG белого цвета — минимальная валидная картинка (PNG: IHDR 1x1, 8 бит, RGB).
+png=$TMP/px.png
+printf '\211PNG\r\n\032\n\000\000\000\015IHDR\000\000\000\001\000\000\000\001\010\002\000\000\000\220wS\336\000\000\000\014IDATx\234c\370\377\377\077\000\005\376\002\376\015\357F\270\000\000\000\000IEND\256B\140\202' >"$png"
+
+at=$TMP/attach
+SNENS_ATTACH_DIR=$at
+export SNENS_ATTACH_DIR
+t view "$png"
+want 0 "$rc" "view: код 0 на PNG"
+has "image/png" "$out" "view: тип по магии"
+has "1x1" "$out" "view: размеры из заголовка"
+[ -f "$at/px.png" ] && ok "view: файл в канале вложений" || bad "view: файла нет в SNENS_ATTACH_DIR"
+has "вложение px.png" "$out" "view: имя вложения в ответе"
+
+# Повтор не затирает: второе имя получает индекс.
+t view "$png"
+[ -f "$at/px-1.png" ] && ok "view: коллизия имён разводится" || bad "view: коллизия имён потеряна"
+
+printf 'не картинка' >"$TMP/notimg.txt"
+t view "$TMP/notimg.txt"
+want 1 "$rc" "view: не изображение — код 1"
+has "не изображение" "$err" "view: не изображение — текст"
+
+t view "$TMP/нет.png"
+want 1 "$rc" "view: отсутствующий файл — код 1"
+
+# Без канала view не падает: метаданные есть, вложение не уезжает.
+unset SNENS_ATTACH_DIR
+t view "$png"
+want 0 "$rc" "view: без канала — код 0"
+has "канал вложений недоступен" "$out" "view: без канала — пометка"
+
 if [ "$fails" -ne 0 ]; then
   echo
   echo "провалено проверок: $fails"
