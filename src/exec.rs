@@ -161,30 +161,40 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     .await;
     let ms = started.elapsed().as_millis() as u64;
 
-    let (exit, raw, timed_out) = match res {
-        Ok(Ok(out)) => {
-            let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-            let err = String::from_utf8_lossy(&out.stderr);
-            if !err.trim().is_empty() {
-                s.push_str("\n[stderr]\n");
-                s.push_str(&err);
-            }
-            (out.status.code().unwrap_or(-1), s, false)
-        }
+    let (exit, stdout, stderr, timed_out) = match res {
+        Ok(Ok(out)) => (out.status.code().unwrap_or(-1), out.stdout, out.stderr, false),
         Ok(Err(e)) => return Err(format!("spawn failed: {e}").into()),
-        Err(_) => (124, format!("[timeout after {}s]", sp.timeout_s), true),
+        Err(_) => (
+            124,
+            Vec::new(),
+            format!("[timeout after {}s]", sp.timeout_s).into_bytes(),
+            true,
+        ),
     };
 
-    let bytes = raw.len();
-    let mut text = if sp.reduce {
-        reduce(&raw, sp.cap)
+    // Полный вывод (то, что уйдёт в дамп) — байты как есть, до замены бинарных
+    // потоков дескриптором: иначе в дампе был бы текст-заглушка, а не оригинал.
+    let mut raw_bytes = stdout.clone();
+    if !stderr.is_empty() {
+        raw_bytes.extend_from_slice(b"\n[stderr]\n");
+        raw_bytes.extend_from_slice(&stderr);
+    }
+    let bytes = raw_bytes.len();
+    let (assembled, binary) = join_streams(&stdout, &stderr);
+    let mut text = if binary {
+        // Дескриптор уже короткий: reduce/truncate к нему неприменимы.
+        assembled
+    } else if sp.reduce {
+        reduce(&assembled, sp.cap)
     } else {
-        truncate(&raw, sp.cap)
+        truncate(&assembled, sp.cap)
     };
     // Обрезанное не теряется: полный вывод ложится в файл, модель получает путь.
-    if bytes > sp.cap {
+    // Бинарный вывод выносим в дамп всегда — в контексте ему места нет, а посмотреть
+    // оригинал (hexdump, file) модели может понадобиться.
+    if bytes > sp.cap || binary {
         if let Some(dir) = sp.dump_dir {
-            if let Ok(p) = dump(dir, &raw) {
+            if let Ok(p) = dump(dir, &raw_bytes) {
                 text.push_str(&format!("\n[полный вывод: {}]", p.display()));
             }
         }
@@ -327,8 +337,74 @@ fn jpeg_dims(b: &[u8]) -> (u32, u32) {
     (0, 0)
 }
 
+/// Бинарный ли поток: решает NUL-байт в первых килобайтах (классический детект),
+/// а если NUL нет — доля управляющих байт (кроме таба/переводов строк). Высокие
+/// байты (>0x80) сюда не входят: текст в другой кодировке (cp1251, latin-1) ими
+/// полон, а бинарём не является.
+fn is_binary(b: &[u8]) -> bool {
+    let head = &b[..b.len().min(8192)];
+    if head.contains(&0) {
+        return true;
+    }
+    if head.is_empty() {
+        return false;
+    }
+    let ctl = head
+        .iter()
+        .filter(|c| (**c < 0x20 && !matches!(**c, b'\t' | b'\n' | b'\r')) || **c == 0x7f)
+        .count();
+    ctl * 100 / head.len() > 15
+}
+
+/// Дескриптор вместо содержимого: размер и угаданный тип. Содержимого нет даже
+/// куском — это hexdump без смысла. Полный вывод вызывающий кладёт в дамп, и
+/// модель берёт путь (`file`, `xxd`, `strings` по нему работают).
+fn binary_descriptor(bytes: &[u8]) -> String {
+    format!("[бинарный вывод, {} Б, {}]", bytes.len(), sniff_mime(bytes))
+}
+
+/// Тип бинарного потока по магическим байтам — ровно настолько, чтобы отличить
+/// ELF от архива: полноценный mime-детект здесь не нужен.
+fn sniff_mime(b: &[u8]) -> &'static str {
+    match b {
+        _ if b.starts_with(b"\x7fELF") => "ELF",
+        _ if b.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) || b.starts_with(&[0xce, 0xfa, 0xed, 0xfe]) => {
+            "Mach-O"
+        }
+        _ if b.starts_with(b"MZ") => "PE/DOS",
+        _ if b.starts_with(&[0x1f, 0x8b]) => "gzip",
+        _ if b.starts_with(b"PK\x03\x04") => "zip",
+        _ if b.starts_with(b"\x89PNG") => "PNG",
+        _ if b.starts_with(b"\xff\xd8\xff") => "JPEG",
+        _ if b.starts_with(b"%PDF") => "PDF",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Склеить stdout и stderr в одно сообщение модели. Если хоть один поток бинарный,
+/// содержимое не отдаём — только дескрипторы (модель и так не прочитает hexdump,
+/// а контекст он съедает). Текстовые потоки проходят как раньше.
+pub fn join_streams(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
+    let out_bin = is_binary(stdout);
+    let err_bin = is_binary(stderr);
+    let mut s = if out_bin {
+        binary_descriptor(stdout)
+    } else {
+        String::from_utf8_lossy(stdout).into_owned()
+    };
+    if !stderr.is_empty() {
+        s.push_str("\n[stderr]\n");
+        if err_bin {
+            s.push_str(&binary_descriptor(stderr));
+        } else {
+            s.push_str(&String::from_utf8_lossy(stderr));
+        }
+    }
+    (s, out_bin || err_bin)
+}
+
 /// Полный вывод на диск; имя — от содержимого, поэтому одинаковые дампы не плодятся.
-fn dump(dir: &Path, text: &str) -> R<PathBuf> {
+fn dump(dir: &Path, text: &[u8]) -> R<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
@@ -514,6 +590,24 @@ mod tests {
             out.text
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Бинарный stdout не уезжает модели содержимым: только дескриптор с типом
+    /// и размером. Текст с редкими невалидными байтами (другая кодировка) — не бинарник.
+    #[test]
+    fn binary_stdout_becomes_descriptor() {
+        let elf = [b"\x7fELF".as_ref(), &[0u8; 32]].concat();
+        let (s, bin) = join_streams(&elf, b"");
+        assert!(bin, "ELF не распознан бинарным");
+        assert!(s.contains("бинарный вывод"), "нет дескриптора: {s}");
+        assert!(s.contains("ELF"), "тип не угадан: {s}");
+        // UTF-8-текст проходит как есть.
+        let (s2, bin2) = join_streams("привет\n".as_bytes(), b"");
+        assert!(!bin2 && s2.contains("привет"), "текст испорчен: {s2}");
+        // Бинарный stderr — тоже дескриптор.
+        let (s3, bin3) = join_streams(b"ok\n", &[0u8, 1, 2, 3]);
+        assert!(bin3, "бинарный stderr не пойман");
+        assert!(s3.contains("[stderr]") && s3.contains("бинарный вывод"), "{s3}");
     }
 
     /// Обрезанное не теряется: полный вывод лежит в файле, путь уходит модели.

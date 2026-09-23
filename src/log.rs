@@ -67,6 +67,11 @@ pub enum Rec {
         upstream_id: String,
         #[serde(default)]
         fingerprint: String,
+        /// `finish_reason` этого хода (`stop`/`tool_calls`/`length`/`content_filter`).
+        /// Старые логи читаются как есть. Нужен, чтобы «модель закончила» отличалось
+        /// от «ответ оборван лимитом токенов» при разборе сессии.
+        #[serde(default)]
+        finish_reason: String,
     },
     /// Что проекция сделала с контекстом. Лог остаётся неизменным: это журнал
     /// действий над ним, а не новая версия истории.

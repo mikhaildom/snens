@@ -156,6 +156,10 @@ pub async fn run_agent<L: Llm>(
     // Полные выводы обрезанных команд: модель получает путь и может дочитать.
     let out_dir = sess.path().with_extension("out");
     let mut turn = 0u32;
+    // Пустой ответ — не конец работы, а сбой (обрыв стрима, непарсимый формат
+    // вызова). Считаем подряд: первый повторяем запросом, второй — выходим явной
+    // ошибкой, чтобы прогон не закрылся «успешно», ничего не сделав.
+    let mut empty_replies = 0u32;
     loop {
         turn += 1;
         let log = sess.read()?;
@@ -189,6 +193,45 @@ pub async fn run_agent<L: Llm>(
 
         let reply: Reply = stream_reply(cfg, msgs, defs.clone(), llm, ui).await?;
 
+        // Расход по ходу, а не только в `show` после сессии: в терминале видно,
+        // какой ход чего стоил.
+        if reply.usage.in_tok + reply.usage.out_tok > 0 {
+            let cost = if reply.usage.cost_micro > 0 {
+                format!(" ${:.4}", reply.usage.cost_micro as f64 / 1e6)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[snens] ход {turn}: ↑{} (кеш {}) ↓{}{cost}",
+                reply.usage.in_tok, reply.usage.cached_tok, reply.usage.out_tok
+            );
+        }
+
+        // Пусто (ни текста, ни вызовов) — это сбой, а не «работа кончилась»:
+        // провайдер мог оборвать стрим или прислать вызов в непарсимом формате.
+        // Ход пишем только записью расхода (пустая assistant-запись сбила бы
+        // проекцию), делаем один повтор; второй пустой подряд — явная ошибка,
+        // иначе прогон закрывается «успешно», ничего не сделав.
+        if reply.calls.is_empty() && reply.text.trim().is_empty() {
+            sess.append(usage_rec(&reply))?;
+            empty_replies += 1;
+            let hint = if reply.finish_reason.is_empty() {
+                "провайдер не сообщил finish_reason".to_string()
+            } else {
+                format!("finish_reason={}", reply.finish_reason)
+            };
+            if empty_replies >= 2 {
+                return Err(format!(
+                    "пустой ответ модели дважды подряд (ход {turn}, {hint}) — \
+                     прерываю, работа не сделана"
+                )
+                .into());
+            }
+            eprintln!("[snens] пустой ответ модели ({hint}), повтор запроса");
+            continue;
+        }
+        empty_replies = 0;
+
         sess.append(Rec::Assistant {
             ts: log::now(),
             text: if reply.text.is_empty() {
@@ -204,19 +247,6 @@ pub async fn run_agent<L: Llm>(
             },
         })?;
         sess.append(usage_rec(&reply))?;
-        // Расход по ходу, а не только в `show` после сессии: в терминале видно,
-        // какой ход чего стоил.
-        if reply.usage.in_tok + reply.usage.out_tok > 0 {
-            let cost = if reply.usage.cost_micro > 0 {
-                format!(" ${:.4}", reply.usage.cost_micro as f64 / 1e6)
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "[snens] ход {turn}: ↑{} (кеш {}) ↓{}{cost}",
-                reply.usage.in_tok, reply.usage.cached_tok, reply.usage.out_tok
-            );
-        }
 
         if reply.calls.is_empty() {
             retain_turn(sess, cfg, &path, &reply.text).await;
@@ -363,6 +393,7 @@ fn usage_rec(reply: &Reply) -> Rec {
         cost_micro: reply.usage.cost_micro,
         upstream_id: reply.upstream.id.clone(),
         fingerprint: reply.upstream.fingerprint.clone(),
+        finish_reason: reply.finish_reason.clone(),
     }
 }
 
@@ -544,6 +575,7 @@ mod tests {
                 args: r#"{"command":"true"}"#.into(),
             }],
             usage: Usage::default(),
+            finish_reason: String::new(),
         };
         let fake = Fake::new(vec![
             run_once(),
@@ -555,6 +587,7 @@ mod tests {
                 text: "сделал половину".into(),
                 calls: vec![],
                 usage: Usage::default(),
+                finish_reason: String::new(),
             },
         ]);
         // Ok, а не Err: поверхность остаётся жива.
@@ -573,6 +606,81 @@ mod tests {
             )),
             "промежуточный итог не записан"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn cfg_tmp(dir: &std::path::Path) -> Config {
+        Config {
+            sessions_dir: dir.to_string_lossy().into_owned(),
+            tools_dir: dir.join("tools").to_string_lossy().into_owned(),
+            ..Config::default()
+        }
+    }
+
+    fn text_reply(text: &str) -> Reply {
+        Reply {
+            reasoning: String::new(),
+            upstream: Default::default(),
+            text: text.into(),
+            calls: vec![],
+            usage: Usage::default(),
+            finish_reason: String::new(),
+        }
+    }
+
+    /// Пустой ответ (обрыв стрима/непарсимый вызов) не закрывает сессию «успешно»:
+    /// первый пустой — повтор, затем честный ответ записывается в лог.
+    #[tokio::test]
+    async fn empty_reply_is_retried_not_treated_as_done() -> R<()> {
+        let dir = std::env::temp_dir().join(format!("snens-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let cfg = cfg_tmp(&dir);
+        let sess = Session::open(&dir, "e")?;
+        sess.append(Rec::User {
+            ts: log::now(),
+            text: "поработай".into(),
+            source: "test".into(),
+        })?;
+        let fake = Fake::new(vec![text_reply(""), text_reply("готово")]);
+        run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await?;
+        let recs = sess.read()?;
+        // Пустая assistant-запись не попала в лог, честный ответ — попал.
+        assert!(
+            !recs
+                .iter()
+                .any(|r| matches!(r, Rec::Assistant { text: None, tool_calls, .. } if tool_calls.is_empty())),
+            "пустой ответ записан в лог как ход"
+        );
+        assert!(
+            recs.iter().rev().any(|r| matches!(
+                r,
+                Rec::Assistant { text: Some(t), tool_calls, .. } if tool_calls.is_empty() && t == "готово"
+            )),
+            "честный ответ не записан"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Два пустых подряд — явная ошибка, а не тихое закрытие: прогон не должен
+    /// выглядеть успешным, ничего не сделав.
+    #[tokio::test]
+    async fn double_empty_reply_fails_loudly() -> R<()> {
+        let dir = std::env::temp_dir().join(format!("snens-empty2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let cfg = cfg_tmp(&dir);
+        let sess = Session::open(&dir, "e2")?;
+        sess.append(Rec::User {
+            ts: log::now(),
+            text: "поработай".into(),
+            source: "test".into(),
+        })?;
+        let fake = Fake::new(vec![text_reply(""), text_reply("")]);
+        let err = run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await;
+        assert!(err.is_err(), "два пустых ответа не дали ошибку");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -674,6 +782,7 @@ pub async fn selftest() -> R<()> {
                 args: r#"{"args":["a","b"],"stdin":"привет"}"#.into(),
             }],
             usage: Usage::default(),
+            finish_reason: String::new(),
         },
         Reply {
             reasoning: String::new(),
@@ -685,6 +794,7 @@ pub async fn selftest() -> R<()> {
                 args: r#"{"args":[]}"#.into(),
             }],
             usage: Usage::default(),
+            finish_reason: String::new(),
         },
         Reply {
             reasoning: String::new(),
@@ -696,6 +806,7 @@ pub async fn selftest() -> R<()> {
                 args: r#"{"command":"probe via-path"}"#.into(),
             }],
             usage: Usage::default(),
+            finish_reason: String::new(),
         },
         Reply {
             reasoning: String::new(),
@@ -703,6 +814,7 @@ pub async fn selftest() -> R<()> {
             text: "готово".into(),
             calls: vec![],
             usage: Usage::default(),
+            finish_reason: String::new(),
         },
     ]);
 
@@ -795,6 +907,7 @@ pub async fn selftest() -> R<()> {
             args: r#"{"command":"seq 1 3000"}"#.into(),
         }],
         usage: Usage::default(),
+        finish_reason: String::new(),
     };
     let fake2 = Fake::new(vec![
         big(),
@@ -805,6 +918,7 @@ pub async fn selftest() -> R<()> {
             text: "готово".into(),
             calls: vec![],
             usage: Usage::default(),
+            finish_reason: String::new(),
         },
     ]);
     run_agent(&sess2, &cfg2, &fake2, &crate::render::Ui::plain()).await?;
@@ -884,6 +998,7 @@ pub async fn selftest() -> R<()> {
         text: "готово".into(),
         calls: vec![],
         usage: Usage::default(),
+        finish_reason: String::new(),
     }]);
     run_agent(&sess_off, &cfg3, &fake_off, &crate::render::Ui::plain()).await?;
     assert!(
@@ -907,6 +1022,7 @@ pub async fn selftest() -> R<()> {
         text: "готово".into(),
         calls: vec![],
         usage: Usage::default(),
+        finish_reason: String::new(),
     }]);
     run_agent(&sess3, &cfg3, &fake3, &crate::render::Ui::plain()).await?;
     let recs3 = sess3.read()?;

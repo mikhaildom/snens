@@ -22,6 +22,11 @@ pub struct Reply {
     pub reasoning: String,
     pub calls: Vec<Call>,
     pub usage: Usage,
+    /// `finish_reason` последнего кадра стрима: `stop` (модель закончила),
+    /// `tool_calls`, `length` (обрыв по лимиту токенов), `content_filter`. Пустая
+    /// строка — провайдер не прислал. Нужен, чтобы «пусто из-за обрыва» отличать
+    /// от «модель честно ответила» при разборе сессии.
+    pub finish_reason: String,
     /// Идентификатор ответа (`gen-…`) и отпечаток инференс-бэкенда, если их
     /// прислал провайдер. Нужны для диагностики кеша: роутер (OpenRouter за
     /// Nous) может увести запрос к другому апстриму, и тогда промах кеша — не
@@ -151,6 +156,9 @@ impl OpenAi {
         // Отпечаток апстрима для диагностики кеша: id виден в каждом кадре,
         // fingerprint (vLLM) — только когда провайдер его пришлёт.
         let mut upstream = Upstream::default();
+        // Последний непустой finish_reason: у OpenAI он приходит в кадре с
+        // пустой delta, но иногда и раньше — держим последнее значение.
+        let mut finish_reason = String::new();
 
         'outer: while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
@@ -185,6 +193,11 @@ impl OpenAi {
                 }
                 if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                     usage = parse_usage(u);
+                }
+                if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
+                    if !fr.is_empty() {
+                        finish_reason = fr.to_string();
+                    }
                 }
                 let Some(d) = v.pointer("/choices/0/delta") else {
                     continue;
@@ -244,6 +257,7 @@ impl OpenAi {
             calls,
             usage,
             upstream,
+            finish_reason,
         })
     }
 }
