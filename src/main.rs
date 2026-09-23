@@ -1,9 +1,11 @@
 mod agent;
 mod cfg;
+mod dispatch;
 mod exec;
 mod improve;
 mod llm;
 mod log;
+mod memory;
 mod project;
 mod registry;
 mod render;

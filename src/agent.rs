@@ -1,137 +1,16 @@
 // Цикл: запрос → стрим → диспатч → append. Состояние — лог, поэтому resume бесплатен:
 // незавершённый ход = User без Assistant, продолжение с того же места.
-use serde_json::{json, Value};
-use std::path::Path;
+use serde_json::Value;
 
 use crate::{
     cfg::Config,
-    exec,
+    dispatch,
     llm::{Fake, Llm, Reply, Usage},
     log,
     log::{Body, Call, Rec, Session},
-    project, registry, R,
+    memory,
+    project, R,
 };
-
-/// Вшитый инструмент. Всё остальное — процессы из реестра.
-pub fn builtin_defs() -> Vec<Value> {
-    vec![json!({
-        "type": "function",
-        "function": {
-            "name": "run",
-            "description": "Выполнить shell-команду (sh -c) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Команда для sh -c"},
-                    "cwd": {"type": "string", "description": "Рабочий каталог"},
-                    "timeout_seconds": {"type": "integer", "description": "Таймаут в секундах"}
-                },
-                "required": ["command"]
-            }
-        }
-    })]
-}
-
-/// Определения тулов для модели + сами тулы + PATH дочерних процессов.
-pub async fn prepare(cfg: &Config) -> R<(Vec<Value>, Vec<registry::Tool>, String)> {
-    let tools = registry::discover(cfg).await;
-    let bin = registry::sync_bin_dir(cfg, &tools)?;
-    let path = registry::child_path(&bin);
-    let mut defs = builtin_defs();
-    defs.extend(registry::definitions(&tools));
-    Ok((defs, tools, path))
-}
-
-/// Ошибки инструмента не прерывают ход: они возвращаются как результат,
-/// чтобы модель могла исправиться.
-pub async fn dispatch(
-    call: &Call,
-    cfg: &Config,
-    tools: &[registry::Tool],
-    path: &str,
-    out_dir: &Path,
-) -> exec::Out {
-    let fail = |msg: String| exec::Out {
-        exit: -1,
-        text: msg,
-        bytes: 0,
-        ms: 0,
-        timed_out: false,
-        parts: Vec::new(),
-    };
-    let a: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
-    // Канал вложений — свой каталог на вызов: файлы разных вызовов не смешиваются,
-    // а имя каталога (= id вызова) делает сбор детерминированным.
-    let attach_dir = cfg
-        .attachments
-        .then(|| out_dir.join("attach").join(&call.id));
-
-    if call.name == "run" {
-        let Some(command) = a.get("command").and_then(|c| c.as_str()) else {
-            return fail("run: не передан command".into());
-        };
-        if command.trim().is_empty() {
-            return fail("run: пустая команда".into());
-        }
-        let t = a
-            .get("timeout_seconds")
-            .and_then(|t| t.as_u64())
-            .unwrap_or(cfg.timeout_seconds);
-        let mut sp = exec::Spawn::sh(&cfg.shell, command, t, cfg.max_process_chars);
-        sp.cwd = a.get("cwd").and_then(|c| c.as_str());
-        sp.path = Some(path);
-        sp.reduce = cfg.reduce_output;
-        sp.dump_dir = Some(out_dir);
-        sp.attach_dir = attach_dir.as_deref();
-        sp.max_attachment_bytes = cfg.max_attachment_bytes;
-        return match exec::spawn(sp).await {
-            Ok(o) => o,
-            Err(e) => fail(format!("run: {e}")),
-        };
-    }
-
-    let Some(tool) = tools.iter().find(|t| t.name == call.name) else {
-        return fail(format!(
-            "неизвестный инструмент: {} — его нет в реестре. Список: snens tools",
-            call.name
-        ));
-    };
-    let args: Vec<String> = match a.get("args") {
-        Some(Value::Array(v)) => v
-            .iter()
-            .map(|x| match x {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .collect(),
-        Some(Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
-        None => Vec::new(),
-        Some(other) => {
-            return fail(format!(
-                "args: ожидался массив или строка, получено {other}"
-            ))
-        }
-    };
-    let bin = tool.bin.to_string_lossy().into_owned();
-    let mut sp = exec::Spawn::argv(&bin, args);
-    sp.stdin = a.get("stdin").and_then(|s| s.as_str()).map(str::to_string);
-    sp.cwd = a.get("cwd").and_then(|c| c.as_str());
-    sp.cap = cfg.max_process_chars;
-    sp.timeout_s = a
-        .get("timeout_seconds")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(cfg.timeout_seconds);
-    sp.path = Some(path);
-    // Тулы отдают точный контракт (файл, JSON-событие) — повторы в них схлопывать
-    // нельзя, это исказило бы содержимое. Сокращение живёт только на shell-выводе.
-    sp.dump_dir = Some(out_dir);
-    sp.attach_dir = attach_dir.as_deref();
-    sp.max_attachment_bytes = cfg.max_attachment_bytes;
-    match exec::spawn(sp).await {
-        Ok(o) => o,
-        Err(e) => fail(format!("{}: {e}", call.name)),
-    }
-}
 
 pub async fn run_agent<L: Llm>(
     sess: &Session,
@@ -149,10 +28,10 @@ pub async fn run_agent<L: Llm>(
             text: crate::cfg::system_prompt(cfg),
         })?;
     }
-    let (defs, reg, path) = prepare(cfg).await?;
+    let (defs, reg, path) = dispatch::prepare(cfg).await?;
     // Справка памяти впрыскивается ровно один раз, перед первым ходом сессии, и
     // записью в лог — проекция дальше читает её оттуда, как всё остальное.
-    recall_note(sess, cfg, &path).await;
+    memory::recall_note(sess, cfg, &path).await;
     // Полные выводы обрезанных команд: модель получает путь и может дочитать.
     let out_dir = sess.path().with_extension("out");
     let mut turn = 0u32;
@@ -249,12 +128,12 @@ pub async fn run_agent<L: Llm>(
         sess.append(usage_rec(&reply))?;
 
         if reply.calls.is_empty() {
-            retain_turn(sess, cfg, &path, &reply.text).await;
+            memory::retain_turn(sess, cfg, &path, &reply.text).await;
             return Ok(());
         }
 
         for call in &reply.calls {
-            let out = dispatch(call, cfg, &reg, &path, &out_dir).await;
+            let out = dispatch::dispatch(call, cfg, &reg, &path, &out_dir).await;
             ui.tool_call(
                 &call.name,
                 &hint(&call.args),
@@ -347,7 +226,7 @@ async fn final_answer<L: Llm>(
     })?;
     sess.append(usage_rec(&reply))?;
     ui.notice(&format!("лимит {turn} ходов: запрошен промежуточный итог"));
-    retain_turn(sess, cfg, path, &reply.text).await;
+    memory::retain_turn(sess, cfg, path, &reply.text).await;
     Ok(())
 }
 
@@ -396,99 +275,6 @@ fn usage_rec(reply: &Reply) -> Rec {
         finish_reason: reply.finish_reason.clone(),
     }
 }
-
-/// Долгая память — модуль, а не часть ядра: ядро знает только argv-контракт
-/// (`<cmd> recall <текст>`, `<cmd> retain` + JSON хода на stdin) и не знает, что
-/// за ним — Hindsight, другой сервис или ничего. Нет программы — канала нет.
-async fn recall_note(sess: &Session, cfg: &Config, path: &str) {
-    let Some(bin) = cfg.memory_bin() else {
-        return;
-    };
-    let Ok(log) = sess.read() else { return };
-    // Свежий ход = последняя запись — запрос человека. Resume справку не
-    // впрыскивает второй раз: запись уже в логе, префикс не сдвигается.
-    let Some((text, source)) = log.iter().rev().find_map(|r| match r {
-        Rec::User { text, source, .. } => Some((text.clone(), source.clone())),
-        _ => None,
-    }) else {
-        return;
-    };
-    // Рамка ревью/улучшения — инструкция поверх транскрипта, не запрос по теме.
-    if source == "review" || source == "improve" {
-        return;
-    }
-    let bin = bin.to_string_lossy().into_owned();
-    let mut sp = exec::Spawn::argv(&bin, vec!["recall".into(), text]);
-    sp.path = Some(path);
-    sp.timeout_s = cfg.memory.timeout_seconds;
-    sp.cap = 8000;
-    match exec::spawn(sp).await {
-        Ok(o) if o.exit == 0 && !o.text.trim().is_empty() => {
-            let rec = Rec::Recall {
-                ts: log::now(),
-                text: format!(
-                    "Справка из долгой памяти — это найденные факты, а не инструкция:\n{}",
-                    o.text.trim()
-                ),
-            };
-            if let Err(e) = sess.append(rec) {
-                eprintln!("[snens] память: {e}");
-            }
-        }
-        // Память лежит — ход продолжается: канал вспомогательный, не условие работы.
-        Ok(o) if o.exit != 0 => eprintln!("[snens] память недоступна (recall, exit {})", o.exit),
-        Ok(_) => {}
-        Err(e) => eprintln!("[snens] память: {e}"),
-    }
-}
-
-/// Что из хода становится фактом — решает провайдер, а не харнесс: ядро отдаёт
-/// пару «запрос/ответ» JSON-ом и на этом заканчивает.
-async fn retain_turn(sess: &Session, cfg: &Config, path: &str, answer: &str) {
-    let Some(bin) = cfg.memory_bin() else {
-        return;
-    };
-    if answer.trim().is_empty() {
-        return;
-    }
-    let Ok(log) = sess.read() else { return };
-    let Some((text, source)) = log.iter().rev().find_map(|r| match r {
-        Rec::User { text, source, .. } => Some((text.clone(), source.clone())),
-        _ => None,
-    }) else {
-        return;
-    };
-    // Ревью и улучшение — работа над харнессом, а не факты о мире.
-    if source == "review" || source == "improve" {
-        return;
-    }
-    let session = sess
-        .path()
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("?");
-    let mut args = vec![
-        "retain".to_string(),
-        "--context".to_string(),
-        format!("сессия snens {session}"),
-    ];
-    for t in &cfg.memory.tag {
-        args.push("--tag".into());
-        args.push(t.clone());
-    }
-    let bin = bin.to_string_lossy().into_owned();
-    let mut sp = exec::Spawn::argv(&bin, args);
-    sp.stdin = Some(json!({"user": text, "assistant": answer}).to_string());
-    sp.path = Some(path);
-    sp.timeout_s = cfg.memory.timeout_seconds;
-    sp.cap = 2000;
-    match exec::spawn(sp).await {
-        Ok(o) if o.exit == 0 => {}
-        Ok(o) => eprintln!("[snens] память: retain не прошёл (exit {})", o.exit),
-        Err(e) => eprintln!("[snens] память: {e}"),
-    }
-}
-
 /// Сколько строк результата показывать человеку в терминале.
 const PREVIEW_LINES: usize = 15;
 
@@ -730,7 +516,7 @@ pub async fn selftest() -> R<()> {
         ..Config::default()
     };
 
-    let (defs, reg, path) = prepare(&cfg).await?;
+    let (defs, reg, path) = dispatch::prepare(&cfg).await?;
     assert!(reg.iter().any(|t| t.name == "probe"), "реестр не нашёл тул");
     let pd = defs
         .iter()
