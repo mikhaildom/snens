@@ -10,6 +10,7 @@ mod project;
 mod registry;
 mod render;
 mod review;
+mod selftest;
 mod tui;
 
 use std::{collections::BTreeMap, error::Error};
@@ -51,7 +52,7 @@ async fn main() -> R<()> {
         Some("build") => cmd_build(&flags),
         Some("review") => review::cmd(&flags).await,
         Some("improve") => improve::cmd(&flags).await,
-        Some("selftest") => agent::selftest().await,
+        Some("selftest") => selftest::selftest().await,
         _ => {
             print!("{USAGE}");
             Ok(())
