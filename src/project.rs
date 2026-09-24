@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::{
     cfg::{self, Config},
-    exec::truncate,
+    reduce::truncate,
     log::{Body, Part, Rec},
 };
 

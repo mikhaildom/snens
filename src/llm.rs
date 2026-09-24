@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, sync::Mutex};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::{cfg::Config, exec::truncate, log::Call, R};
+use crate::{cfg::Config, log::Call, reduce::truncate, R};
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Usage {

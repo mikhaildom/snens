@@ -1,4 +1,5 @@
 mod agent;
+mod attach;
 mod cfg;
 mod dispatch;
 mod exec;
@@ -7,6 +8,7 @@ mod llm;
 mod log;
 mod memory;
 mod project;
+mod reduce;
 mod registry;
 mod render;
 mod review;

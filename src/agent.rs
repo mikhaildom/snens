@@ -317,7 +317,7 @@ fn preview(text: &str) -> Option<String> {
     let mut s = lines
         .iter()
         .take(PREVIEW_LINES)
-        .map(|l| format!("  {}", crate::exec::truncate(l, 300)))
+        .map(|l| format!("  {}", crate::reduce::truncate(l, 300)))
         .collect::<Vec<_>>()
         .join("\n");
     if lines.len() > PREVIEW_LINES {

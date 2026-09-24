@@ -1,5 +1,6 @@
 // Выполнение процесса: единственный механизм и для `run`, и для внешних тулов.
-// Таймаут, кап вывода, закрытый stdin, exit code.
+// Таймаут, кап вывода, закрытый stdin, exit code. Сокращение текста и разбор
+// вложений — отдельные модули (reduce, attach): здесь только запуск и сборка.
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -8,10 +9,12 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::{log::Part, R};
-
-/// Строку такой длины модель всё равно не читает, а контекст она съедает.
-const MAX_LINE: usize = 400;
+use crate::{
+    attach::{self, MAX_ATTACHMENT_BYTES},
+    log::Part,
+    reduce,
+    R,
+};
 
 pub struct Out {
     pub exit: i32,
@@ -89,34 +92,6 @@ impl<'a> Spawn<'a> {
     }
 }
 
-/// Потолок вложения: больше — это уже не картинка «посмотреть», а файл для инструмента.
-/// Задаётся в конфиге, здесь — только дефолт для прямых вызовов `Spawn`.
-pub const MAX_ATTACHMENT_BYTES: usize = 32 * 1024 * 1024;
-
-/// Что именно считается вложением — по расширению файла (mime выводится из него).
-/// Набор и порядок — часть контракта канала, поэтому он один, а не в каждом туле.
-const ATTACH_EXTS: &[(&str, &str, &str)] = &[
-    ("png", "image", "image/png"),
-    ("jpg", "image", "image/jpeg"),
-    ("jpeg", "image", "image/jpeg"),
-    ("gif", "image", "image/gif"),
-    ("webp", "image", "image/webp"),
-    ("mp3", "audio", "audio/mpeg"),
-    ("wav", "audio", "audio/wav"),
-    ("ogg", "audio", "audio/ogg"),
-    ("mp4", "video", "video/mp4"),
-    ("webm", "video", "video/webm"),
-    ("pdf", "file", "application/pdf"),
-];
-
-fn attach_kind(path: &Path) -> Option<(&'static str, &'static str)> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    ATTACH_EXTS
-        .iter()
-        .find(|(e, _, _)| *e == ext)
-        .map(|(_, k, m)| (*k, *m))
-}
-
 pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     let started = Instant::now();
     let mut c = Command::new(&sp.program);
@@ -180,14 +155,14 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
         raw_bytes.extend_from_slice(&stderr);
     }
     let bytes = raw_bytes.len();
-    let (assembled, binary) = join_streams(&stdout, &stderr);
+    let (assembled, binary) = attach::join_streams(&stdout, &stderr);
     let mut text = if binary {
         // Дескриптор уже короткий: reduce/truncate к нему неприменимы.
         assembled
     } else if sp.reduce {
-        reduce(&assembled, sp.cap)
+        reduce::reduce(&assembled, sp.cap)
     } else {
-        truncate(&assembled, sp.cap)
+        reduce::truncate(&assembled, sp.cap)
     };
     // Обрезанное не теряется: полный вывод ложится в файл, модель получает путь.
     // Бинарный вывод выносим в дамп всегда — в контексте ему места нет, а посмотреть
@@ -201,7 +176,7 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     }
 
     let parts = match sp.attach_dir {
-        Some(d) => collect_attachments(d, sp.max_attachment_bytes, &mut text),
+        Some(d) => attach::collect_attachments(d, sp.max_attachment_bytes, &mut text),
         None => Vec::new(),
     };
 
@@ -215,194 +190,6 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     })
 }
 
-/// Вложения вызова: файлы whitelisted-типов из каталога канала. Слишком большие
-/// отбрасываются с пометкой в тексте — лучше отказ, чем транскрипт с 50 МБ base64.
-/// Незнакомые расширения игнорируются: канал не должен превращаться в свалку.
-fn collect_attachments(dir: &Path, max_bytes: usize, text: &mut String) -> Vec<Part> {
-    let mut parts = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return parts;
-    };
-    let mut files: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .collect();
-    // Порядок чтения каталога произволен — сортируем, иначе проекция недетерминирована.
-    files.sort();
-    for p in files {
-        let Some((kind, mime)) = attach_kind(&p) else {
-            continue;
-        };
-        let Ok(meta) = p.metadata() else { continue };
-        if meta.len() as usize > max_bytes {
-            text.push_str(&format!(
-                "\n[вложение отброшено: {} Б > потолка {} Б — {}]",
-                meta.len(),
-                max_bytes,
-                p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-            ));
-            continue;
-        }
-        let (width, height) = if kind == "image" {
-            std::fs::read(&p)
-                .ok()
-                .map(|b| image_dims(&b, mime))
-                .unwrap_or((0, 0))
-        } else {
-            (0, 0)
-        };
-        if kind == "image" && width == 0 {
-            // Не распознали как картинку — не отправляем: провайдер ответит 400.
-            text.push_str(&format!(
-                "\n[вложение не распознано как изображение: {}]",
-                p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-            ));
-            continue;
-        }
-        parts.push(Part {
-            kind: kind.to_string(),
-            path: p.to_string_lossy().into_owned(),
-            mime: mime.to_string(),
-            bytes: meta.len() as usize,
-            width,
-            height,
-        });
-    }
-    parts
-}
-
-/// Размеры картинки из заголовка: без декодирования форматы и без картинных крейтов
-/// (ядро тащит только std + rustls + serde). Не распознали — (0, 0), и вызывающий решает.
-fn image_dims(b: &[u8], mime: &str) -> (u32, u32) {
-    match mime {
-        "image/png" if b.len() >= 24 && b.starts_with(b"\x89PNG\r\n\x1a\n") => (
-            u32::from_be_bytes(b[16..20].try_into().unwrap()),
-            u32::from_be_bytes(b[20..24].try_into().unwrap()),
-        ),
-        "image/gif" if b.len() >= 10 && (b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a")) => (
-            u16::from_le_bytes(b[6..8].try_into().unwrap()) as u32,
-            u16::from_le_bytes(b[8..10].try_into().unwrap()) as u32,
-        ),
-        "image/jpeg" => jpeg_dims(b),
-        "image/webp" if b.len() >= 30 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" => {
-            match &b[12..16] {
-                b"VP8 " => (
-                    (u16::from_le_bytes(b[26..28].try_into().unwrap()) & 0x3fff) as u32,
-                    (u16::from_le_bytes(b[28..30].try_into().unwrap()) & 0x3fff) as u32,
-                ),
-                b"VP8L" => {
-                    let bits = u32::from_le_bytes(b[21..25].try_into().unwrap());
-                    ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
-                }
-                b"VP8X" => (
-                    (u32::from_le_bytes([b[24], b[25], b[26], 0]) & 0xffffff) + 1,
-                    (u32::from_le_bytes([b[27], b[28], b[29], 0]) & 0xffffff) + 1,
-                ),
-                _ => (0, 0),
-            }
-        }
-        _ => (0, 0),
-    }
-}
-
-/// Рамки JPEG по маркерам: идём по сегментам до SOF (кроме SOF4/SOF8/SOF12).
-fn jpeg_dims(b: &[u8]) -> (u32, u32) {
-    let mut i = 2; // пропускаем SOI
-    while i + 9 < b.len() {
-        if b[i] != 0xff {
-            i += 1;
-            continue;
-        }
-        let marker = b[i + 1];
-        // Паддинг из нескольких 0xff.
-        if marker == 0xff {
-            i += 1;
-            continue;
-        }
-        // Сегменты без длины.
-        if marker == 0x01 || (0xd0..=0xd9).contains(&marker) {
-            i += 2;
-            continue;
-        }
-        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
-        // SOF0..SOF15, исключая DHT(0xc4), JPG(0xc8), DAC(0xcc).
-        if (0xc0..=0xcf).contains(&marker) && marker != 0xc4 && marker != 0xc8 && marker != 0xcc {
-            let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
-            let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
-            return (w, h);
-        }
-        i += 2 + len;
-    }
-    (0, 0)
-}
-
-/// Бинарный ли поток: решает NUL-байт в первых килобайтах (классический детект),
-/// а если NUL нет — доля управляющих байт (кроме таба/переводов строк). Высокие
-/// байты (>0x80) сюда не входят: текст в другой кодировке (cp1251, latin-1) ими
-/// полон, а бинарём не является.
-fn is_binary(b: &[u8]) -> bool {
-    let head = &b[..b.len().min(8192)];
-    if head.contains(&0) {
-        return true;
-    }
-    if head.is_empty() {
-        return false;
-    }
-    let ctl = head
-        .iter()
-        .filter(|c| (**c < 0x20 && !matches!(**c, b'\t' | b'\n' | b'\r')) || **c == 0x7f)
-        .count();
-    ctl * 100 / head.len() > 15
-}
-
-/// Дескриптор вместо содержимого: размер и угаданный тип. Содержимого нет даже
-/// куском — это hexdump без смысла. Полный вывод вызывающий кладёт в дамп, и
-/// модель берёт путь (`file`, `xxd`, `strings` по нему работают).
-fn binary_descriptor(bytes: &[u8]) -> String {
-    format!("[бинарный вывод, {} Б, {}]", bytes.len(), sniff_mime(bytes))
-}
-
-/// Тип бинарного потока по магическим байтам — ровно настолько, чтобы отличить
-/// ELF от архива: полноценный mime-детект здесь не нужен.
-fn sniff_mime(b: &[u8]) -> &'static str {
-    match b {
-        _ if b.starts_with(b"\x7fELF") => "ELF",
-        _ if b.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) || b.starts_with(&[0xce, 0xfa, 0xed, 0xfe]) => {
-            "Mach-O"
-        }
-        _ if b.starts_with(b"MZ") => "PE/DOS",
-        _ if b.starts_with(&[0x1f, 0x8b]) => "gzip",
-        _ if b.starts_with(b"PK\x03\x04") => "zip",
-        _ if b.starts_with(b"\x89PNG") => "PNG",
-        _ if b.starts_with(b"\xff\xd8\xff") => "JPEG",
-        _ if b.starts_with(b"%PDF") => "PDF",
-        _ => "application/octet-stream",
-    }
-}
-
-/// Склеить stdout и stderr в одно сообщение модели. Если хоть один поток бинарный,
-/// содержимое не отдаём — только дескрипторы (модель и так не прочитает hexdump,
-/// а контекст он съедает). Текстовые потоки проходят как раньше.
-pub fn join_streams(stdout: &[u8], stderr: &[u8]) -> (String, bool) {
-    let out_bin = is_binary(stdout);
-    let err_bin = is_binary(stderr);
-    let mut s = if out_bin {
-        binary_descriptor(stdout)
-    } else {
-        String::from_utf8_lossy(stdout).into_owned()
-    };
-    if !stderr.is_empty() {
-        s.push_str("\n[stderr]\n");
-        if err_bin {
-            s.push_str(&binary_descriptor(stderr));
-        } else {
-            s.push_str(&String::from_utf8_lossy(stderr));
-        }
-    }
-    (s, out_bin || err_bin)
-}
-
 /// Полный вывод на диск; имя — от содержимого, поэтому одинаковые дампы не плодятся.
 fn dump(dir: &Path, text: &[u8]) -> R<PathBuf> {
     std::fs::create_dir_all(dir)?;
@@ -414,124 +201,35 @@ fn dump(dir: &Path, text: &[u8]) -> R<PathBuf> {
     }
     Ok(path)
 }
-
-/// Превентивное сокращение вывода shell-команд до попадания в контекст:
-/// ANSI-мусор, нечеловечески длинные строки, повторы, общий размер.
-pub fn reduce(s: &str, cap: usize) -> String {
-    let stripped = strip_ansi(s);
-    let mut lines: Vec<String> = Vec::new();
-    let mut prev: Option<String> = None;
-    let mut run = 0usize;
-    for raw_line in stripped.lines() {
-        let line = cap_line(raw_line.trim_end());
-        if Some(&line) == prev.as_ref() {
-            run += 1;
-            continue;
-        }
-        if run > 0 {
-            lines.push(format!("  [×{}]", run + 1));
-            run = 0;
-        }
-        prev = Some(line.clone());
-        lines.push(line);
-    }
-    if run > 0 {
-        lines.push(format!("  [×{}]", run + 1));
-    }
-    truncate(&lines.join("\n"), cap)
-}
-
-fn cap_line(l: &str) -> String {
-    let n = l.chars().count();
-    if n <= MAX_LINE {
-        return l.to_string();
-    }
-    let head: String = l.chars().take(MAX_LINE).collect();
-    format!("{head}… (+{} симв.)", n - MAX_LINE)
-}
-
-/// Управляющие последовательности: цвет, прогресс-бары, курсор — токены без смысла.
-fn strip_ansi(s: &str) -> String {
-    if !s.contains('\u{1b}') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut it = s.chars().peekable();
-    while let Some(c) = it.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match it.peek() {
-            // CSI: ESC [ ... финальный байт в диапазоне @..~
-            Some('[') => {
-                it.next();
-                while let Some(&n) = it.peek() {
-                    it.next();
-                    if ('@'..='~').contains(&n) {
-                        break;
-                    }
-                }
-            }
-            // OSC: ESC ] ... BEL или ESC \
-            Some(']') => {
-                it.next();
-                while let Some(n) = it.next() {
-                    if n == '\u{7}' {
-                        break;
-                    }
-                    if n == '\u{1b}' && it.peek() == Some(&'\\') {
-                        it.next();
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Усечение с явной пометкой: модель должна знать, что видит часть.
-pub fn truncate(s: &str, cap: usize) -> String {
-    if s.len() <= cap {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(cap * 3 / 4).collect();
-    let tail: String = s
-        .chars()
-        .rev()
-        .take(cap / 4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    format!(
-        "{head}\n[... обрезано {} символов из {} ...]\n{tail}",
-        s.len() - cap,
-        s.len()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn ansi_and_repeats_are_squeezed() {
-        let s = "\u{1b}[32mok\u{1b}[0m\nшум\nшум\nшум\nконец\n";
-        let r = reduce(s, 10_000);
-        assert!(r.contains("ok"), "текст потерян: {r}");
-        assert!(!r.contains('\u{1b}'), "ANSI остался: {r:?}");
-        assert!(r.contains("[×3]"), "повторы не схлопнуты: {r}");
-        assert!(r.contains("конец"));
-        let long = "x".repeat(1000);
-        let r2 = reduce(&long, 10_000);
+    /// Обрезанное не теряется: полный вывод лежит в файле, путь уходит модели.
+    #[tokio::test]
+    async fn big_output_is_dumped_to_file() {
+        let dir = std::env::temp_dir().join(format!("snens-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut sp = Spawn::sh(&["sh".into(), "-c".into()], "seq 1 20000", 20, 500);
+        sp.reduce = true;
+        sp.dump_dir = Some(dir.as_path());
+        let out = spawn(sp).await.expect("спавн упал");
+
+        assert!(out.bytes > 500, "вывод должен быть больше капа");
         assert!(
-            r2.contains("симв."),
-            "длинная строка без пометки: {}",
-            r2.len()
+            out.text.contains("полный вывод: "),
+            "нет ссылки на дамп: {}",
+            &out.text[..200.min(out.text.len())]
         );
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("каталог дампов не создан")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1, "ожидался один дамп, их {}", files.len());
+        let full = std::fs::read_to_string(files[0].path()).expect("дамп не читается");
+        assert_eq!(full.lines().count(), 20000, "дамп обрезан");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Канал вложений: процесс получает SNENS_ATTACH_DIR и кладёт туда картинку,
@@ -590,50 +288,5 @@ mod tests {
             out.text
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Бинарный stdout не уезжает модели содержимым: только дескриптор с типом
-    /// и размером. Текст с редкими невалидными байтами (другая кодировка) — не бинарник.
-    #[test]
-    fn binary_stdout_becomes_descriptor() {
-        let elf = [b"\x7fELF".as_ref(), &[0u8; 32]].concat();
-        let (s, bin) = join_streams(&elf, b"");
-        assert!(bin, "ELF не распознан бинарным");
-        assert!(s.contains("бинарный вывод"), "нет дескриптора: {s}");
-        assert!(s.contains("ELF"), "тип не угадан: {s}");
-        // UTF-8-текст проходит как есть.
-        let (s2, bin2) = join_streams("привет\n".as_bytes(), b"");
-        assert!(!bin2 && s2.contains("привет"), "текст испорчен: {s2}");
-        // Бинарный stderr — тоже дескриптор.
-        let (s3, bin3) = join_streams(b"ok\n", &[0u8, 1, 2, 3]);
-        assert!(bin3, "бинарный stderr не пойман");
-        assert!(s3.contains("[stderr]") && s3.contains("бинарный вывод"), "{s3}");
-    }
-
-    /// Обрезанное не теряется: полный вывод лежит в файле, путь уходит модели.
-    #[tokio::test]
-    async fn big_output_is_dumped_to_file() {
-        let dir = std::env::temp_dir().join(format!("snens-dump-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let mut sp = Spawn::sh(&["sh".into(), "-c".into()], "seq 1 20000", 20, 500);
-        sp.reduce = true;
-        sp.dump_dir = Some(dir.as_path());
-        let out = spawn(sp).await.expect("спавн упал");
-
-        assert!(out.bytes > 500, "вывод должен быть больше капа");
-        assert!(
-            out.text.contains("полный вывод: "),
-            "нет ссылки на дамп: {}",
-            &out.text[..200.min(out.text.len())]
-        );
-        let files: Vec<_> = std::fs::read_dir(&dir)
-            .expect("каталог дампов не создан")
-            .flatten()
-            .collect();
-        assert_eq!(files.len(), 1, "ожидался один дамп, их {}", files.len());
-        let full = std::fs::read_to_string(files[0].path()).expect("дамп не читается");
-        assert_eq!(full.lines().count(), 20000, "дамп обрезан");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
