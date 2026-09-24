@@ -111,10 +111,11 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     if let Some(p) = sp.path {
         c.env("PATH", p);
     }
-    // Каталог вложений: переменная сама сообщает процессу, что канал есть, и
-    // сразу исключает мусор — команда, не знающая про неё, ничего туда не кладёт.
+    // Каталог вложений не создаём заранее: большинство вызовов ничего туда не
+    // кладут, а пустой каталог на каждый вызов копил бы мусор в <id>.out/attach/.
+    // Путь сообщаем переменной; кому файл нужен — сам делает mkdir (view так и
+    // делает), а collect_attachments толерантен к отсутствующему каталогу.
     if let Some(d) = sp.attach_dir {
-        std::fs::create_dir_all(d)?;
         c.env("SNENS_ATTACH_DIR", d);
     }
     for (k, v) in &sp.envs {
@@ -276,6 +277,39 @@ mod tests {
         assert_eq!(out.parts[0].kind, "image");
         assert_eq!((out.parts[0].width, out.parts[0].height), (1, 1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Каталог вложений ядро не создаёт: путь сообщается, а mkdir — дело тула.
+    /// Иначе на каждый вызов (даже без вложений) оставался бы пустой каталог.
+    #[tokio::test]
+    async fn attach_dir_is_not_created_eagerly() {
+        let base = std::env::temp_dir().join(format!("snens-attach-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("attach/call_1");
+
+        // Вызов без вложений: каталога после него быть не должно.
+        let mut sp = Spawn::sh(&["sh".into(), "-c".into()], "true", 10, 10_000);
+        sp.attach_dir = Some(dir.as_path());
+        spawn(sp).await.expect("спавн упал");
+        assert!(!dir.exists(), "пустой каталог вложений создан ядром");
+
+        // Тул, которому вложение нужно, создаёт каталог сам — ядро его подберёт.
+        let src = base.join("src.png");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            &src,
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01",
+        )
+        .unwrap();
+        let sh = format!(
+            "mkdir -p \"$SNENS_ATTACH_DIR\"; cp '{}' \"$SNENS_ATTACH_DIR/pic.png\"",
+            src.display()
+        );
+        let mut sp = Spawn::sh(&["sh".into(), "-c".into()], &sh, 10, 10_000);
+        sp.attach_dir = Some(dir.as_path());
+        let out = spawn(sp).await.expect("спавн упал");
+        assert_eq!(out.parts.len(), 1, "вложение не подобрано: {:?}", out.parts);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Потолок вложения: слишком большой файл не едет, но и не теряется молча.
