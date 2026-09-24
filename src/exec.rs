@@ -12,8 +12,7 @@ use tokio::process::Command;
 use crate::{
     attach::{self, MAX_ATTACHMENT_BYTES},
     log::Part,
-    reduce,
-    R,
+    reduce, R,
 };
 
 pub struct Out {
@@ -137,7 +136,12 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     let ms = started.elapsed().as_millis() as u64;
 
     let (exit, stdout, stderr, timed_out) = match res {
-        Ok(Ok(out)) => (out.status.code().unwrap_or(-1), out.stdout, out.stderr, false),
+        Ok(Ok(out)) => (
+            out.status.code().unwrap_or(-1),
+            out.stdout,
+            out.stderr,
+            false,
+        ),
         Ok(Err(e)) => return Err(format!("spawn failed: {e}").into()),
         Err(_) => (
             124,

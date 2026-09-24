@@ -186,7 +186,9 @@ fn binary_descriptor(bytes: &[u8]) -> String {
 fn sniff_mime(b: &[u8]) -> &'static str {
     match b {
         _ if b.starts_with(b"\x7fELF") => "ELF",
-        _ if b.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) || b.starts_with(&[0xce, 0xfa, 0xed, 0xfe]) => {
+        _ if b.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+            || b.starts_with(&[0xce, 0xfa, 0xed, 0xfe]) =>
+        {
             "Mach-O"
         }
         _ if b.starts_with(b"MZ") => "PE/DOS",
@@ -240,6 +242,9 @@ mod tests {
         // Бинарный stderr — тоже дескриптор.
         let (s3, bin3) = join_streams(b"ok\n", &[0u8, 1, 2, 3]);
         assert!(bin3, "бинарный stderr не пойман");
-        assert!(s3.contains("[stderr]") && s3.contains("бинарный вывод"), "{s3}");
+        assert!(
+            s3.contains("[stderr]") && s3.contains("бинарный вывод"),
+            "{s3}"
+        );
     }
 }

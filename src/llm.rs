@@ -194,7 +194,10 @@ impl OpenAi {
                 if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                     usage = parse_usage(u);
                 }
-                if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
+                if let Some(fr) = v
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(|x| x.as_str())
+                {
                     if !fr.is_empty() {
                         finish_reason = fr.to_string();
                     }

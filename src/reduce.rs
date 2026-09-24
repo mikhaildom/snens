@@ -100,7 +100,8 @@ pub fn truncate(s: &str, cap: usize) -> String {
         s.len() - cap,
         s.len()
     )
-}#[cfg(test)]
+}
+#[cfg(test)]
 mod tests {
     use super::*;
 

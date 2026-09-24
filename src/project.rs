@@ -9,9 +9,9 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::{
-    cfg::{self, Config},
-    reduce::truncate,
+    cfg::Config,
     log::{Body, Part, Rec},
+    reduce::truncate,
 };
 
 /// Пометка перед рамкой ревью/улучшения: выше лежит транскрипт уже закрытой
@@ -57,7 +57,7 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
             Rec::System { text, .. } => Some(text.clone()),
             _ => None,
         })
-        .unwrap_or_else(|| cfg::system_prompt(cfg));
+        .unwrap_or_else(|| crate::prompt::system_prompt(cfg));
     let mut out = vec![json!({"role": "system", "content": system})];
     let mut report = Report::default();
     // Последние keep_results остаются как есть при любом размере: модель работает

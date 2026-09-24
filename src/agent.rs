@@ -8,8 +8,7 @@ use crate::{
     llm::{Llm, Reply},
     log,
     log::{Body, Rec, Session},
-    memory,
-    project, R,
+    memory, project, R,
 };
 
 pub async fn run_agent<L: Llm>(
@@ -25,7 +24,7 @@ pub async fn run_agent<L: Llm>(
     if !sess.read()?.iter().any(|r| matches!(r, Rec::System { .. })) {
         sess.append(Rec::System {
             ts: log::now(),
-            text: crate::cfg::system_prompt(cfg),
+            text: crate::prompt::system_prompt(cfg),
         })?;
     }
     let (defs, reg, path) = dispatch::prepare(cfg).await?;

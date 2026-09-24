@@ -8,6 +8,7 @@ mod llm;
 mod log;
 mod memory;
 mod project;
+mod prompt;
 mod reduce;
 mod registry;
 mod render;
@@ -331,10 +332,8 @@ pub fn rebuild_and_install(repo: &std::path::Path) -> R<()> {
     if !ok.success() {
         return Err("cargo build завершился с ошибкой".into());
     }
-    let built = cargo_target_dir(repo)?.join(format!(
-        "debug/snens{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let built =
+        cargo_target_dir(repo)?.join(format!("debug/snens{}", std::env::consts::EXE_SUFFIX));
     let Some(dest) = on_path("snens") else {
         eprintln!("[snens] snens не найден в PATH — бинарник только пересобран");
         return Ok(());
