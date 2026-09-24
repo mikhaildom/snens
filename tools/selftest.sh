@@ -229,6 +229,10 @@ want 0 "$rc" "view: без канала — код 0"
 has "канал вложений недоступен" "$out" "view: без канала — пометка"
 
 # ---- agent ----
+# Тесты могут идти изнутри сессии агента, где dispatch уже выставил SNENS_SESSION
+# и SNENS_MAIL_DIR: снимаем их, иначе проверки «без контекста» видят чужой контекст.
+unset SNENS_SESSION SNENS_MAIL_DIR SNENS_PARENT 2>/dev/null || true
+
 # Родитель не задан — ask некуда слать.
 t agent ask "вопрос"
 want 1 "$rc" "agent: ask без родителя — код 1"

@@ -2,14 +2,47 @@
 // читаемый текст оставался как есть, а служебные блоки (рассуждение, вызовы)
 // отличались. Панелей и своего скролла нет намеренно: скроллбек терминала —
 // история диалога, выделение и копипаст работают.
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use rustyline::ExternalPrinter;
+
+/// Куда идёт вывод агента. Слой один: и живой стрим, и служебные строки проходят
+/// через него. В TUI подмена на `ExternalPrinter` нужна, потому что поле ввода
+/// живо всё время работы агента — вывод обязан печататься НАД приглашением, а не
+/// поверх него.
+pub trait Sink: Send {
+    /// Печатать строку с переводом строки.
+    fn line(&mut self, s: &str);
+}
+
+/// Обычный stdout: без активного приглашения (пайп, фоновый прогон, CLI).
+struct Stdout;
+
+impl Sink for Stdout {
+    fn line(&mut self, s: &str) {
+        println!("{s}");
+    }
+}
+
+/// Печать над приглашением readline: он стирает строку ввода, печатает сообщение
+/// и перерисовывает приглашение — так поток агента не рвёт ввод.
+struct Printer(Box<dyn ExternalPrinter + Send>);
+
+impl Sink for Printer {
+    fn line(&mut self, s: &str) {
+        let _ = self.0.print(format!("{s}\n"));
+    }
+}
 
 /// Состояние вывода: цвет включаем только на терминале (в файл/пайп — plain),
 /// а видимость рассуждения — переключатель, общий с поверхностью.
+/// `sink` — разделяемый с задачей агента, поэтому за мьютексом.
 pub struct Ui {
     pub color: bool,
     show_reasoning: AtomicBool,
+    sink: Arc<Mutex<Box<dyn Sink>>>,
 }
 
 impl Default for Ui {
@@ -17,6 +50,7 @@ impl Default for Ui {
         Ui {
             color: std::io::stdout().is_terminal(),
             show_reasoning: AtomicBool::new(true),
+            sink: Arc::new(Mutex::new(Box::new(Stdout) as Box<dyn Sink>)),
         }
     }
 }
@@ -28,7 +62,31 @@ impl Ui {
         Ui {
             color: false,
             show_reasoning: AtomicBool::new(false),
+            sink: Arc::new(Mutex::new(Box::new(Stdout) as Box<dyn Sink>)),
         }
+    }
+
+    /// TUI: вывод печатается над приглашением, цвет включён (мы на терминале).
+    pub fn with_printer(p: Box<dyn ExternalPrinter + Send>) -> Self {
+        Ui {
+            color: true,
+            show_reasoning: AtomicBool::new(true),
+            sink: Arc::new(Mutex::new(Box::new(Printer(p)) as Box<dyn Sink>)),
+        }
+    }
+
+    /// Ссылка на приёмник вывода — её берёт `Stream` для стрима ответа.
+    pub fn sink(&self) -> Arc<Mutex<Box<dyn Sink>>> {
+        Arc::clone(&self.sink)
+    }
+
+    /// Строка вывода в общий приёмник (минуя разметку стилей).
+    pub fn line(&self, s: &str) {
+        lock(&self.sink).line(s);
+    }
+
+    fn emit(&self, s: String) {
+        lock(&self.sink).line(&s);
     }
 
     pub fn show_reasoning(&self) -> bool {
@@ -54,7 +112,9 @@ impl Ui {
             ""
         };
         let reset = if self.color { "\x1b[0m" } else { "" };
-        eprintln!("{prefix}[{name}] {hint} → exit={exit} {bytes} Б {ms} мс{tail}{reset}");
+        self.emit(format!(
+            "{prefix}[{name}] {hint} → exit={exit} {bytes} Б {ms} мс{tail}{reset}"
+        ));
     }
 
     /// Голова результата инструмента человеку: приглушённо, чтобы не спорить с
@@ -65,11 +125,21 @@ impl Ui {
         } else {
             ("", "")
         };
-        println!("{on}{preview}{off}");
+        self.emit(format!("{on}{preview}{off}"));
     }
 
     pub fn notice(&self, text: &str) {
-        eprintln!("[snens] {text}");
+        self.emit(format!("[snens] {text}"));
+    }
+}
+
+/// Мьютекс приёмника: паника в одном потоке не должна ронять печать в другом
+/// (ядро не должно падать из-за косметики вывода). Блокировка внутри — через
+/// `Box<dyn Sink>`: голый трейт-объект в мьютексе утаскивает 'static-границу.
+fn lock(s: &Arc<Mutex<Box<dyn Sink>>>) -> std::sync::MutexGuard<'_, Box<dyn Sink>> {
+    match s.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
     }
 }
 
@@ -82,16 +152,23 @@ pub struct Stream {
     line: String,
     /// Накопленные строки текущего табличного блока (все начинались с `|`).
     table: Vec<String>,
+    /// Тот же приёмник, что у `Ui`: в TUI стрим печатается над приглашением.
+    sink: Arc<Mutex<Box<dyn Sink>>>,
 }
 
 impl Stream {
-    pub fn new(color: bool) -> Self {
+    pub fn new(color: bool, sink: Arc<Mutex<Box<dyn Sink>>>) -> Self {
         Stream {
             color,
             in_reasoning: false,
             line: String::new(),
             table: Vec::new(),
+            sink,
         }
+    }
+
+    fn emit(&mut self, s: &str) {
+        lock(&self.sink).line(s);
     }
 
     /// Ответ ассистента: рассуждение заканчивается, текст печатается как есть.
@@ -115,18 +192,14 @@ impl Stream {
                 self.line.push(ch);
             }
         }
-        let _ = std::io::stdout().flush();
     }
 
     /// Начало рассуждения: серым и курсивом, чтобы визуально не путать с ответом.
+    /// Стиль применяется к каждой строке отдельно (открыт+закрыт в `emit_line`):
+    /// в TUI строка уходит в приглашение одним сообщением, а не потоком — нести
+    /// состояние цвета между сообщениями нельзя.
     pub fn reasoning(&mut self, show: bool) {
-        if !show {
-            return;
-        }
-        if !self.in_reasoning {
-            if self.color {
-                print!("\x1b[90;3m");
-            }
+        if show {
             self.in_reasoning = true;
         }
     }
@@ -140,11 +213,16 @@ impl Stream {
             let line = std::mem::take(&mut self.line);
             self.emit_line(&line);
         }
-        if self.color {
-            print!("\x1b[0m");
-        }
-        println!();
         self.in_reasoning = false;
+    }
+
+    /// Оформить строку по текущему режиму (рассуждение — серый курсив).
+    fn style(&self, line: &str) -> String {
+        if self.color && self.in_reasoning {
+            format!("\x1b[90;3m{line}\x1b[0m")
+        } else {
+            line.to_string()
+        }
     }
 
     fn emit_line(&mut self, line: &str) {
@@ -154,9 +232,8 @@ impl Stream {
         }
         // Таблица кончилась: сначала рисуем её, потом текущую строку.
         self.flush_table();
-        // Цвет строки задаёт печатающий режим (`in_reasoning` — серый курсив),
-        // сама строка печатается как есть.
-        println!("{line}");
+        let styled = self.style(line);
+        self.emit(&styled);
     }
 
     fn flush_table(&mut self) {
@@ -166,12 +243,14 @@ impl Stream {
         let block = std::mem::take(&mut self.table);
         match table_align(&block) {
             Some(table) => {
-                println!("{table}");
+                // Таблица рисуется рамкой — серый курсив к ней не применяем.
+                self.emit(&table);
             }
             // Не таблица (нет разделителя) — печатаем строки как были.
             None => {
                 for l in block {
-                    println!("{l}");
+                    let styled = self.style(&l);
+                    self.emit(&styled);
                 }
             }
         }

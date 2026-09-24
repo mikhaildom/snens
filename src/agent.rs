@@ -342,7 +342,7 @@ async fn stream_reply<L: Llm>(
     llm: &L,
     ui: &crate::render::Ui,
 ) -> R<Reply> {
-    let mut stream = crate::render::Stream::new(ui.color);
+    let mut stream = crate::render::Stream::new(ui.color, ui.sink());
     let show = ui.show_reasoning();
     let mut reason_on = false;
     let reply = llm
