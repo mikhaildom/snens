@@ -50,6 +50,9 @@ pub struct Spawn<'a> {
     pub attach_dir: Option<&'a Path>,
     /// Сколько байт вложения допускаем; больше — файл отбрасывается с пометкой.
     pub max_attachment_bytes: usize,
+    /// Доп. переменные окружения ребёнка (сессия, ящик, родитель): по ним тул
+    /// понимает, в какой сессии он работает и с кем может говорить.
+    pub envs: Vec<(String, String)>,
 }
 
 impl<'a> Spawn<'a> {
@@ -71,6 +74,7 @@ impl<'a> Spawn<'a> {
             dump_dir: None,
             attach_dir: None,
             max_attachment_bytes: MAX_ATTACHMENT_BYTES,
+            envs: Vec::new(),
         }
     }
 
@@ -87,6 +91,7 @@ impl<'a> Spawn<'a> {
             dump_dir: None,
             attach_dir: None,
             max_attachment_bytes: MAX_ATTACHMENT_BYTES,
+            envs: Vec::new(),
         }
     }
 }
@@ -111,6 +116,9 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     if let Some(d) = sp.attach_dir {
         std::fs::create_dir_all(d)?;
         c.env("SNENS_ATTACH_DIR", d);
+    }
+    for (k, v) in &sp.envs {
+        c.env(k, v);
     }
 
     let mut child = c.spawn().map_err(|e| format!("spawn failed: {e}"))?;

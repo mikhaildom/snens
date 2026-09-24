@@ -86,6 +86,10 @@ pub struct Config {
     /// Свой файл промпта ревью вместо вкомпилированного (для опытов).
     #[serde(default)]
     pub review_prompt: Option<String>,
+    /// Ящик сессий: канал между подагентом и родителем. Дефолт — рядом с сессиями,
+    /// чтобы всё инстанса жило в одном месте.
+    #[serde(default = "d_mail")]
+    pub mail_dir: String,
     /// Долгая память: программа-провайдер, вызываемая как `<cmd> recall <текст>`
     /// и `<cmd> retain` (JSON хода на stdin). Пусто — канала нет: чистая
     /// установка за модуль не платит, а ядро о нём ничего не знает.
@@ -150,6 +154,9 @@ fn d_max_attach() -> usize {
 }
 fn d_keep_attach() -> usize {
     3
+}
+fn d_mail() -> String {
+    format!("{}/mail", data_dir())
 }
 fn d_tickets() -> String {
     format!("{}/tickets", data_dir())
@@ -237,6 +244,7 @@ impl Config {
         cfg.tools_dir = cfg.tools_dir.replace('~', &home());
         cfg.tickets_dir = cfg.tickets_dir.replace('~', &home());
         cfg.skills_dir = cfg.skills_dir.replace('~', &home());
+        cfg.mail_dir = cfg.mail_dir.replace('~', &home());
         Ok(cfg)
     }
 
@@ -275,6 +283,10 @@ impl Config {
 
     pub fn tickets_path(&self) -> PathBuf {
         PathBuf::from(&self.tickets_dir)
+    }
+
+    pub fn mail_path(&self) -> PathBuf {
+        PathBuf::from(&self.mail_dir)
     }
 
     pub fn tools_path(&self) -> PathBuf {

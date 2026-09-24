@@ -10,3 +10,4 @@ tools/*/write
 tools/*/audit
 tools/*/view
 tools/*/memory
+tools/*/agent

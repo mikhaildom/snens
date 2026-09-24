@@ -4,7 +4,20 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::{cfg::Config, exec, log::Call, registry, R};
+use crate::{cfg::Config, exec, log::Call, log::Session, registry, R};
+
+/// Что тул знает о сессии, в которой он вызван. Через env — как канал вложений:
+/// переменной нет — тул просто не знает контекста, ничего не ломается.
+fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
+    let mut v = vec![
+        ("SNENS_SESSION".to_string(), sess.id().to_string()),
+        ("SNENS_MAIL_DIR".to_string(), cfg.mail_path().display().to_string()),
+    ];
+    if !sess.parent().is_empty() {
+        v.push(("SNENS_PARENT".to_string(), sess.parent().to_string()));
+    }
+    v
+}
 
 /// Вшитый инструмент. Всё остальное — процессы из реестра.
 pub fn builtin_defs() -> Vec<Value> {
@@ -44,6 +57,7 @@ pub async fn dispatch(
     tools: &[registry::Tool],
     path: &str,
     out_dir: &Path,
+    sess: &Session,
 ) -> exec::Out {
     let fail = |msg: String| exec::Out {
         exit: -1,
@@ -78,6 +92,7 @@ pub async fn dispatch(
         sp.dump_dir = Some(out_dir);
         sp.attach_dir = attach_dir.as_deref();
         sp.max_attachment_bytes = cfg.max_attachment_bytes;
+        sp.envs = session_env(sess, cfg);
         return match exec::spawn(sp).await {
             Ok(o) => o,
             Err(e) => fail(format!("run: {e}")),
@@ -121,6 +136,7 @@ pub async fn dispatch(
     sp.dump_dir = Some(out_dir);
     sp.attach_dir = attach_dir.as_deref();
     sp.max_attachment_bytes = cfg.max_attachment_bytes;
+    sp.envs = session_env(sess, cfg);
     match exec::spawn(sp).await {
         Ok(o) => o,
         Err(e) => fail(format!("{}: {e}", call.name)),

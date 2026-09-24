@@ -17,6 +17,10 @@ pub enum Rec {
     Meta {
         ts: u64,
         model: String,
+        /// Сессия-родитель, если это подагент. Пусто у корневой сессии.
+        /// Старые логи читаются как есть (serde default).
+        #[serde(default)]
+        parent: String,
     },
     /// Системный промпт сессии. Собирается один раз в начале и дальше читается
     /// из лога: файлы инстанса (soul/user/memory, скиллы) правятся по ходу, и
@@ -88,6 +92,25 @@ pub enum Rec {
         ts: u64,
         text: String,
     },
+    /// Сообщение от другой сессии (родитель, ребёнок, человек через steer),
+    /// впрыснутое на границе хода. В проекции едет ролью `user` с пометкой
+    /// отправителя: это чужое слово, а не ввод этой сессии.
+    Steer {
+        ts: u64,
+        from: String,
+        /// `steer` | `ask` | `report` — что это за слово. Имя поля не `kind`:
+        /// `kind` занято тегом самой записи.
+        via: String,
+        text: String,
+    },
+    /// Терминатор сессии: пишет харнесс, а не модель, на всех путях выхода цикла.
+    /// По нему родитель узнаёт, что ребёнок закончил, и с каким исходом —
+    /// даже если модель «забыла» отчитаться.
+    Done {
+        ts: u64,
+        status: String,
+        turns: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -122,30 +145,73 @@ pub struct Part {
 }
 
 pub struct Session {
+    id: String,
     path: PathBuf,
     file: std::cell::RefCell<File>,
     lines: Cell<u64>,
+    /// Сессия-родитель, если это подагент; читается из `Meta` при открытии.
+    parent: String,
 }
 
 impl Session {
     pub fn open(dir: &Path, id: &str) -> R<Session> {
+        Session::open_child(dir, id, "")
+    }
+
+    /// Открыть сессию с указанием родителя (для подагента). Родитель пишется в
+    /// `Meta` один раз при создании лога и больше не меняется.
+    pub fn open_child(dir: &Path, id: &str, parent: &str) -> R<Session> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{id}.jsonl"));
         let exists = path.exists();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let lines = Cell::new(count_lines(&path)?.max(1));
-        let s = Session {
-            path,
-            file: std::cell::RefCell::new(file),
-            lines,
+        // Родитель неизменяем и живёт в `Meta`: при открытии существующего лога
+        // берём его оттуда, а не из аргумента (resume подагента не должен терять связь).
+        let parent = if exists {
+            read_file(&path)
+                .ok()
+                .and_then(|rs| {
+                    rs.into_iter().find_map(|r| match r {
+                        Rec::Meta { parent, .. } => Some(parent),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            parent.to_string()
         };
         if !exists {
+            let s = Session {
+                id: id.to_string(),
+                path,
+                file: std::cell::RefCell::new(file),
+                lines,
+                parent: parent.clone(),
+            };
             s.append(Rec::Meta {
                 ts: now(),
                 model: String::new(),
+                parent,
             })?;
+            return Ok(s);
         }
+        let s = Session {
+            id: id.to_string(),
+            path,
+            file: std::cell::RefCell::new(file),
+            lines,
+            parent,
+        };
         Ok(s)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn parent(&self) -> &str {
+        &self.parent
     }
 
     pub fn path(&self) -> &Path {

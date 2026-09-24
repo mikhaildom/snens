@@ -8,15 +8,58 @@ use crate::{
     llm::{Llm, Reply},
     log,
     log::{Body, Rec, Session},
-    memory, project, R,
+    mail, memory, project, R,
 };
 
+/// Исход прогона: `ok` — модель закончила сама, `limit` — упёрлась в лимит ходов
+/// (цикл не падал, а попросил промежуточный итог).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Finish {
+    Ok,
+    Limit,
+}
+
+impl Finish {
+    fn status(self) -> &'static str {
+        match self {
+            Finish::Ok => "ok",
+            Finish::Limit => "limit",
+        }
+    }
+}
+
+/// Точка входа цикла. Терминатор `Done` пишет харнесс, а не модель: по нему
+/// родитель узнаёт о конце подагента даже если тот «забыл» отчитаться. Пишется
+/// на всех путях — и при нормальном финале, и при ошибке.
 pub async fn run_agent<L: Llm>(
     sess: &Session,
     cfg: &Config,
     llm: &L,
     ui: &crate::render::Ui,
 ) -> R<()> {
+    let r = run_loop(sess, cfg, llm, ui).await;
+    let status = match &r {
+        Ok(f) => f.status(),
+        Err(_) => "error",
+    };
+    let turns = sess
+        .read()
+        .map(|rs| rs.iter().filter(|x| matches!(x, Rec::Assistant { .. })).count() as u32)
+        .unwrap_or(0);
+    let _ = sess.append(Rec::Done {
+        ts: log::now(),
+        status: status.to_string(),
+        turns,
+    });
+    r.map(|_| ())
+}
+
+async fn run_loop<L: Llm>(
+    sess: &Session,
+    cfg: &Config,
+    llm: &L,
+    ui: &crate::render::Ui,
+) -> R<Finish> {
     // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
     // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
     // ходу промахивалась бы мимо префикс-кеша. Здесь — единственная точка, через
@@ -33,6 +76,7 @@ pub async fn run_agent<L: Llm>(
     memory::recall_note(sess, cfg, &path).await;
     // Полные выводы обрезанных команд: модель получает путь и может дочитать.
     let out_dir = sess.path().with_extension("out");
+    let mail_dir = cfg.mail_path();
     let mut turn = 0u32;
     // Пустой ответ — не конец работы, а сбой (обрыв стрима, непарсимый формат
     // вызова). Считаем подряд: первый повторяем запросом, второй — выходим явной
@@ -40,6 +84,22 @@ pub async fn run_agent<L: Llm>(
     let mut empty_replies = 0u32;
     loop {
         turn += 1;
+        // Граница хода: после всех результатов предыдущего шага и перед новым
+        // запросом. Инвариант провайдера (assistant с tool_calls обязан иметь
+        // ответы) уже соблюдён, поэтому сюда безопасно впрыскивать чужое слово —
+        // steer человека или сообщение родителя/ребёнка. В лог — отдельной
+        // записью, чтобы резюме не доставило его второй раз.
+        for msg in mail::drain(&mail_dir, sess.id()) {
+            if msg.text.trim().is_empty() {
+                continue;
+            }
+            let _ = sess.append(Rec::Steer {
+                ts: log::now(),
+                from: msg.from,
+                via: msg.kind,
+                text: msg.text,
+            });
+        }
         let log = sess.read()?;
         let (msgs, report) = project::project(&log, cfg);
         let approx = project::estimate_tokens(&msgs);
@@ -128,11 +188,17 @@ pub async fn run_agent<L: Llm>(
 
         if reply.calls.is_empty() {
             memory::retain_turn(sess, cfg, &path, &reply.text).await;
-            return Ok(());
+            // Подагенты: пока есть живые дети, не выходим — ждём их вопросы и
+            // итоги. Иначе вопрос ребёнка родителю никто не прочитает и он уедет
+            // в таймаут. Это supervisor вокруг цикла, а не вызов инструмента.
+            if supervisor(sess, cfg, ui).await {
+                continue;
+            }
+            return Ok(Finish::Ok);
         }
 
         for call in &reply.calls {
-            let out = dispatch::dispatch(call, cfg, &reg, &path, &out_dir).await;
+            let out = dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess).await;
             ui.tool_call(
                 &call.name,
                 &hint(&call.args),
@@ -179,8 +245,45 @@ pub async fn run_agent<L: Llm>(
         // промежуточный итог и на этом заканчиваем запуск (см. final_answer).
         if turn >= cfg.max_turns {
             final_answer(sess, cfg, llm, ui, &path, turn).await?;
-            return Ok(());
+            return Ok(Finish::Limit);
         }
+    }
+}
+
+/// Сколько держим родителя живым ради детей, после чего отпускаем (дети всё
+/// равно отсоединены и доработают; просто их вопросы больше некому прочитать).
+const SUPERVISE_LIMIT_SECS: u64 = 1800;
+
+/// Пока у сессии есть работающие дети — не выходим: ждём их вопросов и итогов.
+/// Это харнесс вокруг цикла, а не вызов инструмента, поэтому «модель забыла» тут
+/// ничего не ломает. Возвращает true, если в ящике появилось сообщение — тогда
+/// нужен ещё ход (его прочитает дренаж в начале цикла).
+async fn supervisor(sess: &Session, cfg: &Config, ui: &crate::render::Ui) -> bool {
+    let parent = sess.id();
+    let mail_dir = cfg.mail_path();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(SUPERVISE_LIMIT_SECS);
+    let mut noticed = 0;
+    loop {
+        // Сообщение уже ждёт — не нужно ждать детей, отдаём ход.
+        if mail::has_pending(&mail_dir, parent) {
+            return true;
+        }
+        let running = crate::subagent::children(cfg, parent)
+            .into_iter()
+            .filter(|c| c.state == crate::subagent::State::Running)
+            .count();
+        if running == 0 {
+            return false;
+        }
+        if noticed != running {
+            noticed = running;
+            ui.notice(&format!("жду подагентов: работает {running}"));
+        }
+        if std::time::Instant::now() >= deadline {
+            ui.notice("подагенты ещё работают — отпускаю родителя, они отсоединены");
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 

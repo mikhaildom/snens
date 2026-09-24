@@ -6,6 +6,7 @@ mod exec;
 mod improve;
 mod llm;
 mod log;
+mod mail;
 mod memory;
 mod project;
 mod prompt;
@@ -14,6 +15,7 @@ mod registry;
 mod render;
 mod review;
 mod selftest;
+mod subagent;
 mod tui;
 
 use std::{collections::BTreeMap, error::Error};
@@ -33,6 +35,12 @@ snens — узкое ядро агента
   snens review [--session ID]
   snens improve
   snens selftest
+
+Подагенты:
+  snens run --detach --session ID [--parent PID] <задача>
+  snens steer <ID> <текст>       (текст берётся со stdin, если не задан)
+  snens agents [--session ID]    список и состояние детей
+  snens result <ID>              финальный текст сессии
 ";
 
 #[tokio::main]
@@ -41,6 +49,12 @@ async fn main() -> R<()> {
     let (cmd, flags, positional) = parse_args(&argv);
     match cmd.as_deref() {
         Some("run") => cmd_run(&flags, positional).await,
+        // Внутренние подкоманды, которые сам себя спавнит харнесс (run --detach
+        // и agent start). Человеку звать их не нужно — только через `run`/`agent`.
+        Some("run-child") => cmd_run_child(&flags).await,
+        Some("steer") => cmd_steer(&flags, positional),
+        Some("agents") => cmd_agents(&flags),
+        Some("result") => cmd_result(&flags, positional),
         Some("tui") => tui::cmd(&flags).await,
         Some("show") => cmd_show(&flags),
         Some("log") => cmd_log(&flags),
@@ -71,7 +85,7 @@ fn parse_args(argv: &[String]) -> (Option<String>, BTreeMap<String, String>, Vec
     let cmd = it.next().cloned();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--session" | "--config" => {
+            "--session" | "--config" | "--parent" => {
                 if let Some(v) = it.next() {
                     flags.insert(a.trim_start_matches("--").to_string(), v.clone());
                 }
@@ -102,8 +116,23 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
     if prompt.trim().is_empty() {
         return Err("нужен текст запроса".into());
     }
+    // --detach: не гоняем цикл здесь, а спавним себя отдельным процессом и
+    // возвращаем id. Так подагент автономен и переживает родителя.
+    if flags.contains_key("detach") {
+        let id = session_id(&cfg, flags)?;
+        let pid = spawn_child(&cfg, &id, &prompt, flags.get("parent").map(|s| s.as_str()))?;
+        // Регистрируем ребёнка у родителя: по pid отличаем «убили наглухо» от
+        // «ещё работает», если `Done` так и не появится.
+        if let Some(parent) = flags.get("parent").filter(|p| !p.is_empty()) {
+            subagent::register_child(&cfg.mail_path(), parent, &id, pid)?;
+        }
+        println!("{id}");
+        eprintln!("[snens] подагент {id}: pid {pid}");
+        return Ok(());
+    }
     let id = session_id(&cfg, flags)?;
-    let sess = log::Session::open(&cfg.sessions_path(), &id)?;
+    let parent = flags.get("parent").map(|s| s.as_str()).unwrap_or("");
+    let sess = log::Session::open_child(&cfg.sessions_path(), &id, parent)?;
     sess.append(log::Rec::User {
         ts: log::now(),
         text: prompt,
@@ -115,6 +144,151 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
     eprintln!("[snens] {id} → {} ({})", cfg.base_url, cfg.model);
     agent::run_agent(&sess, &cfg, &llm, &render::Ui::default()).await?;
     autopilot(&cfg, &id).await
+}
+
+/// Дитя-подагент: то, что запускает `run --detach`. Задача приходит в переменной
+/// окружения (стабильно при detached-спавне), родитель — в `SNENS_PARENT` или
+/// флаге. В конце кладём родителю итог в ящик — это харнесс, а не модель.
+async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let prompt = std::env::var("SNENS_PROMPT").unwrap_or_default();
+    if prompt.trim().is_empty() {
+        return Err("run-child: пустая задача (SNENS_PROMPT)".into());
+    }
+    let id = flags
+        .get("session")
+        .cloned()
+        .ok_or("run-child: нужен --session")?;
+    let parent = flags
+        .get("parent")
+        .cloned()
+        .or_else(|| std::env::var("SNENS_PARENT").ok())
+        .unwrap_or_default();
+    let sess = log::Session::open_child(&cfg.sessions_path(), &id, &parent)?;
+    sess.append(log::Rec::User {
+        ts: log::now(),
+        text: prompt,
+        source: "agent".into(),
+    })?;
+    let key = cfg.api_key()?;
+    let llm = llm::OpenAi::new(key)?;
+    let ui = render::Ui::plain();
+    // Терминатор (`Done`) и доклад родителю пишет харнесс — по факту выхода цикла,
+    // а не по вызову модели: `agent report` мог бы не состояться.
+    let res = agent::run_agent(&sess, &cfg, &llm, &ui).await;
+    if !parent.is_empty() {
+        let status = if res.is_ok() { "ok" } else { "error" };
+        let text = subagent::final_text(&cfg, &id).unwrap_or_default();
+        let body = if text.trim().is_empty() {
+            format!("подагент {id} завершился ({status}), финального текста нет")
+        } else {
+            format!("подагент {id} завершился ({status}):\n{text}")
+        };
+        let _ = mail::send(&cfg.mail_path(), &parent, &id, "report", &body);
+    }
+    res
+}
+
+/// Текст со stdin, если не задан позиционно.
+fn text_or_stdin(positional: &[String]) -> String {
+    let joined = positional.join(" ");
+    if !joined.trim().is_empty() {
+        return joined;
+    }
+    use std::io::Read;
+    let mut s = String::new();
+    let _ = std::io::stdin().read_to_string(&mut s);
+    s.trim().to_string()
+}
+
+/// Steer: сообщение сессии на границе ближайшего хода (человек — тоже сессия).
+fn cmd_steer(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let id = flags
+        .get("session")
+        .cloned()
+        .ok_or("steer: нужен --session <ID>")?;
+    let text = text_or_stdin(&positional);
+    if text.trim().is_empty() {
+        return Err("steer: пустое сообщение".into());
+    }
+    mail::send(&cfg.mail_path(), &id, "human", "steer", &text)?;
+    eprintln!("[snens] steer → {id}");
+    Ok(())
+}
+
+fn cmd_agents(flags: &BTreeMap<String, String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let id = session_id(&cfg, flags)?;
+    let kids = subagent::children(&cfg, &id);
+    println!("сессия: {id}");
+    if kids.is_empty() {
+        println!("(детей нет)");
+        return Ok(());
+    }
+    for c in &kids {
+        let extra = match &c.state {
+            subagent::State::Failed(s) => format!(" ({s})"),
+            _ => String::new(),
+        };
+        let tail = subagent::final_text(&cfg, &c.id)
+            .map(|t| {
+                let one = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                let s: String = one.chars().take(100).collect();
+                format!(" — {s}")
+            })
+            .unwrap_or_default();
+        println!("{}: {}{extra}{tail}", c.id, subagent::describe(&c.state));
+    }
+    Ok(())
+}
+
+fn cmd_result(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let id = match positional.first() {
+        Some(s) => s.clone(),
+        None => session_id(&cfg, flags)?,
+    };
+    match subagent::final_text(&cfg, &id) {
+        Some(t) => println!("{t}"),
+        None => eprintln!("[snens] у сессии {id} нет финального текста"),
+    }
+    Ok(())
+}
+
+/// Спавн подагента отдельным процессом: своя сессия процесса (setsid), как у
+/// фонового ревью, — чтобы Ctrl+C и закрытие окна до ребёнка не дострелили.
+///
+/// Задачу передаём переменной окружения, а не argv: она может быть длинной и
+/// многострочной. Стандартные потоки — в /dev/null: подагент работает молча, его
+/// жизнь видна через лог и ящик, а не через наш терминал.
+fn spawn_child(_cfg: &cfg::Config, id: &str, prompt: &str, parent: Option<&str>) -> R<u32> {
+    let _hup = HupBlock::new();
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("run-child")
+        .arg("--session")
+        .arg(id)
+        .arg("--config")
+        .arg(cfg::config_path())
+        .env("SNENS_PROMPT", prompt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(p) = parent.filter(|p| !p.is_empty()) {
+        cmd.arg("--parent").arg(p);
+    }
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::sigprocmask(libc::SIG_UNBLOCK, &hup_set(), std::ptr::null_mut());
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    Ok(child.id())
 }
 
 /// Автономный цикл: длинная сессия → ревью. Порог по длине, не по цене: цена

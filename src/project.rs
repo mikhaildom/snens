@@ -195,7 +195,26 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
             // Справка памяти — системная роль: это контекст, а не запрос
             // пользователя, и второй `user` подряд ломает чередование ролей.
             Rec::Recall { text, .. } => out.push(json!({"role": "system", "content": text})),
-            Rec::System { .. } | Rec::Meta { .. } | Rec::Usage { .. } | Rec::Ctx { .. } => {}
+            // Сообщение от другой сессии (родителя/ребёнка) или steer человека:
+            // это слово, адресованное нам, поэтому роль `user` — но с пометкой
+            // отправителя, чтобы модель не спутала его со своим запросом.
+            Rec::Steer {
+                from, via, text, ..
+            } => {
+                let label = match (from.is_empty(), via.as_str()) {
+                    (true, _) => String::new(),
+                    (false, "ask") => format!("[вопрос от {from}] "),
+                    (false, "report") => format!("[итог от {from}] "),
+                    (false, "steer") => "[сообщение от человека] ".to_string(),
+                    (false, other) => format!("[{other} от {from}] "),
+                };
+                out.push(json!({"role": "user", "content": format!("{label}{text}")}));
+            }
+            Rec::System { .. }
+            | Rec::Meta { .. }
+            | Rec::Usage { .. }
+            | Rec::Ctx { .. }
+            | Rec::Done { .. } => {}
         }
     }
     (out, report)

@@ -228,6 +228,28 @@ t view "$png"
 want 0 "$rc" "view: без канала — код 0"
 has "канал вложений недоступен" "$out" "view: без канала — пометка"
 
+# ---- agent ----
+# Родитель не задан — ask некуда слать.
+t agent ask "вопрос"
+want 1 "$rc" "agent: ask без родителя — код 1"
+has "я не подагент" "$err" "agent: ask без родителя — текст"
+
+t agent list
+want 1 "$rc" "agent: list без сессии — код 1"
+has "нет SNENS_SESSION" "$err" "agent: list без сессии — текст"
+
+t agent wait "нет-такого" --timeout 1
+want 1 "$rc" "agent: wait несуществующего — код 1"
+
+# Свой ящик: send кладёт сообщение туда, откуда его прочитает сессия.
+SNENS_SESSION=me
+SNENS_MAIL_DIR="$TMP/mail"
+export SNENS_SESSION SNENS_MAIL_DIR
+t agent send kid "привет"
+want 0 "$rc" "agent: send — код 0"
+ls "$TMP/mail/kid/new"/*.json >/dev/null 2>&1 && ok "agent: send положил сообщение в ящик" || bad "agent: send не положил сообщение в ящик"
+has "\"kind\":\"steer\"" "$(cat "$TMP/mail/kid/new"/*.json)" "agent: send — вид steer"
+
 if [ "$fails" -ne 0 ]; then
   echo
   echo "провалено проверок: $fails"
