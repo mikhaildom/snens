@@ -110,21 +110,21 @@ async fn run_loop<L: Llm>(
         // Оба порога пока только сигналят: это точки, где должна сработать компакция (M3).
         let ratio = approx as f64 / cfg.ctx_window as f64;
         if ratio > cfg.hard {
-            eprintln!(
-                "[snens] ~{approx} токенов — пройден порог саммаризации ({:.0}%), саммари ещё нет",
+            ui.notice(&format!(
+                "~{approx} токенов — пройден порог саммаризации ({:.0}%), саммари ещё нет",
                 cfg.hard * 100.0
-            );
+            ));
         } else if ratio > cfg.soft {
-            eprintln!(
-                "[snens] ~{approx} токенов — пройден порог элизии ({:.0}%)",
+            ui.notice(&format!(
+                "~{approx} токенов — пройден порог элизии ({:.0}%)",
                 cfg.soft * 100.0
-            );
+            ));
         }
         if report.elided > last_elided(&log) {
-            eprintln!(
-                "[snens] компакция: вырезано результатов {}, освобождено {} Б",
+            ui.notice(&format!(
+                "компакция: вырезано результатов {}, освобождено {} Б",
                 report.elided, report.freed_bytes
-            );
+            ));
             sess.append(Rec::Ctx {
                 ts: log::now(),
                 action: "elide".into(),
@@ -143,10 +143,10 @@ async fn run_loop<L: Llm>(
             } else {
                 String::new()
             };
-            eprintln!(
-                "[snens] ход {turn}: ↑{} (кеш {}) ↓{}{cost}",
+            ui.notice(&format!(
+                "ход {turn}: ↑{} (кеш {}) ↓{}{cost}",
                 reply.usage.in_tok, reply.usage.cached_tok, reply.usage.out_tok
-            );
+            ));
         }
 
         // Пусто (ни текста, ни вызовов) — это сбой, а не «работа кончилась»:
@@ -169,7 +169,7 @@ async fn run_loop<L: Llm>(
                 )
                 .into());
             }
-            eprintln!("[snens] пустой ответ модели ({hint}), повтор запроса");
+            ui.notice(&format!("пустой ответ модели ({hint}), повтор запроса"));
             continue;
         }
         empty_replies = 0;
@@ -226,10 +226,10 @@ async fn run_loop<L: Llm>(
             // что оно есть и откуда его взять.
             if !out.parts.is_empty() {
                 for p in &out.parts {
-                    println!(
+                    ui.line(&format!(
                         "  [вложение] {} {}x{} {} Б — {}",
                         p.kind, p.width, p.height, p.bytes, p.path
-                    );
+                    ));
                 }
             }
             sess.append(Rec::ToolResult {
