@@ -86,7 +86,11 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
                 let on = ui.toggle_reasoning();
                 ui.line(&format!(
                     "рассуждение: {}",
-                    if on { "показано" } else { "скрыто" }
+                    if on {
+                        "показано"
+                    } else {
+                        "скрыто"
+                    }
                 ));
                 continue;
             }

@@ -44,7 +44,11 @@ pub async fn run_agent<L: Llm>(
     };
     let turns = sess
         .read()
-        .map(|rs| rs.iter().filter(|x| matches!(x, Rec::Assistant { .. })).count() as u32)
+        .map(|rs| {
+            rs.iter()
+                .filter(|x| matches!(x, Rec::Assistant { .. }))
+                .count() as u32
+        })
         .unwrap_or(0);
     let _ = sess.append(Rec::Done {
         ts: log::now(),

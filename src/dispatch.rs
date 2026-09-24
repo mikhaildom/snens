@@ -11,7 +11,10 @@ use crate::{cfg::Config, exec, log::Call, log::Session, registry, R};
 fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
     let mut v = vec![
         ("SNENS_SESSION".to_string(), sess.id().to_string()),
-        ("SNENS_MAIL_DIR".to_string(), cfg.mail_path().display().to_string()),
+        (
+            "SNENS_MAIL_DIR".to_string(),
+            cfg.mail_path().display().to_string(),
+        ),
     ];
     if !sess.parent().is_empty() {
         v.push(("SNENS_PARENT".to_string(), sess.parent().to_string()));

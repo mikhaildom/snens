@@ -64,7 +64,9 @@ struct File {
 
 impl Cfg {
     fn load() -> Cfg {
-        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
         let f: File = std::env::var("SNENS_CONFIG")
             .ok()
             .or_else(|| Some(format!("{home}/.config/snens/config.toml")))
@@ -111,7 +113,13 @@ fn now() -> u64 {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -135,9 +143,8 @@ fn send(cfg: &Cfg, to: &str, from: &str, kind: &str, text: &str) {
     let name = format!("{nanos:020}-{}-{}.json", sanitize(from), std::process::id());
     let path = dir.join(&name);
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_string(&msg).unwrap_or_default()).unwrap_or_else(|e| {
-        die(format!("agent: запись сообщения: {e}"))
-    });
+    std::fs::write(&tmp, serde_json::to_string(&msg).unwrap_or_default())
+        .unwrap_or_else(|e| die(format!("agent: запись сообщения: {e}")));
     let _ = std::fs::rename(&tmp, &path);
 }
 
@@ -208,11 +215,11 @@ fn done_status(cfg: &Cfg, id: &str) -> Option<String> {
 
 fn final_text(cfg: &Cfg, id: &str) -> Option<String> {
     read_log(cfg, id).into_iter().rev().find_map(|r| match r {
-        Rec::Assistant { text: Some(t), tool_calls, .. }
-            if tool_calls.is_empty() && !t.trim().is_empty() =>
-        {
-            Some(t)
-        }
+        Rec::Assistant {
+            text: Some(t),
+            tool_calls,
+            ..
+        } if tool_calls.is_empty() && !t.trim().is_empty() => Some(t),
         _ => None,
     })
 }
@@ -294,7 +301,9 @@ fn cmd_start(cfg: &Cfg, args: &[String]) {
         cmd.arg("--parent").arg(&cfg.me);
     }
     cmd.arg(&task);
-    let out = cmd.output().unwrap_or_else(|e| die(format!("agent start: {e}")));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| die(format!("agent start: {e}")));
     if !out.status.success() {
         die(format!(
             "agent start: snens вернул код {:?}: {}",
@@ -352,7 +361,9 @@ fn cmd_wait(cfg: &Cfg, args: &[String]) {
             ));
         }
         if Instant::now() >= deadline {
-            die(format!("agent wait: {id} ещё работает, истёк таймаут {timeout}s"));
+            die(format!(
+                "agent wait: {id} ещё работает, истёк таймаут {timeout}s"
+            ));
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -412,11 +423,7 @@ fn cmd_ask(cfg: &Cfg, args: &[String]) {
 
 fn cmd_send(cfg: &Cfg, args: &[String]) {
     let id = first_arg(args);
-    let rest: Vec<String> = args
-        .iter()
-        .filter(|a| *a != &id)
-        .cloned()
-        .collect();
+    let rest: Vec<String> = args.iter().filter(|a| *a != &id).cloned().collect();
     let text = take_text(&rest);
     if text.trim().is_empty() {
         die("agent send: пустой текст".into());

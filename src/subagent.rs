@@ -132,7 +132,6 @@ pub fn state_of(cfg: &Config, parent: &str, id: &str) -> State {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

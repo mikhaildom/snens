@@ -50,9 +50,8 @@ pub fn send(mail_dir: &Path, to: &str, from: &str, kind: &str, text: &str) -> R<
 pub fn has_pending(mail_dir: &Path, id: &str) -> bool {
     std::fs::read_dir(new_dir(mail_dir, id))
         .map(|rd| {
-            rd.flatten().any(|e| {
-                e.path().extension().and_then(|x| x.to_str()) == Some("json")
-            })
+            rd.flatten()
+                .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
         })
         .unwrap_or(false)
 }
@@ -89,7 +88,13 @@ pub fn drain(mail_dir: &Path, id: &str) -> Vec<Msg> {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -120,7 +125,10 @@ mod tests {
         assert_eq!(got[0].kind, "ask");
         assert!(got[0].text.contains("первое"));
         // Повторный дренаж пуст: сообщения ушли в read/, а не остались в new/.
-        assert!(drain(&dir, "child").is_empty(), "сообщение доставлено дважды");
+        assert!(
+            drain(&dir, "child").is_empty(),
+            "сообщение доставлено дважды"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
