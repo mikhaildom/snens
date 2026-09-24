@@ -6,8 +6,6 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rustyline::ExternalPrinter;
-
 /// Куда идёт вывод агента. Слой один: и живой стрим, и служебные строки проходят
 /// через него. В TUI подмена на `ExternalPrinter` нужна, потому что поле ввода
 /// живо всё время работы агента — вывод обязан печататься НАД приглашением, а не
@@ -23,16 +21,6 @@ struct Stdout;
 impl Sink for Stdout {
     fn line(&mut self, s: &str) {
         println!("{s}");
-    }
-}
-
-/// Печать над приглашением readline: он стирает строку ввода, печатает сообщение
-/// и перерисовывает приглашение — так поток агента не рвёт ввод.
-struct Printer(Box<dyn ExternalPrinter + Send>);
-
-impl Sink for Printer {
-    fn line(&mut self, s: &str) {
-        let _ = self.0.print(format!("{s}\n"));
     }
 }
 
@@ -66,12 +54,13 @@ impl Ui {
         }
     }
 
-    /// TUI: вывод печатается над приглашением, цвет включён (мы на терминале).
-    pub fn with_printer(p: Box<dyn ExternalPrinter + Send>) -> Self {
+    /// TUI: свой приёмник вывода (печатает над приглашением своего читателя),
+    /// цвет включён — мы на терминале.
+    pub fn with_sink(sink: Box<dyn Sink>) -> Self {
         Ui {
             color: true,
             show_reasoning: AtomicBool::new(true),
-            sink: Arc::new(Mutex::new(Box::new(Printer(p)) as Box<dyn Sink>)),
+            sink: Arc::new(Mutex::new(sink)),
         }
     }
 

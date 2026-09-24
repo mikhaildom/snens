@@ -4,6 +4,7 @@ mod cfg;
 mod dispatch;
 mod exec;
 mod improve;
+mod input;
 mod llm;
 mod log;
 mod mail;

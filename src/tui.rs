@@ -2,52 +2,40 @@
 // выходе, скроллбек терминала — история диалога. Панелей и собственного скролла
 // нет намеренно: они ломают выделение и копипаст, а история и так есть.
 //
-// Steer: поле ввода остаётся живым, пока агент работает. Для этого readline живёт
-// в своём потоке (он и держит приглашение), вывод агента идёт через
-// `ExternalPrinter` — печатается НАД приглашением, а не поверх него. Строка,
-// введённая во время хода, не блокирует агент: она кладётся в ящик сессии
-// (`mail::send`, тот же канал, что у подагентов) и впрыскивается на границе хода.
-use std::{collections::BTreeMap, io::IsTerminal, path::PathBuf, sync::mpsc, thread};
+// Steer: поле ввода остаётся живым, пока агент работает. Читатель ввода (`input.rs`)
+// живёт в своём потоке и владеет приглашением; вывод агента проходит через `Sink`
+// и печатается НАД приглашением, а не поверх него. Строка, введённая во время хода,
+// кладётся в ящик сессии (`mail::send`, тот же канал, что у подагентов) и
+// впрыскивается на границе хода. Свой читатель вместо rustyline — чтобы тем же
+// механизмом читать строку без эха (пароль для askpass) и владеть терминалом.
+use std::{collections::BTreeMap, io::IsTerminal, path::PathBuf, sync::Arc};
 
-use rustyline::{error::ReadlineError, DefaultEditor, ExternalPrinter};
-
-use crate::{agent, cfg::Config, llm, log, mail, render::Ui, R};
+use crate::{agent, cfg::Config, input, input::In, llm, log, mail, render::Ui, R};
 
 const HELP: &str = "/new — новая сессия · /reasoning — скрыть/показать рассуждение · \
 /help · /quit (или Ctrl+D) · Ctrl+C — отменить ход · во время хода строка уходит агенту \
 как steer (после текущего шага)";
 
-/// Что приходит от потока ввода в основной цикл.
-enum In {
-    Line(String),
-    /// Ctrl+C: на приглашении — «передумал», в ходе — отмена хода.
-    Interrupt,
-    Eof,
-}
-
 pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
     let cfg = Config::load(flags.get("config").map(|s| s.as_str()))?;
     let llm = llm::OpenAi::new(cfg.api_key()?)?;
 
-    // Без tty (пайп, скрипт, CI) приглашения и ExternalPrinter нет: читаем строки
+    // Без tty (пайп, скрипт, CI) приглашения и своего читателя нет: читаем строки
     // построчно и гоняем ходы последовательно. Steer тут недоступен — он требует
     // живой поверхности, а не потока строк. Так `printf '…\n/quit\n' | snens tui`
     // остаётся проверяемым.
     if !std::io::stdin().is_terminal() {
         return plain(&cfg, &llm, flags).await;
     }
+    // Сырой режим не поднялся (нет tty или платформа) — тот же последовательный путь.
+    let Ok(_raw) = input::raw_mode() else {
+        return plain(&cfg, &llm, flags).await;
+    };
 
+    let term = Arc::new(input::Term::new("> "));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<In>();
-    let (ptx, prx) = mpsc::channel::<Result<Box<dyn ExternalPrinter + Send>, String>>();
-    let hist = history_path(&cfg);
-    spawn_reader(tx, ptx, hist);
-
-    // Принтер приходит из потока ввода: он создаётся из того же редактора, что
-    // держит приглашение, и только так умеет печатать поверх него.
-    let printer = prx
-        .recv()
-        .map_err(|e| format!("ввод: поток не поднялся: {e}"))??;
-    let ui = Ui::with_printer(printer);
+    input::spawn(Arc::clone(&term), tx, history_path(&cfg));
+    let ui = Ui::with_sink(Box::new(input::TermSink(Arc::clone(&term))));
 
     let mut id = match flags.get("session") {
         Some(s) => s.clone(),
@@ -205,61 +193,6 @@ async fn plain(cfg: &Config, llm: &llm::OpenAi, flags: &BTreeMap<String, String>
     }
     crate::autopilot(cfg, &id).await?;
     Ok(())
-}
-
-/// Поток ввода: редактор, приглашение и печать поверх него. Владение редактором
-/// остаётся здесь (он не `Send`), наружу отдаём только принтер и строки.
-fn spawn_reader(
-    tx: tokio::sync::mpsc::UnboundedSender<In>,
-    ptx: mpsc::Sender<Result<Box<dyn ExternalPrinter + Send>, String>>,
-    hist: PathBuf,
-) {
-    thread::spawn(move || {
-        let mut rl = match DefaultEditor::new() {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = ptx.send(Err(format!("редактор: {e}")));
-                return;
-            }
-        };
-        let _ = rl.load_history(&hist);
-        match rl.create_external_printer() {
-            Ok(p) => {
-                if ptx.send(Ok(Box::new(p))).is_err() {
-                    return;
-                }
-            }
-            Err(e) => {
-                let _ = ptx.send(Err(format!("принтер: {e}")));
-                return;
-            }
-        }
-        loop {
-            match rl.readline("> ") {
-                Ok(l) => {
-                    let t = l.trim().to_string();
-                    if t.is_empty() {
-                        continue;
-                    }
-                    let _ = rl.add_history_entry(t.as_str());
-                    // Сохраняем сразу: выход из TUI может случиться в любой момент.
-                    let _ = rl.save_history(&hist);
-                    if tx.send(In::Line(t)).is_err() {
-                        break;
-                    }
-                }
-                Err(ReadlineError::Interrupted) => {
-                    if tx.send(In::Interrupt).is_err() {
-                        break;
-                    }
-                }
-                Err(ReadlineError::Eof) | Err(_) => {
-                    let _ = tx.send(In::Eof);
-                    break;
-                }
-            }
-        }
-    });
 }
 
 /// История ввода живёт рядом с сессиями: она про человека, а не про сессию.
