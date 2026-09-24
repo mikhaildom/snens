@@ -206,15 +206,26 @@ impl Term {
         self.lock().buf.is_empty()
     }
 
-    /// Забрать введённую строку: строка остаётся в скроллбеке (перевод строки),
-    /// буфер очищается, приглашение перерисовывается.
-    pub fn take_line(&self) -> String {
+    /// Строка пуста с точностью до пробелов: ровно такие Enter'ы отбрасываются,
+    /// поэтому и эхо им не нужно.
+    pub fn buf_trimmed_empty(&self) -> bool {
+        self.lock().buf.trim().is_empty()
+    }
+
+    /// Забрать введённую строку. Буфер очищается, приглашение перерисовывается.
+    /// `echo` — оставить строку в скроллбеке (Enter с текстом): раньше она просто
+    /// стиралась `collapse` без печати, и сообщение человека исчезало из истории
+    /// сразу после отправки. Для пустого Enter и Ctrl+C не эхоим — там стирать
+    /// нечего.
+    pub fn take_line(&self, echo: bool) -> String {
         let mut i = self.lock();
         let s = std::mem::take(&mut i.buf);
         i.cursor = 0;
         let mut out = io::stdout();
         collapse(&mut i, &mut out);
-        let _ = write!(out, "\r\n");
+        if echo {
+            let _ = write!(out, "{}{}\r\n", i.prompt, s);
+        }
         draw(&mut i, &mut out);
         let _ = out.flush();
         s
@@ -425,7 +436,9 @@ fn reader_loop(term: Arc<Term>, tx: UnboundedSender<In>, hist_path: PathBuf) {
         };
         match b {
             0x0d | 0x0a => {
-                let line = term.take_line();
+                // Пустой (пробельный) Enter отбрасываем — не эхоим его в историю.
+                let empty = term.buf_trimmed_empty();
+                let line = term.take_line(!empty);
                 let t = line.trim().to_string();
                 if t.is_empty() {
                     continue;
@@ -439,7 +452,7 @@ fn reader_loop(term: Arc<Term>, tx: UnboundedSender<In>, hist_path: PathBuf) {
             }
             // Ctrl+C: «передумал» — строка сбрасывается, ход отменяется основным циклом.
             0x03 => {
-                term.take_line();
+                term.take_line(false);
                 if tx.send(In::Interrupt).is_err() {
                     break;
                 }
@@ -740,17 +753,29 @@ mod tests {
         assert_eq!(next_word(s, 14), 14);
     }
 
+    /// Пустой Enter распознаётся до забора строки: ему не нужно эхо в историю.
+    #[test]
+    fn blank_enter_is_detected_before_take() {
+        let t = Term::new("> ");
+        assert!(t.buf_trimmed_empty());
+        t.insert(' ');
+        t.insert('\t');
+        assert!(t.buf_trimmed_empty());
+        t.insert('x');
+        assert!(!t.buf_trimmed_empty());
+    }
+
     /// Ctrl/Alt+Backspace стирает слово слева от курсора.
     #[test]
     fn delete_word_left() {
         let t = Term::new("> ");
         t.set_line("one two three");
         t.delete_word();
-        assert_eq!(t.take_line(), "one two ");
+        assert_eq!(t.take_line(false), "one two ");
         t.set_line("one two");
         t.home();
         t.delete_word();
-        assert_eq!(t.take_line(), "one two");
+        assert_eq!(t.take_line(false), "one two");
     }
 
     /// Вставка и удаление по символьному курсору не портят UTF-8.
@@ -760,10 +785,10 @@ mod tests {
         t.insert('д');
         t.insert('а');
         t.insert('!');
-        assert_eq!(t.take_line(), "да!");
+        assert_eq!(t.take_line(false), "да!");
         t.insert('я');
         t.backspace();
-        assert_eq!(t.take_line(), "");
+        assert_eq!(t.take_line(false), "");
     }
 }
 

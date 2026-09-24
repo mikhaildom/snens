@@ -141,6 +141,9 @@ pub struct Stream {
     line: String,
     /// Накопленные строки текущего табличного блока (все начинались с `|`).
     table: Vec<String>,
+    /// Ширина терминала: таблица шире неё не влезает — терминал переносит строки
+    /// жёстко и рамка рвётся. `None` (пайп, файл) — ограничения нет.
+    max: Option<usize>,
     /// Тот же приёмник, что у `Ui`: в TUI стрим печатается над приглашением.
     sink: Arc<Mutex<Box<dyn Sink>>>,
 }
@@ -152,8 +155,16 @@ impl Stream {
             in_reasoning: false,
             line: String::new(),
             table: Vec::new(),
+            max: term_cols(),
             sink,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_max(color: bool, sink: Arc<Mutex<Box<dyn Sink>>>, max: Option<usize>) -> Self {
+        let mut s = Stream::new(color, sink);
+        s.max = max;
+        s
     }
 
     fn emit(&mut self, s: &str) {
@@ -202,6 +213,9 @@ impl Stream {
             let line = std::mem::take(&mut self.line);
             self.emit_line(&line);
         }
+        // Таблица рассуждения обязана закрыться до начала текста ответа: иначе
+        // накопленные строки склеятся с таблицей ответа в один блок.
+        self.flush_table();
         self.in_reasoning = false;
     }
 
@@ -230,10 +244,19 @@ impl Stream {
             return;
         }
         let block = std::mem::take(&mut self.table);
-        match table_align(&block) {
+        match table_align(&block, self.max) {
             Some(table) => {
-                // Таблица рисуется рамкой — серый курсив к ней не применяем.
-                self.emit(&table);
+                // Каждая строка рамки — отдельное сообщение в TUI, поэтому стиль
+                // (серый курсив для рассуждения) открываем и закрываем построчно.
+                let on = self.color && self.in_reasoning;
+                for l in table.lines() {
+                    let styled = if on {
+                        format!("\x1b[90;3m{l}\x1b[0m")
+                    } else {
+                        l.to_string()
+                    };
+                    self.emit(&styled);
+                }
             }
             // Не таблица (нет разделителя) — печатаем строки как были.
             None => {
@@ -260,6 +283,27 @@ fn is_table_row(line: &str) -> bool {
     line.trim_start().starts_with('|')
 }
 
+/// Ширина терминала в колонках: таблица шире экрана рвётся переносом. `None`,
+/// если вывода на терминал нет (пайп, файл) — там ограничивать нечем.
+#[cfg(unix)]
+fn term_cols() -> Option<usize> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return Some(ws.ws_col as usize);
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn term_cols() -> Option<usize> {
+    None
+}
+
 /// Разделитель GFM: `|---|---|` (с опциональными `:` и пробелами).
 fn is_separator(line: &str) -> bool {
     let t = line.trim().trim_matches('|').trim();
@@ -273,8 +317,10 @@ fn is_separator(line: &str) -> bool {
 }
 
 /// Рисует GFM-таблицу рамкой, выравнивая колонки по ширине содержимого.
+/// `max` — ширина терминала: таблица шире неё не влезает, терминал переносит
+/// строки жёстко и рамка рвётся, поэтому широкие ячейки усекаются.
 /// Возвращает None, если разделитель не найден (тогда это не таблица).
-fn table_align(lines: &[String]) -> Option<String> {
+fn table_align(lines: &[String], max: Option<usize>) -> Option<String> {
     if lines.len() < 2 || !is_separator(&lines[1]) {
         return None;
     }
@@ -293,6 +339,34 @@ fn table_align(lines: &[String]) -> Option<String> {
             width[c] = width[c].max(cell.chars().count());
         }
     }
+    // Впихнуть в терминал: рамка (cols+1 колонок) и паддинг (2 на колонку)
+    // съедают фиксированную часть, остальное — на содержимое. Ужимаем самые
+    // широкие колонки, пока сумма не влезет; ниже 1 символа не опускаемся.
+    if let Some(max) = max.filter(|m| *m > 0) {
+        let budget = max.saturating_sub(3 * cols + 1);
+        while width.iter().sum::<usize>() > budget {
+            let Some(c) = (0..cols)
+                .filter(|c| width[*c] > 1)
+                .max_by_key(|c| width[*c])
+            else {
+                break;
+            };
+            width[c] -= 1;
+        }
+    }
+    // Обрезка ячейки до её колонки: вплотную — первые `w` символов, иначе
+    // последний видимый заменяем на «…».
+    let clip = |cell: &str, w: usize| -> String {
+        let n = cell.chars().count();
+        if n <= w {
+            cell.to_string()
+        } else if w == 0 {
+            String::new()
+        } else {
+            let head: String = cell.chars().take(w - 1).collect();
+            format!("{head}…")
+        }
+    };
     // Выравнивание по `:` из разделителя.
     let seps = cells(&lines[1]);
     let align_right = |c: usize| -> bool {
@@ -320,16 +394,16 @@ fn table_align(lines: &[String]) -> Option<String> {
         }
         let mut line = String::from("│");
         for (c, w) in width.iter().enumerate().take(cols) {
-            let cell = rows[i].get(c).map(String::as_str).unwrap_or("");
+            let cell = clip(rows[i].get(c).map(String::as_str).unwrap_or(""), *w);
             let pad = w - cell.chars().count();
             if align_right(c) {
                 line.push(' ');
                 line.push_str(&" ".repeat(pad));
-                line.push_str(cell);
+                line.push_str(&cell);
                 line.push(' ');
             } else {
                 line.push(' ');
-                line.push_str(cell);
+                line.push_str(&cell);
                 line.push_str(&" ".repeat(pad));
                 line.push(' ');
             }
@@ -354,7 +428,7 @@ mod tests {
             "| run | команда |".to_string(),
             "| edit | правка |".to_string(),
         ];
-        let s = table_align(&t).expect("таблица не распознана");
+        let s = table_align(&t, None).expect("таблица не распознана");
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(lines.len(), 6, "рамка из 6 строк: {s}");
         assert!(lines[0].starts_with('┌'), "{s}");
@@ -371,13 +445,82 @@ mod tests {
             "|---:|:--|".to_string(),
             "| 1 | 2 |".to_string(),
         ];
-        let s = table_align(&t).unwrap();
+        let s = table_align(&t, None).unwrap();
         assert!(s.contains("│   1 │ 2 │") || s.contains("│ 1 │"), "{s}");
     }
 
     #[test]
     fn non_table_pipe_lines_pass_through() {
         let t = vec!["| не таблица".to_string(), "| просто труба".to_string()];
-        assert!(table_align(&t).is_none());
+        assert!(table_align(&t, None).is_none());
+    }
+
+    /// Таблица шире терминала не должна переноситься жёстко (рамка рвётся):
+    /// широкие ячейки усекаются до бюджета, каждая строка влезает в `max`.
+    #[test]
+    fn wide_table_is_clipped_to_terminal() {
+        let t = vec![
+            "| a | b |".to_string(),
+            "|---|---|".to_string(),
+            "| очень длинный текст ячейки | ещё длинный текст |".to_string(),
+        ];
+        let s = table_align(&t, Some(40)).unwrap();
+        for l in s.lines() {
+            assert!(
+                l.chars().count() <= 40,
+                "строка шире 40: {} ({})",
+                l.chars().count(),
+                l
+            );
+        }
+        assert!(s.contains('…'), "обрезанная ячейка без многоточия: {s}");
+    }
+
+    /// Приёмник, собирающий строки: проверить границы блоков и стиль.
+    fn collect(color: bool, max: Option<usize>, f: impl FnOnce(&mut Stream)) -> Vec<String> {
+        struct Cap(Arc<Mutex<Vec<String>>>);
+        impl Sink for Cap {
+            fn line(&mut self, s: &str) {
+                self.0.lock().unwrap().push(s.to_string());
+            }
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<Mutex<Box<dyn Sink>>> =
+            Arc::new(Mutex::new(Box::new(Cap(out.clone())) as Box<dyn Sink>));
+        let mut st = Stream::new_with_max(color, sink, max);
+        f(&mut st);
+        let v = out.lock().unwrap().clone();
+        v
+    }
+
+    /// Таблица рассуждения закрывается на границе с текстом ответа, а не
+    /// склеивается с таблицей ответа в один блок.
+    #[test]
+    fn reasoning_table_is_not_merged_with_answer_table() {
+        let v = collect(false, Some(80), |st| {
+            st.reasoning(true);
+            st.reasoning_chunk("| r | s |\n|---|---|\n| 1 | 2 |\n");
+            st.content("текст\n| c | d |\n|---|---|\n| 3 | 4 |\n");
+            st.finish();
+        });
+        let tables = v.iter().filter(|l| l.starts_with('┌')).count();
+        assert_eq!(tables, 2, "таблицы склеились: {v:?}");
+    }
+
+    /// Таблица внутри рассуждения рендерится и остаётся серо-курсивной (рамка
+    /// печатается построчно, стиль открыт и закрыт в каждой строке).
+    #[test]
+    fn reasoning_table_is_styled_per_line() {
+        let v = collect(true, Some(80), |st| {
+            st.reasoning(true);
+            st.reasoning_chunk("| a |\n|---|\n| 1 |\n");
+            st.finish();
+        });
+        assert!(!v.is_empty(), "таблица рассуждения не отрендерена");
+        assert!(
+            v.iter()
+                .all(|l| l.starts_with("\x1b[90;3m") && l.ends_with("\x1b[0m")),
+            "не каждая строка покрашена: {v:?}"
+        );
     }
 }
