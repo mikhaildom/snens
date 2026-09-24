@@ -165,8 +165,12 @@ pub fn sync_bin_dir(cfg: &Config, tools: &[Tool]) -> R<PathBuf> {
 
 /// PATH детей: разделитель путей свой у каждой платформы, склеиваем им. Каталог
 /// самого харнесса тоже в PATH — иначе изнутри сессии не позвать `snens sessions`.
-pub fn child_path(bin: &Path) -> String {
-    let mut parts = vec![bin.to_path_buf()];
+/// PATH детей с дополнительными каталогами В НАЧАЛЕ (каталог шимов: `sudo` →
+/// `sudo -A`). Порядок важен: шим должен затенять системный sudo, но только у
+/// процессов-инструментов агента, а не в обычной оболочке пользователя.
+pub fn child_path_with(prefix: &[PathBuf], bin: &Path) -> String {
+    let mut parts: Vec<PathBuf> = prefix.to_vec();
+    parts.push(bin.to_path_buf());
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))

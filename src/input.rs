@@ -36,8 +36,16 @@ struct Inner {
     cursor: usize,
 }
 
+/// Запрос на секретный ввод (пароль): читатель уходит в режим без эха, ответ
+/// отдаётся по каналу тому, кто ждёт (askpass-сервер).
+pub struct SecretReq {
+    pub tx: std::sync::mpsc::Sender<String>,
+}
+
 pub struct Term {
     inner: Mutex<Inner>,
+    /// Ожидающий запрос пароля; забирает его поток чтения (он один владеет stdin).
+    secret: Mutex<Option<SecretReq>>,
 }
 
 impl Term {
@@ -48,7 +56,27 @@ impl Term {
                 buf: String::new(),
                 cursor: 0,
             }),
+            secret: Mutex::new(None),
         }
+    }
+
+    /// Попросить пароль: показать его приглашение и вернуть канал с ответом.
+    /// Ответ придёт, когда поток чтения прочитает строку без эха.
+    pub fn request_secret(&self, prompt: String) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Запрос регистрируем ДО показа приглашения: иначе символ, набранный
+        // сразу после появления промпта, мог бы попасть в обычный буфер.
+        *self.secret.lock().unwrap_or_else(|e| e.into_inner()) = Some(SecretReq { tx });
+        {
+            let mut out = io::stdout();
+            let _ = write!(out, "\r\x1b[K{} ", prompt.trim_end());
+            let _ = out.flush();
+        }
+        rx
+    }
+
+    fn secret_take(&self) -> Option<SecretReq> {
+        self.secret.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -151,6 +179,11 @@ impl Term {
         s
     }
 
+    /// Перерисовать строку ввода (после запроса пароля).
+    pub fn redraw(&self) {
+        render(&self.lock());
+    }
+
     /// Печать строки НАД приглашением: стереть строку ввода, напечатать сообщение,
     /// перерисовать приглашение с буфером. Тем самым вывод агента не рвёт ввод.
     pub fn print_above(&self, s: &str) {
@@ -215,7 +248,17 @@ fn reader_loop(term: Arc<Term>, tx: UnboundedSender<In>, hist_path: PathBuf) {
     let mut hist = load_history(&hist_path);
     let mut hidx = hist.len();
     loop {
-        let Some(b) = read_byte() else {
+        // Ждём нажатие. Если в это время поступил запрос пароля (askpass),
+        // первый же байт — начало пароля, и он не должен попасть в обычный буфер.
+        let first = read_byte();
+        if let Some(req) = term.secret_take() {
+            let pw = read_secret_line(first);
+            let _ = req.tx.send(pw);
+            // Строку ввода после запроса перерисовываем как была.
+            term.redraw();
+            continue;
+        }
+        let Some(b) = first else {
             let _ = tx.send(In::Eof);
             break;
         };
@@ -293,6 +336,47 @@ fn reader_loop(term: Arc<Term>, tx: UnboundedSender<In>, hist_path: PathBuf) {
             }
         }
     }
+}
+
+/// Прочитать строку без эха (пароль): Ctrl+U/Ctrl+W и backspace правят буфер,
+/// Enter завершает. На экран ничего не выводим — пароль не должен остаться
+/// ни на терминале, ни в истории, ни в логе.
+#[cfg(unix)]
+fn read_secret_line(first: Option<u8>) -> String {
+    let mut buf: Vec<char> = Vec::new();
+    // Первый байт уже прочитан вызывающим (гонка запрос/нажатие): не теряем его.
+    let mut next = first;
+    loop {
+        let b = match next.take() {
+            Some(b) => b,
+            None => match read_byte() {
+                Some(b) => b,
+                None => break,
+            },
+        };
+        match b {
+            0x0d | 0x0a => break,
+            0x7f | 0x08 => {
+                buf.pop();
+            }
+            0x15 => buf.clear(),
+            0x17 => {
+                while buf.pop().map(|c| c.is_whitespace()).unwrap_or(false) {}
+                while buf.last().map(|c| !c.is_whitespace()).unwrap_or(false) {
+                    buf.pop();
+                }
+            }
+            0x03 => break,
+            _ => {
+                if b < 0x80 {
+                    buf.push(b as char);
+                } else if let Some(ch) = read_utf8(b) {
+                    buf.push(ch);
+                }
+            }
+        }
+    }
+    buf.into_iter().collect()
 }
 
 /// Собрать многобайтный символ UTF-8: ведущий байт уже прочитан.
@@ -395,6 +479,36 @@ fn poll_byte(ms: i32) -> bool {
         revents: 0,
     };
     unsafe { libc::poll(&mut p, 1, ms) > 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Курсор считается в символах, а вставка/удаление — в байтах: многобайтный
+    /// ввод (кириллица) не должен рвать строку пополам.
+    #[test]
+    fn byte_offset_counts_chars_not_bytes() {
+        let s = "aбв"; // 1 + 2 + 2 байта
+        assert_eq!(byte_of(s, 0), 0);
+        assert_eq!(byte_of(s, 1), 1);
+        assert_eq!(byte_of(s, 2), 3);
+        assert_eq!(byte_of(s, 3), 5); // конец
+        assert_eq!(byte_of(s, 99), s.len());
+    }
+
+    /// Вставка и удаление по символьному курсору не портят UTF-8.
+    #[test]
+    fn insert_and_backspace_on_multibyte() {
+        let t = Term::new("> ");
+        t.insert('д');
+        t.insert('а');
+        t.insert('!');
+        assert_eq!(t.take_line(), "да!");
+        t.insert('я');
+        t.backspace();
+        assert_eq!(t.take_line(), "");
+    }
 }
 
 #[cfg(not(unix))]

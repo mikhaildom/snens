@@ -73,10 +73,19 @@ pub async fn selftest() -> R<()> {
         std::fs::symlink_metadata(cfg.bin_path().join("probe")).is_ok(),
         "нет симлинка в PATH-каталоге"
     );
-    let bin_s = cfg.bin_path().to_string_lossy().into_owned();
+    // PATH детей начинается с каталога шимов (`sudo` → `sudo -A`), чтобы sudo
+    // спрашивал пароль через askpass, а сразу за ним — каталог симлинков тулов.
+    let shim_s = cfg.data_path().join("shim");
+    let bin_s = cfg.bin_path();
+    let comps: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+    assert_eq!(
+        comps.first().map(|p| p.as_path()),
+        Some(shim_s.as_path()),
+        "PATH детей не начинается с каталога шимов: {path}"
+    );
     assert!(
-        path.starts_with(&bin_s),
-        "PATH детей не начинается с каталога симлинков: {path}"
+        comps.iter().any(|p| p == &bin_s),
+        "PATH детей не содержит каталог симлинков тулов: {path}"
     );
 
     let sess = Session::open(&dir, "t")?;

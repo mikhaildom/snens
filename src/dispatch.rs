@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::{cfg::Config, exec, log::Call, log::Session, registry, R};
+use crate::{askpass, cfg::Config, exec, log::Call, log::Session, registry, R};
 
 /// Что тул знает о сессии, в которой он вызван. Через env — как канал вложений:
 /// переменной нет — тул просто не знает контекста, ничего не ломается.
@@ -18,6 +18,15 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
     ];
     if !sess.parent().is_empty() {
         v.push(("SNENS_PARENT".to_string(), sess.parent().to_string()));
+    }
+    // Канал пароля: процесс-инструмент (в т.ч. шим `sudo`) узнаёт, где спросить
+    // пароль у TUI. Каталог шимов создаётся при подготовке окружения; здесь
+    // best-effort — без него sudo просто честно упадёт «password required».
+    if let Ok(shim) = askpass::ensure_shims(cfg) {
+        v.extend(askpass::child_env(
+            &askpass::sock_path(&cfg.sessions_path()),
+            &shim,
+        ));
     }
     v
 }
@@ -46,7 +55,14 @@ pub fn builtin_defs() -> Vec<Value> {
 pub async fn prepare(cfg: &Config) -> R<(Vec<Value>, Vec<registry::Tool>, String)> {
     let tools = registry::discover(cfg).await;
     let bin = registry::sync_bin_dir(cfg, &tools)?;
-    let path = registry::child_path(&bin);
+    // Каталог шимов (симлинк `sudo` → `sudo -A`) идёт ПЕРЕД системным PATH: только
+    // внутри окружения инструментов агента, обычный sudo пользователя не тронут.
+    let shim = askpass::ensure_shims(cfg).ok();
+    let mut parts = Vec::new();
+    if let Some(s) = &shim {
+        parts.push(s.clone());
+    }
+    let path = registry::child_path_with(&parts, &bin);
     let mut defs = builtin_defs();
     defs.extend(registry::definitions(&tools));
     Ok((defs, tools, path))

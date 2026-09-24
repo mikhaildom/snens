@@ -35,6 +35,12 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
     let term = Arc::new(input::Term::new("> "));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<In>();
     input::spawn(Arc::clone(&term), tx, history_path(&cfg));
+    // Сервер пароля: sudo-вызовы инструментов спрашивают пароль у человека через
+    // него, а не отбирают /dev/tty у читателя ввода.
+    crate::askpass::spawn_server(
+        crate::askpass::sock_path(&cfg.sessions_path()),
+        Arc::clone(&term),
+    );
     let ui = Ui::with_sink(Box::new(input::TermSink(Arc::clone(&term))));
 
     let mut id = match flags.get("session") {
