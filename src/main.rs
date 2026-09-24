@@ -264,7 +264,7 @@ fn cmd_result(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()
 /// жизнь видна через лог и ящик, а не через наш терминал.
 fn spawn_child(_cfg: &cfg::Config, id: &str, prompt: &str, parent: Option<&str>) -> R<u32> {
     let _hup = HupBlock::new();
-    let exe = std::env::current_exe()?;
+    let exe = self_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("run-child")
         .arg("--session")
@@ -324,7 +324,7 @@ fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
     // SIGHUP всей foreground-группе, и без этого родитель умрёт, не успев даже
     // создать лог, а форкнутый ребёнок — до того, как pre_exec дозвонит setsid.
     let _hup = HupBlock::new();
-    let exe = std::env::current_exe()?;
+    let exe = self_exe()?;
     let log_path = cfg.sessions_path().join(format!("{id}-review.log"));
     let out = std::fs::File::create(&log_path)?;
     let err = out.try_clone()?;
@@ -357,6 +357,27 @@ fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
     // Дочерний процесс не ждём: TUI и run выходят сразу. Дети переподвешиваются
     // к init и работают сами — именно этого и хочет пользователь.
     Ok(())
+}
+
+/// Путь к собственному бинарнику, устойчивый к пересборке во время работы.
+///
+/// cargo (и `snens build`) заменяют бинарник через rename: старый инод отвязывается,
+/// и если наш процесс уже был запущен из этого файла, `current_exe()` вернёт путь
+/// с суффиксом " (deleted)". `Command::new` по такому пути падает с ENOENT — именно
+/// поэтому фоновое ревью, запущенное из только что пересобранного ядра, умирало,
+/// оставив пустой `-review.log`. Снимаем суффикс: путь снова указывает на свежий
+/// бинарник, а его и надо запускать.
+fn self_exe() -> R<std::path::PathBuf> {
+    Ok(strip_deleted(std::env::current_exe()?))
+}
+
+/// Убирает пометку " (deleted)", которую ядро дописывает к `/proc/self/exe`,
+/// когда файл уже отвязан (пересборка ядра под собой). Путь снова оживает.
+fn strip_deleted(p: std::path::PathBuf) -> std::path::PathBuf {
+    match p.to_string_lossy().strip_suffix(" (deleted)") {
+        Some(stripped) => std::path::PathBuf::from(stripped),
+        None => p,
+    }
 }
 
 /// Набор сигналов из одного SIGHUP: для sigprocmask-блокировки на время spawn.
@@ -597,4 +618,22 @@ fn cargo_target_dir(root: &std::path::Path) -> R<std::path::PathBuf> {
         .and_then(|v| v.as_str())
         .ok_or("cargo metadata без target_directory")?;
     Ok(std::path::PathBuf::from(dir))
+}
+#[cfg(test)]
+mod tests {
+    use super::strip_deleted;
+    use std::path::PathBuf;
+
+    #[test]
+    fn strip_deleted_recovers_path_after_rebuild() {
+        // Ровно то, что отдаёт /proc/self/exe после пересборки бинарника под ногами.
+        let p = PathBuf::from("/mnt/target/debug/snens (deleted)");
+        assert_eq!(strip_deleted(p), PathBuf::from("/mnt/target/debug/snens"));
+    }
+
+    #[test]
+    fn strip_deleted_leaves_clean_path() {
+        let p = PathBuf::from("/mnt/target/debug/snens");
+        assert_eq!(strip_deleted(p.clone()), p);
+    }
 }
