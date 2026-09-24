@@ -146,6 +146,10 @@ pub async fn autopilot(cfg: &cfg::Config, id: &str) -> R<()> {
 /// Ждём только факт запуска, не завершения. Вывод — в файл `<id>-review.log`
 /// рядом с сессией: там видно, чем кончилось фоновое ревью.
 fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
+    // Блокируем SIGHUP на весь критический участок: закрытие окна терминала шлёт
+    // SIGHUP всей foreground-группе, и без этого родитель умрёт, не успев даже
+    // создать лог, а форкнутый ребёнок — до того, как pre_exec дозвонит setsid.
+    let _hup = HupBlock::new();
     let exe = std::env::current_exe()?;
     let log_path = cfg.sessions_path().join(format!("{id}-review.log"));
     let out = std::fs::File::create(&log_path)?;
@@ -164,6 +168,9 @@ fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             libc::setsid();
+            // После setsid групповая рассылка при закрытии окна до нас уже не
+            // достаёт — снимаем блокировку SIGHUP, унаследованную от родителя.
+            libc::sigprocmask(libc::SIG_UNBLOCK, &hup_set(), std::ptr::null_mut());
             Ok(())
         });
     }
@@ -176,6 +183,48 @@ fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
     // Дочерний процесс не ждём: TUI и run выходят сразу. Дети переподвешиваются
     // к init и работают сами — именно этого и хочет пользователь.
     Ok(())
+}
+
+/// Набор сигналов из одного SIGHUP: для sigprocmask-блокировки на время spawn.
+#[cfg(unix)]
+fn hup_set() -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        set
+    }
+}
+
+/// Блокирует SIGHUP на время жизни: закрытие окна в этот момент лишь отложит
+/// сигнал (он станет pending), а не убьёт процесс посреди spawn. При отпускании
+/// маска восстанавливается — отложенный SIGHUP дострелит уже после того, как
+/// ребёнок отцепился в свою сессию.
+struct HupBlock {
+    #[cfg(unix)]
+    old: libc::sigset_t,
+}
+
+impl HupBlock {
+    fn new() -> Self {
+        #[cfg(unix)]
+        unsafe {
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigprocmask(libc::SIG_BLOCK, &hup_set(), &mut old);
+            Self { old }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HupBlock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sigprocmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut());
+        }
+    }
 }
 
 fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
