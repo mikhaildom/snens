@@ -21,7 +21,11 @@ edit <путь>   — либо {\"edits\": [{\"old_string\", \"new_string\", \"r
 Несколько правок одного файла — одним вызовом (поле edits): применяются по
 порядку, и если хоть одна не совпала, файл не трогается, а в ошибке — её номер.
 Пишет атомарно (temp + rename). --dry-run показывает затронутый участок и не пишет.
-В stdout — одна строка JSON-события.";
+В stdout — одна строка JSON-события.
+
+Многострочные значения можно подавать как есть, с реальными переводами строк
+внутри кавычек: сырые управляющие символы (перевод строки, таб) чинятся сами,
+экранировать их бэкслешем не нужно.";
 
 const DRY: &str = "--dry-run";
 const HINT_CUTOFF: f32 = 0.5;
@@ -98,6 +102,65 @@ fn hint(text: &str, old: &str) -> String {
         Some((_, n, l)) => format!("ближайшее — строка {n}: {:?}", short(l)),
         None => "похожего фрагмента нет — прочитай файл заново (read)".into(),
     }
+}
+
+/// Невалидный JSON здесь — почти всегда одно и то же: модель пишет значения
+/// `old_string`/`new_string` с реальными переводами строк внутри кавычек, а JSON
+/// такие управляющие символы в строке запрещает. Требовать `\n`-экранирования —
+/// терять вызов на каждой многострочной правке. Поэтому: если ошибка парсера —
+/// «control character while parsing a string», чиним вход, экранируя сырые
+/// управляющие символы ВНУТРИ строк, и пробуем ещё раз. Пробуем один раз: если
+/// вход и после этого не разобрался, показываем свою ошибку парсера.
+fn parse_patch(raw: &str) -> Result<Value, serde_json::Error> {
+    let first = match serde_json::from_str(raw) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    if !first.to_string().contains("control character") {
+        return Err(first);
+    }
+    serde_json::from_str(&escape_raw_controls(raw)).map_err(|_| first)
+}
+
+/// Заменить сырые управляющие символы внутри строк на их \-экранированные
+/// формы, не трогая структуру JSON. Правила как в JSON: строки в `"..."`,
+/// экранирование бэкслешом. `\n`, `\t`, `\r` эмитируются сразу с бэкслешем —
+/// это распространённые разделители строк; любой другой управляющий символ —
+/// как `\uXXXX`, лишь бы парсер принял его в строке.
+fn escape_raw_controls(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut in_string = false;
+    let mut escape = false;
+    for c in src.chars() {
+        if in_string {
+            if escape {
+                out.push(c);
+                escape = false;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    out.push(c);
+                    escape = true;
+                }
+                '"' => {
+                    out.push(c);
+                    in_string = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+            if c == '"' {
+                in_string = true;
+            }
+        }
+    }
+    out
 }
 
 fn abs(p: &str) -> String {
@@ -251,8 +314,12 @@ fn main() {
     if raw.trim().is_empty() {
         die("edit: пустой stdin — нужен JSON {\"old_string\", \"new_string\"}".into());
     }
-    let j: serde_json::Value =
-        serde_json::from_str(&raw).unwrap_or_else(|e| die(format!("edit: stdin не JSON: {e}")));
+    let j: serde_json::Value = parse_patch(&raw).unwrap_or_else(|e| {
+        die(format!(
+            "edit: stdin не JSON: {e}\n(сырые переводы строк и табы внутри строк чинятся сами; \
+             если ошибка про control character всё же осталась — проблема в другом месте)"
+        ))
+    });
 
     let path = rest
         .first()
@@ -375,6 +442,43 @@ mod tests {
         let (b, n2) = apply_one(&a, &e(2, "let b = 2;", "let b = a + 1;"), "f");
         assert_eq!(n1 + n2, 2);
         assert_eq!(b, "let a = 10;\nlet b = a + 1;\n");
+    }
+
+    #[test]
+    fn accepts_literal_newlines_inside_strings() {
+        // Ровно то, что присылает модель: реальные переводы строк в кавычках.
+        let raw = "{\"old_string\": \"let a = 1;\nlet b = 2;\", \"new_string\": \"let a = 10;\nlet b = 2;\"}";
+        let j = parse_patch(raw).expect("сырые переводы строк должны разбираться");
+        assert_eq!(j["old_string"], "let a = 1;\nlet b = 2;");
+        assert_eq!(j["new_string"], "let a = 10;\nlet b = 2;");
+    }
+
+    #[test]
+    fn accepts_literal_tabs_inside_strings() {
+        let raw = "{\"old_string\": \"\tvalue\", \"new_string\": \"\tother\"}";
+        let j = parse_patch(raw).expect("сырые табы должны разбираться");
+        assert_eq!(j["old_string"], "\tvalue");
+    }
+
+    #[test]
+    fn valid_json_still_works_and_backslashes_survive() {
+        let raw = r#"{"old_string": "let a = \"x\";", "new_string": "let a = \"y\";"}"#;
+        let j = parse_patch(raw).expect("валидный JSON не трогаем");
+        assert_eq!(j["old_string"], "let a = \"x\";");
+    }
+
+    #[test]
+    fn garbage_still_rejected() {
+        let raw = "{не json}";
+        assert!(parse_patch(raw).is_err());
+    }
+
+    #[test]
+    fn escape_leaves_structure_untouched() {
+        let raw = "{\"old_string\": \"a\nb\", \"path\": \"f\"}";
+        let fixed = escape_raw_controls(raw);
+        assert!(serde_json::from_str::<Value>(&fixed).is_ok());
+        assert!(fixed.contains("a\\nb"));
     }
 
     #[test]
