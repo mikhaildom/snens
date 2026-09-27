@@ -368,11 +368,13 @@ mod tests {
         let cfg = Config::default();
         let log = vec![user("разбери тикеты", "improve")];
         let msgs = msgs(&log, &cfg);
+        // Ищем именно пометку реплея, а не слово «транскрипт»: оно встречается
+        // в memory.md и тест ловил бы память инстанса вместо пометки.
         assert!(
             !msgs.iter().any(|m| m["content"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("транскрипт")),
+                .contains(REPLAY_NOTE)),
             "пометка не нужна, когда транскрипта нет"
         );
         assert_eq!(msgs[1]["role"], "system", "рамка улучшения — системная");

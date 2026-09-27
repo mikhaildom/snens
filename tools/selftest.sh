@@ -228,6 +228,32 @@ t view "$png"
 want 0 "$rc" "view: без канала — код 0"
 has "канал вложений недоступен" "$out" "view: без канала — пометка"
 
+# ---- search ----
+# Свой набор проверок у тула лежит рядом (tools/search/selftest.sh): он длиннее
+# общего и требует живого SearXNG. Здесь — только контракт, который видит модель.
+t search --help
+want 0 "$rc" "search: --help — код 0"
+has "search — " "$out" "search: --help, строка 1 = суть"
+has "search <запрос>" "$out" "search: --help, строка 2 = usage"
+
+t search
+want 2 "$rc" "search: без запроса — код 2"
+has "search <запрос>" "$err" "search: без запроса — usage в stderr"
+
+# ---- fetch ----
+t fetch --help
+want 0 "$rc" "fetch: --help — код 0"
+has "fetch — " "$out" "fetch: --help, строка 1 = суть"
+has "fetch <url>" "$out" "fetch: --help, строка 2 = usage"
+
+t fetch
+want 2 "$rc" "fetch: без url — код 2"
+has "fetch <url>" "$err" "fetch: без url — usage в stderr"
+
+t fetch "ftp://example.com/x"
+want 2 "$rc" "fetch: не http(s) — код 2"
+has "только http/https" "$err" "fetch: не http(s) — текст"
+
 # ---- agent ----
 # Тесты могут идти изнутри сессии агента, где dispatch уже выставил SNENS_SESSION
 # и SNENS_MAIL_DIR: снимаем их, иначе проверки «без контекста» видят чужой контекст.

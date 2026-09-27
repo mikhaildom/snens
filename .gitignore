@@ -11,3 +11,5 @@ tools/*/audit
 tools/*/view
 tools/*/memory
 tools/*/agent
+tools/*/search
+tools/*/fetch
