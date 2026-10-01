@@ -25,12 +25,17 @@ pub fn system_prompt(cfg: &Config) -> String {
     // Дешёвый канал самоулучшения: неудобство фиксируется сразу, пока факт жив.
     let tickets = cfg.tickets_path().display().to_string();
     let memory = cfg.data_path().join("memory.md").display().to_string();
+    let instance = cfg.data_path().display().to_string();
     s.push_str(&format!(
         "\nРабочий каталог: {cwd} — инструменты и команды выполняются в нём.\n\
          Заметил неудобство по ходу работы — тул путает контракт, вызов пришлось \
          повторять, вывод пришлось дочитывать — сразу допиши тикет в {tickets}: \
          markdown-файл с front-matter (status: open, kind, target, hits) и секциями \
-         Симптом / Гипотеза / История. Не откладывай на потом.\n\
+         Симптом / Гипотеза / История. Не откладывай на потом: инстанс — локальный \
+         git-репозиторий, тикет коммить сразу \
+         (`git -C {instance} add tickets && git -C {instance} -c user.name=snens \
+         -c user.email=snens@local commit -m \"ticket: <кратко>\"`), иначе тикеты копятся \
+         незакоммиченными.\n\
          Что куда: разовое неудобство — тикет; то же самое второй раз (тикет с hits ≥ 2) — \
          процедура или грабли, строка в подходящий скилл — это работа improve, а не твоя \
          по ходу дела; долгий факт, нужный в любой сессии, — строка в {memory} \
