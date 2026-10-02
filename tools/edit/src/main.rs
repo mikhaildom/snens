@@ -247,13 +247,8 @@ impl Edit {
                 where_n(n)
             ));
         }
-        if old == new {
-            die(format!(
-                "edit: old_string и new_string совпадают{},
-                менять нечего",
-                where_n(n)
-            ));
-        }
+        // `old == new` — не ошибка, а no-op: файл ровно в том состоянии, которое
+        // просили. Возврат ошибки красит нормальный исход в «неудачу» в разборе.
         Edit { n, old, new, all }
     }
 }
@@ -268,6 +263,12 @@ fn where_n(n: usize) -> String {
 }
 
 fn apply_one(text: &str, e: &Edit, path: &str) -> (String, usize) {
+    // No-op: менять нечего. Возвращаем текст как есть — файл уже в нужном виде.
+    // Проверяем ДО поиска фрагмента: иначе нечего-менять ошибочно читается как
+    // «фрагмент не найден», хотя это разные исходы.
+    if e.old == e.new {
+        return (text.to_string(), 0);
+    }
     let count = text.matches(&e.old).count();
     if count == 0 {
         die(format!(
@@ -401,6 +402,9 @@ fn main() {
             "bytes_before": data.len(),
             "bytes_after": out_text.len(),
             "dry_run": dry,
+            // Все правки оказались no-op: файл уже был в нужном виде. Не ошибка,
+            // но и не «сделано» — разбору полезно видеть разницу.
+            "unchanged": replaced == 0,
         })
     );
 }
@@ -442,6 +446,18 @@ mod tests {
         let (b, n2) = apply_one(&a, &e(2, "let b = 2;", "let b = a + 1;"), "f");
         assert_eq!(n1 + n2, 2);
         assert_eq!(b, "let a = 10;\nlet b = a + 1;\n");
+    }
+
+    #[test]
+    fn identical_strings_are_noop_not_error() {
+        // Файл уже ровно в нужном виде: 0 замен, текст без изменений.
+        let (t, n) = apply_one("alpha beta\n", &e(0, "alpha", "alpha"), "f");
+        assert_eq!(n, 0);
+        assert_eq!(t, "alpha beta\n");
+        // Даже когда фрагмента в файле нет — при old == new это не «не найден».
+        let (t, n) = apply_one("other\n", &e(0, "absent", "absent"), "f");
+        assert_eq!(n, 0);
+        assert_eq!(t, "other\n");
     }
 
     #[test]

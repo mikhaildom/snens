@@ -37,7 +37,7 @@ pub fn builtin_defs() -> Vec<Value> {
         "type": "function",
         "function": {
             "name": "run",
-            "description": "Выполнить shell-команду (sh -c) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]",
+            "description": "Выполнить shell-команду (sh -c) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]\nОболочка — sh (dash), не bash: нет ${x:0:n}, [[ ]], массивов, $'\\t'; нужен bash — зови `bash -c '...'`. Код возврата при `;`-цепочке — от последней команды, поэтому хвостовой `which`/`grep` может покрасить успешную команду в ошибку (для bash-измов это частая причина).",
             "parameters": {
                 "type": "object",
                 "properties": {
