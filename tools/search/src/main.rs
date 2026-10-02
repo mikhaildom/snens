@@ -215,9 +215,13 @@ struct Hit {
 struct Answer {
     #[serde(default)]
     results: Vec<Hit>,
+    // Движки, которые отвалились (429/CAPTCHA/timeout). Без этого поля «ничего
+    // не найдено» не отличить от «движки как раз упали» — а они падают регулярно.
+    #[serde(default)]
+    unresponsive_engines: Vec<(String, String)>,
 }
 
-fn fetch(base: &str, a: &Args) -> Result<(usize, Vec<Value>), String> {
+fn fetch(base: &str, a: &Args) -> Result<(usize, Vec<Value>, Vec<(String, String)>), String> {
     let mut q = a.query.clone();
     if let Some(site) = &a.site {
         q.push_str(&format!(" site:{site}"));
@@ -270,7 +274,7 @@ fn fetch(base: &str, a: &Args) -> Result<(usize, Vec<Value>), String> {
             })
         })
         .collect();
-    Ok((total, results))
+    Ok((total, results, ans.unresponsive_engines))
 }
 
 fn main() {
@@ -285,22 +289,36 @@ fn main() {
     }
     let a = parse(&argv);
     let base = base_url();
-    let (total, results) = match fetch(&base, &a) {
+    let (total, results, unresponsive) = match fetch(&base, &a) {
         Ok(v) => v,
         Err(e) => die(1, e),
     };
+    let dead: Vec<String> = unresponsive
+        .iter()
+        .map(|(e, w)| format!("{e} ({w})"))
+        .collect();
 
     if a.json {
         println!(
             "{}",
-            serde_json::to_string(&json!({"query": a.query, "results": results}))
-                .unwrap_or_else(|e| die(1, format!("search: {e}")))
+            serde_json::to_string(&json!({
+                "query": a.query,
+                "results": results,
+                "unresponsive_engines": dead,
+            }))
+            .unwrap_or_else(|e| die(1, format!("search: {e}")))
         );
         return;
     }
 
     if results.is_empty() {
-        println!("ничего не найдено");
+        // Различие, ради которого поле и читается: пусто из-за упавших движков —
+        // это не «в интернете нет», а «инстанс сейчас не ищет».
+        if dead.is_empty() {
+            println!("ничего не найдено");
+        } else {
+            println!("ничего не найдено; отвалились движки: {}", dead.join(", "));
+        }
         return;
     }
     let mut engines = std::collections::BTreeSet::new();
@@ -319,6 +337,9 @@ fn main() {
         results.len(),
         engines.len()
     );
+    if !dead.is_empty() {
+        println!("отвалились движки: {}", dead.join(", "));
+    }
 }
 
 #[cfg(test)]
@@ -373,5 +394,15 @@ mod tests {
         assert_eq!(ans.results[0].published.as_deref(), Some("2024-01-01"));
         assert_eq!(ans.results[1].content, "");
         assert!(ans.results[1].published.is_none());
+    }
+
+    #[test]
+    fn reads_unresponsive_engines() {
+        let raw = r#"{"query":"x","results":[],
+            "unresponsive_engines":[["brave","too many requests"],["duckduckgo","timeout"]]}"#;
+        let ans: Answer = serde_json::from_str(raw).unwrap();
+        assert!(ans.results.is_empty());
+        assert_eq!(ans.unresponsive_engines.len(), 2);
+        assert_eq!(ans.unresponsive_engines[0].0, "brave");
     }
 }
