@@ -40,6 +40,7 @@ snens — узкое ядро агента
   snens review [--session ID]
   snens improve
   snens selftest
+  snens verify                   # check + test --workspace + selftest тулов, один вердикт
 
 Подагенты:
   snens run --detach --session ID [--parent PID] <задача>
@@ -92,6 +93,7 @@ async fn main() -> R<()> {
         Some("review") => review::cmd(&flags).await,
         Some("improve") => improve::cmd(&flags).await,
         Some("selftest") => selftest::selftest().await,
+        Some("verify") => cmd_verify(&flags),
         _ => {
             print!("{USAGE}");
             Ok(())
@@ -612,6 +614,49 @@ pub fn rebuild_and_install(repo: &std::path::Path) -> R<()> {
     let _ = std::fs::remove_file(&dest);
     std::fs::copy(&built, &dest)?;
     eprintln!("[snens] бинарник обновлён: {}", dest.display());
+    Ok(())
+}
+
+/// Одна команда «проверь всё»: cargo check → cargo test --workspace → selftest.sh,
+/// стоп на первой красной. Смысл не в скорости, а в вердикте: без него проверка —
+/// рутина из трёх команд, а фильтрованный вывод на успехе печатает пустоту, и
+/// «тихо» неотличимо от «неясно».
+fn cmd_verify(flags: &BTreeMap<String, String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let repo = cfg.repo_path()?;
+
+    let steps: Vec<(&str, Vec<String>)> = vec![
+        // check, а не build: на каждой правке линковка не нужна.
+        ("cargo check", vec!["check".into(), "--workspace".into()]),
+        (
+            "cargo test --workspace",
+            vec!["test".into(), "--workspace".into()],
+        ),
+        ("selftest тулов", vec![]),
+    ];
+    for (label, args) in steps {
+        println!("── {label}");
+        let status = if label == "selftest тулов" {
+            let sh = repo.join("tools/selftest.sh");
+            if !sh.is_file() {
+                eprintln!("[snens] нет {} — шаг пропущен", sh.display());
+                continue;
+            }
+            std::process::Command::new("sh")
+                .arg(&sh)
+                .current_dir(&repo)
+                .status()?
+        } else {
+            std::process::Command::new("cargo")
+                .args(&args)
+                .current_dir(&repo)
+                .status()?
+        };
+        if !status.success() {
+            return Err(format!("{label}: красный (код {:?})", status.code()).into());
+        }
+    }
+    println!("verify ok");
     Ok(())
 }
 
