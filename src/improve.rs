@@ -16,7 +16,12 @@ pub async fn run(cfg: &Config, llm: &llm::OpenAi) -> R<()> {
     let repo = cfg.repo_path()?;
     let text = PROMPT
         .replace("{{REPO}}", &repo.display().to_string())
-        .replace("{{TICKETS}}", &review::tickets_full(cfg))
+        // Оглавление, а не полные тела: тикетов много, и они растут. Тело
+        // конкретного модель дотянет через `snens tickets show <имя>`.
+        .replace(
+            "{{TICKETS}}",
+            &crate::tickets::open_brief(&cfg.tickets_path()),
+        )
         .replace("{{TICKETS_DIR}}", &cfg.tickets_path().display().to_string())
         .replace("{{INSTANCE}}", &cfg.data_path().display().to_string())
         .replace("{{DATE}}", &review::ymd(log::now()));

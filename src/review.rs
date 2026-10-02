@@ -74,79 +74,9 @@ async fn audit_report(cfg: &Config, log_path: &Path) -> R<String> {
 }
 
 /// Открытые тикеты одной строкой на каждый: ревью должно видеть, что уже есть,
-/// иначе оно придумает ту же проблему заново.
+/// иначе оно придумает ту же проблему заново. Разбор живёт в [`crate::tickets`].
 fn ticket_list(dir: &Path) -> String {
-    let mut rows: Vec<String> = Vec::new();
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("md") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&p) else {
-            continue;
-        };
-        let field = |k: &str| fm(&text, k);
-        if field("status") != "open" {
-            continue;
-        }
-        let symptom = text
-            .lines()
-            .skip_while(|l| !l.trim_start().starts_with("## Симптом"))
-            .skip(1)
-            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("## "))
-            .unwrap_or("")
-            .trim();
-        rows.push(format!(
-            "- {} | {} | {} | hits {} | {}",
-            p.file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
-            field("kind"),
-            field("target"),
-            field("hits"),
-            clip(symptom, 140)
-        ));
-    }
-    rows.sort();
-    if rows.is_empty() {
-        "(открытых тикетов нет)".into()
-    } else {
-        rows.join("\n")
-    }
-}
-
-/// Поле front-matter тикета.
-fn fm(text: &str, key: &str) -> String {
-    text.lines()
-        .find_map(|l| l.strip_prefix(&format!("{key}:")))
-        .map(|v| v.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// Полные тела открытых тикетов: improve разбирает их без хождения по файлам.
-pub fn tickets_full(cfg: &Config) -> String {
-    let mut out = String::new();
-    for e in std::fs::read_dir(cfg.tickets_path())
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("md") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&p) else {
-            continue;
-        };
-        if fm(&text, "status") != "open" {
-            continue;
-        }
-        let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-        out.push_str(&format!("=== {name} ===\n{text}\n"));
-    }
-    if out.is_empty() {
-        "(открытых тикетов нет)".into()
-    } else {
-        out
-    }
+    crate::tickets::open_list(dir)
 }
 
 fn render_prompt(
@@ -163,14 +93,6 @@ fn render_prompt(
         .replace("{{TICKETS}}", tickets.trim_end())
         .replace("{{TICKETS_DIR}}", tickets_dir)
         .replace("{{DATE}}", date)
-}
-
-fn clip(s: &str, n: usize) -> String {
-    let mut t: String = s.chars().take(n).collect();
-    if s.chars().count() > n {
-        t.push('…');
-    }
-    t
 }
 
 /// Дата из unix-времени: без зависимостей и без внешней `date` (её нет на Windows).

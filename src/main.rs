@@ -18,6 +18,7 @@ mod render;
 mod review;
 mod selftest;
 mod subagent;
+mod tickets;
 mod tui;
 
 use std::{collections::BTreeMap, error::Error};
@@ -32,6 +33,8 @@ snens — узкое ядро агента
   snens show [--session ID]
   snens log  [--session ID]
   snens sessions
+  snens tickets [--all] [--target T] [--kind K]
+  snens tickets show <имя> | grep <текст> | stats
   snens tools
   snens build
   snens review [--session ID]
@@ -83,6 +86,7 @@ async fn main() -> R<()> {
             }
             Ok(())
         }
+        Some("tickets") => tickets::cmd(&flags, positional),
         Some("tools") => cmd_tools(&flags).await,
         Some("build") => cmd_build(&flags),
         Some("review") => review::cmd(&flags).await,
