@@ -36,7 +36,7 @@ snens — узкое ядро агента
   snens tickets [--all] [--target T] [--kind K]
   snens tickets show <имя> | grep <текст> | stats
   snens tools
-  snens build
+  snens build [<tool>…]          # без аргументов весь workspace, с аргументами — только названные тулы
   snens review [--session ID]
   snens improve
   snens selftest
@@ -89,7 +89,7 @@ async fn main() -> R<()> {
         }
         Some("tickets") => tickets::cmd(&flags, positional),
         Some("tools") => cmd_tools(&flags).await,
-        Some("build") => cmd_build(&flags),
+        Some("build") => cmd_build(&flags, positional),
         Some("review") => review::cmd(&flags).await,
         Some("improve") => improve::cmd(&flags).await,
         Some("selftest") => selftest::selftest().await,
@@ -541,17 +541,41 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
 /// Собрать вшитые тулы и положить бинарники туда, откуда их берёт реестр:
 /// `tools/<имя>/<имя>[.exe]`. Шаг входит в дефолтную установку, поэтому он в
 /// харнессе, а не в sh-скрипте: на Windows sh нет.
-fn cmd_build(flags: &BTreeMap<String, String>) -> R<()> {
+/// `snens build [<tool>…]` — без аргументов весь workspace, с аргументами только
+/// названные крейты (правка одного тула не должна линковать все, ~40 с → ~2 с).
+fn cmd_build(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
+    if flags.contains_key("help") || flags.contains_key("h") {
+        println!("snens build [<tool>…] — без аргументов весь workspace, с аргументами — только названные тулы");
+        return Ok(());
+    }
     let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
     let tools_dir = cfg.tools_path();
     let root = tools_dir
         .parent()
         .ok_or("у tools_dir нет родителя — негде запускать cargo")?;
 
-    let ok = std::process::Command::new("cargo")
-        .args(["build", "--release", "--workspace"])
-        .current_dir(root)
-        .status()?;
+    // Что собирать: названные крейты или весь workspace. Имена сверяем с
+    // каталогами тулов, чтобы `snens build nosuch` падал, а не собирал всё молча.
+    let all = positional.is_empty();
+    let mut targets = Vec::new();
+    for name in &positional {
+        let dir = tools_dir.join(name);
+        if !dir.join("Cargo.toml").is_file() {
+            return Err(format!("нет тула {name} в {}", tools_dir.display()).into());
+        }
+        targets.push(name.clone());
+    }
+
+    let mut cargo = std::process::Command::new("cargo");
+    cargo.args(["build", "--release"]);
+    if all {
+        cargo.arg("--workspace");
+    } else {
+        for name in &targets {
+            cargo.args(["-p", name]);
+        }
+    }
+    let ok = cargo.current_dir(root).status()?;
     if !ok.success() {
         return Err("cargo build завершился с ошибкой".into());
     }
@@ -566,6 +590,9 @@ fn cmd_build(flags: &BTreeMap<String, String>) -> R<()> {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
             continue;
         };
+        if !all && !targets.contains(&name) {
+            continue;
+        }
         let from = release.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         if !from.is_file() {
             eprintln!("[snens] {name}: нет {} — пропускаю", from.display());
