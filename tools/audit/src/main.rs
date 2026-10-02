@@ -60,7 +60,10 @@ fn main() {
 struct Row {
     turn: usize,
     tool: String,
+    /// человекочитаемая строка вызова (обрезана для печати)
     cmd: String,
+    /// ключ повтора: полное содержимое вызова, без обрезки
+    key: String,
     exit: i32,
     bytes: usize,
     ms: u64,
@@ -80,13 +83,16 @@ struct Report {
     freed_bytes: usize,
 }
 
-/// `argv[0]` — сырая строка аргументов от модели; для глаза достаём из неё `args`
-/// (у тулов) или `command` (у `run`).
-fn cmd_of(raw: &str) -> String {
+/// Разбор сырой строки аргументов от модели в пару (человекочитаемый `cmd`,
+/// ключ повтора `key`). `argv[0]` — сырая строка аргументов; для глаза достаём
+/// из неё `args` (у тулов) или `command` (у `run`), а ключом делаем **полное**
+/// содержимое вызова, иначе две разные правки с общим 40-символьным префиксом
+/// `old_string` склеиваются в ложный `duplicate`.
+fn cmd_of(raw: &str) -> (String, String) {
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
-        return raw.to_string();
+        return (raw.to_string(), raw.to_string());
     };
-    let mut s = match v.get("args") {
+    let head = match v.get("args") {
         Some(Value::String(x)) => x.clone(),
         Some(Value::Array(a)) => a
             .iter()
@@ -100,8 +106,11 @@ fn cmd_of(raw: &str) -> String {
     };
     // Правка того же файла другим текстом — не повтор вызова: без этого два
     // разных `edit` неотличимы и попадают в duplicate.
+    let mut full = head.clone();
+    let mut shown = head;
     if let Some(old) = v.get("old_string").and_then(Value::as_str) {
-        s.push_str(&format!("  ⟵ «{}»", clip(old, 40)));
+        full.push_str(&format!("  ⟵ «{old}»"));
+        shown.push_str(&format!("  ⟵ «{}»", clip(old, 40)));
     }
     if let Some(stdin) = v.get("stdin").and_then(Value::as_str) {
         // У тулов правки payload приходит на stdin, а не в args: без разбора
@@ -112,11 +121,18 @@ fn cmd_of(raw: &str) -> String {
                 .map(str::to_string)
         });
         match old {
-            Some(o) => s.push_str(&format!("  ⟵ «{}»", clip(&o, 40))),
-            None => s.push_str(&format!("  ⇐ {} Б на stdin", stdin.len())),
+            Some(o) => {
+                full.push_str(&format!("  ⟵ «{o}»"));
+                shown.push_str(&format!("  ⟵ «{}»", clip(&o, 40)));
+            }
+            None => {
+                let t = format!("  ⇐ {} Б на stdin", stdin.len());
+                full.push_str(&t);
+                shown.push_str(&t);
+            }
         }
     }
-    s
+    (shown, full)
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -142,7 +158,7 @@ fn analyze(path: &str, text: &str) -> Report {
         freed_bytes: 0,
     };
     // Вызовы текущего хода: результат приходит отдельной записью и знает только call_id.
-    let mut pending: Vec<(String, String, String)> = Vec::new();
+    let mut pending: Vec<(String, String, String, String)> = Vec::new();
 
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -171,8 +187,8 @@ fn analyze(path: &str, text: &str) -> Report {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let cmd = cmd_of(c.get("args").and_then(Value::as_str).unwrap_or(""));
-                    pending.push((id, name, cmd));
+                    let (cmd, key) = cmd_of(c.get("args").and_then(Value::as_str).unwrap_or(""));
+                    pending.push((id, name, cmd, key));
                 }
             }
             "tool_result" => {
@@ -188,18 +204,22 @@ fn analyze(path: &str, text: &str) -> Report {
                     .and_then(|a| a.first())
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let found = pending.iter().position(|(cid, _, _)| cid == id);
-                let (tool, cmd) = match found {
+                let found = pending.iter().position(|(cid, _, _, _)| cid == id);
+                let (tool, cmd, key) = match found {
                     Some(pos) => {
-                        let (_, n, c) = pending.remove(pos);
-                        (n, c)
+                        let (_, n, c, k) = pending.remove(pos);
+                        (n, c, k)
                     }
-                    None => (tool, cmd_of(argv0)),
+                    None => {
+                        let (c, k) = cmd_of(argv0);
+                        (tool, c, k)
+                    }
                 };
                 r.rows.push(Row {
                     turn: r.turns,
                     tool,
                     cmd,
+                    key,
                     exit: v.get("exit").and_then(Value::as_i64).unwrap_or(-1) as i32,
                     bytes: v.get("bytes").and_then(Value::as_u64).unwrap_or(0) as usize,
                     ms: v.get("ms").and_then(Value::as_u64).unwrap_or(0),
@@ -228,7 +248,10 @@ fn suspects(rows: &[Row], huge: usize) -> Vec<String> {
     // ponytail: линейный поиск по ключу, лог на тысячи строк ещё не тот случай
     let mut groups: Vec<((&str, &str), Vec<usize>)> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
-        let key = (r.tool.as_str(), r.cmd.as_str());
+        // Ключ повтора — полное содержимое вызова (r.key), а не обрезанное для
+        // печати r.cmd: иначе две разные правки с общим префиксом old_string
+        // дают ложный duplicate.
+        let key = (r.tool.as_str(), r.key.as_str());
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, list)) => list.push(i),
             None => groups.push((key, vec![i])),
@@ -269,7 +292,7 @@ fn suspects(rows: &[Row], huge: usize) -> Vec<String> {
         let retried_ok = rows
             .iter()
             .skip(i + 1)
-            .any(|n| n.exit == 0 && n.tool == r.tool && n.cmd == r.cmd);
+            .any(|n| n.exit == 0 && n.tool == r.tool && n.key == r.key);
         if !retried_ok {
             out.push(format!(
                 "failed-abandoned exit={:<4} ход {}  {}  {}",
@@ -463,6 +486,40 @@ mod tests {
             "разные правки — не повтор: {out}"
         );
         assert!(out.contains("«alpha»"), "текст правки виден: {out}");
+    }
+
+    /// Регресс: у двух разных правок `old_string` совпадает в первых 40+ символах.
+    /// Ключ повтора обязан брать полный текст, иначе — ложный duplicate.
+    #[test]
+    fn edits_sharing_a_long_prefix_are_not_duplicates() {
+        let prefix = "pub struct Reply {\n    pub text: String,\n    pub calls: Vec<Call>,";
+        assert!(prefix.chars().count() > 40);
+        let mut s = String::new();
+        for (id, tail) in [
+            ("e1", "\n    pub extra: bool,"),
+            ("e2", "\n    /// ход\n    pub note: String,"),
+        ] {
+            let old = format!("{prefix}{tail}");
+            let inner = serde_json::json!({"old_string": old, "new_string": "x"}).to_string();
+            let args = serde_json::json!({"args": "f.rs", "stdin": inner}).to_string();
+            s.push_str(
+                &serde_json::json!({"kind":"assistant","ts":1,"text":null,
+                    "tool_calls":[{"id":id,"name":"edit","args":args}]})
+                .to_string(),
+            );
+            s.push('\n');
+            s.push_str(
+                &serde_json::json!({"kind":"tool_result","ts":2,"call_id":id,"tool":"edit",
+                    "argv":["{}"],"exit":0,"bytes":130,"ms":5,"body":{"t":"inline","text":"{}"}})
+                .to_string(),
+            );
+            s.push('\n');
+        }
+        let out = render(&analyze("t.jsonl", &s), HUGE);
+        assert!(
+            !out.contains("duplicate"),
+            "общий префикс old_string — не повтор: {out}"
+        );
     }
 
     #[test]
