@@ -12,6 +12,7 @@ mod mail;
 mod memory;
 mod project;
 mod prompt;
+mod reasoning;
 mod reduce;
 mod registry;
 mod render;
@@ -455,6 +456,8 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
     let recs = sess.read()?;
 
     let (mut calls, mut in_tok, mut cached, mut out_tok, mut cost) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut reason_tok = 0u64;
+    let mut encrypted_turns = 0u64;
     let mut biggest: Option<(usize, &str)> = None;
     // Для диагностики кеша: сколько ходов пришло без кеша и менялся ли апстрим
     // провайдера. Смена бэкенда объясняет промах, который иначе искать в проекции.
@@ -474,12 +477,18 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
                 out_tok: o,
                 cost_micro: m,
                 upstream_id,
+                reason_tok: r,
+                encrypted_reasoning,
                 ..
             } => {
                 in_tok += i;
                 cached += c;
                 out_tok += o;
                 cost += m;
+                reason_tok += r;
+                if *encrypted_reasoning {
+                    encrypted_turns += 1;
+                }
                 usages += 1;
                 if *c == 0 {
                     uncached_turns += 1;
@@ -499,6 +508,16 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
         println!("макс. результат: {b} Б ({name})");
     }
     println!("токены:  вход {in_tok} (из них кеш {cached}), выход {out_tok}");
+    if reason_tok > 0 {
+        // Рассуждение у зашифрованных моделей не читается, но оплачено —
+        // сумма показывает, сколько стоили ходы, которых мы не видели.
+        let closed = if encrypted_turns > 0 {
+            format!(", ходов с закрытым рассуждением: {encrypted_turns}")
+        } else {
+            String::new()
+        };
+        println!("рассуж.: {reason_tok} токенов{closed}");
+    }
     if usages > 0 {
         // Ходы без кеша — норма для первого хода и после смены апстрима. Если их
         // много подряд на одном апстриме — тогда промах наш, искать в проекции.

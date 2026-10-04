@@ -143,8 +143,20 @@ async fn run_loop<L: Llm>(
             } else {
                 String::new()
             };
+            // Рассуждение отдельной строкой только когда оно было и было видно:
+            // иначе ↓ молча обманывает — выход кажется дешёвым, а в нём сидел
+            // зашифрованный ход, за который мы всё равно заплатили.
+            let reasoning = if reply.usage.reason_tok > 0 {
+                format!(
+                    " (рассуж. {}{})",
+                    reply.usage.reason_tok,
+                    if reply.usage.encrypted { " зашифровано" } else { "" }
+                )
+            } else {
+                String::new()
+            };
             ui.notice(&format!(
-                "ход {turn}: ↑{} (кеш {}) ↓{}{cost}",
+                "ход {turn}: ↑{} (кеш {}) ↓{}{reasoning}{cost}",
                 reply.usage.in_tok, reply.usage.cached_tok, reply.usage.out_tok
             ));
         }
@@ -379,6 +391,8 @@ fn usage_rec(reply: &Reply) -> Rec {
         upstream_id: reply.upstream.id.clone(),
         fingerprint: reply.upstream.fingerprint.clone(),
         finish_reason: reply.finish_reason.clone(),
+        reason_tok: reply.usage.reason_tok,
+        encrypted_reasoning: reply.usage.encrypted,
     }
 }
 /// Сколько строк результата показывать человеку в терминале.

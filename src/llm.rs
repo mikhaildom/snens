@@ -13,6 +13,16 @@ pub struct Usage {
     pub cached_tok: u64,
     pub out_tok: u64,
     pub cost_micro: u64,
+    /// Токены рассуждения по счётчику провайдера
+    /// (`completion_tokens_details.reasoning_tokens`). У моделей, которые
+    /// прячут рассуждение, это единственный след его настоящей цены: видимый
+    /// текст и usage по выходу показывают только короткий ответ.
+    pub reason_tok: u64,
+    /// Провайдер отдал рассуждение зашифрованным (`reasoning.encrypted`):
+    /// вместо текста пришёл блоб, который нам не прочитать. Видно только
+    /// сводку (`reasoning.summary`), если она была. Флаг — чтобы не молчать
+    /// там, где reasoning на самом деле был и стоил денег.
+    pub encrypted: bool,
 }
 
 pub struct Reply {
@@ -153,6 +163,9 @@ impl OpenAi {
         // index -> (id, name, arguments) — стрим приходит фрагментами
         let mut parts: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
         let mut usage = Usage::default();
+        // Признак зашифрованного reasoning: сам блоб нам не прочитать, но его
+        // наличие видно и объясняет, почему сводка такая короткая.
+        let mut encrypted = false;
         // Отпечаток апстрима для диагностики кеша: id виден в каждом кадре,
         // fingerprint (vLLM) — только когда провайдер его пришлёт.
         let mut upstream = Upstream::default();
@@ -212,6 +225,11 @@ impl OpenAi {
                         on_delta(Delta::Reasoning(r));
                     }
                 }
+                if let Some(summary) = crate::reasoning::take_details(d, &mut encrypted) {
+                    reasoning.push_str(&summary);
+                    *seen = true;
+                    on_delta(Delta::Reasoning(&summary));
+                }
                 if let Some(c) = d.get("content").and_then(|c| c.as_str()) {
                     if !c.is_empty() {
                         text.push_str(c);
@@ -258,12 +276,16 @@ impl OpenAi {
             text,
             reasoning,
             calls,
-            usage,
+            usage: Usage {
+                encrypted,
+                ..usage
+            },
             upstream,
             finish_reason,
         })
     }
 }
+
 
 fn parse_usage(u: &Value) -> Usage {
     Usage {
@@ -276,6 +298,11 @@ fn parse_usage(u: &Value) -> Usage {
             .pointer("/prompt_tokens_details/cached_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        reason_tok: u
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        encrypted: false,
         cost_micro: u
             .get("cost")
             .and_then(|v| v.as_f64())
