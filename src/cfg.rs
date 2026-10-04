@@ -319,6 +319,69 @@ impl Config {
         }
     }
 
+    /// Сменить основную модель: правит строку `model = "..."` в конфиге.
+    /// Текстом, а не пере-сериализацией TOML: комментарии и порядок полей
+    /// человека — часть конфига, `toml::to_string` их сносит. Ключа в файле
+    /// нет — вставляем до первой `[секции]`, чтобы остался top-level.
+    /// Возвращает путь конфига (что именно поправили).
+    pub fn set_model(&self, slug: &str, override_path: Option<&str>) -> R<PathBuf> {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            return Err("пустой slug модели".into());
+        }
+        let path = match override_path {
+            Some(p) => PathBuf::from(p),
+            None => config_path(),
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+        };
+        let line = format!("model = \"{slug}\"");
+        let mut out = String::new();
+        let mut replaced = false;
+        let mut inserted = false;
+        for raw in text.lines() {
+            let key = raw.trim_start();
+            let is_model = key
+                .strip_prefix("model")
+                .map(|rest| rest.trim_start().starts_with('='))
+                .unwrap_or(false);
+            if !replaced && is_model {
+                out.push_str(&line);
+                out.push('\n');
+                replaced = true;
+                continue;
+            }
+            // Нет ключа: вставляем перед первой секцией (иначе ключ уедет в неё).
+            if !replaced && !inserted && key.starts_with('[') {
+                out.push_str(&line);
+                out.push('\n');
+                inserted = true;
+            }
+            out.push_str(raw);
+            out.push('\n');
+        }
+        if !replaced && !inserted {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, out)?;
+        // Проверяем, что конфиг остался валидным и модель действительно та.
+        let check = Config::load(Some(&path.display().to_string()))?;
+        if check.model != slug {
+            return Err(format!("модель не применилась: в конфиге {}", check.model).into());
+        }
+        Ok(path)
+    }
+
     /// Ключ: сначала переменная окружения, потом `.env` рядом с конфигом —
     /// чтобы snens мог стоять сам, без оболочки с экспортами.
     pub fn api_key(&self) -> R<String> {
@@ -351,5 +414,59 @@ impl Config {
             path.display()
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("snens-cfg-{}-{name}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn set_model_заменяет_строку_и_хранит_комментарии() {
+        let p = tmp("replace");
+        std::fs::write(
+            &p,
+            "# шапка\nmodel = \"старая\"\nbase_url = \"http://x\"\n\n[memory]\ncmd = \"memory\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&p.display().to_string())).unwrap();
+        cfg.set_model("новая/модель", Some(&p.display().to_string()))
+            .unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# шапка"), "комментарий потерян: {text}");
+        assert!(text.contains("model = \"новая/модель\""));
+        assert!(!text.contains("старая"));
+        // секция осталась секцией, ключ не уехал в неё
+        let reload = Config::load(Some(&p.display().to_string())).unwrap();
+        assert_eq!(reload.model, "новая/модель");
+        assert_eq!(reload.memory.cmd, "memory");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn set_model_вставляет_ключ_перед_секцией() {
+        let p = tmp("insert");
+        std::fs::write(&p, "base_url = \"http://x\"\n\n[memory]\ncmd = \"memory\"\n").unwrap();
+        let cfg = Config::load(Some(&p.display().to_string())).unwrap();
+        cfg.set_model("m1", Some(&p.display().to_string())).unwrap();
+        let reload = Config::load(Some(&p.display().to_string())).unwrap();
+        assert_eq!(reload.model, "m1");
+        assert_eq!(reload.memory.cmd, "memory");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn set_model_пустой_слаг_ошибка() {
+        let p = tmp("empty");
+        std::fs::write(&p, "model = \"x\"\n").unwrap();
+        let cfg = Config::load(Some(&p.display().to_string())).unwrap();
+        assert!(cfg.set_model("  ", Some(&p.display().to_string())).is_err());
+        let _ = std::fs::remove_file(&p);
     }
 }

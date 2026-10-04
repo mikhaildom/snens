@@ -36,6 +36,7 @@ snens — узкое ядро агента
   snens tickets [--all] [--target T] [--kind K]
   snens tickets show <имя> | grep <текст> | stats
   snens tools
+  snens model [slug]             # без аргумента — какая сейчас; со slug — сменить в конфиге
   snens build [<tool>…]          # без аргументов весь workspace, с аргументами — только названные тулы
   snens review [--session ID]
   snens improve
@@ -89,6 +90,7 @@ async fn main() -> R<()> {
         }
         Some("tickets") => tickets::cmd(&flags, positional),
         Some("tools") => cmd_tools(&flags).await,
+        Some("model") => cmd_model(&flags, positional),
         Some("build") => cmd_build(&flags, positional),
         Some("review") => review::cmd(&flags).await,
         Some("improve") => improve::cmd(&flags).await,
@@ -534,6 +536,24 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
     }
     for t in &tools {
         println!("{}\n  {}\n  {}", t.name, t.summary, t.usage);
+    }
+    Ok(())
+}
+
+/// `snens model [slug]` — какая модель сейчас и смена основной модели в конфиге.
+/// Без аргумента печатает текущую; со slug правит `model = "..."` в config.toml.
+fn cmd_model(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
+    if flags.contains_key("help") || flags.contains_key("h") {
+        println!("snens model [slug] — без аргумента показать текущую модель, со slug — сменить в конфиге");
+        return Ok(());
+    }
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    match positional.first() {
+        None => println!("{}", cfg.model),
+        Some(slug) => {
+            let path = cfg.set_model(slug, flags.get("config").map(|s| s.as_str()))?;
+            println!("{slug}\n({})", path.display());
+        }
     }
     Ok(())
 }
