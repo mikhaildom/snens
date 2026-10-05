@@ -81,6 +81,19 @@ async fn run_loop<L: Llm>(
     // Полные выводы обрезанных команд: модель получает путь и может дочитать.
     let out_dir = sess.path().with_extension("out");
     let mail_dir = cfg.mail_path();
+    let mut mirror = crate::context::Mirror::open(sess, cfg)?;
+    let mut pressure_next = cfg.context_budget();
+    // Persist reminder hysteresis across resume; successful edits can re-arm it below target.
+    for rec in sess.read()? {
+        if let Rec::User { source, .. } = rec {
+            if let Some(n) = source
+                .strip_prefix("context-cleanup:")
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                pressure_next = n;
+            }
+        }
+    }
     let mut turn = 0u32;
     // Пустой ответ — не конец работы, а сбой (обрыв стрима, непарсимый формат
     // вызова). Считаем подряд: первый повторяем запросом, второй — выходим явной
@@ -104,33 +117,37 @@ async fn run_loop<L: Llm>(
                 text: msg.text,
             });
         }
-        let log = sess.read()?;
-        let (msgs, report) = project::project(&log, cfg);
-        let approx = project::estimate_tokens(&msgs);
-        // Оба порога пока только сигналят: это точки, где должна сработать компакция (M3).
-        let ratio = approx as f64 / cfg.ctx_window as f64;
-        if ratio > cfg.hard {
+        let raw = sess.read()?;
+        let mut msgs = mirror.prepare(&raw, cfg)?;
+        let schema_tokens = serde_json::to_vec(&defs)?.len() as u64 / 3;
+        let approx = project::estimate_tokens(&msgs) + schema_tokens;
+        if approx < cfg.context_target() {
+            pressure_next = cfg.context_budget();
+        }
+        if approx >= pressure_next {
+            pressure_next = approx
+                .saturating_add(cfg.context_budget() / 4)
+                .max(approx.saturating_add(1));
+            sess.append(Rec::User {
+                ts: log::now(),
+                source: format!("context-cleanup:{pressure_next}"),
+                text: format!("[Уборка рабочего контекста] Сейчас ~{approx} токенов, экономический бюджет {}. Перед продолжением задачи отредактируй {} и вызови ctx commit. Ориентир после уборки — {} токенов. Удали переваренные выводы и законченные ветки, сохрани полезные точные фрагменты и обнови записку для продолжения: цель, ограничения, решения, точные данные, открытые проверки, следующие действия. Не пересказывай историю ради пересказа. Стратегию и объём правок выбираешь ты.", cfg.context_budget(), mirror.path().display(), cfg.context_target()),
+            })?;
+            msgs = mirror.prepare(&sess.read()?, cfg)?;
             ui.notice(&format!(
-                "~{approx} токенов — пройден порог саммаризации ({:.0}%), саммари ещё нет",
-                cfg.hard * 100.0
-            ));
-        } else if ratio > cfg.soft {
-            ui.notice(&format!(
-                "~{approx} токенов — пройден порог элизии ({:.0}%)",
-                cfg.soft * 100.0
+                "контекст ~{approx}: запрос уборки (бюджет {})",
+                cfg.context_budget()
             ));
         }
-        if report.elided > last_elided(&log) {
-            ui.notice(&format!(
-                "компакция: вырезано результатов {}, освобождено {} Б",
-                report.elided, report.freed_bytes
-            ));
-            sess.append(Rec::Ctx {
-                ts: log::now(),
-                action: "elide".into(),
-                elided: report.elided,
-                freed_bytes: report.freed_bytes,
-            })?;
+        // Protocol is constant across requests; outside the editable mirror.
+        msgs.insert(1, serde_json::json!({"role":"system", "content": format!(
+            "Ты управляешь своим рабочим контекстом. Зеркало следующего ввода: {} (также SNENS_CONTEXT_PATH в окружении инструментов). Читай его окнами и редактируй обычными read/edit/write/run, затем ctx commit. JSON blocks содержат messages; вызовы и ответы инструмента связаны одним блоком: нельзя оставлять сироты. Можно сокращать аргументы (валидный JSON), ответы, удалять целые пары/блоки, добавлять текстовые user notes с id new-*. Системные сообщения вне зеркала. Правка действует после результатов шага; исходный журнал не меняется. Держи рабочую записку и proactively удаляй ненужное. Бюджет {} токенов, цель уборки {}. Успешные прямые read/edit/write зеркала и ctx commit не остаются в рабочей истории; shell-команды остаются. Не дублируй всё зеркало в ответе.", mirror.path().display(), cfg.context_budget(), cfg.context_target())}));
+
+        let physical_limit = cfg
+            .ctx_window
+            .saturating_sub(cfg.context_reserve.min(cfg.ctx_window / 4));
+        if project::estimate_tokens(&msgs) + schema_tokens >= physical_limit {
+            return Err("рабочий контекст достиг физического предела; запрос не отправлен. Нужна уборка LIVE_CONTEXT.json или больший размер окна".into());
         }
 
         let reply: Reply = stream_reply(cfg, msgs, defs.clone(), llm, ui).await?;
@@ -150,7 +167,11 @@ async fn run_loop<L: Llm>(
                 format!(
                     " (рассуж. {}{})",
                     reply.usage.reason_tok,
-                    if reply.usage.encrypted { " зашифровано" } else { "" }
+                    if reply.usage.encrypted {
+                        " зашифровано"
+                    } else {
+                        ""
+                    }
                 )
             } else {
                 String::new()
@@ -257,6 +278,31 @@ async fn run_loop<L: Llm>(
             })?;
         }
 
+        let committing = reply.calls.iter().any(|c| {
+            c.name == "ctx"
+                && serde_json::from_str::<Value>(&c.args)
+                    .ok()
+                    .is_some_and(|a| {
+                        a.get("action").and_then(Value::as_str).unwrap_or("commit") == "commit"
+                    })
+        });
+        let outcome = if committing {
+            Some(
+                mirror
+                    .apply(sess, cfg)?
+                    .unwrap_or_else(|| "context unchanged: no edit to apply".to_string()),
+            )
+        } else {
+            None
+        };
+        if let Some(outcome) = outcome {
+            ui.notice(&outcome);
+            sess.append(Rec::ContextNotice {
+                ts: log::now(),
+                text: format!("[Harness context status] {outcome}"),
+            })?;
+        }
+
         // Лимит исчерпан — не падаем и не закрываем поверхность: просим
         // промежуточный итог и на этом заканчиваем запуск (см. final_answer).
         if turn >= cfg.max_turns {
@@ -326,7 +372,13 @@ async fn final_answer<L: Llm>(
         source: "limit".into(),
     })?;
     let log = sess.read()?;
-    let (msgs, _) = project::project(&log, cfg);
+    let msgs = crate::context::effective(&log, cfg)?;
+    let limit = cfg
+        .ctx_window
+        .saturating_sub(cfg.context_reserve.min(cfg.ctx_window / 4));
+    if project::estimate_tokens(&msgs) >= limit {
+        return Err("final answer context exceeds physical window; compact before resuming".into());
+    }
     let reply = stream_reply(cfg, msgs, Vec::new(), llm, ui).await?;
     sess.append(Rec::Assistant {
         ts: log::now(),
@@ -591,15 +643,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
-}
-
-/// Сколько результатов проекция уже вырезала по последней записи журнала.
-fn last_elided(log: &[Rec]) -> usize {
-    log.iter()
-        .rev()
-        .find_map(|r| match r {
-            Rec::Ctx { elided, .. } => Some(*elided),
-            _ => None,
-        })
-        .unwrap_or(0)
 }

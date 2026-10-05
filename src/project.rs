@@ -1,8 +1,5 @@
 // Промпт — чистая проекция лога. Бухгалтерия (Usage/Meta/Ctx) сюда не попадает,
 // поэтому префикс стабилен и кеш не промахивается.
-//
-// Компакция — правило проекции, а не перезапись лога: лог неизменяем, элизия
-// обратима, потому что исходные результаты по-прежнему лежат в файле сессии.
 use std::{collections::HashSet, sync::Mutex};
 
 use base64::Engine;
@@ -21,34 +18,16 @@ const REPLAY_NOTE: &str = "Всё выше — транскрипт уже за�
 вызовы инструментов не твои, повторять их нельзя. Не продолжай ту работу: дальше — новая \
 инструкция, и выполнять нужно только её.";
 
-#[derive(Default, Clone, Copy, Debug)]
-pub struct Report {
-    pub elided: usize,
-    pub freed_bytes: usize,
-    /// Сколько вложений вырезано при компакции (они дороже текста в разы).
-    pub elided_attachments: usize,
-}
-
-/// Проекция с учётом переполнения: если она не влезает в мягкий порог,
-/// старые результаты тулов схлопываются до пометки. Решение детерминировано —
-/// зависит только от лога и конфига, поэтому кеш не промахивается сам по себе.
-pub fn project(log: &[Rec], cfg: &Config) -> (Vec<Value>, Report) {
-    let (full, _) = build(log, cfg, false);
-    if estimate_tokens(&full) <= soft_limit(cfg) {
-        return (full, Report::default());
-    }
-    build(log, cfg, true)
+pub fn raw_msgs(log: &[Rec], cfg: &Config) -> Vec<Value> {
+    build(log, cfg)
 }
 
 pub fn msgs(log: &[Rec], cfg: &Config) -> Vec<Value> {
-    project(log, cfg).0
+    // Inspection can show the raw journal if a checkpoint was damaged.
+    crate::context::effective(log, cfg).unwrap_or_else(|_| raw_msgs(log, cfg))
 }
 
-pub fn soft_limit(cfg: &Config) -> u64 {
-    (cfg.ctx_window as f64 * cfg.soft) as u64
-}
-
-fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
+fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
     // Промпт сессии — из лога. Пересборка из файлов только как запасной путь для
     // логов, записанных до появления записи System.
     let system = log
@@ -59,22 +38,6 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
         })
         .unwrap_or_else(|| crate::prompt::system_prompt(cfg));
     let mut out = vec![json!({"role": "system", "content": system})];
-    let mut report = Report::default();
-    // Последние keep_results остаются как есть при любом размере: модель работает
-    // именно с ними. Всё, что раньше, — уже переваренный материал.
-    let total_results = log
-        .iter()
-        .filter(|r| matches!(r, Rec::ToolResult { .. }))
-        .count();
-    let keep_from = total_results.saturating_sub(cfg.keep_results);
-    let mut seen_results = 0usize;
-    // Вложения дороже текста в разы, поэтому у них свой, более строгий порог.
-    let total_with_parts = log
-        .iter()
-        .filter(|r| matches!(r, Rec::ToolResult { parts, .. } if !parts.is_empty()))
-        .count();
-    let keep_from_attach = total_with_parts.saturating_sub(cfg.keep_attachments);
-    let mut seen_with_parts = 0usize;
     // Есть ли выше рамки настоящий ход (запрос пользователя и/или вызовы): тогда
     // рамка — это ревью/улучшение поверх транскрипта, и транскрипт надо пометить.
     let mut had_work = false;
@@ -124,7 +87,7 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
                             json!({
                                 "id": c.id,
                                 "type": "function",
-                                "function": {"name": c.name, "arguments": c.args}
+                                "function": {"name": c.name, "arguments": historical_arguments(&c.args)}
                             })
                         })
                         .collect();
@@ -149,51 +112,21 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
             }
             Rec::ToolResult {
                 call_id,
-                tool,
-                argv,
-                exit,
-                bytes,
                 body,
                 parts,
                 ..
             } => {
-                let idx = seen_results;
-                seen_results += 1;
                 // Кап на результат живёт здесь, а не в инструменте: это единственная
                 // точка, через которую проходит любой вывод любого тула.
                 let text = match body {
                     Body::Inline { text } => truncate(text, cfg.max_result_chars),
                 };
-                let text = if elide && idx < keep_from {
-                    report.elided += 1;
-                    report.freed_bytes += text.len();
-                    format!(
-                        "[результат вырезан при компакции: {tool}, {bytes} Б, exit {exit} — {}]",
-                        command_hint(argv)
-                    )
-                } else {
-                    text
-                };
-                let part_idx = if parts.is_empty() {
-                    None
-                } else {
-                    let i = seen_with_parts;
-                    seen_with_parts += 1;
-                    Some(i)
-                };
-                // Вложения вырезаются по своему порогу: держим последние
-                // keep_attachments, остальные — уже просмотренный материал.
-                let drop_parts = elide && part_idx.is_some_and(|i| i < keep_from_attach);
-                let kept: &[Part] = if drop_parts { &[] } else { parts };
-                if drop_parts {
-                    report.elided_attachments += parts.len();
-                    report.freed_bytes += parts.iter().map(|p| p.bytes).sum::<usize>();
-                }
-                let content = content_value(&text, kept, cfg, drop_parts);
+                let content = content_value(&text, parts, cfg);
                 out.push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
             }
             // Справка памяти — системная роль: это контекст, а не запрос
             // пользователя, и второй `user` подряд ломает чередование ролей.
+            Rec::ContextNotice { text, .. } => out.push(json!({"role":"system","content":text})),
             Rec::Recall { text, .. } => out.push(json!({"role": "system", "content": text})),
             // Сообщение от другой сессии (родителя/ребёнка) или steer человека:
             // это слово, адресованное нам, поэтому роль `user` — но с пометкой
@@ -213,11 +146,12 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
             Rec::System { .. }
             | Rec::Meta { .. }
             | Rec::Usage { .. }
+            | Rec::ContextRevision { .. }
             | Rec::Ctx { .. }
             | Rec::Done { .. } => {}
         }
     }
-    (out, report)
+    out
 }
 
 /// Контент сообщения: плоская строка, если вложений нет (как раньше), иначе
@@ -226,13 +160,9 @@ fn build(log: &[Rec], cfg: &Config, elide: bool) -> (Vec<Value>, Report) {
 ///
 /// Ссылку на путь не подставляем вместо base64: у провайдера нет доступа к
 /// нашей файловой системе, он запросит URL и получит 400.
-fn content_value(text: &str, parts: &[Part], cfg: &Config, elided: bool) -> Value {
+fn content_value(text: &str, parts: &[Part], cfg: &Config) -> Value {
     if parts.is_empty() {
-        let mut t = text.to_string();
-        if elided {
-            t.push_str("\n[вложения вырезаны при компакции: перечитай файл, если нужны]");
-        }
-        return json!(t);
+        return json!(text);
     }
     let mut arr = vec![json!({"type": "text", "text": text})];
     for p in parts {
@@ -286,33 +216,74 @@ fn data_url(path: &str, mime: &str) -> Option<String> {
     Some(url)
 }
 
-/// Команду из лога оставляем в пометке: без неё модель не знает, что именно
-/// было вырезано, и не может решить, перезапускать или нет.
-fn command_hint(argv: &[String]) -> String {
-    let raw = argv.join(" ").replace('\n', " ");
-    let mut s: String = raw.chars().take(160).collect();
-    if raw.chars().count() > 160 {
-        s.push('…');
-    }
-    s
-}
-
 /// Грубая оценка токенов проекции: точные числа берём из usage провайдера,
 /// а это — только для порога компакции.
 pub fn estimate_tokens(msgs: &[Value]) -> u64 {
-    let bytes: usize = msgs
-        .iter()
-        .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
-        .sum();
-    // ponytail: 1 токен ≈ 4 символа для латиницы; для кириллицы это занижает,
-    // поэтому считаем по 3 символам — лучше сработать чуть раньше.
-    (bytes / 3) as u64
+    fn size(value: &Value) -> u64 {
+        match value {
+            Value::Object(_) if value["type"] == "image_url" => 4096,
+            Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| k.len() as u64 / 3 + size(v) + 4)
+                .sum(),
+            Value::Array(items) => items.iter().map(size).sum(),
+            Value::String(s) => s.len() as u64 / 3 + 1,
+            _ => 1,
+        }
+    }
+    msgs.iter().map(size).sum()
+}
+
+/// A provider may emit broken JSON. Dispatch reports it, but history must remain
+/// sendable so the model can correct the call. Only the projection is repaired.
+fn historical_arguments(args: &str) -> String {
+    if serde_json::from_str::<Value>(args).is_ok() {
+        args.to_string()
+    } else {
+        json!({"_snens_invalid_arguments": args}).to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::log::Rec;
+
+    #[test]
+    fn image_estimate_ignores_base64_length() {
+        let small = vec![
+            json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,a"}}]}),
+        ];
+        let large = vec![
+            json!({"role":"user","content":[{"type":"image_url","image_url":{"url":format!("data:image/png;base64,{}", "a".repeat(1_400_000))}}]}),
+        ];
+        assert_eq!(estimate_tokens(&small), estimate_tokens(&large));
+        assert!(estimate_tokens(&large) < 5000);
+    }
+
+    #[test]
+    fn malformed_provider_arguments_repaired_in_projection_only() {
+        let call = crate::log::Call {
+            id: "broken".into(),
+            name: "run".into(),
+            args: "{broken".into(),
+        };
+        let raw = vec![Rec::Assistant {
+            ts: 0,
+            text: None,
+            tool_calls: vec![call],
+            reasoning: None,
+        }];
+        let msgs = raw_msgs(&raw, &Config::default());
+        assert!(serde_json::from_str::<Value>(
+            msgs[1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+        )
+        .is_ok());
+        crate::context_document::validate(&msgs, true).unwrap();
+        assert!(serde_json::to_string(&raw).unwrap().contains("{broken"));
+    }
 
     fn user(text: &str, source: &str) -> Rec {
         Rec::User {
@@ -467,11 +438,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Вложения вырезаются при компакции по своему порогу: они дороже текста.
-    /// Пометка вместо картинки, последняя остаётся, проекция детерминирована.
+    /// Переполнение окна само по себе не должно менять текст или терять картинки.
     #[test]
-    fn attachments_are_elided_on_compaction() {
-        let dir = std::env::temp_dir().join(format!("snens-attach-elide-{}", std::process::id()));
+    fn attachments_are_preserved_regardless_of_window() {
+        let dir =
+            std::env::temp_dir().join(format!("snens-attach-preserve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let png: Vec<u8> = vec![
@@ -479,10 +450,7 @@ mod tests {
             0, 0, 0, 1, 0, 0, 0, 1,
         ];
         let mut cfg = Config::default();
-        // Крошечное окно: элизия срабатывает сразу.
-        cfg.ctx_window = 400;
-        cfg.keep_results = 1;
-        cfg.keep_attachments = 1;
+        cfg.ctx_window = 40_000;
         let part = |path: &std::path::Path| Part {
             kind: "image".into(),
             path: path.to_string_lossy().into_owned(),
@@ -496,7 +464,7 @@ mod tests {
         let img2 = dir.join("b.png");
         std::fs::write(&img2, &png).unwrap();
         let log = vec![
-            user("две картинки", "cli"),
+            user(&"x".repeat(150_000), "cli"),
             Rec::Assistant {
                 reasoning: None,
                 ts: 0,
@@ -542,24 +510,22 @@ mod tests {
         ];
         let projected = msgs(&log, &cfg);
         let tools: Vec<&Value> = projected.iter().filter(|m| m["role"] == "tool").collect();
-        let first = serde_json::to_string(&tools[0]["content"]).unwrap();
-        let last = serde_json::to_string(&tools[1]["content"]).unwrap();
-        assert!(
-            first.contains("вырезаны при компакции"),
-            "старое вложение не вырезано: {first}"
-        );
-        assert!(
-            !first.contains("image_url"),
-            "старое вложение уехало как картинка: {first}"
-        );
-        assert!(
-            last.contains("image_url"),
-            "последнее вложение потеряно: {last}"
-        );
-        assert_eq!(
-            serde_json::to_string(&projected).unwrap(),
-            serde_json::to_string(&msgs(&log, &cfg)).unwrap()
-        );
+        assert!(estimate_tokens(&projected) > cfg.ctx_window);
+        assert_eq!(tools.len(), 2);
+        for (tool, text) in tools.iter().zip(["a", "b"]) {
+            let content = tool["content"].as_array().unwrap();
+            assert_eq!(content.len(), 2);
+            assert_eq!(content[0], json!({"type": "text", "text": text}));
+            assert_eq!(content[1]["type"], "image_url");
+            assert!(content[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"));
+        }
+        assert_eq!(projected, raw_msgs(&log, &cfg));
+        assert_eq!(projected, msgs(&log, &cfg));
+        cfg.ctx_window = 400_000;
+        assert_eq!(projected, msgs(&log, &cfg));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

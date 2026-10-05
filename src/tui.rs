@@ -13,7 +13,7 @@ use std::{collections::BTreeMap, io::IsTerminal, path::PathBuf, sync::Arc};
 use crate::{agent, cfg::Config, input, input::In, llm, log, mail, render::Ui, R};
 
 const HELP: &str = "/new — новая сессия · /reasoning — скрыть/показать рассуждение · \
-/help · /quit (или Ctrl+D) · Ctrl+C — отменить ход · во время хода строка уходит агенту \
+/compact [инструкция] — уборка контекста · /help · /quit (или Ctrl+D) · Ctrl+C — отменить ход · во время хода строка уходит агенту \
 как steer (после текущего шага)";
 
 pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
@@ -91,6 +91,7 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
             _ => {}
         }
 
+        let line = compact_request(line);
         sess.append(log::Rec::User {
             ts: log::now(),
             text: line,
@@ -190,6 +191,7 @@ async fn plain(cfg: &Config, llm: &llm::OpenAi, flags: &BTreeMap<String, String>
             "/reasoning" => continue,
             _ => {}
         }
+        let line = compact_request(line);
         sess.append(log::Rec::User {
             ts: log::now(),
             text: line,
@@ -207,4 +209,13 @@ fn history_path(cfg: &Config) -> PathBuf {
         .parent()
         .map(|p| p.join("history.txt"))
         .unwrap_or_else(|| PathBuf::from("snens-history.txt"))
+}
+
+/// Manual cleanup uses the same agent and editable context, not a summarizer.
+fn compact_request(line: String) -> String {
+    if line == "/compact" || line.starts_with("/compact ") {
+        format!("Приведи рабочий контекст в порядок через LIVE_CONTEXT.json и ctx commit. Убери ненужное, сохрани точные полезные фрагменты, обнови записку для продолжения и завершения задачи. Не пересказывай историю. Дополнительная инструкция: {}", line.strip_prefix("/compact").unwrap_or("").trim())
+    } else {
+        line
+    }
 }

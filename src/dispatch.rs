@@ -28,27 +28,45 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
             &shim,
         ));
     }
+    v.push((
+        "SNENS_CONTEXT_PATH".into(),
+        sess.path()
+            .with_extension("out")
+            .join("LIVE_CONTEXT.json")
+            .display()
+            .to_string(),
+    ));
     v
 }
 
 /// Вшитый инструмент. Всё остальное — процессы из реестра.
 pub fn builtin_defs() -> Vec<Value> {
-    vec![json!({
-        "type": "function",
-        "function": {
-            "name": "run",
-            "description": "Выполнить shell-команду (sh -c) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]\nОболочка — sh (dash), не bash: нет ${x:0:n}, [[ ]], массивов, $'\\t'; нужен bash — зови `bash -c '...'`. Код возврата при `;`-цепочке — от последней команды, поэтому хвостовой `which`/`grep` может покрасить успешную команду в ошибку (для bash-измов это частая причина).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "Команда для sh -c"},
-                    "cwd": {"type": "string", "description": "Рабочий каталог"},
-                    "timeout_seconds": {"type": "integer", "description": "Таймаут в секундах"}
-                },
-                "required": ["command"]
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run",
+                "description": "Выполнить shell-команду (sh -c) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]\nОболочка — sh (dash), не bash: нет ${x:0:n}, [[ ]], массивов, $'\\t'; нужен bash — зови `bash -c '...'`. Код возврата при `;`-цепочке — от последней команды, поэтому хвостовой `which`/`grep` может покрасить успешную команду в ошибку (для bash-измов это частая причина).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Команда для sh -c"},
+                        "cwd": {"type": "string", "description": "Рабочий каталог"},
+                        "timeout_seconds": {"type": "integer", "description": "Таймаут в секундах"}
+                    },
+                    "required": ["command"]
+                }
             }
-        }
-    })]
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ctx",
+                "description": "Управление рабочим контекстом: после правки LIVE_CONTEXT.json вызови commit. Правка проверяется и применяется после всех результатов текущего шага; статус принятия придёт перед следующим запросом. status показывает путь и экономический бюджет.",
+                "parameters": {"type":"object", "properties":{"action":{"type":"string","enum":["commit","status"]}}}
+            }
+        }),
+    ]
 }
 
 /// Определения тулов для модели + сами тулы + PATH дочерних процессов.
@@ -87,6 +105,37 @@ pub async fn dispatch(
         parts: Vec::new(),
     };
     let a: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
+    if call.name == "ctx" {
+        let action = a.get("action").and_then(Value::as_str).unwrap_or("commit");
+        let text = match action {
+            "commit" => {
+                "Draft отправлен. Следующее системное сообщение [Harness context status] содержит окончательный результат; не вызывай commit повторно ради подтверждения."
+                    .to_string()
+            }
+            "status" => format!(
+                "Зеркало: {}\nБюджет: {} токенов; цель уборки: {}\nПоследняя принятая ревизия: {}",
+                out_dir.join("LIVE_CONTEXT.json").display(),
+                cfg.context_budget(),
+                cfg.context_target(),
+                sess.read()
+                    .ok()
+                    .and_then(|rs| rs.into_iter().rev().find_map(|r| match r {
+                        crate::log::Rec::ContextRevision { anchor, .. } => Some(anchor.to_string()),
+                        _ => None,
+                    }))
+                    .unwrap_or_else(|| "нет".into())
+            ),
+            _ => return fail(format!("ctx: неизвестное действие {action}")),
+        };
+        return exec::Out {
+            bytes: text.len(),
+            text,
+            exit: 0,
+            ms: 0,
+            timed_out: false,
+            parts: Vec::new(),
+        };
+    }
     // Канал вложений — свой каталог на вызов: файлы разных вызовов не смешиваются,
     // а имя каталога (= id вызова) делает сбор детерминированным.
     let attach_dir = cfg

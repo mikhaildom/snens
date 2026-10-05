@@ -96,6 +96,14 @@ pub enum Rec {
     /// проводе: проекция обязана собираться байт-в-байт одинаково и после
     /// рестарта, а resume не должен впрыскивать её второй раз.
     Recall { ts: u64, text: String },
+    /// Accepted working-context projection. Original events remain immutable.
+    ContextNotice { ts: u64, text: String },
+    ContextRevision {
+        ts: u64,
+        anchor: usize,
+        digest: String,
+        messages: Vec<serde_json::Value>,
+    },
     /// Сообщение от другой сессии (родитель, ребёнок, человек через steer),
     /// впрыснутое на границе хода. В проекции едет ролью `user` с пометкой
     /// отправителя: это чужое слово, а не ввод этой сессии.

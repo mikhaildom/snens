@@ -1,6 +1,5 @@
 // Интеграционная проверка ядра: единственная, что падает, если цикл сломан.
 // Живёт отдельно от цикла: это тест-сценарий на реальных процессах, не код исполнения.
-use serde_json::Value;
 
 use crate::{
     agent::run_agent,
@@ -211,22 +210,23 @@ pub async fn selftest() -> R<()> {
     let b = serde_json::to_string(&project::msgs(&sess.read()?, &cfg))?;
     assert_eq!(a, b, "проекция недетерминирована");
 
-    // --- компакция: элизия старых результатов при переполнении окна ---
+    // --- economic cleanup request: no automatic deletion of model context ---
     let mut cfg2 = cfg.clone();
-    cfg2.ctx_window = 400; // крошечное окно: мягкий порог пройден сразу
-    cfg2.keep_results = 1;
+    cfg2.ctx_window = 40_000;
+    cfg2.context_budget = 5_000;
+    cfg2.context_target = 3_000;
     let sess2 = Session::open(&dir, "t2")?;
     sess2.append(Rec::User {
         ts: log::now(),
         text: "два больших вывода".into(),
         source: "selftest".into(),
     })?;
-    let big = || Reply {
+    let big = |id: &str| Reply {
         reasoning: String::new(),
         upstream: Default::default(),
         text: String::new(),
         calls: vec![Call {
-            id: "b".into(),
+            id: id.into(),
             name: "run".into(),
             args: r#"{"command":"seq 1 3000"}"#.into(),
         }],
@@ -234,8 +234,8 @@ pub async fn selftest() -> R<()> {
         finish_reason: String::new(),
     };
     let fake2 = Fake::new(vec![
-        big(),
-        big(),
+        big("b1"),
+        big("b2"),
         Reply {
             reasoning: String::new(),
             upstream: Default::default(),
@@ -248,45 +248,23 @@ pub async fn selftest() -> R<()> {
     run_agent(&sess2, &cfg2, &fake2, &crate::render::Ui::plain()).await?;
     let recs2 = sess2.read()?;
     assert!(
-        recs2.iter().any(|r| matches!(r, Rec::Ctx { .. })),
-        "компакция не записала Ctx в журнал"
+        recs2.iter().any(
+            |r| matches!(r, Rec::User { source, .. } if source.starts_with("context-cleanup:"))
+        ),
+        "cleanup request missing"
     );
     let msgs2 = project::msgs(&recs2, &cfg2);
-    let tool_msgs: Vec<&Value> = msgs2.iter().filter(|m| m["role"] == "tool").collect();
-    assert_eq!(
-        tool_msgs.len(),
-        2,
-        "элизия не должна выбрасывать сообщения: assistant с tool_calls обязан иметь ответы"
-    );
-    let first = tool_msgs[0]["content"].as_str().unwrap_or_default();
-    let last = tool_msgs[1]["content"].as_str().unwrap_or_default();
+    let tools: Vec<_> = msgs2.iter().filter(|m| m["role"] == "tool").collect();
+    assert_eq!(tools.len(), 2);
     assert!(
-        first.contains("вырезан при компакции"),
-        "старый результат не вырезан: {first}"
-    );
-    assert!(
-        last.starts_with('1'),
-        "последний результат должен остаться как есть"
-    );
-    let raw_bytes: usize = recs2
-        .iter()
-        .filter_map(|r| match r {
-            Rec::ToolResult {
-                body: Body::Inline { text },
-                ..
-            } => Some(text.len()),
-            _ => None,
-        })
-        .sum();
-    assert!(
-        project::estimate_tokens(&msgs2) * 3 < raw_bytes as u64,
-        "элизия не уменьшила проекцию: {} Б против {raw_bytes} Б в логе",
-        project::estimate_tokens(&msgs2) * 3
+        tools
+            .iter()
+            .all(|m| m["content"].as_str().unwrap_or_default().starts_with('1')),
+        "harness deleted an observation without model edit"
     );
     assert_eq!(
         serde_json::to_string(&project::msgs(&recs2, &cfg2))?,
-        serde_json::to_string(&project::msgs(&sess2.read()?, &cfg2))?,
-        "проекция с элизией недетерминирована"
+        serde_json::to_string(&project::msgs(&sess2.read()?, &cfg2))?
     );
 
     // --- долгая память: ядро знает только argv-контракт, провайдер — тул ---

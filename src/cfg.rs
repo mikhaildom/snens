@@ -12,6 +12,9 @@ pub struct Config {
     pub base_url: String,
     #[serde(default = "d_model")]
     pub model: String,
+    /// Optional override for detached child agents, never the primary session.
+    #[serde(default)]
+    pub subagent_model: Option<String>,
     #[serde(default = "d_key_env")]
     pub key_env: String,
     /// Произвольные поля в тело запроса (quirks конкретного провайдера).
@@ -24,12 +27,15 @@ pub struct Config {
     /// Размер окна модели в токенах (не хардкодим «1M у всех»).
     #[serde(default = "d_ctx")]
     pub ctx_window: u64,
-    /// Порог элизии (доля окна).
-    #[serde(default = "d_soft")]
-    pub soft: f64,
-    /// Порог саммаризации (доля окна).
-    #[serde(default = "d_hard")]
-    pub hard: f64,
+    /// Экономический порог уборки в токенах; 0 — авто по размеру окна.
+    #[serde(default)]
+    pub context_budget: u64,
+    /// Запас до физического предела окна; для маленьких окон не больше четверти.
+    #[serde(default = "d_context_reserve")]
+    pub context_reserve: u64,
+    /// Цель после уборки в токенах; 0 — 70% эффективного бюджета.
+    #[serde(default)]
+    pub context_target: u64,
     /// Сколько символов одного tool-результата доезжает до модели.
     #[serde(default = "d_max_chars")]
     pub max_result_chars: usize,
@@ -46,9 +52,6 @@ pub struct Config {
     /// Каталог тулов: подкаталог = тул. Рядом с ним создаётся bin/ с симлинками.
     #[serde(default = "d_tools")]
     pub tools_dir: String,
-    /// Сколько последних результатов тулов проекция отдаёт как есть при компакции.
-    #[serde(default = "d_keep")]
-    pub keep_results: usize,
     /// Сокращать вывод shell-команд (ANSI, длинные строки, повторы) до отправки модели.
     #[serde(default = "d_true")]
     pub reduce_output: bool,
@@ -60,10 +63,6 @@ pub struct Config {
     /// Потолок одного вложения, байты.
     #[serde(default = "d_max_attach")]
     pub max_attachment_bytes: usize,
-    /// Сколько последних вложений проекция отдаёт провайдеру как есть; более
-    /// ранние вырезаются при компакции — они дороже текста в разы.
-    #[serde(default = "d_keep_attach")]
-    pub keep_attachments: usize,
     /// Оболочка для `run`: программа и её флаги. `sh -c` в коде не зашит —
     /// на Windows это `cmd /C`.
     #[serde(default = "d_shell")]
@@ -125,11 +124,8 @@ fn d_true() -> bool {
 fn d_ctx() -> u64 {
     1_000_000
 }
-fn d_soft() -> f64 {
-    0.60
-}
-fn d_hard() -> f64 {
-    0.85
+fn d_context_reserve() -> u64 {
+    8_192
 }
 fn d_max_chars() -> usize {
     24_000
@@ -146,14 +142,8 @@ fn d_sessions() -> String {
 fn d_tools() -> String {
     format!("{}/tools", data_dir())
 }
-fn d_keep() -> usize {
-    5
-}
 fn d_max_attach() -> usize {
     32 * 1024 * 1024
-}
-fn d_keep_attach() -> usize {
-    3
 }
 fn d_mail() -> String {
     format!("{}/mail", data_dir())
@@ -227,6 +217,34 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Экономический бюджет, ограниченный окном с запасом для следующего хода.
+    pub fn context_budget(&self) -> u64 {
+        let budget = if self.context_budget > 0 {
+            self.context_budget
+        } else if self.ctx_window <= 300_000 {
+            100_000
+        } else {
+            200_000
+        };
+        // Дефолтный reserve не должен обнулять синтетические маленькие окна.
+        let reserve = self.context_reserve.min(self.ctx_window / 4);
+        let physical = self.ctx_window.saturating_sub(reserve);
+        let ceiling = (u128::from(physical) * 85 / 100) as u64;
+        budget.min(ceiling)
+    }
+
+    /// Цель уборки не превышает эффективный экономический бюджет.
+    pub fn context_target(&self) -> u64 {
+        let budget = self.context_budget();
+        let target = if self.context_target > 0 {
+            self.context_target
+        } else {
+            // u128 сохраняет точные 70% без переполнения даже при u64::MAX.
+            (u128::from(budget) * 7 / 10) as u64
+        };
+        target.min(budget)
+    }
+
     pub fn load(override_path: Option<&str>) -> R<Config> {
         let path = match override_path {
             Some(p) => PathBuf::from(p),
@@ -421,6 +439,71 @@ impl Config {
 mod tests {
     use super::*;
 
+    #[test]
+    fn context_defaults_and_auto_windows() {
+        let cfg = Config::default();
+        assert_eq!(cfg.context_budget, 0);
+        assert_eq!(cfg.context_reserve, 8_192);
+        assert_eq!(cfg.context_target, 0);
+        for (window, budget, target) in [
+            (250_000, 100_000, 70_000),
+            (300_000, 100_000, 70_000),
+            (300_001, 200_000, 140_000),
+            (1_000_000, 200_000, 140_000),
+        ] {
+            let cfg: Config = toml::from_str(&format!("ctx_window = {window}")).unwrap();
+            assert_eq!(cfg.context_budget(), budget);
+            assert_eq!(cfg.context_target(), target);
+        }
+    }
+
+    #[test]
+    fn context_overrides_and_reserve() {
+        let mut cfg: Config = toml::from_str(
+            "ctx_window = 250000\ncontext_budget = 150000\ncontext_target = 90000\ncontext_reserve = 20000",
+        )
+        .unwrap();
+        assert_eq!(cfg.context_budget(), 150_000);
+        assert_eq!(cfg.context_target(), 90_000);
+        cfg.context_budget = 250_000;
+        cfg.context_target = 240_000;
+        assert_eq!(cfg.context_budget(), 195_500);
+        assert_eq!(cfg.context_target(), 195_500);
+        cfg.context_reserve = 0;
+        assert_eq!(cfg.context_budget(), 212_500);
+        cfg.context_target = 0;
+        assert_eq!(cfg.context_target(), 148_750);
+    }
+
+    #[test]
+    fn context_tiny_windows_and_extreme_values_are_safe() {
+        for (window, budget) in [(0, 0), (1, 0), (3, 2), (4, 2), (400, 255)] {
+            let cfg = Config {
+                ctx_window: window,
+                ..Config::default()
+            };
+            assert_eq!(cfg.context_budget(), budget);
+            assert_eq!(cfg.context_target(), budget * 7 / 10);
+        }
+        let mut cfg = Config {
+            ctx_window: 400,
+            context_reserve: u64::MAX,
+            ..Config::default()
+        };
+        assert_eq!(cfg.context_budget(), 255);
+        cfg.ctx_window = u64::MAX;
+        cfg.context_budget = u64::MAX;
+        cfg.context_reserve = 0;
+        assert_eq!(
+            cfg.context_budget(),
+            (u128::from(u64::MAX) * 85 / 100) as u64
+        );
+        assert_eq!(
+            cfg.context_target(),
+            (u128::from(cfg.context_budget()) * 7 / 10) as u64
+        );
+    }
+
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("snens-cfg-{}-{name}.toml", std::process::id()));
         let _ = std::fs::remove_file(&p);
@@ -452,7 +535,11 @@ mod tests {
     #[test]
     fn set_model_вставляет_ключ_перед_секцией() {
         let p = tmp("insert");
-        std::fs::write(&p, "base_url = \"http://x\"\n\n[memory]\ncmd = \"memory\"\n").unwrap();
+        std::fs::write(
+            &p,
+            "base_url = \"http://x\"\n\n[memory]\ncmd = \"memory\"\n",
+        )
+        .unwrap();
         let cfg = Config::load(Some(&p.display().to_string())).unwrap();
         cfg.set_model("m1", Some(&p.display().to_string())).unwrap();
         let reload = Config::load(Some(&p.display().to_string())).unwrap();

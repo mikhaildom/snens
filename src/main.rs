@@ -2,6 +2,10 @@ mod agent;
 mod askpass;
 mod attach;
 mod cfg;
+mod context;
+mod context_document;
+#[cfg(test)]
+mod context_loop_tests;
 mod dispatch;
 mod exec;
 mod improve;
@@ -177,7 +181,10 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
 /// окружения (стабильно при detached-спавне), родитель — в `SNENS_PARENT` или
 /// флаге. В конце кладём родителю итог в ящик — это харнесс, а не модель.
 async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
-    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let mut cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    if let Some(model) = &cfg.subagent_model {
+        cfg.model = model.clone();
+    }
     let prompt = std::env::var("SNENS_PROMPT").unwrap_or_default();
     if prompt.trim().is_empty() {
         return Err("run-child: пустая задача (SNENS_PROMPT)".into());
