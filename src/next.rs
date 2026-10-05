@@ -9,7 +9,7 @@ const HELP: &str = "snens-next — experimental surface API (separate data and b
   serve --config PATH [--data-dir DIR] [--listen 127.0.0.1:PORT] [--token-file PATH]\n\
   tui [--endpoint http://127.0.0.1:7419] [--token-file PATH] [--session ID] [--data-dir DIR]\n\
 Default data: ~/.local/share/snens-next; default token file: <data-dir>/api.token.\n\
---token-file is always a literal path (no "auto" sentinel).\n\
+--token-file is always a literal path (no auto sentinel).\n\
 Start serve explicitly in another terminal. /quit disconnects; /stop cancels a run.\n\
 Experimental: text/steer/stop/history only; no attachment upload or remote secret entry yet.\n";
 
