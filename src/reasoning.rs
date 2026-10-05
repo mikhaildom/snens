@@ -9,6 +9,21 @@
 
 use serde_json::Value;
 
+/// Один видимый кусок на кадр: `reasoning` и `reasoning_details` могут
+/// одновременно содержать одну и ту же сводку. Детали всё равно разбираем,
+/// чтобы не потерять признак шифрования, даже когда текст берём из строки.
+pub fn take_delta(d: &Value, encrypted: &mut bool) -> Option<String> {
+    let summary = take_details(d, encrypted);
+    match d
+        .get("reasoning")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(text) => Some(text.to_owned()),
+        None => summary,
+    }
+}
+
 /// Разбор `delta.reasoning_details` — того, чем провайдер с зашифрованным
 /// reasoning заменяет строку `delta.reasoning`.
 ///
@@ -51,6 +66,60 @@ mod tests {
     }
 
     #[test]
+    fn mirrored_summary_is_emitted_once_per_frame() {
+        let mut enc = false;
+        let mut got = String::new();
+        // Реальный формат SSE от OpenAI через Nous/OpenRouter. Повторяющиеся
+        // слова в разных кадрах не дедуплицируем: это может быть сам текст.
+        for chunk in ["**Comparing decimals**\n\nI", " need", " need"] {
+            let d = json!({"reasoning": chunk, "reasoning_details": [
+                {"type": "reasoning.summary", "summary": chunk,
+                 "format": "openai-responses-v1", "index": 0}
+            ]});
+            got.push_str(&take_delta(&d, &mut enc).unwrap());
+        }
+        assert_eq!(got, "**Comparing decimals**\n\nI need need");
+        assert!(!enc);
+    }
+
+    #[test]
+    fn text_precedence_preserves_encrypted_flag() {
+        let mut enc = false;
+        let d = json!({"reasoning": "visible", "reasoning_details": [
+            {"type": "reasoning.summary", "summary": "fallback"},
+            {"type": "reasoning.encrypted", "data": "secret"}
+        ]});
+        assert_eq!(take_delta(&d, &mut enc).as_deref(), Some("visible"));
+        assert!(enc);
+    }
+
+    #[test]
+    fn summary_fallback_for_null_empty_or_missing_reasoning() {
+        for reasoning in [None, Some(Value::Null), Some(json!(""))] {
+            let mut enc = false;
+            let mut d = json!({"reasoning_details": [
+                {"type": "reasoning.summary", "summary": "summary"}
+            ]});
+            if let Some(value) = reasoning {
+                d["reasoning"] = value;
+            }
+            assert_eq!(take_delta(&d, &mut enc).as_deref(), Some("summary"));
+            assert!(!enc);
+        }
+    }
+
+    #[test]
+    fn plain_reasoning_without_details() {
+        let mut enc = false;
+        assert_eq!(
+            take_delta(&json!({"reasoning": "plain"}), &mut enc).as_deref(),
+            Some("plain")
+        );
+        assert!(take_delta(&json!({"content": "answer"}), &mut enc).is_none());
+        assert!(!enc);
+    }
+
+    #[test]
     fn summary_chunks_join_into_one_text() {
         let mut enc = false;
         let mut got = String::new();
@@ -80,7 +149,11 @@ mod tests {
             ]})),
             &mut enc,
         );
-        assert_eq!(got.as_deref(), Some("**План**"), "в блоб текста не попадает");
+        assert_eq!(
+            got.as_deref(),
+            Some("**План**"),
+            "в блоб текста не попадает"
+        );
         assert!(enc, "блоб обязан быть помечен");
     }
 

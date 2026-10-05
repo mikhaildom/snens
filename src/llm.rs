@@ -218,14 +218,7 @@ impl OpenAi {
                 let Some(d) = v.pointer("/choices/0/delta") else {
                     continue;
                 };
-                if let Some(r) = d.get("reasoning").and_then(|c| c.as_str()) {
-                    if !r.is_empty() {
-                        reasoning.push_str(r);
-                        *seen = true;
-                        on_delta(Delta::Reasoning(r));
-                    }
-                }
-                if let Some(summary) = crate::reasoning::take_details(d, &mut encrypted) {
+                if let Some(summary) = crate::reasoning::take_delta(d, &mut encrypted) {
                     reasoning.push_str(&summary);
                     *seen = true;
                     on_delta(Delta::Reasoning(&summary));
@@ -276,16 +269,12 @@ impl OpenAi {
             text,
             reasoning,
             calls,
-            usage: Usage {
-                encrypted,
-                ..usage
-            },
+            usage: Usage { encrypted, ..usage },
             upstream,
             finish_reason,
         })
     }
 }
-
 
 fn parse_usage(u: &Value) -> Usage {
     Usage {
