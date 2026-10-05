@@ -122,7 +122,13 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
         c.env(k, v);
     }
 
+    // Each tool owns a process group: cancelling only the shell leaves sleep,
+    // compilers and other descendants alive. Detached agents use setsid themselves.
+    #[cfg(unix)]
+    c.process_group(0);
     let mut child = c.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    #[cfg(unix)]
+    let _group = ProcessGroup(child.id().ok_or("spawned process has no pid")? as i32);
     match sp.stdin {
         // Пишем в отдельной задаче: иначе дедлок, если ребёнок ждёт конца stdin,
         // а мы ждём его вывода.
@@ -201,6 +207,19 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
         timed_out,
         parts,
     })
+}
+
+#[cfg(unix)]
+struct ProcessGroup(i32);
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        // Includes timeout and dropped futures. Normal completion also cleans
+        // up background children which inherited the tool's process group.
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
 }
 
 /// Полный вывод на диск; имя — от содержимого, поэтому одинаковые дампы не плодятся.
@@ -334,5 +353,34 @@ mod tests {
             out.text
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_tool_kills_shell_descendants() {
+        let dir =
+            std::env::temp_dir().join(format!("snens-process-group-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let marker = dir.join("escaped");
+        let script = format!(
+            "(sleep 2; echo escaped > '{}') & echo $! > '{}'; wait",
+            marker.display(),
+            pidfile.display()
+        );
+        let task =
+            tokio::spawn(async move { spawn(Spawn::argv("sh", vec!["-c".into(), script])).await });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pidfile.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pidfile.exists(), "shell must have started its child");
+        task.abort();
+        assert!(matches!(task.await, Err(e) if e.is_cancelled()));
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            !marker.exists(),
+            "descendant survived cancellation and executed a side effect"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -1,4 +1,4 @@
 # Сборка на втором диске: на / осталось ~2.8 ГБ, туда target не влезает с запасом.
 # ponytail: путь машинно-специфичный, репозиторий персональный — держим здесь, а не в ~/.bashrc
 [build]
-target-dir = "/mnt/HC_Volume_106138989/cargo-target/snens"
+target-dir = "/mnt/HC_Volume_106138989/cargo-target/snens-next"

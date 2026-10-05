@@ -1,6 +1,7 @@
 // Цикл: запрос → стрим → диспатч → append. Состояние — лог, поэтому resume бесплатен:
 // незавершённый ход = User без Assistant, продолжение с того же места.
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::{
     cfg::Config,
@@ -31,13 +32,49 @@ impl Finish {
 /// Точка входа цикла. Терминатор `Done` пишет харнесс, а не модель: по нему
 /// родитель узнаёт о конце подагента даже если тот «забыл» отчитаться. Пишется
 /// на всех путях — и при нормальном финале, и при ошибке.
+/// События цикла для surface-слоёв; поля события несут то, что клиенту
+/// видно, даже если ядро их не читает.
+#[allow(dead_code)]
+pub enum SurfaceSignal {
+    Delta {
+        text: String,
+        kind: &'static str,
+    },
+    ToolStarted {
+        name: String,
+        call_id: String,
+        args: String,
+    },
+    ToolCompleted {
+        name: String,
+        call_id: String,
+        exit: i32,
+        preview: String,
+    },
+    Notice(String),
+}
+
 pub async fn run_agent<L: Llm>(
     sess: &Session,
     cfg: &Config,
     llm: &L,
     ui: &crate::render::Ui,
 ) -> R<()> {
-    let r = run_loop(sess, cfg, llm, ui).await;
+    run_agent_surface(sess, cfg, llm, ui, &|_| {}, None, None).await
+}
+
+pub async fn run_agent_surface<L: Llm>(
+    sess: &Session,
+    cfg: &Config,
+    llm: &L,
+    ui: &crate::render::Ui,
+    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
+    cancel: Option<watch::Receiver<bool>>,
+    queued: Option<
+        std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    >,
+) -> R<()> {
+    let r = run_loop(sess, cfg, llm, ui, observe, cancel, queued).await;
     let status = match &r {
         Ok(f) => f.status(),
         Err(_) => "error",
@@ -63,6 +100,11 @@ async fn run_loop<L: Llm>(
     cfg: &Config,
     llm: &L,
     ui: &crate::render::Ui,
+    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
+    mut cancel: Option<watch::Receiver<bool>>,
+    queued: Option<
+        std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    >,
 ) -> R<Finish> {
     // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
     // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
@@ -100,7 +142,20 @@ async fn run_loop<L: Llm>(
     // ошибкой, чтобы прогон не закрылся «успешно», ничего не сделав.
     let mut empty_replies = 0u32;
     loop {
+        if cancel.as_ref().is_some_and(|c| *c.borrow()) {
+            return Err("cancelled".into());
+        }
         turn += 1;
+        if let Some(rx) = queued.as_ref() {
+            let mut rx = rx.lock().await;
+            while let Ok(text) = rx.try_recv() {
+                sess.append(Rec::User {
+                    ts: log::now(),
+                    text,
+                    source: "surface-steer".into(),
+                })?;
+            }
+        }
         // Граница хода: после всех результатов предыдущего шага и перед новым
         // запросом. Инвариант провайдера (assistant с tool_calls обязан иметь
         // ответы) уже соблюдён, поэтому сюда безопасно впрыскивать чужое слово —
@@ -150,7 +205,11 @@ async fn run_loop<L: Llm>(
             return Err("рабочий контекст достиг физического предела; запрос не отправлен. Нужна уборка LIVE_CONTEXT.json или больший размер окна".into());
         }
 
-        let reply: Reply = stream_reply(cfg, msgs, defs.clone(), llm, ui).await?;
+        let reply: Reply = if let Some(c) = cancel.as_mut() {
+            tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), r = stream_reply(cfg, msgs, defs.clone(), llm, ui, observe) => r? }
+        } else {
+            stream_reply(cfg, msgs, defs.clone(), llm, ui, observe).await?
+        };
 
         // Расход по ходу, а не только в `show` после сессии: в терминале видно,
         // какой ход чего стоил.
@@ -231,11 +290,44 @@ async fn run_loop<L: Llm>(
             if supervisor(sess, cfg, ui).await {
                 continue;
             }
+            if let Some(rx) = queued.as_ref() {
+                let mut rx = rx.lock().await;
+                let mut accepted = Vec::new();
+                while let Ok(text) = rx.try_recv() {
+                    accepted.push(text);
+                }
+                drop(rx);
+                if !accepted.is_empty() {
+                    for text in accepted {
+                        sess.append(Rec::User {
+                            ts: log::now(),
+                            text,
+                            source: "surface-steer".into(),
+                        })?;
+                    }
+                    continue;
+                }
+            }
             return Ok(Finish::Ok);
         }
 
         for call in &reply.calls {
-            let out = dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess).await;
+            observe(SurfaceSignal::ToolStarted {
+                name: call.name.clone(),
+                call_id: call.id.clone(),
+                args: call.args.clone(),
+            });
+            let out = if let Some(c) = cancel.as_mut() {
+                tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), o = dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess) => o }
+            } else {
+                dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess).await
+            };
+            observe(SurfaceSignal::ToolCompleted {
+                name: call.name.clone(),
+                call_id: call.id.clone(),
+                exit: out.exit,
+                preview: out.text.chars().take(500).collect(),
+            });
             ui.tool_call(
                 &call.name,
                 &hint(&call.args),
@@ -306,7 +398,7 @@ async fn run_loop<L: Llm>(
         // Лимит исчерпан — не падаем и не закрываем поверхность: просим
         // промежуточный итог и на этом заканчиваем запуск (см. final_answer).
         if turn >= cfg.max_turns {
-            final_answer(sess, cfg, llm, ui, &path, turn).await?;
+            final_answer(sess, cfg, llm, ui, &path, turn, observe).await?;
             return Ok(Finish::Limit);
         }
     }
@@ -365,6 +457,7 @@ async fn final_answer<L: Llm>(
     ui: &crate::render::Ui,
     path: &str,
     turn: u32,
+    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
 ) -> R<()> {
     sess.append(Rec::User {
         ts: log::now(),
@@ -379,7 +472,7 @@ async fn final_answer<L: Llm>(
     if project::estimate_tokens(&msgs) >= limit {
         return Err("final answer context exceeds physical window; compact before resuming".into());
     }
-    let reply = stream_reply(cfg, msgs, Vec::new(), llm, ui).await?;
+    let reply = stream_reply(cfg, msgs, Vec::new(), llm, ui, observe).await?;
     sess.append(Rec::Assistant {
         ts: log::now(),
         text: if reply.text.is_empty() {
@@ -409,6 +502,7 @@ async fn stream_reply<L: Llm>(
     tools: Vec<Value>,
     llm: &L,
     ui: &crate::render::Ui,
+    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
 ) -> R<Reply> {
     let mut stream = crate::render::Stream::new(ui.color, ui.sink());
     let show = ui.show_reasoning();
@@ -416,6 +510,10 @@ async fn stream_reply<L: Llm>(
     let reply = llm
         .reply(cfg, msgs, tools, &mut |d| match d {
             crate::llm::Delta::Reasoning(r) => {
+                observe(SurfaceSignal::Delta {
+                    text: r.to_string(),
+                    kind: "reasoning",
+                });
                 if !reason_on {
                     reason_on = true;
                     stream.reasoning(show);
@@ -424,7 +522,13 @@ async fn stream_reply<L: Llm>(
                     stream.reasoning_chunk(r);
                 }
             }
-            crate::llm::Delta::Content(c) => stream.content(c),
+            crate::llm::Delta::Content(c) => {
+                observe(SurfaceSignal::Delta {
+                    text: c.to_string(),
+                    kind: "content",
+                });
+                stream.content(c)
+            }
         })
         .await?;
     stream.finish();
