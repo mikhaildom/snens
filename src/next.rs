@@ -47,10 +47,7 @@ pub async fn entry() -> R<()> {
     std::fs::create_dir_all(&data)?;
     let data = std::fs::canonicalize(data)?;
     protect_data(&data)?;
-    let token_path = flags
-        .get("token-file")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data.join("api.token"));
+    let token_path = token_path_for(flags.get("token-file"), &data);
     match cmd {
         "serve" => {
             let config_path = flags.get("config").ok_or(
@@ -98,6 +95,15 @@ pub async fn entry() -> R<()> {
             .await
         }
         _ => Err(format!("unknown command {cmd}\n{HELP}").into()),
+    }
+}
+
+/// Сантинел `auto` — не путь, а просьба положить токен в data-dir: `./auto`
+/// в cwd неожиданно для запускающего создавал секрет в чужом каталоге.
+fn token_path_for(flag: Option<&String>, data: &Path) -> PathBuf {
+    match flag.map(String::as_str) {
+        Some("auto") | None => data.join("api.token"),
+        Some(path) => PathBuf::from(path),
     }
 }
 
@@ -239,6 +245,19 @@ fn isolate(source: &str, data: &Path) -> R<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn token_path_resolves_sentinel_to_data_dir() {
+        let data = Path::new("/tmp/never-created-snens-next");
+        assert_eq!(token_path_for(None, data), data.join("api.token"));
+        assert_eq!(
+            token_path_for(Some(&"auto".to_string()), data),
+            data.join("api.token")
+        );
+        assert_eq!(
+            token_path_for(Some(&"/tmp/explicit-token".to_string()), data),
+            PathBuf::from("/tmp/explicit-token")
+        );
+    }
     #[test]
     fn strict_options() {
         assert!(flags(&["--unknown".into(), "x".into()]).is_err());
