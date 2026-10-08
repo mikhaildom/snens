@@ -2,7 +2,7 @@
 // Промпт — проекция лога (project.rs), а не сам лог.
 use std::{
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -10,6 +10,7 @@ use std::{
     },
 };
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::R;
@@ -24,6 +25,9 @@ pub enum Rec {
         /// Старые логи читаются как есть (serde default).
         #[serde(default)]
         parent: String,
+        /// Поверхность, создавшая сессию. Legacy-логи остаются без метки.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<String>,
     },
     /// Системный промпт сессии. Собирается один раз в начале и дальше читается
     /// из лога: файлы инстанса (soul/user/memory, скиллы) правятся по ходу, и
@@ -168,16 +172,39 @@ pub struct Session {
 
 impl Session {
     pub fn open(dir: &Path, id: &str) -> R<Session> {
-        Session::open_child(dir, id, "")
+        Session::open_surface(dir, id, None)
+    }
+
+    /// Открыть новую сессию с меткой поверхности. На существующем логе метка
+    /// не меняется: это метаданные создания, а не resume.
+    pub fn open_surface(dir: &Path, id: &str, surface: Option<&str>) -> R<Session> {
+        Session::open_child_surface(dir, id, "", surface)
     }
 
     /// Открыть сессию с указанием родителя (для подагента). Родитель пишется в
     /// `Meta` один раз при создании лога и больше не меняется.
     pub fn open_child(dir: &Path, id: &str, parent: &str) -> R<Session> {
+        Session::open_child_surface(dir, id, parent, None)
+    }
+
+    pub fn open_child_surface(
+        dir: &Path,
+        id: &str,
+        parent: &str,
+        surface: Option<&str>,
+    ) -> R<Session> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{id}.jsonl"));
         let exists = path.exists();
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        file.try_lock_exclusive().map_err(|e| {
+            format!("session {id} is already open for writing (possibly by surface API); stop that writer before resuming: {e}")
+        })?;
+        recover_tail(&mut file, &path)?;
         let lines = AtomicU64::new(count_lines(&path)?.max(1));
         // Родитель неизменяем и живёт в `Meta`: при открытии существующего лога
         // берём его оттуда, а не из аргумента (resume подагента не должен терять связь).
@@ -206,6 +233,7 @@ impl Session {
                 ts: now(),
                 model: String::new(),
                 parent,
+                surface: surface.map(str::to_owned),
             })?;
             return Ok(s);
         }
@@ -245,6 +273,40 @@ impl Session {
     pub fn read(&self) -> R<Vec<Rec>> {
         read_file(&self.path)
     }
+}
+
+/// With the writer lock held, validate complete records and repair only an
+/// incomplete final line. A valid unterminated JSON record is preserved.
+fn recover_tail(file: &mut File, path: &Path) -> R<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let complete_end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+
+    for (i, line) in bytes[..complete_end].split(|b| *b == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        serde_json::from_slice::<Rec>(line).map_err(|e| {
+            format!(
+                "corrupt session log {} at complete line {}: {e}",
+                path.display(),
+                i + 1
+            )
+        })?;
+    }
+
+    if complete_end < bytes.len() {
+        let tail = &bytes[complete_end..];
+        if serde_json::from_slice::<Rec>(tail).is_ok() {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+        } else {
+            file.set_len(complete_end as u64)?;
+        }
+        file.sync_data()?;
+    }
+    Ok(())
 }
 
 pub fn read_file(path: &Path) -> R<Vec<Rec>> {
@@ -299,6 +361,139 @@ pub fn latest(dir: &Path) -> R<String> {
     }
     best.map(|(_, id)| id)
         .ok_or_else(|| format!("сессий нет в {}", dir.display()).into())
+}
+
+#[cfg(test)]
+mod writer_safety_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("snens-log-test-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn user(text: &str) -> Rec {
+        Rec::User {
+            ts: 1,
+            text: text.to_string(),
+            source: "test".to_string(),
+            parts: vec![],
+        }
+    }
+
+    #[test]
+    fn subprocess_writer_observes_lifetime_lock() {
+        let Some(dir) = std::env::var_os("SNENS_LOG_LOCK_TEST_DIR") else {
+            return;
+        };
+        let error = Session::open(Path::new(&dir), "lock").err().unwrap();
+        assert!(error.to_string().contains("already open for writing"));
+    }
+
+    #[test]
+    fn writer_lock_is_exclusive_read_only_access_works_and_drop_releases() {
+        let dir = TempDir::new();
+        let session = Session::open(&dir.0, "lock").unwrap();
+        let path = session.path().to_path_buf();
+        let second = Session::open(&dir.0, "lock");
+        assert!(second.err().unwrap().to_string().contains("surface API"));
+        assert_eq!(read_file(&path).unwrap().len(), 1);
+        assert_eq!(list(&dir.0).unwrap(), vec!["lock"]);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("log::writer_safety_tests::subprocess_writer_observes_lifetime_lock")
+            .arg("--nocapture")
+            .env("SNENS_LOG_LOCK_TEST_DIR", &dir.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "subprocess failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(session);
+        let reopened = Session::open(&dir.0, "lock").unwrap();
+        reopened.append(user("after release")).unwrap();
+        assert_eq!(reopened.read().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn valid_unterminated_tail_is_preserved_and_separated_before_append() {
+        let dir = TempDir::new();
+        let path = dir.0.join("tail.jsonl");
+        let rec = serde_json::to_vec(&user("preserve me")).unwrap();
+        std::fs::write(&path, &rec).unwrap();
+        let session = Session::open(&dir.0, "tail").unwrap();
+        session.append(user("new record")).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.windows(2).any(|w| w == b"}\n"));
+        let records = read_file(&path).unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn malformed_unterminated_tail_is_truncated_before_append() {
+        let dir = TempDir::new();
+        let path = dir.0.join("tail.jsonl");
+        let valid = serde_json::to_vec(&user("keep")).unwrap();
+        let mut contents = valid;
+        contents.extend_from_slice(b"\n{\"kind\":");
+        std::fs::write(&path, contents).unwrap();
+        let session = Session::open(&dir.0, "tail").unwrap();
+        session.append(user("next")).unwrap();
+        let records = read_file(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(&records[0], Rec::User { text, .. } if text == "keep"));
+    }
+
+    #[test]
+    fn surface_marker_is_written_only_for_new_logs_and_legacy_meta_defaults() {
+        let dir = TempDir::new();
+        let session = Session::open_surface(&dir.0, "api", Some("telegram")).unwrap();
+        let records = session.read().unwrap();
+        assert!(
+            matches!(&records[0], Rec::Meta { surface: Some(surface), .. } if surface == "telegram")
+        );
+        drop(session);
+
+        let legacy = dir.0.join("legacy.jsonl");
+        std::fs::write(
+            &legacy,
+            b"{\"kind\":\"meta\",\"ts\":1,\"model\":\"\",\"parent\":\"\"}\n",
+        )
+        .unwrap();
+        let session = Session::open_surface(&dir.0, "legacy", Some("telegram")).unwrap();
+        assert!(matches!(
+            &session.read().unwrap()[0],
+            Rec::Meta { surface: None, .. }
+        ));
+    }
+
+    #[test]
+    fn corruption_in_complete_middle_record_rejects_writer_open() {
+        let dir = TempDir::new();
+        let path = dir.0.join("bad.jsonl");
+        std::fs::write(&path, b"{}\nnot-json\n{}\n").unwrap();
+        assert!(Session::open(&dir.0, "bad").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}\nnot-json\n{}\n");
+    }
 }
 
 pub fn list(dir: &Path) -> R<Vec<String>> {
