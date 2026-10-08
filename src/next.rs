@@ -9,7 +9,7 @@ const HELP: &str = "snens-next — experimental surface API (separate data and b
   serve --config PATH [--data-dir DIR] [--listen 127.0.0.1:PORT] [--token-file PATH]\n\
   tui [--endpoint http://127.0.0.1:7419] [--token-file PATH] [--session ID] [--data-dir DIR]\n\
 Default data: ~/.local/share/snens-next; default token file: <data-dir>/api.token.\n\
---token-file is always a literal path (no auto sentinel).\n\
+--token-file auto uses <data-dir>/api.token; other values are literal paths.\n\
 Start serve explicitly in another terminal. /quit disconnects; /stop cancels a run.\n\
 Experimental: text/steer/stop/history only; no attachment upload or remote secret entry yet.\n";
 
@@ -44,9 +44,7 @@ pub async fn entry() -> R<()> {
             .cloned()
             .unwrap_or_else(|| format!("{}-next", crate::cfg::data_dir())),
     );
-    std::fs::create_dir_all(&data)?;
-    let data = std::fs::canonicalize(data)?;
-    protect_data(&data)?;
+    let data = prepare_data(&data)?;
     let token_path = token_path_for(flags.get("token-file"), &data);
     match cmd {
         "serve" => {
@@ -130,6 +128,33 @@ fn flags(args: &[String]) -> R<BTreeMap<String, String>> {
     Ok(out)
 }
 
+// Resolve existing ancestors before any mkdir, including symlinks into production.
+fn future_path(path: &Path) -> R<PathBuf> {
+    if path.exists() {
+        return Ok(std::fs::canonicalize(path)?);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let parent = absolute.parent().ok_or("data path has no parent")?;
+    let name = absolute.file_name().ok_or("invalid data path")?;
+    Ok(future_path(parent)?.join(name))
+}
+
+fn prepare_data(path: &Path) -> R<PathBuf> {
+    let data = future_path(path)?;
+    let production = future_path(Path::new(&crate::cfg::data_dir()))?;
+    if data.starts_with(production) {
+        return Err("snens-next data must be outside the production snens instance".into());
+    }
+    std::fs::create_dir_all(&data)?;
+    let data = std::fs::canonicalize(data)?;
+    protect_data(&data)?;
+    Ok(data)
+}
+
 fn protect_data(data: &Path) -> R<()> {
     let production = PathBuf::from(crate::cfg::data_dir());
     let production = std::fs::canonicalize(&production).unwrap_or(production);
@@ -183,6 +208,12 @@ fn isolate(source: &str, data: &Path) -> R<Config> {
     let text = std::fs::read_to_string(source)?;
     let mut doc: toml::Table = toml::from_str(&text)?;
     let original = Config::load(Some(source))?;
+    // Resolve the source config's private .env before switching to runtime.toml.
+    // Detached children inherit the resolved key, even with a custom data-dir.
+    std::env::set_var("SNENS_CONFIG", std::fs::canonicalize(source)?);
+    if let Ok(key) = original.api_key() {
+        std::env::set_var(&original.key_env, key);
+    }
     // Separate bin directory: registry::sync_bin_dir mutates it on every run.
     let tools = data.join("tools");
     std::fs::create_dir_all(&tools)?;
@@ -276,6 +307,21 @@ mod tests {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         assert!(protect_data(&path).is_err());
         assert!(protect_data(&path.join("experiment")).is_err());
+    }
+    #[test]
+    fn rejected_data_is_not_created() {
+        let path = PathBuf::from(crate::cfg::data_dir())
+            .join(format!("rejected-next-{}", uuid::Uuid::new_v4()));
+        assert!(prepare_data(&path).is_err());
+        assert!(!path.exists());
+        #[cfg(unix)]
+        {
+            let temp = std::env::temp_dir().join(format!("next-path-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&temp).unwrap();
+            std::os::unix::fs::symlink(crate::cfg::data_dir(), temp.join("alias")).unwrap();
+            assert!(prepare_data(&temp.join("alias").join("forbidden")).is_err());
+            std::fs::remove_dir_all(temp).unwrap();
+        }
     }
     #[test]
     fn token_is_persistent_and_private() {

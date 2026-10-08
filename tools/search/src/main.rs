@@ -221,7 +221,9 @@ struct Answer {
     unresponsive_engines: Vec<(String, String)>,
 }
 
-fn fetch(base: &str, a: &Args) -> Result<(usize, Vec<Value>, Vec<(String, String)>), String> {
+type SearchResults = (usize, Vec<Value>, Vec<(String, String)>);
+
+fn fetch(base: &str, a: &Args) -> Result<SearchResults, String> {
     let mut q = a.query.clone();
     if let Some(site) = &a.site {
         q.push_str(&format!(" site:{site}"));

@@ -54,3 +54,57 @@
 Стрим дельт и тул-события, steer во время хода, Ctrl+C (run.cancelled, потомки убиты),
 `/sessions` → `/resume`, SIGTERM graceful, токен из `.env` production найден сам через
 `cfg.api_key()`. Отдельная экспериментальная ветка, не в master.
+
+## Экспериментальная установка для разработки
+
+`~/projects/snens-next` — git worktree ветки `feat/surface-api`, отдельный от рабочего
+`~/projects/snens` (общая git-история, разные рабочие деревья). Все новые изменения сначала
+собираются и проверяются здесь; перенос и обновление рабочей установки — отдельно.
+
+- Конфиг `~/.config/snens-next/config.toml`, собственная приватная копия `.env`.
+- Данные `~/.local/share/snens-next`: отдельные sessions/mail/tickets/store, копии
+  soul/user/skills и собственная memory.md. Это отдельный локальный git-репозиторий;
+  ключи, токены, сессии и runtime-конфиг исключены из git.
+- Тулы собираются из этого worktree в отдельный cargo target и устанавливаются в
+  его `tools/*`; staging и PATH не используют бинарники рабочего worktree.
+- `snens-next` (без аргументов) — TUI; `snens-next tui --session ID` — восстановить сессию.
+- User-service `snens-next.service` держит HTTP/SSE сервер на loopback:7419.
+  `systemctl --user status|restart|stop snens-next`, логи `journalctl --user -u snens-next`.
+  Перед рестартом завершить ходы: running станут interrupted, queued — cancelled.
+- `snens-next serve` — ручной запуск с экспериментальным конфигом. Сначала остановить
+  service; второй сервер на том же data-dir запрещён.
+- `snens-next dev build` — только экспериментальное ядро и тулы.
+- `snens-next dev verify` — сборка, workspace tests, clippy, HTTP/PTY smoke и tool selftests.
+- `snens-next dev install` — сборка и launcher в `~/.local/bin/snens-next`.
+
+Автоматическая memory и review отключены, тестовая модель — `openai/gpt-6-luna`.
+Это **не sandbox**: инструменты имеют обычные права пользователя; явный вызов memory
+может обращаться к общей внешней памяти, его не использовать для тестовых записей.
+В surface API пока нет attachment upload и remote secret/sudo entry.
+Сервис не подхватывает пересборку сам: после успешных тестов нужен restart.
+
+## SSE: изоляция и переполнение
+
+Снимок событий и подписка берутся под общей блокировкой с emit. Каждая подписка
+отдаёт только события своей сессии с `seq > cursor`, включая live-поток.
+При переполнении broadcast буфера история после последнего отправленного cursor
+восстанавливается из persisted store; остаток broadcast дедуплицируется.
+TUI не двигает cursor от чужих событий и не рисует повторы.
+Детерминированные unit-тесты проверяют переполнение >1024 и границу snapshot/live;
+HTTP-регрессия проверяет две подписки с разными per-session seq.
+
+Публикация SurfaceSignal идёт через один FIFO relay; перед assistant.completed и
+run.finished сервер ждёт его опустошения. Независимые tokio::spawn на каждый delta
+переупорядочивали чанки — это поймала PTY-проверка queued steer после reconnect.
+
+Финальная проверка экспериментальной установки: полный `snens-next dev verify`
+(86 next unit-тестов, workspace tests/clippy, 27 HTTP/PTY checks, tool selftests),
+повторный smoke 27/27; реальный Nous/Luna через установленный TUI PTY: run printf,
+ответ/стрим, sleep+Ctrl+C, /quit, восстановление истории после restart service.
+Production binary и config совпали по SHA-256 до/после.
+
+Изоляция data-dir проверяется до mkdir (включая существующие symlink-предки).
+Ключ исходного конфига разрешается до переключения на runtime.toml и наследуется
+дочерними процессами; ключ не записывается в runtime.toml/store/log.
+Incremental cache в next-worktree выключен: target-диск общий и заполнен почти
+полностью; удаление next/debug/incremental освободило 1.3 ГБ. Production target не чистили.

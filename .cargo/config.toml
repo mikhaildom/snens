@@ -2,3 +2,5 @@
 # ponytail: путь машинно-специфичный, репозиторий персональный — держим здесь, а не в ~/.bashrc
 [build]
 target-dir = "/mnt/HC_Volume_106138989/cargo-target/snens-next"
+# Keep the experimental cache bounded on the shared build disk.
+incremental = false

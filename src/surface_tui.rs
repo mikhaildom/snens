@@ -135,8 +135,7 @@ async fn app_loop(
             message = events.recv() => if let Some(message) = message {
                 match message {
                     Notice::Event(event, seq) => {
-                        if session.as_ref().is_some_and(|s| s.id == event.session_id) {
-                            cursor = cursor.max(seq);
+                        if accept_event(&event, seq, session.as_ref().map(|s| s.id.as_str()), &mut cursor) {
                             if event.kind == "assistant.delta" {
                                 display(&event, &ui, Some(stream.get_or_insert_with(|| Stream::new(ui.color, ui.sink()))));
                             } else {
@@ -156,6 +155,15 @@ async fn app_loop(
         task.abort();
     }
     Ok(())
+}
+
+fn accept_event(event: &Event, seq: u64, selected: Option<&str>, cursor: &mut u64) -> bool {
+    if selected == Some(event.session_id.as_str()) && seq == event.seq && seq > *cursor {
+        *cursor = seq;
+        true
+    } else {
+        false
+    }
 }
 
 fn current_session_id(session: Option<&Session>) -> Option<&str> {
@@ -182,8 +190,10 @@ fn subscribe(
             let last = Arc::clone(&delivered);
             let result = client
                 .events(&id, delivered.load(Ordering::Relaxed), |event, seq| {
-                    last.fetch_max(seq, Ordering::Relaxed);
-                    let _ = tx_events.send(Notice::Event(event, seq));
+                    if event.session_id == id {
+                        last.fetch_max(seq, Ordering::Relaxed);
+                        let _ = tx_events.send(Notice::Event(event, seq));
+                    }
                 })
                 .await;
             match result {
@@ -317,6 +327,36 @@ async fn stop_current(client: &Client, session: &Option<Session>, run: &Option<S
 
 fn command_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn event(session_id: &str, seq: u64) -> Event {
+        Event {
+            seq,
+            session_id: session_id.into(),
+            run_id: None,
+            kind: "test".into(),
+            fields: json!({}),
+        }
+    }
+
+    #[test]
+    fn delivered_cursor_ignores_foreign_and_duplicate_events() {
+        let mut cursor = 2;
+        assert!(!accept_event(&event("b", 20), 20, Some("a"), &mut cursor));
+        assert_eq!(cursor, 2);
+        assert!(!accept_event(&event("a", 2), 2, Some("a"), &mut cursor));
+        assert!(!accept_event(&event("a", 4), 3, Some("a"), &mut cursor));
+        assert_eq!(cursor, 2);
+        assert!(accept_event(&event("a", 3), 3, Some("a"), &mut cursor));
+        assert_eq!(cursor, 3);
+        assert!(!accept_event(&event("a", 3), 3, Some("a"), &mut cursor));
+        assert_eq!(cursor, 3);
+    }
 }
 
 fn display(event: &Event, ui: &Ui, stream: Option<&mut Stream>) {

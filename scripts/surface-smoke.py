@@ -8,6 +8,7 @@ No live provider, credentials, third-party Python packages, or fixed ports are u
 """
 from __future__ import annotations
 
+import http.client
 import json
 import sqlite3
 import os
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,7 +73,9 @@ class StubHandler(BaseHTTPRequestHandler):
             frames = [self.frame({"tool_calls": [tool]}, None), self.frame({}, "tool_calls")]
         else:
             # Hold a deterministic window for concurrent commands/stop tests.
-            if "surface-smoke:hold" in latest or "surface-smoke:later" in latest:
+            if "surface-smoke:pty-hold" in latest:
+                time.sleep(6.0)
+            elif "surface-smoke:hold" in latest or "surface-smoke:later" in latest:
                 time.sleep(4.0)
             elif "surface-smoke:slow" in latest or "surface-smoke:steer" in latest:
                 time.sleep(1.4)
@@ -281,6 +285,7 @@ def run_suite(base, server, token_path, data, child_pid_file, stub=None):
     c.check("session B survives stop on A", lambda: assert_true(session_state(base, b) in ("idle", "running"), "B entered invalid state"))
     c.check("event history has increasing contiguous sequence and no private prompt records", lambda: check_history(base, a))
     c.check("SSE replay with after cursor has no gaps or duplicates", lambda: check_sse(base, a))
+    c.check("parallel live SSE sessions are isolated and reconnect after cursor", lambda: check_parallel_sse(base, create_cmd, msg))
     pty_session = create_cmd(cid("smoke-pty-session"))
     pty_id = pty_session[1].get("id") if pty_session[0] in (200, 201) else None
     pty_pid_file = child_pid_file.with_name("pty-" + child_pid_file.name)
@@ -291,6 +296,7 @@ def run_suite(base, server, token_path, data, child_pid_file, stub=None):
         if stub is not None:
             stub.sleep_command = stub_pid_file["command"]
     c.check("TUI PTY Ctrl+C stop", lambda: pty_smoke(base, server["bin"], token_path, data, pty_id, pty_pid_file))
+    c.check("TUI PTY steer and reconnect while run is active", lambda: pty_steer_reconnect(base, server["bin"], token_path, data, create_cmd))
     history_session = create_cmd(cid("smoke-pty-history-session"))
     history_id = history_session[1].get("id") if history_session[0] in (200, 201) else None
     if history_id:
@@ -423,6 +429,78 @@ def pty_smoke(base, binary, token_path, data_dir, sid, child_pid_file):
 
 
 
+def pty_steer_reconnect(base, binary, token_path, data_dir, create_cmd):
+    status, session = create_cmd(cid("smoke-pty-reconnect-session"))
+    assert status in (200, 201), session
+    sid = session["id"]
+    pid, master = pty.fork()
+    if pid == 0:
+        argv = [str(binary), "tui", "--endpoint", base, "--token-file", str(token_path), "--session", sid, "--data-dir", str(data_dir)]
+        os.execvpe(argv[0], argv, os.environ.copy())
+    output = bytearray()
+
+    def collect(predicate, description, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate(output):
+                return
+            ready, _, _ = select.select([master], [], [], .1)
+            if ready:
+                try:
+                    output.extend(os.read(master, 8192))
+                except OSError:
+                    break
+        raise AssertionError(f"{description} timed out; PTY={output.decode(errors='replace')[-1200:]}")
+
+    def send_line(line):
+        for byte in line.encode() + b"\n":
+            os.write(master, bytes((byte,)))
+            time.sleep(.002)
+
+    def terminate_tui():
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+    try:
+        collect(lambda out: b"/quit" in out, "initial TUI prompt")
+        send_line("surface-smoke:pty-hold")
+        eventually(lambda: has_event(base, sid, "run.started", 0), "PTY run starts before disconnect")
+        collect(lambda out: b"applied" in out, "TUI accepted initial run")
+        send_line("surface-smoke:pty-steer")
+        eventually(
+            lambda: any(e.get("type") == "message.accepted" and e.get("text") == "surface-smoke:pty-steer" for e in request(base, f"/v1/sessions/{sid}/history")[1]["events"]),
+            "PTY steer accepted while run active",
+        )
+        assert session_state(base, sid) == "running", "mock run unexpectedly finished before disconnect"
+        terminate_tui()  # Client disconnect must not stop or lose the server-side run.
+        assert session_state(base, sid) == "running", "disconnect cancelled active run"
+
+        pid, master = pty.fork()
+        if pid == 0:
+            argv = [str(binary), "tui", "--endpoint", base, "--token-file", str(token_path), "--session", sid, "--data-dir", str(data_dir)]
+            os.execvpe(argv[0], argv, os.environ.copy())
+        output = bytearray()
+        collect(lambda out: f"сессия {sid} · running".encode() in out, "TUI resumes active session")
+        collect(lambda out: b"stub-ok: surface-smoke:pty-hold" in out, "reconnected TUI receives active run output", 10)
+        collect(lambda out: b"stub-ok: surface-smoke:pty-steer" in out, "reconnected TUI receives queued steer output", 10)
+        eventually(lambda: session_state(base, sid) == "idle", "resumed run and steer complete")
+        status, history = request(base, f"/v1/sessions/{sid}/history")
+        assert status == 200, history
+        assert any(e.get("type") == "message.accepted" and e.get("text") == "surface-smoke:pty-steer" for e in history["events"]), "steer acceptance missing from history"
+    finally:
+        terminate_tui()
+
+
 def pty_sequence(base, binary, token_path, data_dir, sid):
     if not sid:
         raise AssertionError("failed to make history session")
@@ -518,23 +596,198 @@ def check_sse(base, sid):
     status, history = request(base, f"/v1/sessions/{sid}/history")
     assert status == 200
     cursor = max(0, history["cursor"] - 3)
-    url = base + f"/v1/sessions/{sid}/events?after={cursor}"
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + TOKEN, "Accept": "text/event-stream"})
-    with urllib.request.urlopen(req, timeout=4) as response:
-        assert response.status == 200
-        ids, events = [], []
+    response = open_sse(base, sid, cursor)
+    records = []
+    ready = threading.Event()
+    stop = threading.Event()
+    errors = []
+    reader = threading.Thread(target=read_sse, args=(response, records, ready, stop, errors))
+    reader.start()
+    try:
+        assert ready.wait(4), "SSE reader did not start"
         deadline = time.monotonic() + 1.2
-        while time.monotonic() < deadline and len(ids) < 3:
-            line = response.readline().decode().strip()
-            if line.startswith("id:"):
-                ids.append(int(line[3:].strip()))
-            elif line.startswith("data:"):
-                events.append(json.loads(line[5:].strip()))
-    expected = [e["seq"] for e in history["events"] if e["seq"] > cursor]
+        expected = [e["seq"] for e in history["events"] if e["seq"] > cursor]
+        while time.monotonic() < deadline and len(records) < min(3, len(expected)):
+            time.sleep(.01)
+    finally:
+        close_sse(response, reader, stop, errors)
+    ids = [i for i, _ in records]
+    events = [e for _, e in records]
     assert ids == expected[:len(ids)], f"replayed SSE IDs {ids}, expected prefix {expected}"
     assert len(ids) == len(set(ids)), f"SSE duplicate IDs {ids}"
     assert all(e["seq"] == i for e, i in zip(events, ids)), "SSE event data/id mismatch"
 
+
+def open_sse(base, sid, after):
+    parsed = urllib.parse.urlparse(base)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=8)
+    connection.request(
+        "GET", f"/v1/sessions/{sid}/events?after={after}",
+        headers={"Authorization": "Bearer " + TOKEN, "Accept": "text/event-stream"},
+    )
+    response = connection.getresponse()
+    if response.status != 200:
+        body = response.read()
+        connection.close()
+        raise AssertionError(f"SSE HTTP {response.status}: {body!r}")
+    response.connection = connection
+    return response
+
+
+def read_sse(response, records, ready, stop, errors):
+    event_id = None
+    data = []
+    ready.set()
+    try:
+        while not stop.is_set():
+            raw = response.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8").rstrip("\r\n")
+            if not line:
+                if data:
+                    records.append((int(event_id), json.loads("\n".join(data))))
+                event_id, data = None, []
+            elif line.startswith("id:"):
+                event_id = line[3:].strip()
+            elif line.startswith("data:"):
+                data.append(line[5:].lstrip())
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        if not stop.is_set():
+            errors.append(exc)
+    except Exception as exc:
+        errors.append(exc)
+
+
+def close_sse_connection(response):
+    connection = getattr(response, "connection", None)
+    if connection is not None:
+        connection.close()
+    else:
+        response.close()
+
+
+def stop_sse_reader(response, reader, stop, errors):
+    # Shutdown wakes the blocked reader; do not close HTTPResponse concurrently
+    # with HTTPResponse.readline(), which races its internal chunk parser.
+    stop.set()
+    connection = getattr(response, "connection", None)
+    if connection is not None and connection.sock is not None:
+        try:
+            connection.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    reader.join(timeout=3)
+    assert not reader.is_alive(), "SSE reader did not stop after socket shutdown"
+    close_sse_connection(response)
+    assert not errors, f"SSE reader failed: {errors!r}"
+
+
+def close_sse(response, reader, stop, errors):
+    stop_sse_reader(response, reader, stop, errors)
+
+
+def wait_for_records(records, predicate, description, timeout=8, errors=None):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if errors:
+            raise AssertionError(f"SSE reader failed while waiting for {description}: {errors!r}")
+        snapshot = list(records)
+        if predicate(snapshot):
+            return snapshot
+        time.sleep(.01)
+    if errors:
+        raise AssertionError(f"SSE reader failed while waiting for {description}: {errors!r}")
+    raise AssertionError(f"timeout waiting for {description}; got {records!r}")
+
+
+def check_parallel_sse(base, create_cmd, msg):
+    sessions = []
+    for label in ("sse-A", "sse-B"):
+        status, obj = create_cmd(cid("smoke-" + label))
+        assert status in (200, 201), (status, obj)
+        sessions.append(obj["id"])
+    a, b = sessions
+    # Give B a distinct, nonzero cursor before subscribing; A's first live seq
+    # will be lower than B's history cursor, exposing cross-session cursor bleed.
+    status, seeded = msg(b, cid("smoke-sse-seed-B"), "surface-smoke:sse-seed-B")
+    assert status == 202, seeded
+    eventually(lambda: session_state(base, b) == "idle", "B seed run completes")
+    cursors = []
+    for sid in sessions:
+        status, history = request(base, f"/v1/sessions/{sid}/history")
+        assert status == 200, history
+        cursors.append(history["cursor"])
+    assert cursors[0] != cursors[1] and cursors[1] > cursors[0], f"test requires distinct cursors, got {cursors}"
+
+    # Keep both response bodies open before either session emits its unique marker.
+    responses, records, readers, reader_states = [], [[], []], [], []
+    try:
+        for sid, output in zip(sessions, records):
+            response = open_sse(base, sid, cursors[len(responses)])
+            responses.append(response)
+            ready, stop, errors = threading.Event(), threading.Event(), []
+            reader_states.append((stop, errors))
+            reader = threading.Thread(target=read_sse, args=(response, output, ready, stop, errors))
+            readers.append(reader)
+            reader.start()
+            assert ready.wait(4), f"SSE reader failed to start for {sid}"
+
+        markers = ("surface-smoke:sse-only-A-7e91", "surface-smoke:sse-only-B-c428")
+        for sid, marker in zip(sessions, markers):
+            status, result = msg(sid, cid("smoke-" + marker), marker)
+            assert status == 202, (status, result)
+
+        live = []
+        for sid, marker, output in zip(sessions, markers, records):
+            def complete_run(rs):
+                by_run = {}
+                for seq, event in sorted(rs, key=lambda pair: pair[0]):
+                    if event.get("session_id") == sid and event.get("type") == "assistant.delta":
+                        by_run.setdefault(event.get("run_id"), []).append(str(event.get("text", "")))
+                finished = {
+                    event.get("run_id") for _, event in rs
+                    if event.get("session_id") == sid and event.get("type") == "run.finished"
+                }
+                return any(marker in "".join(chunks) for run_id, chunks in by_run.items() if run_id in finished)
+
+            snapshot = wait_for_records(output, complete_run, f"live marker and run.finished on {sid}", errors=reader_states[len(live)][1])
+            live.append(snapshot)
+
+        for own, other_marker, marker, snapshot in zip(sessions, markers[::-1], markers, live):
+            ids = [seq for seq, event in snapshot]
+            assert all(event.get("session_id") == own for _, event in snapshot), f"foreign event on {own}: {snapshot}"
+            assert ids == sorted(set(ids)), f"non-monotonic/duplicate live seqs on {own}: {ids}"
+            assert any(marker in str(event.get("text", "")) for _, event in snapshot), f"own marker absent on {own}"
+            assert not any(other_marker in str(event) for _, event in snapshot), f"foreign session marker leaked to {own}"
+
+        # Reconnect after each run.started cursor and compare replay IDs and payloads
+        # against that session's history; this catches cursor skips, duplicates and leaks.
+        for index, (sid, cursor) in enumerate(zip(sessions, cursors)):
+            eventually(lambda sid=sid: session_state(base, sid) == "idle", f"{sid} run completes")
+            status, history = request(base, f"/v1/sessions/{sid}/history")
+            assert status == 200, history
+            expected = [e for e in history["events"] if e["seq"] > cursor]
+            replay_response = open_sse(base, sid, cursor)
+            replay = []
+            ready, stop, errors = threading.Event(), threading.Event(), []
+            reader = threading.Thread(target=read_sse, args=(replay_response, replay, ready, stop, errors))
+            readers.append(reader)
+            reader.start()
+            try:
+                assert ready.wait(4), f"reconnect reader failed for {sid}"
+                replayed = wait_for_records(replay, lambda rs: len(rs) >= len(expected), f"replay of {sid}", errors=errors) if expected else []
+            finally:
+                close_sse(replay_response, reader, stop, errors)
+            readers.remove(reader)
+            replayed = replayed[:len(expected)]
+            assert [seq for seq, _ in replayed] == [e["seq"] for e in expected], f"reconnect IDs differ for {sid}"
+            assert [event for _, event in replayed] == expected, f"reconnect payloads differ for {sid}"
+            assert all(event.get("session_id") == sid for _, event in replayed), f"foreign event in reconnect for {sid}"
+    finally:
+        for response, reader, (stop, errors) in zip(responses, readers, reader_states):
+            stop_sse_reader(response, reader, stop, errors)
+        assert all(not reader.is_alive() for reader in readers), "SSE readers remain alive after cleanup"
 
 def check_token(path):
     assert path.exists(), "server did not generate token"

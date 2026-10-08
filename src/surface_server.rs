@@ -11,9 +11,9 @@ use axum::{
     Json, Router,
 };
 use fs2::FileExt;
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use serde::Deserialize;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 
 pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()> {
     if !addr.ip().is_loopback() {
@@ -253,6 +253,26 @@ async fn message(
     }
     (StatusCode::ACCEPTED, Json(result)).into_response()
 }
+async fn drain_surface_signals<F, Fut>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    mut emit: F,
+) -> crate::R<()>
+where
+    F: FnMut(String, serde_json::Value) -> Fut,
+    Fut: std::future::Future<Output = crate::R<()>>,
+{
+    let mut first_error = None;
+    while let Some((kind, fields)) = rx.recv().await {
+        if let Err(error) = emit(kind, fields).await {
+            first_error.get_or_insert_with(|| error.to_string());
+        }
+    }
+    match first_error {
+        Some(error) => Err(std::io::Error::other(error).into()),
+        None => Ok(()),
+    }
+}
+
 async fn launch(s: Arc<Runtime>, id: String, run: String, text: String) {
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -286,9 +306,7 @@ async fn launch(s: Arc<Runtime>, id: String, run: String, text: String) {
             text,
             source: "surface".into(),
         });
-        let obs_s = s.clone();
-        let obs_id = id.clone();
-        let obs_run = run.clone();
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
         let observe = move |sig: crate::agent::SurfaceSignal| {
             let (kind, fields) = match sig {
                 crate::agent::SurfaceSignal::Delta { text, kind } => (
@@ -316,13 +334,21 @@ async fn launch(s: Arc<Runtime>, id: String, run: String, text: String) {
                     ("notice", serde_json::json!({"text":text}))
                 }
             };
-            let s = obs_s.clone();
-            let id = obs_id.clone();
-            let run = obs_run.clone();
-            tokio::spawn(async move {
-                let _ = s.emit(&id, Some(run), kind, fields).await;
-            });
+            // An unbounded FIFO preserves callback order without blocking the agent.
+            let _ = signal_tx.send((kind.to_owned(), fields));
         };
+        let relay_s = s.clone();
+        let relay_id = id.clone();
+        let relay_run = run.clone();
+        let relay = tokio::spawn(async move {
+            drain_surface_signals(signal_rx, |kind, fields| {
+                let s = relay_s.clone();
+                let id = relay_id.clone();
+                let run = relay_run.clone();
+                async move { s.emit(&id, Some(run), &kind, fields).await.map(|_| ()) }
+            })
+            .await
+        });
         let _ = s
             .emit(&id, Some(run.clone()), "run.started", serde_json::json!({}))
             .await;
@@ -336,17 +362,25 @@ async fn launch(s: Arc<Runtime>, id: String, run: String, text: String) {
             Some(queue_rx.clone()),
         )
         .await;
-        let status = if result.is_ok() {
+        // Drop the callback's sender before joining: every accepted signal is drained
+        // before completion events, including on cancellation.
+        drop(observe);
+        let relay_error = match relay.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(format!("signal relay task failed: {error}")),
+        };
+        let result_error = result.as_ref().err().map(|e| e.to_string());
+        let status = if relay_error.is_some() {
+            "error"
+        } else if result.is_ok() {
             "ok"
-        } else if result
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.to_string() == "cancelled")
-        {
+        } else if result_error.as_deref() == Some("cancelled") {
             "cancelled"
         } else {
             "error"
         };
+        let error = relay_error.or(result_error);
         let assistant = sess
             .read()
             .unwrap_or_default()
@@ -383,7 +417,7 @@ async fn launch(s: Arc<Runtime>, id: String, run: String, text: String) {
                 &id,
                 Some(run.clone()),
                 "run.finished",
-                serde_json::json!({"status":status,"error":result.err().map(|e|e.to_string())}),
+                serde_json::json!({"status":status,"error":error}),
             )
             .await;
         s.controls.lock().await.remove(&id);
@@ -450,34 +484,308 @@ async fn events(
     Path(id): Path<String>,
     Query(q): Query<After>,
 ) -> impl IntoResponse {
-    let rx = s.tx.subscribe();
     let after = q.after.unwrap_or(0);
-    let initial = {
-        let d = s.data.lock().await;
-        if !d.sessions.contains_key(&id) {
-            return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
-        }
-        d.events.get(&id).cloned().unwrap_or_default()
+    let Some((rx, initial)) = snapshot_and_subscribe(&s, &id, after).await else {
+        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     };
-    let init = tokio_stream::iter(
-        initial
-            .into_iter()
-            .filter(move |e| e.seq > after)
-            .map(|e| Ok::<_, std::convert::Infallible>(sse(e))),
-    );
-    let live = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|msg| async move {
-        match msg {
-            Ok(e) => Some(Ok(sse(e))),
-            Err(_) => None,
-        }
-    });
-    Sse::new(init.chain(live))
+    let (initial, cursor) = initial;
+    let live = session_event_stream(s, id, rx, cursor, initial)
+        .map(|event| Ok::<_, std::convert::Infallible>(sse(event)));
+    Sse::new(live)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+async fn snapshot_and_subscribe(
+    s: &Runtime,
+    id: &str,
+    after: u64,
+) -> Option<(
+    tokio::sync::broadcast::Receiver<Event>,
+    (VecDeque<Event>, u64),
+)> {
+    let d = s.data.lock().await;
+    if !d.sessions.contains_key(id) {
+        return None;
+    }
+    let initial = d
+        .events
+        .get(id)
+        .into_iter()
+        .flatten()
+        .filter(|event| event.seq > after)
+        .cloned()
+        .collect();
+    // emit also needs data lock, so no publish can cross this boundary.
+    let rx = s.tx.subscribe();
+    Some((rx, (initial, after)))
+}
+
+fn session_event_stream(
+    s: Arc<Runtime>,
+    id: String,
+    rx: tokio::sync::broadcast::Receiver<Event>,
+    cursor: u64,
+    initial: VecDeque<Event>,
+) -> impl futures_util::Stream<Item = Event> {
+    stream::unfold(
+        (s, id, rx, cursor, initial),
+        |(s, id, mut rx, mut cursor, mut pending)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    if event.session_id == id && event.seq > cursor {
+                        cursor = event.seq;
+                        return Some((event, (s, id, rx, cursor, pending)));
+                    }
+                    continue;
+                }
+                match rx.recv().await {
+                    Ok(event) if event.session_id == id && event.seq > cursor => {
+                        cursor = event.seq;
+                        return Some((event, (s, id, rx, cursor, pending)));
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Broadcast is only a wake-up/low-latency path. Replay from the
+                        // durable in-memory store to close every overflow gap.
+                        let d = s.data.lock().await;
+                        pending.extend(
+                            d.events
+                                .get(&id)
+                                .into_iter()
+                                .flatten()
+                                .filter(|event| event.seq > cursor)
+                                .cloned(),
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
 }
 fn sse(e: Event) -> SseEvent {
     SseEvent::default()
         .id(e.seq.to_string())
         .json_data(e)
         .unwrap_or_else(|_| SseEvent::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use tokio::sync::{broadcast, oneshot, Mutex};
+
+    fn event(session_id: &str, seq: u64) -> Event {
+        Event {
+            seq,
+            session_id: session_id.into(),
+            run_id: None,
+            kind: "test".into(),
+            fields: serde_json::json!({"seq":seq}),
+        }
+    }
+
+    async fn runtime() -> (Arc<Runtime>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("surface-sse-{}", uuid::Uuid::new_v4()));
+        let (mut store, db) = rt::open_store(&dir).unwrap();
+        for id in ["a", "b"] {
+            store.sessions.insert(
+                id.into(),
+                Session {
+                    id: id.into(),
+                    surface: "test".into(),
+                    state: "idle".into(),
+                    run_id: None,
+                },
+            );
+            store.events.insert(id.into(), Vec::new());
+        }
+        rt::persist_store(&db, &store).unwrap();
+        let (tx, _) = broadcast::channel(1024);
+        (
+            Arc::new(Runtime {
+                data: Mutex::new(store),
+                db: std::sync::Mutex::new(db),
+                tx,
+                cfg: Config::default(),
+                llm: Arc::new(crate::llm::OpenAi::new(String::new()).unwrap()),
+                locks: Default::default(),
+                controls: Default::default(),
+            }),
+            dir,
+        )
+    }
+
+    async fn add_event(runtime: &Runtime, id: &str, seq: u64) {
+        let event = event(id, seq);
+        let mut data = runtime.data.lock().await;
+        data.events.get_mut(id).unwrap().push(event.clone());
+        runtime.persist(&data).unwrap();
+        let _ = runtime.tx.send(event);
+    }
+
+    async fn add_events(runtime: &Runtime, events: Vec<Event>) {
+        let mut data = runtime.data.lock().await;
+        for event in &events {
+            data.events
+                .get_mut(&event.session_id)
+                .unwrap()
+                .push(event.clone());
+        }
+        // Match emit's persist-before-publish ordering, but pay for one durable
+        // transaction rather than rewriting the whole store for every test event.
+        runtime.persist(&data).unwrap();
+        for event in events {
+            let _ = runtime.tx.send(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_relay_preserves_fifo_and_final_waits_for_drain() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let emitted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = emitted.clone();
+        let relay = tokio::spawn(async move {
+            let mut started_tx = Some(started_tx);
+            let mut release_rx = Some(release_rx);
+            drain_surface_signals(rx, move |kind, _| {
+                let seen = seen.clone();
+                let is_blocked = kind == "assistant.delta";
+                let started = started_tx.take();
+                let release = if is_blocked { release_rx.take() } else { None };
+                async move {
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                    seen.lock().await.push(kind);
+                    Ok(())
+                }
+            })
+            .await
+        });
+
+        tx.send(("notice".to_owned(), serde_json::json!({"text":"stub-ok: "})))
+            .unwrap();
+        tx.send((
+            "assistant.delta".to_owned(),
+            serde_json::json!({"text":"surface-smoke:pty-steer"}),
+        ))
+        .unwrap();
+        started_rx.await.unwrap();
+        tx.send(("notice".to_owned(), serde_json::json!({"text":"queued"})))
+            .unwrap();
+        drop(tx); // producer finished; relay must drain queued signal before final.
+        assert!(
+            !relay.is_finished(),
+            "relay must wait for the blocked first signal"
+        );
+        release_tx.send(()).unwrap();
+        relay.await.unwrap().unwrap();
+        emitted.lock().await.push("assistant.completed".into());
+        emitted.lock().await.push("run.finished".into());
+        assert_eq!(
+            *emitted.lock().await,
+            [
+                "notice",
+                "assistant.delta",
+                "notice",
+                "assistant.completed",
+                "run.finished"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_boundary_filters_sessions_and_suppresses_overlap() {
+        let (runtime, dir) = runtime().await;
+        add_event(&runtime, "a", 1).await;
+        add_event(&runtime, "b", 1).await;
+        // Snapshot captures A:1; its already-broadcast copy and B:2 must not leak live.
+        let (rx, (initial, cursor)) = snapshot_and_subscribe(&runtime, "a", 0).await.unwrap();
+        // Inject the overlap explicitly: A:1 was included in the snapshot and
+        // can also be present in the receiver queue at the boundary.
+        let _ = runtime.tx.send(event("a", 1));
+        add_event(&runtime, "a", 2).await;
+        add_event(&runtime, "b", 2).await;
+        let mut stream = Box::pin(session_event_stream(
+            runtime.clone(),
+            "a".into(),
+            rx,
+            cursor,
+            initial,
+        ));
+        let first = stream.next().await.unwrap();
+        assert_eq!((first.session_id.as_str(), first.seq), ("a", 1));
+        let second = stream.next().await.unwrap();
+        assert_eq!((second.session_id.as_str(), second.seq), ("a", 2));
+        drop(stream);
+        drop(runtime);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn after_cursor_and_lag_replay_are_session_scoped_and_gapless() {
+        let (runtime, dir) = runtime().await;
+        // Different sessions have independent sequences; A resumes strictly after 3.
+        for n in 1..=3 {
+            add_event(&runtime, "a", n).await;
+        }
+        for n in 1..=12 {
+            add_event(&runtime, "b", n).await;
+        }
+        let (rx, (initial, cursor)) = snapshot_and_subscribe(&runtime, "a", 3).await.unwrap();
+        let mut stream = Box::pin(session_event_stream(
+            runtime.clone(),
+            "a".into(),
+            rx,
+            cursor,
+            initial,
+        ));
+        // New A events overflow the 1024-entry broadcast buffer; B makes global traffic
+        // exceed the limit too, without sharing A's per-session cursor.
+        let mut overflow = Vec::new();
+        for n in 4..=1100 {
+            overflow.push(event("a", n));
+            overflow.push(event("b", n + 12));
+        }
+        add_events(&runtime, overflow).await;
+        let mut got = Vec::new();
+        for _ in 4..=1100 {
+            let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+            got.push((event.session_id, event.seq));
+        }
+        assert_eq!(got.len(), 1097);
+        assert!(got
+            .iter()
+            .enumerate()
+            .all(|(index, (id, seq))| id == "a" && *seq == index as u64 + 4));
+
+        // Replay drained the gap; the same subscription must continue live,
+        // including while traffic from the other session keeps arriving.
+        add_events(&runtime, vec![event("b", 1200), event("a", 1101)]).await;
+        let next = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((next.session_id.as_str(), next.seq), ("a", 1101));
+        add_event(&runtime, "b", 1201).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), stream.next())
+                .await
+                .is_err()
+        );
+        drop(stream);
+        drop(runtime);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
