@@ -48,7 +48,7 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
         ts: log::now(),
         text,
         source: "review".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
     eprintln!("[snens] ревью {rid} → {} ({})", cfg.base_url, cfg.model);
     agent::run_agent(&sess, cfg, llm, &crate::render::Ui::plain()).await

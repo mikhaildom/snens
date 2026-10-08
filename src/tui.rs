@@ -96,7 +96,7 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
             ts: log::now(),
             text: line,
             source: "tui".into(),
-                parts: Vec::new(),
+            parts: Vec::new(),
         })?;
         // Ход не блокирует ввод: пока он идёт, строки из канала уезжают агенту
         // как steer. Ctrl+C или Ctrl+D прерывают ход.
@@ -197,7 +197,7 @@ async fn plain(cfg: &Config, llm: &llm::OpenAi, flags: &BTreeMap<String, String>
             ts: log::now(),
             text: line,
             source: "tui".into(),
-                parts: Vec::new(),
+            parts: Vec::new(),
         })?;
         agent::run_agent(&sess, cfg, llm, &ui).await?;
     }

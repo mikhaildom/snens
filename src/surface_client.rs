@@ -32,8 +32,32 @@ pub struct Event {
 
 #[derive(Debug, Deserialize)]
 pub struct History {
+    #[serde(default)]
     pub events: Vec<Event>,
     pub cursor: u64,
+    #[serde(default)]
+    pub messages: Option<Vec<TranscriptMessage>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Protocol metadata is decoded even when the terminal renderer does not use it.
+pub struct TranscriptMessage {
+    pub seq: u64,
+    pub ts: u64,
+    pub role: String,
+    pub content: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub exit: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]

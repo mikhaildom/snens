@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn clean_log_reports_nothing_suspicious() {
         let text = "{\"kind\":\"assistant\",\"ts\":1,\"text\":\"ок\",\"tool_calls\":[]}\n";
-        let r = analyze("t.jsonl", &text);
+        let r = analyze("t.jsonl", text);
         let out = render(&r, HUGE);
         assert!(out.contains("(ничего)"), "на чистом логе: {out}");
         assert!(out.contains("(вызовов инструментов не было)"));

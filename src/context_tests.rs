@@ -30,7 +30,7 @@ impl Fixture {
                 ts: 1,
                 text: text.into(),
                 source: "human".into(),
-                    parts: Vec::new(),
+                parts: Vec::new(),
             })
             .unwrap();
     }

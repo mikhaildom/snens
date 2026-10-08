@@ -55,6 +55,12 @@
 `/sessions` → `/resume`, SIGTERM graceful, токен из `.env` production найден сам через
 `cfg.api_key()`. Отдельная экспериментальная ветка, не в master.
 
+## History and legacy session compatibility
+
+`GET /v1/sessions` returns `{sessions:[{id,surface,state,run_id}]}` merged from existing API delivery state and UUID-or-legacy `<timestamp>-<pid>.jsonl` files under the configured sessions directory. Legacy logs without `Meta.surface` use `surface: "legacy"`; discovery is read-only and does not migrate/rewrite transcripts. `GET /v1/sessions/{id}` resolves a valid legacy JSONL ID even before it has API delivery state.
+
+`GET /v1/sessions/{id}/history` returns `{cursor,events,messages}`. `cursor` and `events` retain the API's durable SSE-delivery sequence and lifecycle/action events; they are not transcript positions. `messages` is the canonical JSONL projection, ordered by physical 1-based line number: `{seq,ts,role,content,source?,reasoning?,tool_calls?,tool_call_id?,name?,exit?}`. `role` is user/assistant/tool; seq may have gaps for metadata/accounting records. Assistant calls use OpenAI function-call shape. No transcript deltas/messages are synthesized into SSE. Complete malformed JSONL records fail the history request; an incomplete malformed final tail is ignored. Resuming a JSONL session opens its exclusive writer lock; concurrent writers fail fast.
+
 ## Экспериментальная установка для разработки
 
 `~/projects/snens-next` — git worktree ветки `feat/surface-api`, отдельный от рабочего

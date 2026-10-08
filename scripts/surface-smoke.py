@@ -584,7 +584,10 @@ def check_history(base, sid):
     assert status == 200, h
     events = h["events"]
     seqs = [e["seq"] for e in events]
-    assert seqs == list(range(1, len(seqs) + 1)), f"sequence gaps/duplicates: {seqs}"
+    # Ephemeral SSE delta events consume sequence numbers but are deliberately
+    # absent from durable history. Durable events must remain strictly ordered
+    # and unique; replay correctness is asserted separately by check_sse().
+    assert seqs == sorted(set(seqs)), f"non-monotonic/duplicate durable sequence: {seqs}"
     assert h["cursor"] == (seqs[-1] if seqs else 0)
     for event in events:
         dumped = json.dumps(event).lower()

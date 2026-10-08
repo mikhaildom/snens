@@ -1,17 +1,21 @@
 use crate::cfg::Config;
 use crate::surface_runtime::{self as rt, Event, Runtime, Session};
+#[path = "surface_discovery.rs"]
+mod discovery;
+#[path = "surface_history.rs"]
+mod history;
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{
-        sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event as SseEvent, KeepAlive, Sse},
     },
     routing::{get, post},
-    Json, Router,
 };
 use fs2::FileExt;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
@@ -35,14 +39,31 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         .map_err(|e| format!("surface store already locked: {e}"))?;
     let (tx, _) = tokio::sync::broadcast::channel(1024);
     let (mut store, db) = rt::open_store(&dir)?;
+    for discovered in discovery::sessions(&cfg.data_path(), &store)? {
+        store
+            .sessions
+            .entry(discovered.id.clone())
+            .or_insert(discovered);
+    }
+    let mut discovered_ids = rt::event_sequences(&db)?;
+    for (id, events) in &store.events {
+        let high = events.iter().map(|event| event.seq).max().unwrap_or(0);
+        discovered_ids
+            .entry(id.clone())
+            .and_modify(|seq| *seq = (*seq).max(high))
+            .or_insert(high);
+    }
     let had_running = store
         .sessions
         .values()
         .any(|s| s.state == "running" || s.state == "stopping");
-    rt::interrupt_running(&mut store);
+    rt::interrupt_running(&mut store, &mut discovered_ids);
     if had_running {
         // Persist restart recovery before accepting requests.
         rt::persist_store(&db, &store)?;
+        for (id, seq) in &discovered_ids {
+            db.execute("INSERT INTO event_sequences(session_id,seq) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq", rusqlite::params![id, *seq as i64])?;
+        }
     }
     let state = Arc::new(Runtime {
         data: tokio::sync::Mutex::new(store),
@@ -53,6 +74,8 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         locks: Default::default(),
         controls: Default::default(),
         pending_tools: Default::default(),
+        writers: Default::default(),
+        event_seq: tokio::sync::Mutex::new(discovered_ids),
     });
     let app = Router::new()
         .route("/v1/sessions", get(list).post(create))
@@ -94,8 +117,13 @@ async fn shutdown(s: &Arc<Runtime>) -> crate::R<()> {
         }
     }
     let mut d = s.data.lock().await;
-    rt::interrupt_running(&mut d);
-    s.persist(&d)
+    let mut sequences = s.event_seq.lock().await;
+    rt::interrupt_running(&mut d, &mut sequences);
+    let db = s.db.lock().unwrap();
+    for (id, seq) in sequences.iter() {
+        db.execute("INSERT INTO event_sequences(session_id,seq) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq", rusqlite::params![id, *seq as i64])?;
+    }
+    rt::persist_store(&db, &d)
 }
 
 async fn auth(
@@ -120,9 +148,27 @@ fn err(code: &str, msg: &str, status: StatusCode) -> impl IntoResponse {
         Json(serde_json::json!({"error":{"code":code,"message":msg}})),
     )
 }
-async fn list(State(s): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+async fn list(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
     let d = s.data.lock().await;
-    Json(serde_json::json!({"sessions":d.sessions.values().collect::<Vec<_>>()}))
+    match discovery::sessions(&s.cfg.data_path(), &d) {
+        Ok(sessions) => {
+            let sessions = sessions
+                .into_iter()
+                .filter(|session| discovery::path(&s.cfg, &session.id).is_some_and(|p| p.is_file()))
+                .collect::<Vec<_>>();
+            drop(d);
+            let mut state = s.data.lock().await;
+            for session in &sessions {
+                state
+                    .sessions
+                    .entry(session.id.clone())
+                    .or_insert_with(|| session.clone());
+                state.events.entry(session.id.clone()).or_default();
+            }
+            Json(serde_json::json!({"sessions":sessions})).into_response()
+        }
+        Err(e) => err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+    }
 }
 #[derive(Deserialize)]
 struct ToolDefs {
@@ -355,6 +401,13 @@ async fn create(State(s): State<Arc<Runtime>>, Json(b): Json<Create>) -> impl In
         return (StatusCode::OK, Json(response)).into_response();
     }
     let id = uuid::Uuid::new_v4().to_string();
+    let writer =
+        match crate::log::Session::open_surface(&s.cfg.sessions_path(), &id, Some(&b.surface)) {
+            Ok(writer) => Arc::new(writer),
+            Err(e) => {
+                return err("session_owned", &e.to_string(), StatusCode::CONFLICT).into_response();
+            }
+        };
     let session = Session {
         id: id.clone(),
         surface: b.surface.clone(),
@@ -367,19 +420,42 @@ async fn create(State(s): State<Arc<Runtime>>, Json(b): Json<Create>) -> impl In
     let mut record = serde_json::to_value(&session).unwrap();
     record["_surface_request"] = serde_json::Value::String(b.surface.clone());
     d.commands.insert(b.command_id, record);
+    s.writers.lock().await.insert(id.clone(), writer);
     if let Err(e) = s.persist(&d) {
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
     }
+    s.event_seq.lock().await.insert(id, 0);
     (StatusCode::CREATED, Json(session)).into_response()
 }
 async fn get_session(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> impl IntoResponse {
     if !rt::valid_id(&id) {
         return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
     }
-    match s.data.lock().await.sessions.get(&id).cloned() {
-        Some(x) => Json(x).into_response(),
-        None => err("not_found", "session not found", StatusCode::NOT_FOUND).into_response(),
+    let Some(path) = discovery::path(&s.cfg, &id) else {
+        unreachable!()
+    };
+    if !path.is_file() {
+        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     }
+    let d = s.data.lock().await;
+    if let Some(session) = d.sessions.get(&id).cloned() {
+        return Json(session).into_response();
+    }
+    let surface = discovery::load_meta_surface(&path).unwrap_or_else(|| "legacy".into());
+    let session = Session {
+        id: id.clone(),
+        surface,
+        state: "idle".into(),
+        run_id: None,
+    };
+    drop(d);
+    s.data
+        .lock()
+        .await
+        .sessions
+        .insert(id.clone(), session.clone());
+    s.data.lock().await.events.entry(id).or_default();
+    Json(session).into_response()
 }
 #[derive(Deserialize)]
 struct UploadQuery {
@@ -424,7 +500,7 @@ async fn upload_attachment(
                 "attachment exceeds configured size limit",
                 StatusCode::PAYLOAD_TOO_LARGE,
             )
-            .into_response()
+            .into_response();
         }
     };
     let digest = format!("{:x}", Sha256::digest(&body));
@@ -591,6 +667,25 @@ fn same_message_payload(existing: &rt::Message, text: &str, attachment_ids: &[St
     existing.text == text && existing.attachment_ids == attachment_ids
 }
 
+async fn ensure_writer(s: &Arc<Runtime>, id: &str) -> crate::R<Arc<crate::log::Session>> {
+    if let Some(writer) = s.writers.lock().await.get(id).cloned() {
+        return Ok(writer);
+    }
+    let path = discovery::path(&s.cfg, id).ok_or("invalid session id")?;
+    let marker = discovery::load_meta_surface(&path);
+    let surface = marker.as_deref().filter(|value| *value != "legacy");
+    let writer = Arc::new(crate::log::Session::open_surface(
+        &s.cfg.sessions_path(),
+        id,
+        surface,
+    )?);
+    let mut writers = s.writers.lock().await;
+    Ok(writers
+        .entry(id.to_string())
+        .or_insert_with(|| writer.clone())
+        .clone())
+}
+
 async fn message(
     State(s): State<Arc<Runtime>>,
     Path(id): Path<String>,
@@ -608,10 +703,33 @@ async fn message(
         .into_response();
     }
     let _guard = s.session_lock(&id).await.lock_owned().await;
-    let mut d = s.data.lock().await;
-    if !d.sessions.contains_key(&id) {
-        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+    let known = s.data.lock().await.sessions.contains_key(&id);
+    if !known {
+        let Some(path) = discovery::path(&s.cfg, &id).filter(|path| path.is_file()) else {
+            return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+        };
+        let session = Session {
+            id: id.clone(),
+            surface: discovery::load_meta_surface(&path).unwrap_or_else(|| "legacy".into()),
+            state: "idle".into(),
+            run_id: None,
+        };
+        let mut data = s.data.lock().await;
+        data.sessions.entry(id.clone()).or_insert(session);
+        data.events.entry(id.clone()).or_default();
+        if let Err(error) = s.persist(&data) {
+            return err(
+                "storage",
+                &error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response();
+        }
     }
+    if let Err(e) = ensure_writer(&s, &id).await {
+        return err("session_owned", &e.to_string(), StatusCode::CONFLICT).into_response();
+    }
+    let mut d = s.data.lock().await;
     if let Some(m) = d
         .messages
         .get(&id)
@@ -709,6 +827,43 @@ where
     }
 }
 
+async fn finalize_launch_error(s: &Arc<Runtime>, id: &str, run: &str, message: &str) {
+    {
+        let mut data = s.data.lock().await;
+        if let Some(session) = data.sessions.get_mut(id) {
+            session.state = "error".into();
+            session.run_id = None;
+        }
+        for queued in data
+            .messages
+            .entry(id.to_string())
+            .or_default()
+            .iter_mut()
+            .filter(|message| message.run_id.as_deref() == Some(run) && message.state == "accepted")
+        {
+            queued.state = "cancelled".into();
+        }
+        let _ = s.persist(&data);
+    }
+    s.controls.lock().await.remove(id);
+    let _ = s
+        .emit(
+            id,
+            Some(run.to_string()),
+            "notice",
+            serde_json::json!({"text":message}),
+        )
+        .await;
+    let _ = s
+        .emit(
+            id,
+            Some(run.to_string()),
+            "run.finished",
+            serde_json::json!({"status":"error"}),
+        )
+        .await;
+}
+
 async fn launch(
     s: Arc<Runtime>,
     id: String,
@@ -793,26 +948,29 @@ async fn launch(
         }
     });
     tokio::spawn(async move {
-        let sess = match crate::log::Session::open(&cfg.sessions_path(), &id) {
-            Ok(x) => x,
-            Err(e) => {
-                let _ = s
-                    .emit(
-                        &id,
-                        Some(run.clone()),
-                        "notice",
-                        serde_json::json!({"text":e.to_string()}),
-                    )
-                    .await;
+        let sess = match s.writers.lock().await.get(&id).cloned() {
+            Some(writer) => writer,
+            None => {
+                finalize_launch_error(&s, &id, &run, "session writer missing").await;
                 return;
             }
         };
-        let _ = sess.append(crate::log::Rec::User {
+        let start_records = match sess.read() {
+            Ok(records) => records.len(),
+            Err(error) => {
+                finalize_launch_error(&s, &id, &run, &error.to_string()).await;
+                return;
+            }
+        };
+        if let Err(error) = sess.append(crate::log::Rec::User {
             ts: crate::log::now(),
             text,
             source: "surface".into(),
             parts,
-        });
+        }) {
+            finalize_launch_error(&s, &id, &run, &error.to_string()).await;
+            return;
+        }
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
         let observe = move |sig: crate::agent::SurfaceSignal| {
             let (kind, fields) = match sig {
@@ -897,6 +1055,7 @@ async fn launch(
             .read()
             .unwrap_or_default()
             .into_iter()
+            .skip(start_records + 1)
             .rev()
             .find_map(|r| {
                 if let crate::log::Rec::Assistant {
@@ -983,13 +1142,37 @@ struct After {
     after: Option<u64>,
 }
 async fn history(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> impl IntoResponse {
-    let d = s.data.lock().await;
-    if let Some(e) = d.events.get(&id) {
-        Json(serde_json::json!({"cursor":e.last().map(|x|x.seq).unwrap_or(0),"events":e}))
-            .into_response()
-    } else {
-        err("not_found", "session not found", StatusCode::NOT_FOUND).into_response()
+    if !rt::valid_id(&id) {
+        return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
     }
+    let d = s.data.lock().await;
+    let session = d.sessions.get(&id);
+    let Some(path) = discovery::path(&s.cfg, &id) else {
+        unreachable!()
+    };
+    if session.is_none() && !path.is_file() {
+        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+    }
+    let messages = match history::read(&path, &s.cfg) {
+        Ok(messages) => messages,
+        Err(e) => {
+            return err(
+                "history_read",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response();
+        }
+    };
+    let events = d.events.get(&id).cloned().unwrap_or_default();
+    let cursor = s
+        .event_seq
+        .lock()
+        .await
+        .get(&id)
+        .copied()
+        .unwrap_or_else(|| events.iter().map(|event| event.seq).max().unwrap_or(0));
+    Json(serde_json::json!({"cursor":cursor,"events":events,"messages":messages})).into_response()
 }
 async fn events(
     State(s): State<Arc<Runtime>>,
@@ -1087,7 +1270,42 @@ fn sse(e: Event) -> SseEvent {
 mod tests {
     use super::*;
     use futures_util::StreamExt;
-    use tokio::sync::{broadcast, oneshot, Mutex};
+    use tokio::sync::{Mutex, broadcast, oneshot};
+
+    #[tokio::test]
+    async fn failed_launch_clears_running_state_and_cancels_queued_messages() {
+        let (runtime, dir) = runtime().await;
+        {
+            let mut data = runtime.data.lock().await;
+            let session = data.sessions.get_mut("a").unwrap();
+            session.state = "running".into();
+            session.run_id = Some("run".into());
+            data.messages.insert(
+                "a".into(),
+                vec![rt::Message {
+                    id: "queued".into(),
+                    command_id: "command".into(),
+                    text: "queued text".into(),
+                    attachment_ids: Vec::new(),
+                    state: "accepted".into(),
+                    run_id: Some("run".into()),
+                }],
+            );
+        }
+        finalize_launch_error(&runtime, "a", "run", "writer open failed").await;
+        let data = runtime.data.lock().await;
+        assert_eq!(data.sessions["a"].state, "error");
+        assert_eq!(data.sessions["a"].run_id, None);
+        assert_eq!(data.messages["a"][0].state, "cancelled");
+        assert!(
+            data.events["a"]
+                .iter()
+                .any(|event| event.kind == "run.finished")
+        );
+        drop(data);
+        drop(runtime);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn message_idempotency_checks_text_payload() {
@@ -1149,6 +1367,8 @@ mod tests {
                 locks: Default::default(),
                 controls: Default::default(),
                 pending_tools: Default::default(),
+                writers: Default::default(),
+                event_seq: Default::default(),
             }),
             dir,
         )
@@ -1184,13 +1404,15 @@ mod tests {
         let cfg = Config::default();
         let valid = serde_json::json!({"type":"function","function":{"name":"send_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}});
         let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt
-            .block_on(validate_tools(vec![valid.clone()], &cfg))
-            .is_ok());
+        assert!(
+            rt.block_on(validate_tools(vec![valid.clone()], &cfg))
+                .is_ok()
+        );
         assert!(rt.block_on(validate_tools(vec![serde_json::json!({"type":"function","function":{"name":"run","parameters":{"type":"object"}}})],&cfg)).is_err());
-        assert!(rt
-            .block_on(validate_tools(vec![valid.clone(), valid], &cfg))
-            .is_err());
+        assert!(
+            rt.block_on(validate_tools(vec![valid.clone(), valid], &cfg))
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1357,10 +1579,11 @@ mod tests {
             got.push((event.session_id, event.seq));
         }
         assert_eq!(got.len(), 1097);
-        assert!(got
-            .iter()
-            .enumerate()
-            .all(|(index, (id, seq))| id == "a" && *seq == index as u64 + 4));
+        assert!(
+            got.iter()
+                .enumerate()
+                .all(|(index, (id, seq))| id == "a" && *seq == index as u64 + 4)
+        );
 
         // Replay drained the gap; the same subscription must continue live,
         // including while traffic from the other session keeps arriving.

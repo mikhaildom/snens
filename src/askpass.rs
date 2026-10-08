@@ -80,6 +80,7 @@ pub async fn client(_prompt: String) -> R<()> {
 
 #[cfg(unix)]
 pub async fn client(prompt: String) -> R<()> {
+    check_askpass_enabled(std::env::var_os("SNENS_ASKPASS_DISABLED").is_some())?;
     let path = client_sock_path()?;
     let Ok(mut conn) = tokio::net::UnixStream::connect(&path).await else {
         return Err("askpass: сервер пароля не запущен".into());
@@ -98,6 +99,15 @@ pub async fn client(prompt: String) -> R<()> {
     std::io::Write::flush(&mut std::io::stdout())?;
     Ok(())
 }
+
+fn check_askpass_enabled(disabled: bool) -> R<()> {
+    if disabled {
+        Err("askpass: disabled in headless surface server; run sudo from snens tui-local or an interactive terminal".into())
+    } else {
+        Ok(())
+    }
+}
+
 
 /// Путь сокета для клиента: переменная окружения (её ставит харнесс детям) или
 /// путь по умолчанию из конфига.
@@ -175,4 +185,20 @@ pub fn invoked_as() -> String {
                 .unwrap_or(a)
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_guard_fails_before_socket_access_with_actionable_notice() {
+        // This is the same guard called before client_sock_path()/connect, so the
+        // disabled case cannot contact any local askpass socket.
+        assert!(check_askpass_enabled(true)
+            .unwrap_err()
+            .to_string()
+            .contains("headless surface server"));
+        assert!(check_askpass_enabled(false).is_ok());
+    }
 }
