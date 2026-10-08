@@ -2,17 +2,17 @@
 
 This is a staged, operator-run procedure. Preparing these assets does **not** install a binary, touch `~/.local/share/snens`, or switch a service. Do not treat preparation/backup as a completed rollout.
 
-## Hard safety boundary
+## Legacy-session safety boundary
 
-Production currently has the legacy TUI and its `run-child` process writing JSONL. Do not kill either, switch their session IDs to the server, or point the server at any session that may still be active. The new server's lock only protects its own surface store; it cannot lock out old binaries. The server may discover old JSONL sessions, but discovery is not permission to mutate/resume them. Telegram must start/use a **new** production session after core is ready; coordinate its deployment with the Telegram owner. Do not run the two pollers at once.
+The production legacy TUI and its `run-child` may still be writing JSONL. Never kill them, resume their session IDs through the API TUI, or let Telegram select an existing/active legacy session. The server lock protects only its own surface store, not legacy JSONL. A new API/Telegram session has a distinct JSONL path, but discovery of legacy sessions does not prove they are idle.
 
-Rollout remains paused until the operator confirms all old production TUI/run-child writers and other writers have exited naturally. This session must not try to make that happen. If they cannot quiesce, stop here: install/start/switch is not safe. A service restart is not a substitute for quiescence.
+A staged core install/start and Telegram start on a **new** session are possible only while every active legacy session ID is excluded by an external per-file guard held until its old writer exits. No such guard is supplied or verified by this rollout; do not invent one or infer it from the server lock. Without that guard, defer activation until old TUI/run-child writers and other writers exit naturally. Never switch or resume legacy IDs. Do not run two Telegram pollers for the same token.
 
 ## Backup stages
 
-Use a private, dated backup location with enough free space; do not put it under the live instance. Keep the production instance's secret files private. First make the requested baseline copy now, while writers may still be active, and label it **non-quiescent baseline**. It is a useful recovery point, not a transactionally consistent backup of a live JSONL tail. Do not use it to roll back an active session.
+Use a private, dated backup location with enough free space; do not put it under the live instance. Keep the production instance's secret files private. Before any production changes, make a baseline copy and label it **non-quiescent baseline** if writers may still be active. It is a useful recovery point, not a transactionally consistent backup of a live JSONL tail. Do not use it to roll back an active session.
 
-After the operator has confirmed quiescence, make the final sync/backup of the complete instance before changing the service pointer. Verify the copy and retain both stages. At minimum preserve `sessions/` (JSONL canonical), `mail/`, `tickets/`, `soul.md`, `user.md`, `memory.md`, `skills/`, and any runtime files the service needs; preserve metadata/permissions. Do not convert JSONL to SQLite: SQLite is only the surface recovery adapter, not the canonical session log. Never restore an old copy over a newer live session log.
+If the rollout may touch any legacy session, wait for writer quiescence and make a final sync/backup of the complete instance before changing the service pointer. Verify it and retain it alongside the baseline. If using the staged path with a verified external per-file guard excluding every active legacy ID, the baseline is the recovery snapshot for new, distinct sessions; do not claim or rely on a final quiescent snapshot. Preserve `sessions/` (JSONL canonical), `mail/`, `tickets/`, `soul.md`, `user.md`, `memory.md`, `skills/`, and runtime files; preserve metadata/permissions. Do not convert JSONL to SQLite: it is only the surface recovery adapter, not the canonical session log. Never restore an old copy over a newer live session log.
 
 Example commands (run as the service user, after choosing a private destination; replace `BACKUP_ROOT`; choose the timestamp once and reuse it for both stages):
 
@@ -24,22 +24,24 @@ mkdir -p "$BACKUP_ROOT/$STAMP/baseline" "$BACKUP_ROOT/$STAMP/final"
 # Baseline: may race a writer; label it honestly.
 rsync -a -- "$HOME/.local/share/snens/" "$BACKUP_ROOT/$STAMP/baseline/"
 printf '%s\n' 'NON-QUIESCENT BASELINE; active JSONL tails may have changed during copy' > "$BACKUP_ROOT/$STAMP/baseline/NOTE"
-# Stop here until an operator independently confirms every old writer exited.
-# Then take final quiescent snapshot, before any production service switch:
+# If any legacy session will be mutated, stop here until its old writer exits.
+# Otherwise require the verified external per-file guard described above; do not treat
+# a service start or the server lock as that guard. Take a final quiescent snapshot if required:
 rsync -a --delete -- "$HOME/.local/share/snens/" "$BACKUP_ROOT/$STAMP/final/"
 ```
 
-Do not execute these examples as part of asset preparation. `--delete` applies only to the dedicated empty `final/` staging destination above; verify paths before running. Record the backup location and verify expected files/counts and that the copy is readable before proceeding. If the quiescent snapshot fails, do not deploy.
+These are examples, not commands to run during documentation preparation. `--delete` applies only to the dedicated empty `final/` staging destination above; verify paths before running. Record the backup location and verify expected files/counts and that the copy is readable before proceeding. If a quiescent snapshot is required but cannot be taken, do not deploy.
 
-## Stage immutable core binary (after implementation/tests are accepted)
+## Stage immutable core binary
 
-Build from this worktree using the feature/bin that owns the production server. Confirm the exact build invocation with the core implementer; do not accidentally install `snens-next` (the experimental binary). The target installed by the unit must be named `snens`.
-
-Example once the production CLI is integrated (run from `~/projects/snens-next`; adjust only if the implementation's verified target requires it):
+The production CLI is `snens` (separate from experimental `snens-next`): it provides `serve --config PATH --listen 127.0.0.1:7420`, API `tui` (default endpoint `7420`, token `prodtoken`), and `tui-local` fallback. The production entry point is the default `snens` binary; the optional `surface-next` feature gates only the experimental `snens-next` binary. Build only `snens`, without that feature. Cargo's configured target directory is relocated, so resolve it from cargo metadata rather than assuming `target/` under the checkout.
 
 ```sh
-cargo build --release --bin snens --features surface-next
-BIN=target/release/snens
+cd ~/projects/snens-next
+cargo build --release --bin snens
+TARGET_DIR=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin).get("target_directory"))')
+BIN="$TARGET_DIR/release/snens"
+test -x "$BIN"
 HASH="$(sha256sum "$BIN" | cut -d' ' -f1)"
 RELEASE="$HOME/.local/lib/snens/releases/$HASH"
 install -d -m 0755 "$RELEASE"
@@ -56,11 +58,11 @@ ln -s "$RELEASE/snens" "$HOME/.local/bin/snens.new"
 mv -Tf "$HOME/.local/bin/snens.new" "$HOME/.local/bin/snens"
 ```
 
-This pointer swap does not itself restart a process. Preserve the old target/release and its hash for rollback. Do not run a service restart without explicit operator approval and a completed quiescent backup.
+This pointer swap does not itself restart a process. Preserve the old target/release and its hash for rollback. Do not run a service restart without explicit operator approval and the applicable backup: a final quiescent snapshot if shared legacy sessions will be touched, otherwise a verified baseline plus the legacy-session guard described above.
 
 ## Unit and activation
 
-`deploy/snens.service` is the core-owned user unit. Install it only during the approved rollout, then explicitly reload the user manager and enable/start as a separate, approved operation. The unit uses separated argv (`--listen`, `127.0.0.1:7420`), the production config/data directory, restrictive `UMask=0077`, loopback binding, and a 120-second stop timeout. Keep the `~/.local/bin/snens` symlink stable across future upgrades and point it only at a verified immutable release.
+`deploy/snens.service` is the core-owned user unit. Install it during the authorized rollout after its safety gates, then explicitly reload the user manager and enable/start in the planned sequence. The unit uses separated argv (`--listen`, `127.0.0.1:7420`), the production config/data directory, restrictive `UMask=0077`, loopback binding, and a 120-second stop timeout. Keep the `~/.local/bin/snens` symlink stable across future upgrades and point it only at a verified immutable release.
 
 The HTTP/SSE service is production-facing and has access to the user's tools/data. Keep it loopback-only; do not expose the listener directly. The server's own store lock prevents a second compatible server instance, not legacy TUI writers. Do not infer global JSONL locking from it.
 
@@ -68,11 +70,11 @@ The HTTP/SSE service is production-facing and has access to the user's tools/dat
 
 1. Stop the new user service under operator control and verify it is inactive. Do not kill old TUI/run-child processes as a rollback tactic.
 2. Atomically repoint `~/.local/bin/snens` to the preserved old immutable release, verify its SHA-256, then start only the intended old service/entrypoint with the preserved config.
-3. Preserve production data created by the new server. Never restore the baseline backup over live data. Restore the final backup only with the operator's explicit choice, after preserving the current tree separately and only if data loss is accepted.
+3. Preserve production data created by the new server. Never restore the baseline backup over live data. Restore a backup only with the operator's explicit choice, after preserving the current tree separately and only if data loss is accepted.
 4. Coordinate Telegram rollback separately; ensure there is only one poller. Keep the failed release and logs for diagnosis.
 
 This is a manual recovery path, not a tested one-command rollback. Service/process state and data writes after cutover need operator judgment.
 
 ## Ownership / gate
 
-Core owns this unit and document. The Telegram agent owns its deployment assets and production smoke; coordinate endpoint/token/session settings directly with that owner. Do not add or modify `scripts/production-smoke*` here. Before activation, require the core implementation and tests to be accepted, the artifact hash recorded, baseline and quiescent backups verified, old writers confirmed exited, and explicit operator authorization. Until all gates pass, production remains unchanged.
+Core owns this unit and document. The Telegram agent owns its deployment assets and production smoke; coordinate endpoint/token/session settings directly with that owner. Do not add or modify `scripts/production-smoke*` here. Before activation, require the core implementation and tests to be accepted, artifact hash recorded, and a verified baseline. If any legacy session could be mutated, also require a verified final quiescent backup and confirmation that old writers exited; alternatively, an independently verified external per-file guard must exclude active legacy IDs until those writers exit. Explicit rollout authorization is already granted for this rollout; do not imply another per-service approval is needed. Do not activate without one of those legacy-session safety conditions.
