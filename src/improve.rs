@@ -36,7 +36,7 @@ pub async fn run(cfg: &Config, llm: &llm::OpenAi) -> R<()> {
         ts: log::now(),
         text,
         source: "improve".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
     eprintln!("[snens] улучшение {id} → {} ({})", cfg.base_url, cfg.model);
     // Рендер как у TUI: `Ui::default()` сам включает цвет только на tty, поэтому

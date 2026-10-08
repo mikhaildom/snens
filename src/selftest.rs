@@ -92,7 +92,7 @@ pub async fn selftest() -> R<()> {
         ts: log::now(),
         text: "проверь тулы".into(),
         source: "selftest".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
 
     let fake = Fake::new(vec![
@@ -221,7 +221,7 @@ pub async fn selftest() -> R<()> {
         ts: log::now(),
         text: "два больших вывода".into(),
         source: "selftest".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
     let big = |id: &str| Reply {
         reasoning: String::new(),
@@ -295,7 +295,7 @@ pub async fn selftest() -> R<()> {
         ts: log::now(),
         text: "проверь память".into(),
         source: "selftest".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
     let fake_off = Fake::new(vec![Reply {
         reasoning: String::new(),
@@ -320,7 +320,7 @@ pub async fn selftest() -> R<()> {
         ts: log::now(),
         text: "проверь память".into(),
         source: "selftest".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
     let fake3 = Fake::new(vec![Reply {
         reasoning: String::new(),
