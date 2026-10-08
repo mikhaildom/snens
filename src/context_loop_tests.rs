@@ -68,6 +68,7 @@ impl Fixture {
             ts: 0,
             text: GOAL.into(),
             source: "test".into(),
+                parts: Vec::new(),
         })?;
         if large {
             // 240k ASCII bytes => at least 80k estimated tokens: 40k + budget.
@@ -76,6 +77,7 @@ impl Fixture {
                 ts: 0,
                 text: format!("{BULK_USER}{}", "x".repeat(120_000)),
                 source: "test".into(),
+                    parts: Vec::new(),
             })?;
             sess.append(Rec::Assistant {
                 ts: 0,
@@ -325,6 +327,7 @@ async fn forty_k_budget_real_loop_compacts_and_resumes_without_replaying_payload
         ts: 0,
         source: "test-resume".into(),
         text: "Continue from the saved note.".into(),
+            parts: Vec::new(),
     })?;
     let expected = context::effective(&resumed.read()?, &f.cfg)?;
     let resume_fake = EditingLlm::new(f.mirror_path(), Script::Resume(expected));

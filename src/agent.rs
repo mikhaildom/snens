@@ -1,6 +1,7 @@
 // Цикл: запрос → стрим → диспатч → append. Состояние — лог, поэтому resume бесплатен:
 // незавершённый ход = User без Assistant, продолжение с того же места.
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::{
     cfg::Config,
@@ -31,13 +32,105 @@ impl Finish {
 /// Точка входа цикла. Терминатор `Done` пишет харнесс, а не модель: по нему
 /// родитель узнаёт о конце подагента даже если тот «забыл» отчитаться. Пишется
 /// на всех путях — и при нормальном финале, и при ошибке.
+/// События цикла для surface-слоёв; поля события несут то, что клиенту
+/// видно, даже если ядро их не читает.
+#[allow(dead_code)]
+pub enum SurfaceSignal {
+    Delta {
+        text: String,
+        kind: &'static str,
+    },
+    ToolStarted {
+        name: String,
+        call_id: String,
+        args: String,
+    },
+    ToolCompleted {
+        name: String,
+        call_id: String,
+        exit: i32,
+        preview: String,
+    },
+    Notice(String),
+}
+
 pub async fn run_agent<L: Llm>(
     sess: &Session,
     cfg: &Config,
     llm: &L,
     ui: &crate::render::Ui,
 ) -> R<()> {
-    let r = run_loop(sess, cfg, llm, ui).await;
+    run_agent_surface(sess, cfg, llm, ui, SurfaceRunOptions::default()).await
+}
+
+/// Optional controls and metadata for running an agent on a surface.
+#[derive(Clone)]
+pub struct QueuedInput {
+    pub text: String,
+    pub parts: Vec<crate::log::Part>,
+}
+
+pub struct SurfaceRunOptions<'a> {
+    pub observe: &'a (dyn Fn(SurfaceSignal) + Send + Sync),
+    pub cancel: Option<watch::Receiver<bool>>,
+    pub queued: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<QueuedInput>>>>,
+    pub surface: Option<&'a str>,
+    pub surface_tools: Vec<Value>,
+    pub tool_tx: Option<tokio::sync::mpsc::UnboundedSender<SurfaceToolRequest>>,
+}
+
+// Each binary is linted independently; only snens-next consumes these fields.
+pub struct SurfaceToolRequest {
+    #[allow(dead_code)]
+    pub call_id: String,
+    #[allow(dead_code)]
+    pub name: String,
+    #[allow(dead_code)]
+    pub args: String,
+    #[allow(dead_code)]
+    pub result: tokio::sync::oneshot::Sender<SurfaceToolResult>,
+}
+#[derive(Clone)]
+#[cfg_attr(not(feature = "surface-next"), allow(dead_code))] // Result is delivered by the experimental HTTP/SSE surface.
+pub struct SurfaceToolResult { pub text: String, pub exit: i32 }
+
+#[cfg(test)]
+fn surface_tool_timeout_secs() -> u64 { 1 }
+
+#[cfg(test)]
+mod surface_tool_timeout_tests {
+    use super::*;
+    #[test]
+    fn timeout_is_short_in_tests_and_finite_in_production() {
+        assert_eq!(surface_tool_timeout_secs(),1);
+    }
+}
+#[cfg(not(test))]
+fn surface_tool_timeout_secs() -> u64 { 60 }
+
+fn ignore_surface_signal(_: SurfaceSignal) {}
+
+impl Default for SurfaceRunOptions<'static> {
+    fn default() -> Self {
+        Self {
+            observe: &ignore_surface_signal,
+            cancel: None,
+            queued: None,
+            surface: None,
+            surface_tools: Vec::new(),
+            tool_tx: None,
+        }
+    }
+}
+
+pub async fn run_agent_surface<L: Llm>(
+    sess: &Session,
+    cfg: &Config,
+    llm: &L,
+    ui: &crate::render::Ui,
+    options: SurfaceRunOptions<'_>,
+) -> R<()> {
+    let r = run_loop(sess, cfg, llm, ui, options).await;
     let status = match &r {
         Ok(f) => f.status(),
         Err(_) => "error",
@@ -63,7 +156,16 @@ async fn run_loop<L: Llm>(
     cfg: &Config,
     llm: &L,
     ui: &crate::render::Ui,
+    options: SurfaceRunOptions<'_>,
 ) -> R<Finish> {
+    let SurfaceRunOptions {
+        observe,
+        mut cancel,
+        queued,
+        surface,
+        surface_tools,
+        tool_tx,
+    } = options;
     // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
     // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
     // ходу промахивалась бы мимо префикс-кеша. Здесь — единственная точка, через
@@ -71,10 +173,11 @@ async fn run_loop<L: Llm>(
     if !sess.read()?.iter().any(|r| matches!(r, Rec::System { .. })) {
         sess.append(Rec::System {
             ts: log::now(),
-            text: crate::prompt::system_prompt(cfg),
+            text: crate::prompt::system_prompt_for_surface(cfg, surface),
         })?;
     }
-    let (defs, reg, path) = dispatch::prepare(cfg).await?;
+    let (mut defs, reg, path) = dispatch::prepare(cfg).await?;
+    defs.extend(surface_tools.clone());
     // Справка памяти впрыскивается ровно один раз, перед первым ходом сессии, и
     // записью в лог — проекция дальше читает её оттуда, как всё остальное.
     memory::recall_note(sess, cfg, &path).await;
@@ -100,7 +203,21 @@ async fn run_loop<L: Llm>(
     // ошибкой, чтобы прогон не закрылся «успешно», ничего не сделав.
     let mut empty_replies = 0u32;
     loop {
+        if cancel.as_ref().is_some_and(|c| *c.borrow()) {
+            return Err("cancelled".into());
+        }
         turn += 1;
+        if let Some(rx) = queued.as_ref() {
+            let mut rx = rx.lock().await;
+            while let Ok(input) = rx.try_recv() {
+                sess.append(Rec::User {
+                    ts: log::now(),
+                    text: input.text,
+                    source: "surface-steer".into(),
+                    parts: input.parts,
+                })?;
+            }
+        }
         // Граница хода: после всех результатов предыдущего шага и перед новым
         // запросом. Инвариант провайдера (assistant с tool_calls обязан иметь
         // ответы) уже соблюдён, поэтому сюда безопасно впрыскивать чужое слово —
@@ -132,6 +249,7 @@ async fn run_loop<L: Llm>(
                 ts: log::now(),
                 source: format!("context-cleanup:{pressure_next}"),
                 text: format!("[Уборка рабочего контекста] Сейчас ~{approx} токенов, экономический бюджет {}. Перед продолжением задачи отредактируй {} и вызови ctx commit. Ориентир после уборки — {} токенов. Удали переваренные выводы и законченные ветки, сохрани полезные точные фрагменты и обнови записку для продолжения: цель, ограничения, решения, точные данные, открытые проверки, следующие действия. Не пересказывай историю ради пересказа. Стратегию и объём правок выбираешь ты.", cfg.context_budget(), mirror.path().display(), cfg.context_target()),
+                    parts: Vec::new(),
             })?;
             msgs = mirror.prepare(&sess.read()?, cfg)?;
             ui.notice(&format!(
@@ -150,7 +268,11 @@ async fn run_loop<L: Llm>(
             return Err("рабочий контекст достиг физического предела; запрос не отправлен. Нужна уборка LIVE_CONTEXT.json или больший размер окна".into());
         }
 
-        let reply: Reply = stream_reply(cfg, msgs, defs.clone(), llm, ui).await?;
+        let reply: Reply = if let Some(c) = cancel.as_mut() {
+            tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), r = stream_reply(cfg, msgs, defs.clone(), llm, ui, observe) => r? }
+        } else {
+            stream_reply(cfg, msgs, defs.clone(), llm, ui, observe).await?
+        };
 
         // Расход по ходу, а не только в `show` после сессии: в терминале видно,
         // какой ход чего стоил.
@@ -231,11 +353,60 @@ async fn run_loop<L: Llm>(
             if supervisor(sess, cfg, ui).await {
                 continue;
             }
+            if let Some(rx) = queued.as_ref() {
+                let mut rx = rx.lock().await;
+                let mut accepted = Vec::new();
+                while let Ok(input) = rx.try_recv() {
+                    accepted.push(input);
+                }
+                drop(rx);
+                if !accepted.is_empty() {
+                    for input in accepted {
+                        sess.append(Rec::User {
+                            ts: log::now(),
+                            text: input.text,
+                            source: "surface-steer".into(),
+                            parts: input.parts,
+                        })?;
+                    }
+                    continue;
+                }
+            }
             return Ok(Finish::Ok);
         }
 
         for call in &reply.calls {
-            let out = dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess).await;
+            observe(SurfaceSignal::ToolStarted {
+                name: call.name.clone(),
+                call_id: call.id.clone(),
+                args: call.args.clone(),
+            });
+            let out = if surface_tools.iter().any(|d| d.pointer("/function/name").and_then(Value::as_str) == Some(call.name.as_str())) {
+                let fail = |text: String| crate::exec::Out { exit: -1, text, bytes: 0, ms: 0, timed_out: false, parts: Vec::new() };
+                if let Some(tx) = tool_tx.as_ref() {
+                    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                    let req = SurfaceToolRequest { call_id: call.id.clone(), name: call.name.clone(), args: call.args.clone(), result: result_tx };
+                    if tx.send(req).is_err() { fail("surface tool broker unavailable".into()) } else {
+                        let wait = tokio::time::timeout(std::time::Duration::from_secs(surface_tool_timeout_secs()), result_rx);
+                        let got = if let Some(c) = cancel.as_mut() {
+                            tokio::select! { biased; _ = c.changed() => { let _=sess.append(Rec::ToolResult{ts:log::now(),call_id:call.id.clone(),tool:call.name.clone(),argv:Vec::new(),exit:-1,bytes:0,ms:0,body:Body::Inline{ text:"cancelled".into() },parts:Vec::new()}); return Err("cancelled".into()) }, r = wait => r }
+                        } else { wait.await };
+                        match got {
+                            Ok(Ok(r)) => crate::exec::Out { exit:r.exit, text:r.text, bytes:0, ms:0, timed_out:false, parts:Vec::new() },
+                            Ok(Err(_)) => fail("surface tool response expired".into()),
+                            Err(_) => fail("surface tool timed out after 60s".into()),
+                        }
+                    }
+                } else { fail("surface tool executor unavailable".into()) }
+            } else if let Some(c) = cancel.as_mut() {
+                tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), o = dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess) => o }
+            } else { dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess).await };
+            observe(SurfaceSignal::ToolCompleted {
+                name: call.name.clone(),
+                call_id: call.id.clone(),
+                exit: out.exit,
+                preview: out.text.chars().take(500).collect(),
+            });
             ui.tool_call(
                 &call.name,
                 &hint(&call.args),
@@ -306,7 +477,7 @@ async fn run_loop<L: Llm>(
         // Лимит исчерпан — не падаем и не закрываем поверхность: просим
         // промежуточный итог и на этом заканчиваем запуск (см. final_answer).
         if turn >= cfg.max_turns {
-            final_answer(sess, cfg, llm, ui, &path, turn).await?;
+            final_answer(sess, cfg, llm, ui, &path, turn, observe).await?;
             return Ok(Finish::Limit);
         }
     }
@@ -365,11 +536,13 @@ async fn final_answer<L: Llm>(
     ui: &crate::render::Ui,
     path: &str,
     turn: u32,
+    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
 ) -> R<()> {
     sess.append(Rec::User {
         ts: log::now(),
         text: LIMIT_NOTE.into(),
         source: "limit".into(),
+            parts: Vec::new(),
     })?;
     let log = sess.read()?;
     let msgs = crate::context::effective(&log, cfg)?;
@@ -379,7 +552,7 @@ async fn final_answer<L: Llm>(
     if project::estimate_tokens(&msgs) >= limit {
         return Err("final answer context exceeds physical window; compact before resuming".into());
     }
-    let reply = stream_reply(cfg, msgs, Vec::new(), llm, ui).await?;
+    let reply = stream_reply(cfg, msgs, Vec::new(), llm, ui, observe).await?;
     sess.append(Rec::Assistant {
         ts: log::now(),
         text: if reply.text.is_empty() {
@@ -409,6 +582,7 @@ async fn stream_reply<L: Llm>(
     tools: Vec<Value>,
     llm: &L,
     ui: &crate::render::Ui,
+    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
 ) -> R<Reply> {
     let mut stream = crate::render::Stream::new(ui.color, ui.sink());
     let show = ui.show_reasoning();
@@ -416,6 +590,10 @@ async fn stream_reply<L: Llm>(
     let reply = llm
         .reply(cfg, msgs, tools, &mut |d| match d {
             crate::llm::Delta::Reasoning(r) => {
+                observe(SurfaceSignal::Delta {
+                    text: r.to_string(),
+                    kind: "reasoning",
+                });
                 if !reason_on {
                     reason_on = true;
                     stream.reasoning(show);
@@ -424,7 +602,13 @@ async fn stream_reply<L: Llm>(
                     stream.reasoning_chunk(r);
                 }
             }
-            crate::llm::Delta::Content(c) => stream.content(c),
+            crate::llm::Delta::Content(c) => {
+                observe(SurfaceSignal::Delta {
+                    text: c.to_string(),
+                    kind: "content",
+                });
+                stream.content(c)
+            }
         })
         .await?;
     stream.finish();
@@ -504,6 +688,74 @@ mod tests {
     use crate::llm::{Fake, Usage};
     use crate::log::Call;
 
+    #[tokio::test]
+    async fn surface_prompt_is_logged_once_and_survives_resume() -> R<()> {
+        let dir = std::env::temp_dir().join(format!("snens-surface-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let cfg = cfg_tmp(&dir);
+        let sess = Session::open(&dir, "surface")?;
+        sess.append(Rec::User {
+            ts: log::now(),
+            text: "hello".into(),
+            source: "surface".into(),
+                parts: Vec::new(),
+        })?;
+        let observe = |_| {};
+
+        run_agent_surface(
+            &sess,
+            &cfg,
+            &Fake::new(vec![text_reply("first")]),
+            &crate::render::Ui::plain(),
+            SurfaceRunOptions {
+                observe: &observe,
+                surface: Some("telegram"),
+                ..SurfaceRunOptions::default()
+            },
+        )
+        .await?;
+        let first = sess.read()?;
+        let prompt = first
+            .iter()
+            .find_map(|r| match r {
+                Rec::System { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("system prompt must be logged");
+        assert!(prompt.contains("Текущая поверхность: Telegram, личный чат."));
+
+        run_agent_surface(
+            &sess,
+            &cfg,
+            &Fake::new(vec![text_reply("resumed")]),
+            &crate::render::Ui::plain(),
+            SurfaceRunOptions {
+                observe: &observe,
+                surface: Some("untrusted\ninstructions"),
+                ..SurfaceRunOptions::default()
+            },
+        )
+        .await?;
+        let second = sess.read()?;
+        let prompts = second
+            .iter()
+            .filter(|r| matches!(r, Rec::System { .. }))
+            .count();
+        assert_eq!(prompts, 1, "resume must retain the original system prompt");
+        let resumed_prompt = second
+            .iter()
+            .find_map(|r| match r {
+                Rec::System { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(prompt, resumed_prompt);
+        assert!(!resumed_prompt.contains("untrusted"));
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
     /// Исчерпание лимита ходов — не ошибка и не закрытие поверхности: цикл
     /// просит у модели промежуточный итог (запись `limit`) и возвращает Ok,
     /// а вызовы, которые модель всё равно прислала, не исполняются.
@@ -523,6 +775,7 @@ mod tests {
             ts: log::now(),
             text: "поработай".into(),
             source: "test".into(),
+                parts: Vec::new(),
         })?;
         let run_once = || Reply {
             reasoning: String::new(),
@@ -601,6 +854,7 @@ mod tests {
             ts: log::now(),
             text: "поработай".into(),
             source: "test".into(),
+                parts: Vec::new(),
         })?;
         let fake = Fake::new(vec![text_reply(""), text_reply("готово")]);
         run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await?;
@@ -636,6 +890,7 @@ mod tests {
             ts: log::now(),
             text: "поработай".into(),
             source: "test".into(),
+                parts: Vec::new(),
         })?;
         let fake = Fake::new(vec![text_reply(""), text_reply("")]);
         let err = run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await;

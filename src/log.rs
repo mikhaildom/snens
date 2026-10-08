@@ -1,10 +1,13 @@
 // Сессия = append-only JSONL. Лог неизменяем, seq = номер строки.
 // Промпт — проекция лога (project.rs), а не сам лог.
 use std::{
-    cell::Cell,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,8 @@ pub enum Rec {
         ts: u64,
         text: String,
         source: String,
+        #[serde(default)]
+        parts: Vec<Part>,
     },
     Assistant {
         ts: u64,
@@ -155,8 +160,8 @@ pub struct Part {
 pub struct Session {
     id: String,
     path: PathBuf,
-    file: std::cell::RefCell<File>,
-    lines: Cell<u64>,
+    file: Mutex<File>,
+    lines: AtomicU64,
     /// Сессия-родитель, если это подагент; читается из `Meta` при открытии.
     parent: String,
 }
@@ -173,7 +178,7 @@ impl Session {
         let path = dir.join(format!("{id}.jsonl"));
         let exists = path.exists();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let lines = Cell::new(count_lines(&path)?.max(1));
+        let lines = AtomicU64::new(count_lines(&path)?.max(1));
         // Родитель неизменяем и живёт в `Meta`: при открытии существующего лога
         // берём его оттуда, а не из аргумента (resume подагента не должен терять связь).
         let parent = if exists {
@@ -193,7 +198,7 @@ impl Session {
             let s = Session {
                 id: id.to_string(),
                 path,
-                file: std::cell::RefCell::new(file),
+                file: Mutex::new(file),
                 lines,
                 parent: parent.clone(),
             };
@@ -207,7 +212,7 @@ impl Session {
         let s = Session {
             id: id.to_string(),
             path,
-            file: std::cell::RefCell::new(file),
+            file: Mutex::new(file),
             lines,
             parent,
         };
@@ -230,11 +235,10 @@ impl Session {
     /// вся история восстановления; недописанный хвост отбрасывается при чтении.
     pub fn append(&self, rec: Rec) -> R<u64> {
         let line = serde_json::to_string(&rec)?;
-        let mut f = self.file.borrow_mut();
+        let mut f = self.file.lock().map_err(|_| "session log lock poisoned")?;
         writeln!(f, "{line}")?;
         f.sync_data()?;
-        let n = self.lines.get();
-        self.lines.set(n + 1);
+        let n = self.lines.fetch_add(1, Ordering::Relaxed);
         Ok(n)
     }
 

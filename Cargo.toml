@@ -2,15 +2,30 @@
 name = "snens"
 version = "0.1.0"
 edition = "2021"
+default-run = "snens"
+
+[features]
+surface-next = []
+
+[[bin]]
+name = "snens-next"
+path = "src/next_main.rs"
+required-features = ["surface-next"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "fs", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "fs", "signal", "net", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 toml = "0.8"
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+fs2 = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
 
 # Только unix: фоновое ревью отвязывается от терминала своей сессией процесса
 # (`setsid`) — это значение платформенной ветки, не общая зависимость.
