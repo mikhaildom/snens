@@ -30,19 +30,32 @@ pub struct Message {
     pub id: String,
     pub command_id: String,
     pub text: String,
+    #[serde(default)]
+    pub attachment_ids: Vec<String>,
     pub state: String,
     pub run_id: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct Attachment {
+    pub attachment_id: String,
+    pub command_id: String,
+    pub filename: String,
+    pub name: String,
+    pub part: crate::log::Part,
+    pub sha256: String,
 }
 #[derive(Default, Serialize, Deserialize)]
 pub struct Store {
     pub sessions: BTreeMap<String, Session>,
     pub events: BTreeMap<String, Vec<Event>>,
     pub messages: BTreeMap<String, Vec<Message>>,
+    #[serde(default)]
+    pub attachments: BTreeMap<String, BTreeMap<String, Attachment>>,
     pub commands: BTreeMap<String, serde_json::Value>,
 }
 pub struct Control {
     pub cancel: watch::Sender<bool>,
-    pub queued: mpsc::UnboundedSender<String>,
+    pub queued: mpsc::UnboundedSender<crate::agent::QueuedInput>,
 }
 pub struct Runtime {
     pub data: Mutex<Store>,
@@ -94,6 +107,9 @@ fn schema(c: &Connection) -> crate::R<()> {
     c.execute_batch("PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,surface TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT);
       CREATE TABLE IF NOT EXISTS messages(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL UNIQUE,seq INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
+      CREATE TABLE IF NOT EXISTS attachments(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL,filename TEXT NOT NULL,name TEXT NOT NULL,part TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
+      CREATE UNIQUE INDEX IF NOT EXISTS attachments_command ON attachments(session_id,command_id);
+      CREATE TABLE IF NOT EXISTS message_attachments(session_id TEXT NOT NULL,message_id TEXT NOT NULL,attachment_id TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(session_id,message_id,attachment_id),FOREIGN KEY(session_id,message_id) REFERENCES messages(session_id,id),FOREIGN KEY(session_id,attachment_id) REFERENCES attachments(session_id,id));
       CREATE TABLE IF NOT EXISTS commands(command_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events(session_id TEXT NOT NULL,seq INTEGER NOT NULL,run_id TEXT,kind TEXT NOT NULL,fields TEXT NOT NULL,PRIMARY KEY(session_id,seq),FOREIGN KEY(session_id) REFERENCES sessions(id));")?;
     Ok(())
@@ -104,7 +120,7 @@ pub fn persist_store(c: &Connection, d: &Store) -> crate::R<()> {
 fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     let tx = c.unchecked_transaction()?;
     tx.execute_batch(
-        "DELETE FROM events; DELETE FROM messages; DELETE FROM commands; DELETE FROM sessions;",
+        "DELETE FROM events; DELETE FROM message_attachments; DELETE FROM attachments; DELETE FROM messages; DELETE FROM commands; DELETE FROM sessions;",
     )?;
     for s in d.sessions.values() {
         tx.execute(
@@ -126,6 +142,32 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
                     m.run_id
                 ],
             )?;
+        }
+    }
+    for (sid, by_id) in &d.attachments {
+        for a in by_id.values() {
+            tx.execute(
+                "INSERT INTO attachments VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    sid,
+                    a.attachment_id,
+                    a.command_id,
+                    a.filename,
+                    a.name,
+                    serde_json::to_string(&a.part)?,
+                    a.sha256
+                ],
+            )?;
+        }
+    }
+    for (sid, ms) in &d.messages {
+        for m in ms {
+            for (seq, attachment_id) in m.attachment_ids.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO message_attachments VALUES(?1,?2,?3,?4)",
+                    params![sid, m.id, attachment_id, seq as i64],
+                )?;
+            }
         }
     }
     for (sid, es) in &d.events {
@@ -170,19 +212,70 @@ fn read_store(c: &Connection) -> crate::R<Store> {
     {
         let mut q=c.prepare("SELECT session_id,id,command_id,text,state,run_id FROM messages ORDER BY session_id,seq")?;
         for row in q.query_map([], |r| {
+            let sid: String = r.get(0)?;
+            let mid: String = r.get(1)?;
             Ok((
-                r.get::<_, String>(0)?,
+                sid,
                 Message {
-                    id: r.get(1)?,
+                    id: mid,
                     command_id: r.get(2)?,
                     text: r.get(3)?,
                     state: r.get(4)?,
                     run_id: r.get(5)?,
+                    attachment_ids: Vec::new(),
                 },
             ))
         })? {
             let (sid, m) = row?;
             d.messages.entry(sid).or_default().push(m);
+        }
+    }
+    {
+        let mut q = c.prepare("SELECT session_id,message_id,attachment_id FROM message_attachments ORDER BY session_id,message_id,seq")?;
+        for row in q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })? {
+            let (sid, mid, aid) = row?;
+            if let Some(m) = d
+                .messages
+                .get_mut(&sid)
+                .and_then(|ms| ms.iter_mut().find(|m| m.id == mid))
+            {
+                m.attachment_ids.push(aid);
+            }
+        }
+    }
+    {
+        let mut q = c.prepare("SELECT session_id,id,command_id,filename,name,part,sha256 FROM attachments ORDER BY session_id,id")?;
+        for row in q.query_map([], |r| {
+            let part: String = r.get(5)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                Attachment {
+                    attachment_id: r.get(1)?,
+                    command_id: r.get(2)?,
+                    filename: r.get(3)?,
+                    name: r.get(4)?,
+                    part: serde_json::from_str(&part).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    sha256: r.get(6)?,
+                },
+            ))
+        })? {
+            let (sid, attachment) = row?;
+            d.attachments
+                .entry(sid)
+                .or_default()
+                .insert(attachment.attachment_id.clone(), attachment);
         }
     }
     {
@@ -297,6 +390,7 @@ mod tests {
                 id: "m".into(),
                 command_id: "cmd".into(),
                 text: "hello".into(),
+                attachment_ids: Vec::new(),
                 state: "applied".into(),
                 run_id: None,
             }],
@@ -343,6 +437,7 @@ mod tests {
                 id: "m".into(),
                 command_id: "c".into(),
                 text: "queued".into(),
+                attachment_ids: Vec::new(),
                 state: "accepted".into(),
                 run_id: Some("r".into()),
             }],
@@ -352,6 +447,105 @@ mod tests {
         assert_eq!(d.messages["s"][0].state, "cancelled");
         assert_eq!(d.events["s"][0].fields["status"], "interrupted");
     }
+    #[test]
+    fn attachment_metadata_and_message_references_roundtrip_in_order() {
+        let dir = temp();
+        let (mut store, db) = open_store(&dir).unwrap();
+        store.sessions.insert(
+            "s".into(),
+            Session {
+                id: "s".into(),
+                surface: "test".into(),
+                state: "idle".into(),
+                run_id: None,
+            },
+        );
+        let part = |path: &str, bytes| crate::log::Part {
+            kind: "image".into(),
+            path: path.into(),
+            mime: "image/png".into(),
+            bytes,
+            width: 12,
+            height: 34,
+        };
+        let first = Attachment {
+            attachment_id: "a1".into(),
+            command_id: "cmd".into(),
+            filename: "first.png".into(),
+            name: "upload-1".into(),
+            part: part("/session/first.png", 123),
+            sha256: "hash-1".into(),
+        };
+        let second = Attachment {
+            attachment_id: "a2".into(),
+            command_id: "cmd-upload-2".into(),
+            filename: "second.png".into(),
+            name: "upload-2".into(),
+            part: part("/session/second.png", 456),
+            sha256: "hash-2".into(),
+        };
+        store.attachments.insert(
+            "s".into(),
+            [("a1".into(), first.clone()), ("a2".into(), second.clone())]
+                .into_iter()
+                .collect(),
+        );
+        store.messages.insert(
+            "s".into(),
+            vec![Message {
+                id: "m".into(),
+                command_id: "cmd".into(),
+                text: "with files".into(),
+                attachment_ids: vec!["a2".into(), "a1".into()],
+                state: "applied".into(),
+                run_id: None,
+            }],
+        );
+
+        persist(&db, &store).unwrap();
+        let loaded = read_store(&db).unwrap();
+        assert_eq!(loaded.attachments["s"]["a1"], first);
+        assert_eq!(loaded.attachments["s"]["a2"], second);
+        assert_eq!(loaded.messages["s"][0].attachment_ids, ["a2", "a1"]);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn user_record_parts_default_for_legacy_and_roundtrip() {
+        use crate::log::Rec;
+
+        let legacy = r#"{"kind":"user","ts":1,"text":"old","source":"surface"}"#;
+        match serde_json::from_str::<Rec>(legacy).unwrap() {
+            Rec::User { parts, .. } => assert!(parts.is_empty()),
+            other => panic!("expected user record, got {other:?}"),
+        }
+
+        let record = Rec::User {
+            ts: 2,
+            text: "new".into(),
+            source: "surface".into(),
+            parts: vec![crate::log::Part {
+                kind: "image".into(),
+                path: "/session/image.png".into(),
+                mime: "image/png".into(),
+                bytes: 42,
+                width: 640,
+                height: 480,
+            }],
+        };
+        let decoded: Rec = serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        match decoded {
+            Rec::User { parts, .. } => {
+                assert_eq!(parts.len(), 1);
+                assert_eq!(parts[0].path, "/session/image.png");
+                assert_eq!(parts[0].bytes, 42);
+                assert_eq!((parts[0].width, parts[0].height), (640, 480));
+            }
+            other => panic!("expected user record, got {other:?}"),
+        }
+    }
+
     #[test]
     fn migration_imports_json_and_renames_it() {
         let dir = temp();
