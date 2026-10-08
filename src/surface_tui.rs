@@ -57,6 +57,10 @@ fn other(s: String) -> Error {
     s.into()
 }
 
+fn choose_default_session(sessions: &[Session]) -> Option<&Session> {
+    sessions.iter().find(|session| session.surface == "tui")
+}
+
 async fn live_loop(
     client: Client,
     initial: Option<String>,
@@ -97,7 +101,7 @@ async fn app_loop(
             Err(e) => ui.line(&format!("ошибка открытия: {e}")),
         }
     } else if let Ok(sessions) = client.sessions().await {
-        if let Some(s) = sessions.into_iter().next() {
+        if let Some(s) = choose_default_session(&sessions) {
             match open_session(&client, &s.id, &ui).await {
                 Ok((opened, c)) => {
                     selected_run = if opened.state == "running" {
@@ -111,7 +115,9 @@ async fn app_loop(
                 Err(e) => ui.line(&format!("ошибка открытия: {e}")),
             }
         } else {
-            ui.line("нет сессий; /new или /sessions");
+            ui.line(
+                "нет TUI-сессии; /new или /sessions (чужие поверхности не выбраны автоматически)",
+            );
         }
     }
     subscription_session_id = session.as_ref().map(|s| s.id.clone());
@@ -357,6 +363,31 @@ fn command_id() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn session(id: &str, surface: &str) -> Session {
+        Session {
+            id: id.into(),
+            surface: surface.into(),
+            state: "idle".into(),
+            run_id: None,
+        }
+    }
+
+    #[test]
+    fn default_session_never_crosses_surfaces() {
+        let telegram_only = vec![session("tg", "telegram")];
+        assert!(choose_default_session(&telegram_only).is_none());
+
+        let mixed = vec![
+            session("tg", "telegram"),
+            session("old", "legacy"),
+            session("tui", "tui"),
+        ];
+        assert_eq!(
+            choose_default_session(&mixed).map(|s| s.id.as_str()),
+            Some("tui")
+        );
+    }
 
     fn event(session_id: &str, seq: u64) -> Event {
         Event {
