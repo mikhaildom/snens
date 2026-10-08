@@ -60,7 +60,29 @@ pub async fn run_agent<L: Llm>(
     llm: &L,
     ui: &crate::render::Ui,
 ) -> R<()> {
-    run_agent_surface(sess, cfg, llm, ui, &|_| {}, None, None, None).await
+    run_agent_surface(sess, cfg, llm, ui, SurfaceRunOptions::default()).await
+}
+
+/// Optional controls and metadata for running an agent on a surface.
+pub struct SurfaceRunOptions<'a> {
+    pub observe: &'a (dyn Fn(SurfaceSignal) + Send + Sync),
+    pub cancel: Option<watch::Receiver<bool>>,
+    pub queued:
+        Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>>,
+    pub surface: Option<&'a str>,
+}
+
+fn ignore_surface_signal(_: SurfaceSignal) {}
+
+impl Default for SurfaceRunOptions<'static> {
+    fn default() -> Self {
+        Self {
+            observe: &ignore_surface_signal,
+            cancel: None,
+            queued: None,
+            surface: None,
+        }
+    }
 }
 
 pub async fn run_agent_surface<L: Llm>(
@@ -68,14 +90,9 @@ pub async fn run_agent_surface<L: Llm>(
     cfg: &Config,
     llm: &L,
     ui: &crate::render::Ui,
-    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
-    cancel: Option<watch::Receiver<bool>>,
-    queued: Option<
-        std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
-    >,
-    surface: Option<&str>,
+    options: SurfaceRunOptions<'_>,
 ) -> R<()> {
-    let r = run_loop(sess, cfg, llm, ui, observe, cancel, queued, surface).await;
+    let r = run_loop(sess, cfg, llm, ui, options).await;
     let status = match &r {
         Ok(f) => f.status(),
         Err(_) => "error",
@@ -101,13 +118,14 @@ async fn run_loop<L: Llm>(
     cfg: &Config,
     llm: &L,
     ui: &crate::render::Ui,
-    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
-    mut cancel: Option<watch::Receiver<bool>>,
-    queued: Option<
-        std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
-    >,
-    surface: Option<&str>,
+    options: SurfaceRunOptions<'_>,
 ) -> R<Finish> {
+    let SurfaceRunOptions {
+        observe,
+        mut cancel,
+        queued,
+        surface,
+    } = options;
     // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
     // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
     // ходу промахивалась бы мимо префикс-кеша. Здесь — единственная точка, через
@@ -625,27 +643,52 @@ mod tests {
         let observe = |_| {};
 
         run_agent_surface(
-            &sess, &cfg, &Fake::new(vec![text_reply("first")]),
-            &crate::render::Ui::plain(), &observe, None, None, Some("telegram"),
-        ).await?;
+            &sess,
+            &cfg,
+            &Fake::new(vec![text_reply("first")]),
+            &crate::render::Ui::plain(),
+            SurfaceRunOptions {
+                observe: &observe,
+                surface: Some("telegram"),
+                ..SurfaceRunOptions::default()
+            },
+        )
+        .await?;
         let first = sess.read()?;
-        let prompt = first.iter().find_map(|r| match r {
-            Rec::System { text, .. } => Some(text.clone()),
-            _ => None,
-        }).expect("system prompt must be logged");
+        let prompt = first
+            .iter()
+            .find_map(|r| match r {
+                Rec::System { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("system prompt must be logged");
         assert!(prompt.contains("Текущая поверхность: Telegram, личный чат."));
 
         run_agent_surface(
-            &sess, &cfg, &Fake::new(vec![text_reply("resumed")]),
-            &crate::render::Ui::plain(), &observe, None, None, Some("untrusted\ninstructions"),
-        ).await?;
+            &sess,
+            &cfg,
+            &Fake::new(vec![text_reply("resumed")]),
+            &crate::render::Ui::plain(),
+            SurfaceRunOptions {
+                observe: &observe,
+                surface: Some("untrusted\ninstructions"),
+                ..SurfaceRunOptions::default()
+            },
+        )
+        .await?;
         let second = sess.read()?;
-        let prompts = second.iter().filter(|r| matches!(r, Rec::System { .. })).count();
+        let prompts = second
+            .iter()
+            .filter(|r| matches!(r, Rec::System { .. }))
+            .count();
         assert_eq!(prompts, 1, "resume must retain the original system prompt");
-        let resumed_prompt = second.iter().find_map(|r| match r {
-            Rec::System { text, .. } => Some(text.as_str()),
-            _ => None,
-        }).unwrap();
+        let resumed_prompt = second
+            .iter()
+            .find_map(|r| match r {
+                Rec::System { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(prompt, resumed_prompt);
         assert!(!resumed_prompt.contains("untrusted"));
         std::fs::remove_dir_all(&dir).ok();

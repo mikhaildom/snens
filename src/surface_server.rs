@@ -370,10 +370,12 @@ async fn launch(s: Arc<Runtime>, id: String, run: String, text: String, surface:
             &cfg,
             &*llm,
             &crate::render::Ui::plain(),
-            &observe,
-            Some(cancel_rx),
-            Some(queue_rx.clone()),
-            Some(&surface),
+            crate::agent::SurfaceRunOptions {
+                observe: &observe,
+                cancel: Some(cancel_rx),
+                queued: Some(queue_rx.clone()),
+                surface: Some(&surface),
+            },
         )
         .await;
         // Drop the callback's sender before joining: every accepted signal is drained
