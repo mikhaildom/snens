@@ -175,6 +175,10 @@ struct Send {
     command_id: String,
     text: String,
 }
+fn same_message_payload(existing: &rt::Message, text: &str) -> bool {
+    existing.text == text
+}
+
 async fn message(
     State(s): State<Arc<Runtime>>,
     Path(id): Path<String>,
@@ -232,6 +236,7 @@ async fn message(
         run_id: run_id.clone(),
     });
     let result = serde_json::json!({"message_id":mid,"run_id":run_id,"state":state});
+    let surface = d.sessions.get(&id).unwrap().surface.clone();
     d.commands.insert(b.command_id, result.clone());
     if !busy {
         let x = d.sessions.get_mut(&id).unwrap();
@@ -255,7 +260,7 @@ async fn message(
         )
         .await;
     if !busy {
-        launch(s.clone(), id, run_id.unwrap(), b.text).await
+        launch(s.clone(), id, run_id.unwrap(), b.text, surface).await
     } else if let Some(c) = s.controls.lock().await.get(&id) {
         let _ = c.queued.send(b.text.clone());
     }
@@ -281,7 +286,7 @@ where
     }
 }
 
-async fn launch(s: Arc<Runtime>, id: String, run: String, text: String) {
+async fn launch(s: Arc<Runtime>, id: String, run: String, text: String, surface: String) {
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
     let queue_rx = Arc::new(tokio::sync::Mutex::new(queue_rx));
@@ -368,6 +373,7 @@ async fn launch(s: Arc<Runtime>, id: String, run: String, text: String) {
             &observe,
             Some(cancel_rx),
             Some(queue_rx.clone()),
+            Some(&surface),
         )
         .await;
         // Drop the callback's sender before joining: every accepted signal is drained
@@ -584,6 +590,19 @@ mod tests {
     use super::*;
     use futures_util::StreamExt;
     use tokio::sync::{broadcast, oneshot, Mutex};
+
+    #[test]
+    fn message_idempotency_checks_text_payload() {
+        let existing = rt::Message {
+            id: "message-id".into(),
+            command_id: "command-id".into(),
+            text: "original input".into(),
+            state: "applied".into(),
+            run_id: Some("run-id".into()),
+        };
+        assert!(same_message_payload(&existing, "original input"));
+        assert!(!same_message_payload(&existing, "changed input"));
+    }
 
     fn event(session_id: &str, seq: u64) -> Event {
         Event {

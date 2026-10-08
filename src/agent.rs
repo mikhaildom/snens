@@ -60,7 +60,7 @@ pub async fn run_agent<L: Llm>(
     llm: &L,
     ui: &crate::render::Ui,
 ) -> R<()> {
-    run_agent_surface(sess, cfg, llm, ui, &|_| {}, None, None).await
+    run_agent_surface(sess, cfg, llm, ui, &|_| {}, None, None, None).await
 }
 
 pub async fn run_agent_surface<L: Llm>(
@@ -73,8 +73,9 @@ pub async fn run_agent_surface<L: Llm>(
     queued: Option<
         std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     >,
+    surface: Option<&str>,
 ) -> R<()> {
-    let r = run_loop(sess, cfg, llm, ui, observe, cancel, queued).await;
+    let r = run_loop(sess, cfg, llm, ui, observe, cancel, queued, surface).await;
     let status = match &r {
         Ok(f) => f.status(),
         Err(_) => "error",
@@ -105,6 +106,7 @@ async fn run_loop<L: Llm>(
     queued: Option<
         std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     >,
+    surface: Option<&str>,
 ) -> R<Finish> {
     // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
     // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
@@ -113,7 +115,7 @@ async fn run_loop<L: Llm>(
     if !sess.read()?.iter().any(|r| matches!(r, Rec::System { .. })) {
         sess.append(Rec::System {
             ts: log::now(),
-            text: crate::prompt::system_prompt(cfg),
+            text: crate::prompt::system_prompt_for_surface(cfg, surface),
         })?;
     }
     let (defs, reg, path) = dispatch::prepare(cfg).await?;
@@ -607,6 +609,48 @@ mod tests {
     use super::*;
     use crate::llm::{Fake, Usage};
     use crate::log::Call;
+
+    #[tokio::test]
+    async fn surface_prompt_is_logged_once_and_survives_resume() -> R<()> {
+        let dir = std::env::temp_dir().join(format!("snens-surface-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let cfg = cfg_tmp(&dir);
+        let sess = Session::open(&dir, "surface")?;
+        sess.append(Rec::User {
+            ts: log::now(),
+            text: "hello".into(),
+            source: "surface".into(),
+        })?;
+        let observe = |_| {};
+
+        run_agent_surface(
+            &sess, &cfg, &Fake::new(vec![text_reply("first")]),
+            &crate::render::Ui::plain(), &observe, None, None, Some("telegram"),
+        ).await?;
+        let first = sess.read()?;
+        let prompt = first.iter().find_map(|r| match r {
+            Rec::System { text, .. } => Some(text.clone()),
+            _ => None,
+        }).expect("system prompt must be logged");
+        assert!(prompt.contains("Текущая поверхность: Telegram, личный чат."));
+
+        run_agent_surface(
+            &sess, &cfg, &Fake::new(vec![text_reply("resumed")]),
+            &crate::render::Ui::plain(), &observe, None, None, Some("untrusted\ninstructions"),
+        ).await?;
+        let second = sess.read()?;
+        let prompts = second.iter().filter(|r| matches!(r, Rec::System { .. })).count();
+        assert_eq!(prompts, 1, "resume must retain the original system prompt");
+        let resumed_prompt = second.iter().find_map(|r| match r {
+            Rec::System { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).unwrap();
+        assert_eq!(prompt, resumed_prompt);
+        assert!(!resumed_prompt.contains("untrusted"));
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
 
     /// Исчерпание лимита ходов — не ошибка и не закрытие поверхности: цикл
     /// просит у модели промежуточный итог (запись `limit`) и возвращает Ok,
