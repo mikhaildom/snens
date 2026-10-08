@@ -1,4 +1,4 @@
-use crate::surface_client::{Client, Event, Session};
+use crate::surface_client::{Client, Event, Session, TranscriptMessage};
 use crate::{
     input::{self, In},
     render::{Stream, Ui},
@@ -95,6 +95,23 @@ async fn app_loop(
                 cursor = c;
             }
             Err(e) => ui.line(&format!("ошибка открытия: {e}")),
+        }
+    } else if let Ok(sessions) = client.sessions().await {
+        if let Some(s) = sessions.into_iter().next() {
+            match open_session(&client, &s.id, &ui).await {
+                Ok((opened, c)) => {
+                    selected_run = if opened.state == "running" {
+                        opened.run_id.clone()
+                    } else {
+                        None
+                    };
+                    session = Some(opened);
+                    cursor = c;
+                }
+                Err(e) => ui.line(&format!("ошибка открытия: {e}")),
+            }
+        } else {
+            ui.line("нет сессий; /new или /sessions");
         }
     }
     subscription_session_id = session.as_ref().map(|s| s.id.clone());
@@ -210,8 +227,15 @@ fn subscribe(
 async fn open_session(client: &Client, id: &str, ui: &Ui) -> Result<(Session, u64), String> {
     let session = client.get_session(id).await?;
     let history = client.history(id).await?;
-    for event in &history.events {
-        display(event, ui, None);
+    if let Some(messages) = history.messages.as_deref() {
+        for message in messages {
+            display_message(message, ui);
+        }
+    } else if !history.events.is_empty() {
+        // Compatibility with older API servers that predate the JSONL transcript field.
+        for event in &history.events {
+            display(event, ui, None);
+        }
     }
     ui.line(&format!(
         "сессия {} · {} · cursor {}",
@@ -356,6 +380,43 @@ mod tests {
         assert_eq!(cursor, 3);
         assert!(!accept_event(&event("a", 3), 3, Some("a"), &mut cursor));
         assert_eq!(cursor, 3);
+    }
+}
+
+fn display_message(message: &TranscriptMessage, ui: &Ui) {
+    match message.role.as_str() {
+        "user" => {
+            if let Some(text) = &message.content {
+                ui.line(&format!("ты: {text}"));
+            }
+        }
+        "assistant" => {
+            if let Some(text) = &message.content {
+                ui.line(text);
+            }
+            if ui.show_reasoning() {
+                if let Some(text) = &message.reasoning {
+                    ui.line(&format!("[рассуждение] {text}"));
+                }
+            }
+            if let Some(calls) = &message.tool_calls {
+                for call in calls {
+                    let function = &call["function"];
+                    ui.line(&format!(
+                        "[{}] {}",
+                        function["name"].as_str().unwrap_or("tool"),
+                        function["arguments"]
+                    ));
+                }
+            }
+        }
+        "tool" => ui.line(&format!(
+            "[{}] exit={} {}",
+            message.name.as_deref().unwrap_or("tool"),
+            message.exit.unwrap_or(-1),
+            message.content.as_deref().unwrap_or("")
+        )),
+        _ => {}
     }
 }
 

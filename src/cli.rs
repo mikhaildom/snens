@@ -14,6 +14,7 @@ mod llm;
 mod log;
 mod mail;
 mod memory;
+mod production;
 mod project;
 mod prompt;
 mod reasoning;
@@ -23,6 +24,10 @@ mod render;
 mod review;
 mod selftest;
 mod subagent;
+mod surface_client;
+mod surface_runtime;
+mod surface_server;
+mod surface_tui;
 mod tickets;
 mod tui;
 
@@ -34,7 +39,9 @@ const USAGE: &str = "\
 snens — узкое ядро агента
 
   snens run [--new] [--session ID] [--config PATH] \"запрос\"
-  snens tui [--session ID] [--config PATH]
+  snens serve [--config PATH] [--listen 127.0.0.1:7420] [--token-file PATH]
+  snens tui [--endpoint URL] [--token-file PATH] [--session ID]
+  snens tui-local [--session ID] [--config PATH]  # прежний локальный TUI
   snens show [--session ID]
   snens log  [--session ID]
   snens sessions
@@ -167,7 +174,7 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
         ts: log::now(),
         text: prompt,
         source: "cli".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
 
     let key = cfg.api_key()?;
@@ -203,7 +210,7 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
         ts: log::now(),
         text: prompt,
         source: "agent".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
     let key = cfg.api_key()?;
     let llm = llm::OpenAi::new(key)?;
@@ -306,6 +313,7 @@ fn spawn_child(_cfg: &cfg::Config, id: &str, prompt: &str, parent: Option<&str>)
         .arg(id)
         .arg("--config")
         .arg(cfg::config_path())
+        .env("SNENS_CONFIG", cfg::config_path())
         .env("SNENS_PROMPT", prompt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -367,6 +375,7 @@ fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
     cmd.arg("review")
         .arg("--session")
         .arg(id)
+        .env("SNENS_CONFIG", cfg::config_path())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err));

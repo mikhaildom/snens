@@ -12,6 +12,10 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
     let mut v = vec![
         ("SNENS_SESSION".to_string(), sess.id().to_string()),
         (
+            "SNENS_CONFIG".to_string(),
+            crate::cfg::config_path().display().to_string(),
+        ),
+        (
             "SNENS_MAIL_DIR".to_string(),
             cfg.mail_path().display().to_string(),
         ),
@@ -22,6 +26,11 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
     // Канал пароля: процесс-инструмент (в т.ч. шим `sudo`) узнаёт, где спросить
     // пароль у TUI. Каталог шимов создаётся при подготовке окружения; здесь
     // best-effort — без него sudo просто честно упадёт «password required».
+    if std::env::var_os("SNENS_ASKPASS_DISABLED").is_some() {
+        // Keep both the policy marker and explicit config in each child; askpass client
+        // rejects before socket connect, even when another TUI owns the default path.
+        v.push(("SNENS_ASKPASS_DISABLED".into(), "1".into()));
+    }
     if let Ok(shim) = askpass::ensure_shims(cfg) {
         v.extend(askpass::child_env(
             &askpass::sock_path(&cfg.sessions_path()),
@@ -73,8 +82,8 @@ pub fn builtin_defs() -> Vec<Value> {
 pub async fn prepare(cfg: &Config) -> R<(Vec<Value>, Vec<registry::Tool>, String)> {
     let tools = registry::discover(cfg).await;
     let bin = registry::sync_bin_dir(cfg, &tools)?;
-    // Каталог шимов (симлинк `sudo` → `sudo -A`) идёт ПЕРЕД системным PATH: только
-    // внутри окружения инструментов агента, обычный sudo пользователя не тронут.
+    // Keep the shim even for headless API sessions: it routes sudo through askpass,
+    // whose explicit disabled guard fails before touching a possibly stale TUI socket.
     let shim = askpass::ensure_shims(cfg).ok();
     let mut parts = Vec::new();
     if let Some(s) = &shim {
