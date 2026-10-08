@@ -52,6 +52,12 @@ pub struct Store {
     #[serde(default)]
     pub attachments: BTreeMap<String, BTreeMap<String, Attachment>>,
     pub commands: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub surface_tools: BTreeMap<String, Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub tool_results: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub tool_requests: BTreeMap<String, serde_json::Value>,
 }
 pub struct Control {
     pub cancel: watch::Sender<bool>,
@@ -65,6 +71,8 @@ pub struct Runtime {
     pub llm: Arc<crate::llm::OpenAi>,
     pub locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     pub controls: Mutex<BTreeMap<String, Control>>,
+    pub pending_tools:
+        Mutex<BTreeMap<String, tokio::sync::oneshot::Sender<crate::agent::SurfaceToolResult>>>,
 }
 impl Runtime {
     pub fn persist(&self, data: &Store) -> crate::R<()> {
@@ -111,6 +119,9 @@ fn schema(c: &Connection) -> crate::R<()> {
       CREATE UNIQUE INDEX IF NOT EXISTS attachments_command ON attachments(session_id,command_id);
       CREATE TABLE IF NOT EXISTS message_attachments(session_id TEXT NOT NULL,message_id TEXT NOT NULL,attachment_id TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(session_id,message_id,attachment_id),FOREIGN KEY(session_id,message_id) REFERENCES messages(session_id,id),FOREIGN KEY(session_id,attachment_id) REFERENCES attachments(session_id,id));
       CREATE TABLE IF NOT EXISTS commands(command_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS surface_tools(session_id TEXT PRIMARY KEY,definitions TEXT NOT NULL,FOREIGN KEY(session_id) REFERENCES sessions(id));
+      CREATE TABLE IF NOT EXISTS tool_results(action_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS tool_requests(action_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events(session_id TEXT NOT NULL,seq INTEGER NOT NULL,run_id TEXT,kind TEXT NOT NULL,fields TEXT NOT NULL,PRIMARY KEY(session_id,seq),FOREIGN KEY(session_id) REFERENCES sessions(id));")?;
     Ok(())
 }
@@ -120,7 +131,7 @@ pub fn persist_store(c: &Connection, d: &Store) -> crate::R<()> {
 fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     let tx = c.unchecked_transaction()?;
     tx.execute_batch(
-        "DELETE FROM events; DELETE FROM message_attachments; DELETE FROM attachments; DELETE FROM messages; DELETE FROM commands; DELETE FROM sessions;",
+        "DELETE FROM events; DELETE FROM tool_results; DELETE FROM tool_requests; DELETE FROM surface_tools; DELETE FROM message_attachments; DELETE FROM attachments; DELETE FROM messages; DELETE FROM commands; DELETE FROM sessions;",
     )?;
     for s in d.sessions.values() {
         tx.execute(
@@ -187,6 +198,24 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     for (id, payload) in &d.commands {
         tx.execute(
             "INSERT INTO commands VALUES(?1,?2)",
+            params![id, serde_json::to_string(payload)?],
+        )?;
+    }
+    for (sid, defs) in &d.surface_tools {
+        tx.execute(
+            "INSERT INTO surface_tools VALUES(?1,?2)",
+            params![sid, serde_json::to_string(defs)?],
+        )?;
+    }
+    for (id, payload) in &d.tool_results {
+        tx.execute(
+            "INSERT INTO tool_results VALUES(?1,?2)",
+            params![id, serde_json::to_string(payload)?],
+        )?;
+    }
+    for (id, payload) in &d.tool_requests {
+        tx.execute(
+            "INSERT INTO tool_requests VALUES(?1,?2)",
             params![id, serde_json::to_string(payload)?],
         )?;
     }
@@ -300,6 +329,27 @@ fn read_store(c: &Connection) -> crate::R<Store> {
         }
     }
     {
+        let mut q = c.prepare("SELECT session_id,definitions FROM surface_tools")?;
+        for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (sid, p) = row?;
+            d.surface_tools.insert(sid, serde_json::from_str(&p)?);
+        }
+    }
+    {
+        let mut q = c.prepare("SELECT action_id,payload FROM tool_requests")?;
+        for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, p) = row?;
+            d.tool_requests.insert(id, serde_json::from_str(&p)?);
+        }
+    }
+    {
+        let mut q = c.prepare("SELECT action_id,payload FROM tool_results")?;
+        for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, p) = row?;
+            d.tool_results.insert(id, serde_json::from_str(&p)?);
+        }
+    }
+    {
         let mut q = c.prepare("SELECT command_id,payload FROM commands")?;
         for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (id, p) = row?;
@@ -336,6 +386,16 @@ pub fn interrupt_running(store: &mut Store) {
         .collect();
     for id in running {
         let run_id = store.sessions.get(&id).and_then(|s| s.run_id.clone());
+        for (action_id, action) in store.tool_requests.iter_mut() {
+            if action_id.starts_with(&format!(
+                "{}/{}/",
+                id,
+                run_id.as_deref().unwrap_or_default()
+            )) && action.get("status").and_then(|v| v.as_str()) == Some("pending")
+            {
+                *action = serde_json::json!({"status":"cancelled"});
+            }
+        }
         if let Some(session) = store.sessions.get_mut(&id) {
             session.state = "interrupted".into();
             session.run_id = None;
@@ -382,6 +442,9 @@ mod tests {
                 run_id: None,
             },
         );
+        d.surface_tools.insert(id.clone(),vec![serde_json::json!({"type":"function","function":{"name":"send_file","parameters":{"type":"object"}}})]);
+        d.tool_requests
+            .insert("s/r/c".into(), serde_json::json!({"status":"pending"}));
         d.commands
             .insert("cmd".into(), serde_json::json!({"ok":true}));
         d.messages.insert(
@@ -408,6 +471,8 @@ mod tests {
         persist(&db, &d).unwrap();
         let got = read_store(&db).unwrap();
         assert_eq!(got.events["s"][0].kind, "test");
+        assert_eq!(got.surface_tools["s"][0]["function"]["name"], "send_file");
+        assert_eq!(got.tool_requests["s/r/c"]["status"], "pending");
         assert_eq!(got.messages["s"][0].command_id, "cmd");
         assert_eq!(got.commands["cmd"]["ok"], true);
         assert!(db
@@ -431,6 +496,8 @@ mod tests {
                 run_id: Some("r".into()),
             },
         );
+        d.tool_requests
+            .insert("s/r/call".into(), serde_json::json!({"status":"pending"}));
         d.messages.insert(
             "s".into(),
             vec![Message {
@@ -444,6 +511,7 @@ mod tests {
         );
         interrupt_running(&mut d);
         assert_eq!(d.sessions["s"].state, "interrupted");
+        assert_eq!(d.tool_requests["s/r/call"]["status"], "cancelled");
         assert_eq!(d.messages["s"][0].state, "cancelled");
         assert_eq!(d.events["s"][0].fields["status"], "interrupted");
     }

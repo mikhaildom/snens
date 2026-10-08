@@ -117,6 +117,7 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
                 parts,
                 ..
             } => {
+                if out.iter().any(|m| m.get("role").and_then(Value::as_str)==Some("tool") && m.get("tool_call_id").and_then(Value::as_str)==Some(call_id.as_str())) { continue; }
                 // Кап на результат живёт здесь, а не в инструменте: это единственная
                 // точка, через которую проходит любой вывод любого тула.
                 let text = match body {
@@ -296,6 +297,14 @@ mod tests {
             source: source.into(),
                 parts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn duplicate_surface_tool_result_projects_once() {
+        let cfg=Config::default();
+        let log=vec![user("do it","surface"),Rec::Assistant{ts:0,text:None,reasoning:None,tool_calls:vec![crate::log::Call{id:"call-1".into(),name:"send_file".into(),args:"{}".into()}]},Rec::ToolResult{ts:1,call_id:"call-1".into(),tool:"send_file".into(),argv:vec![],exit:0,bytes:0,ms:1,body:Body::Inline{text:"ok".into()},parts:vec![]},Rec::ToolResult{ts:2,call_id:"call-1".into(),tool:"send_file".into(),argv:vec![],exit:0,bytes:0,ms:1,body:Body::Inline{text:"duplicate".into()},parts:vec![]}];
+        let projected=raw_msgs(&log,&cfg);
+        assert_eq!(projected.iter().filter(|m|m.get("role").and_then(Value::as_str)==Some("tool") && m.get("tool_call_id").and_then(Value::as_str)==Some("call-1")).count(),1);
     }
 
     #[test]

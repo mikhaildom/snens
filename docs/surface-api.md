@@ -83,6 +83,12 @@
 В surface API есть session-owned attachment upload; remote secret/sudo entry пока нет.
 Сервис не подхватывает пересборку сам: после успешных тестов нужен restart.
 
+## Session-scoped outbound tools
+
+Adapter registers OpenAI function definitions on an existing session with authenticated `PUT /v1/sessions/{sid}/tools`, body `{"tools":[...]}`; response is `{"tools":[...]}`. Repeating the same definitions is safe while a run is active; changing them while active returns 409. Definitions are session-local, capped at 8 and 32 KiB, and may not shadow core tools.
+
+For a model call, SSE emits `tool.requested` with the ordinary `seq`, `session_id`, `run_id`, and `type` envelope plus string `call_id`, `name`, and `args` (raw JSON argument string). The adapter posts `{"text":"...","exit":0}` to `/v1/sessions/{sid}/runs/{rid}/tools/{call_id}/result`; a first submission and exact retry return 200 `{"accepted":true}`. Unknown calls return 404; expired/cancelled calls and conflicting retries return 409. Result text is capped at 64 KiB. Stop cancels the waiter; a late result is rejected. Tools have a finite 60-second wait; timeout becomes a normal failed tool result. No callback URL is accepted and the core never initiates arbitrary outbound requests. These tools exist only on the HTTP surface; the terminal TUI continues to use its regular core tool set.
+
 ## SSE: изоляция и переполнение
 
 Снимок событий и подписка берутся под общей блокировкой с emit. Каждая подписка

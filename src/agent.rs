@@ -75,7 +75,34 @@ pub struct SurfaceRunOptions<'a> {
     pub cancel: Option<watch::Receiver<bool>>,
     pub queued: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<QueuedInput>>>>,
     pub surface: Option<&'a str>,
+    pub surface_tools: Vec<Value>,
+    pub tool_tx: Option<tokio::sync::mpsc::UnboundedSender<SurfaceToolRequest>>,
 }
+
+#[cfg_attr(not(feature = "surface-next"), allow(dead_code))] // Used only by the experimental HTTP/SSE surface.
+pub struct SurfaceToolRequest {
+    pub call_id: String,
+    pub name: String,
+    pub args: String,
+    pub result: tokio::sync::oneshot::Sender<SurfaceToolResult>,
+}
+#[derive(Clone)]
+#[cfg_attr(not(feature = "surface-next"), allow(dead_code))] // Result is delivered by the experimental HTTP/SSE surface.
+pub struct SurfaceToolResult { pub text: String, pub exit: i32 }
+
+#[cfg(test)]
+fn surface_tool_timeout_secs() -> u64 { 1 }
+
+#[cfg(test)]
+mod surface_tool_timeout_tests {
+    use super::*;
+    #[test]
+    fn timeout_is_short_in_tests_and_finite_in_production() {
+        assert_eq!(surface_tool_timeout_secs(),1);
+    }
+}
+#[cfg(not(test))]
+fn surface_tool_timeout_secs() -> u64 { 60 }
 
 fn ignore_surface_signal(_: SurfaceSignal) {}
 
@@ -86,6 +113,8 @@ impl Default for SurfaceRunOptions<'static> {
             cancel: None,
             queued: None,
             surface: None,
+            surface_tools: Vec::new(),
+            tool_tx: None,
         }
     }
 }
@@ -130,6 +159,8 @@ async fn run_loop<L: Llm>(
         mut cancel,
         queued,
         surface,
+        surface_tools,
+        tool_tx,
     } = options;
     // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
     // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
@@ -141,7 +172,8 @@ async fn run_loop<L: Llm>(
             text: crate::prompt::system_prompt_for_surface(cfg, surface),
         })?;
     }
-    let (defs, reg, path) = dispatch::prepare(cfg).await?;
+    let (mut defs, reg, path) = dispatch::prepare(cfg).await?;
+    defs.extend(surface_tools.clone());
     // Справка памяти впрыскивается ровно один раз, перед первым ходом сессии, и
     // записью в лог — проекция дальше читает её оттуда, как всё остальное.
     memory::recall_note(sess, cfg, &path).await;
@@ -345,11 +377,26 @@ async fn run_loop<L: Llm>(
                 call_id: call.id.clone(),
                 args: call.args.clone(),
             });
-            let out = if let Some(c) = cancel.as_mut() {
+            let out = if surface_tools.iter().any(|d| d.pointer("/function/name").and_then(Value::as_str) == Some(call.name.as_str())) {
+                let fail = |text: String| crate::exec::Out { exit: -1, text, bytes: 0, ms: 0, timed_out: false, parts: Vec::new() };
+                if let Some(tx) = tool_tx.as_ref() {
+                    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                    let req = SurfaceToolRequest { call_id: call.id.clone(), name: call.name.clone(), args: call.args.clone(), result: result_tx };
+                    if tx.send(req).is_err() { fail("surface tool broker unavailable".into()) } else {
+                        let wait = tokio::time::timeout(std::time::Duration::from_secs(surface_tool_timeout_secs()), result_rx);
+                        let got = if let Some(c) = cancel.as_mut() {
+                            tokio::select! { biased; _ = c.changed() => { let _=sess.append(Rec::ToolResult{ts:log::now(),call_id:call.id.clone(),tool:call.name.clone(),argv:Vec::new(),exit:-1,bytes:0,ms:0,body:Body::Inline{ text:"cancelled".into() },parts:Vec::new()}); return Err("cancelled".into()) }, r = wait => r }
+                        } else { wait.await };
+                        match got {
+                            Ok(Ok(r)) => crate::exec::Out { exit:r.exit, text:r.text, bytes:0, ms:0, timed_out:false, parts:Vec::new() },
+                            Ok(Err(_)) => fail("surface tool response expired".into()),
+                            Err(_) => fail("surface tool timed out after 60s".into()),
+                        }
+                    }
+                } else { fail("surface tool executor unavailable".into()) }
+            } else if let Some(c) = cancel.as_mut() {
                 tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), o = dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess) => o }
-            } else {
-                dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess).await
-            };
+            } else { dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess).await };
             observe(SurfaceSignal::ToolCompleted {
                 name: call.name.clone(),
                 call_id: call.id.clone(),

@@ -52,11 +52,20 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         llm,
         locks: Default::default(),
         controls: Default::default(),
+        pending_tools: Default::default(),
     });
     let app = Router::new()
         .route("/v1/sessions", get(list).post(create))
         .route("/v1/sessions/{id}", get(get_session))
         .route("/v1/sessions/{id}/messages", post(message))
+        .route(
+            "/v1/sessions/{id}/tools",
+            axum::routing::put(register_tools),
+        )
+        .route(
+            "/v1/sessions/{sid}/runs/{rid}/tools/{call_id}/result",
+            post(tool_result),
+        )
         .route("/v1/sessions/{id}/attachments", post(upload_attachment))
         .route("/v1/sessions/{id}/stop", post(stop))
         .route("/v1/sessions/{id}/events", get(events))
@@ -114,6 +123,205 @@ fn err(code: &str, msg: &str, status: StatusCode) -> impl IntoResponse {
 async fn list(State(s): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     let d = s.data.lock().await;
     Json(serde_json::json!({"sessions":d.sessions.values().collect::<Vec<_>>()}))
+}
+#[derive(Deserialize)]
+struct ToolDefs {
+    tools: Vec<serde_json::Value>,
+}
+async fn register_tools(
+    State(s): State<Arc<Runtime>>,
+    Path(id): Path<String>,
+    Json(body): Json<ToolDefs>,
+) -> impl IntoResponse {
+    if !rt::valid_id(&id) {
+        return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
+    }
+    let defs = match validate_tools(body.tools, &s.cfg).await {
+        Ok(x) => x,
+        Err(e) => return err("invalid_tools", &e, StatusCode::BAD_REQUEST).into_response(),
+    };
+    let mut d = s.data.lock().await;
+    let Some(session) = d.sessions.get(&id) else {
+        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+    };
+    let old = d.surface_tools.get(&id);
+    if old == Some(&defs) {
+        return (StatusCode::OK, Json(serde_json::json!({"tools":defs}))).into_response();
+    }
+    if session.state == "running" || session.state == "stopping" {
+        return err(
+            "run_active",
+            "cannot change tools while run is active",
+            StatusCode::CONFLICT,
+        )
+        .into_response();
+    }
+    d.surface_tools.insert(id.clone(), defs.clone());
+    if let Err(e) = s.persist(&d) {
+        return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
+    (StatusCode::OK, Json(serde_json::json!({"tools":defs}))).into_response()
+}
+async fn validate_tools(
+    tools: Vec<serde_json::Value>,
+    cfg: &Config,
+) -> Result<Vec<serde_json::Value>, String> {
+    use std::collections::BTreeSet;
+    if tools.len() > 8 {
+        return Err("at most 8 surface tools".into());
+    }
+    if serde_json::to_vec(&tools).map_err(|e| e.to_string())?.len() > 32768 {
+        return Err("tool definitions exceed 32 KiB".into());
+    }
+    let dynamic = crate::registry::discover(cfg).await;
+    let core: BTreeSet<String> = crate::dispatch::builtin_defs()
+        .iter()
+        .filter_map(|d| {
+            d.pointer("/function/name")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        })
+        .chain(
+            crate::registry::definitions(&dynamic)
+                .iter()
+                .filter_map(|d| {
+                    d.pointer("/function/name")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string)
+                }),
+        )
+        .collect();
+    let mut names = BTreeSet::new();
+    for t in &tools {
+        if t.get("type").and_then(|x| x.as_str()) != Some("function") {
+            return Err("only OpenAI function tools are supported".into());
+        }
+        let f = &t["function"];
+        let name = f
+            .get("name")
+            .and_then(|x| x.as_str())
+            .ok_or("function.name is required")?;
+        if name.is_empty()
+            || name.len() > 64
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err("invalid function name".into());
+        }
+        if core.contains(name) || !names.insert(name.to_string()) {
+            return Err("duplicate or core tool name".into());
+        }
+        if f.pointer("/parameters/type").and_then(|x| x.as_str()) != Some("object") {
+            return Err("function.parameters.type must be object".into());
+        }
+    }
+    Ok(tools)
+}
+#[derive(Deserialize)]
+struct ToolResultBody {
+    text: String,
+    exit: i32,
+}
+async fn tool_result(
+    State(s): State<Arc<Runtime>>,
+    Path((sid, rid, call_id)): Path<(String, String, String)>,
+    Json(body): Json<ToolResultBody>,
+) -> impl IntoResponse {
+    if body.text.len() > 65536 {
+        return err(
+            "invalid",
+            "tool result exceeds 64 KiB",
+            StatusCode::BAD_REQUEST,
+        )
+        .into_response();
+    }
+    let key = format!("{sid}/{rid}/{call_id}");
+    let result = crate::agent::SurfaceToolResult {
+        text: body.text.clone(),
+        exit: body.exit,
+    };
+    let mut d = s.data.lock().await;
+    if let Some(prev) = d.tool_results.get(&key) {
+        return if prev == &serde_json::json!({"text":body.text,"exit":body.exit}) {
+            (StatusCode::OK, Json(serde_json::json!({"accepted":true}))).into_response()
+        } else {
+            err(
+                "result_conflict",
+                "different tool result already accepted",
+                StatusCode::CONFLICT,
+            )
+            .into_response()
+        };
+    }
+    if !d.sessions.contains_key(&sid) {
+        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+    }
+    if !d
+        .sessions
+        .get(&sid)
+        .is_some_and(|x| x.run_id.as_deref() == Some(&rid) && x.state == "running")
+    {
+        return err("tool_expired", "run is not active", StatusCode::CONFLICT).into_response();
+    }
+    let pending_closed = s
+        .pending_tools
+        .lock()
+        .await
+        .get(&key)
+        .is_some_and(|tx| tx.is_closed());
+    if pending_closed {
+        s.pending_tools.lock().await.remove(&key);
+    }
+    if !s.pending_tools.lock().await.contains_key(&key) {
+        let known = d.events.get(&sid).is_some_and(|es| {
+            es.iter().any(|e| {
+                e.run_id.as_deref() == Some(&rid)
+                    && e.kind == "tool.requested"
+                    && e.fields.get("call_id").and_then(|v| v.as_str()) == Some(call_id.as_str())
+            })
+        });
+        return if known {
+            err(
+                "tool_expired",
+                "tool call expired or was cancelled",
+                StatusCode::CONFLICT,
+            )
+            .into_response()
+        } else {
+            err("not_found", "tool call not found", StatusCode::NOT_FOUND).into_response()
+        };
+    }
+    d.tool_results.insert(
+        key.clone(),
+        serde_json::json!({"text":body.text,"exit":body.exit}),
+    );
+    d.tool_requests
+        .insert(key.clone(), serde_json::json!({"status":"completed"}));
+    if let Err(e) = s.persist(&d) {
+        return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
+    let tx = s
+        .pending_tools
+        .lock()
+        .await
+        .remove(&key)
+        .expect("pending tool checked under serialized result handler");
+    if tx.send(result).is_err() {
+        d.tool_results.remove(&key);
+        d.tool_requests
+            .insert(key.clone(), serde_json::json!({"status":"expired"}));
+        if let Err(e) = s.persist(&d) {
+            return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response();
+        }
+        return err(
+            "tool_expired",
+            "tool waiter expired before result delivery",
+            StatusCode::CONFLICT,
+        )
+        .into_response();
+    }
+    drop(d);
+    (StatusCode::OK, Json(serde_json::json!({"accepted":true}))).into_response()
 }
 #[derive(Deserialize)]
 struct Create {
@@ -521,6 +729,69 @@ async fn launch(
     );
     let cfg = s.cfg.clone();
     let llm = s.llm.clone();
+    let surface_tools = s
+        .data
+        .lock()
+        .await
+        .surface_tools
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+    let (tool_tx, mut tool_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::agent::SurfaceToolRequest>();
+    let broker_s = s.clone();
+    let broker_id = id.clone();
+    let broker_run = run.clone();
+    tokio::spawn(async move {
+        while let Some(req) = tool_rx.recv().await {
+            let key = format!("{broker_id}/{broker_run}/{}", req.call_id);
+            {
+                let mut d = broker_s.data.lock().await;
+                d.tool_requests.insert(
+                    key.clone(),
+                    serde_json::json!({"status":"pending","name":req.name,"args":req.args}),
+                );
+                if broker_s.persist(&d).is_err() {
+                    d.tool_requests.remove(&key);
+                    return;
+                }
+            }
+            broker_s
+                .pending_tools
+                .lock()
+                .await
+                .insert(key.clone(), req.result);
+            let _ = broker_s
+                .emit(
+                    &broker_id,
+                    Some(broker_run.clone()),
+                    "tool.requested",
+                    serde_json::json!({"call_id":req.call_id,"name":req.name,"args":req.args}),
+                )
+                .await;
+            while !broker_s
+                .pending_tools
+                .lock()
+                .await
+                .get(&key)
+                .is_none_or(|tx| tx.is_closed())
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            broker_s.pending_tools.lock().await.remove(&key);
+            let mut d = broker_s.data.lock().await;
+            if d.tool_requests
+                .get(&key)
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str())
+                == Some("pending")
+            {
+                d.tool_requests
+                    .insert(key.clone(), serde_json::json!({"status":"expired"}));
+                let _ = broker_s.persist(&d);
+            }
+        }
+    });
     tokio::spawn(async move {
         let sess = match crate::log::Session::open(&cfg.sessions_path(), &id) {
             Ok(x) => x,
@@ -598,6 +869,8 @@ async fn launch(
                 cancel: Some(cancel_rx),
                 queued: Some(queue_rx.clone()),
                 surface: Some(&surface),
+                surface_tools,
+                tool_tx: Some(tool_tx),
             },
         )
         .await;
@@ -875,6 +1148,7 @@ mod tests {
                 llm: Arc::new(crate::llm::OpenAi::new(String::new()).unwrap()),
                 locks: Default::default(),
                 controls: Default::default(),
+                pending_tools: Default::default(),
             }),
             dir,
         )
@@ -902,6 +1176,62 @@ mod tests {
         for event in events {
             let _ = runtime.tx.send(event);
         }
+    }
+
+    #[test]
+    fn surface_tool_definitions_are_validated_and_bounded() {
+        let dir = std::env::temp_dir().join(format!("surface-tools-{}", uuid::Uuid::new_v4()));
+        let cfg = Config::default();
+        let valid = serde_json::json!({"type":"function","function":{"name":"send_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}});
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt
+            .block_on(validate_tools(vec![valid.clone()], &cfg))
+            .is_ok());
+        assert!(rt.block_on(validate_tools(vec![serde_json::json!({"type":"function","function":{"name":"run","parameters":{"type":"object"}}})],&cfg)).is_err());
+        assert!(rt
+            .block_on(validate_tools(vec![valid.clone(), valid], &cfg))
+            .is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn result_after_waiter_timeout_is_rejected_even_when_run_active() {
+        let (runtime, dir) = runtime().await;
+        {
+            let mut d = runtime.data.lock().await;
+            let s = d.sessions.get_mut("a").unwrap();
+            s.state = "running".into();
+            s.run_id = Some("r".into());
+            d.events.get_mut("a").unwrap().push(Event {
+                seq: 1,
+                session_id: "a".into(),
+                run_id: Some("r".into()),
+                kind: "tool.requested".into(),
+                fields: serde_json::json!({"call_id":"c"}),
+            });
+            runtime.persist(&d).unwrap();
+        }
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        runtime
+            .pending_tools
+            .lock()
+            .await
+            .insert("a/r/c".into(), tx);
+        let response = tool_result(
+            State(runtime.clone()),
+            Path(("a".into(), "r".into(), "c".into())),
+            Json(ToolResultBody {
+                text: "late".into(),
+                exit: 0,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!runtime.data.lock().await.tool_results.contains_key("a/r/c"));
+        drop(runtime);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
