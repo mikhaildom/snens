@@ -198,6 +198,14 @@ async fn message(
         .get(&id)
         .and_then(|v| v.iter().find(|m| m.command_id == b.command_id))
     {
+        if !same_message_payload(m, &b.text) {
+            return err(
+                "idempotency_conflict",
+                "command_id reused with different payload",
+                StatusCode::CONFLICT,
+            )
+            .into_response();
+        }
         return (
             StatusCode::OK,
             Json(serde_json::json!({"message_id":m.id,"run_id":m.run_id,"state":m.state})),
