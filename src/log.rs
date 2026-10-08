@@ -33,6 +33,8 @@ pub enum Rec {
         ts: u64,
         text: String,
         source: String,
+        #[serde(default)]
+        parts: Vec<Part>,
     },
     Assistant {
         ts: u64,

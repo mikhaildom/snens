@@ -25,7 +25,7 @@ const ATTACH_EXTS: &[(&str, &str, &str)] = &[
     ("pdf", "file", "application/pdf"),
 ];
 
-fn attach_kind(path: &Path) -> Option<(&'static str, &'static str)> {
+pub fn attachment_kind(path: &Path) -> Option<(&'static str, &'static str)> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     ATTACH_EXTS
         .iter()
@@ -49,7 +49,7 @@ pub fn collect_attachments(dir: &Path, max_bytes: usize, text: &mut String) -> V
     // Порядок чтения каталога произволен — сортируем, иначе проекция недетерминирована.
     files.sort();
     for p in files {
-        let Some((kind, mime)) = attach_kind(&p) else {
+        let Some((kind, mime)) = attachment_kind(&p) else {
             continue;
         };
         let Ok(meta) = p.metadata() else { continue };
@@ -65,7 +65,7 @@ pub fn collect_attachments(dir: &Path, max_bytes: usize, text: &mut String) -> V
         let (width, height) = if kind == "image" {
             std::fs::read(&p)
                 .ok()
-                .map(|b| image_dims(&b, mime))
+                .map(|b| image_dimensions(&b, mime))
                 .unwrap_or((0, 0))
         } else {
             (0, 0)
@@ -92,7 +92,7 @@ pub fn collect_attachments(dir: &Path, max_bytes: usize, text: &mut String) -> V
 
 /// Размеры картинки из заголовка: без декодирования форматы и без картинных крейтов
 /// (ядро тащит только std + rustls + serde). Не распознали — (0, 0), и вызывающий решает.
-fn image_dims(b: &[u8], mime: &str) -> (u32, u32) {
+pub fn image_dimensions(b: &[u8], mime: &str) -> (u32, u32) {
     match mime {
         "image/png" if b.len() >= 24 && b.starts_with(b"\x89PNG\r\n\x1a\n") => (
             u32::from_be_bytes(b[16..20].try_into().unwrap()),

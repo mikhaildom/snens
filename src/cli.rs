@@ -167,6 +167,7 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
         ts: log::now(),
         text: prompt,
         source: "cli".into(),
+            parts: Vec::new(),
     })?;
 
     let key = cfg.api_key()?;
@@ -202,6 +203,7 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
         ts: log::now(),
         text: prompt,
         source: "agent".into(),
+            parts: Vec::new(),
     })?;
     let key = cfg.api_key()?;
     let llm = llm::OpenAi::new(key)?;

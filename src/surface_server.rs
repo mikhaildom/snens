@@ -13,7 +13,9 @@ use axum::{
 use fs2::FileExt;
 use futures_util::{stream, StreamExt};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
+use tokio::io::AsyncWriteExt;
 
 pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()> {
     if !addr.ip().is_loopback() {
@@ -55,6 +57,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         .route("/v1/sessions", get(list).post(create))
         .route("/v1/sessions/{id}", get(get_session))
         .route("/v1/sessions/{id}/messages", post(message))
+        .route("/v1/sessions/{id}/attachments", post(upload_attachment))
         .route("/v1/sessions/{id}/stop", post(stop))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/history", get(history))
@@ -171,12 +174,213 @@ async fn get_session(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> i
     }
 }
 #[derive(Deserialize)]
+struct UploadQuery {
+    filename: String,
+    command_id: String,
+}
+fn attachment_response(
+    id: &str,
+    name: &str,
+    path: &str,
+    mime: &str,
+    bytes: usize,
+) -> serde_json::Value {
+    serde_json::json!({"attachment_id":id,"name":name,"path":path,"mime":mime,"bytes":bytes})
+}
+async fn upload_attachment(
+    State(s): State<Arc<Runtime>>,
+    Path(id): Path<String>,
+    Query(q): Query<UploadQuery>,
+    request: axum::extract::Request,
+) -> impl IntoResponse {
+    if !rt::valid_id(&id)
+        || !rt::valid_id(&q.command_id)
+        || q.filename.is_empty()
+        || q.filename.len() > 255
+        || q.filename.contains('/')
+        || q.filename.contains('\\')
+    {
+        return err(
+            "invalid",
+            "invalid attachment id or filename",
+            StatusCode::BAD_REQUEST,
+        )
+        .into_response();
+    }
+    let max = s.cfg.max_attachment_bytes;
+    let body = match axum::body::to_bytes(request.into_body(), max.saturating_add(1)).await {
+        Ok(b) if b.len() <= max => b,
+        _ => {
+            return err(
+                "too_large",
+                "attachment exceeds configured size limit",
+                StatusCode::PAYLOAD_TOO_LARGE,
+            )
+            .into_response()
+        }
+    };
+    let digest = format!("{:x}", Sha256::digest(&body));
+    let _guard = s.session_lock(&id).await.lock_owned().await;
+    let mut d = s.data.lock().await;
+    if !d.sessions.contains_key(&id) {
+        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+    }
+    if let Some(existing) = d
+        .attachments
+        .get(&id)
+        .and_then(|m| m.values().find(|a| a.command_id == q.command_id))
+    {
+        if existing.filename == q.filename && existing.sha256 == digest {
+            let p = &existing.part;
+            return (
+                StatusCode::OK,
+                Json(attachment_response(
+                    &existing.attachment_id,
+                    &existing.name,
+                    &p.path,
+                    &p.mime,
+                    p.bytes,
+                )),
+            )
+                .into_response();
+        }
+        return err(
+            "idempotency_conflict",
+            "command_id reused with different upload",
+            StatusCode::CONFLICT,
+        )
+        .into_response();
+    }
+    let original = std::path::Path::new(&q.filename);
+    let candidate = crate::attach::attachment_kind(original);
+    let (kind, mime) = candidate.unwrap_or_else(|| {
+        let mime = match original
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "txt" | "md" | "csv" | "log" => "text/plain",
+            "json" => "application/json",
+            "pdf" => "application/pdf",
+            _ => "application/octet-stream",
+        };
+        ("file", mime)
+    });
+    let aid = uuid::Uuid::new_v4().to_string();
+    let extension = original
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 16 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let dir = s.cfg.sessions_path().join(format!("{id}.attachments"));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join(format!("{aid}{extension}"));
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let write_result = async {
+        let mut f = options.open(&path).await?;
+        f.write_all(&body).await?;
+        f.sync_all().await
+    }
+    .await;
+    if let Err(e) = write_result {
+        return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
+    let (width, height) = if kind == "image" {
+        crate::attach::image_dimensions(&body, mime)
+    } else {
+        (0, 0)
+    };
+    if kind == "image" && (width == 0 || height == 0) {
+        let _ = tokio::fs::remove_file(&path).await;
+        return err(
+            "invalid_image",
+            "image extension/header mismatch",
+            StatusCode::BAD_REQUEST,
+        )
+        .into_response();
+    }
+    let name = q
+        .filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    let part = crate::log::Part {
+        kind: kind.into(),
+        path: path.to_string_lossy().into_owned(),
+        mime: mime.into(),
+        bytes: body.len(),
+        width,
+        height,
+    };
+    let attachment = rt::Attachment {
+        attachment_id: aid.clone(),
+        command_id: q.command_id,
+        filename: q.filename,
+        name: name.clone(),
+        part: part.clone(),
+        sha256: digest,
+    };
+    d.attachments
+        .entry(id.clone())
+        .or_default()
+        .insert(aid.clone(), attachment);
+    if let Err(e) = s.persist(&d) {
+        d.attachments.get_mut(&id).and_then(|m| m.remove(&aid));
+        let _ = tokio::fs::remove_file(&path).await;
+        return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
+    (
+        StatusCode::CREATED,
+        Json(attachment_response(
+            &aid, &name, &part.path, &part.mime, part.bytes,
+        )),
+    )
+        .into_response()
+}
+fn resolve_attachments(
+    d: &rt::Store,
+    sid: &str,
+    ids: &[String],
+) -> Result<Vec<crate::log::Part>, Box<axum::response::Response>> {
+    let mut result = Vec::new();
+    for id in ids {
+        let Some(a) = d.attachments.get(sid).and_then(|m| m.get(id)) else {
+            return Err(Box::new(
+                err(
+                    "not_found",
+                    "attachment not found in session",
+                    StatusCode::BAD_REQUEST,
+                )
+                .into_response(),
+            ));
+        };
+        result.push(a.part.clone());
+    }
+    Ok(result)
+}
+
+#[derive(Deserialize)]
 struct Send {
     command_id: String,
     text: String,
+    #[serde(default)]
+    attachment_ids: Vec<String>,
 }
-fn same_message_payload(existing: &rt::Message, text: &str) -> bool {
-    existing.text == text
+fn same_message_payload(existing: &rt::Message, text: &str, attachment_ids: &[String]) -> bool {
+    existing.text == text && existing.attachment_ids == attachment_ids
 }
 
 async fn message(
@@ -184,10 +388,13 @@ async fn message(
     Path(id): Path<String>,
     Json(b): Json<Send>,
 ) -> impl IntoResponse {
-    if !rt::valid_id(&id) || !rt::valid_id(&b.command_id) || b.text.trim().is_empty() {
+    if !rt::valid_id(&id)
+        || !rt::valid_id(&b.command_id)
+        || (b.text.trim().is_empty() && b.attachment_ids.is_empty())
+    {
         return err(
             "invalid",
-            "invalid id or empty text",
+            "invalid id or empty message",
             StatusCode::BAD_REQUEST,
         )
         .into_response();
@@ -202,7 +409,7 @@ async fn message(
         .get(&id)
         .and_then(|v| v.iter().find(|m| m.command_id == b.command_id))
     {
-        if !same_message_payload(m, &b.text) {
+        if !same_message_payload(m, &b.text, &b.attachment_ids) {
             return err(
                 "idempotency_conflict",
                 "command_id reused with different payload",
@@ -216,6 +423,10 @@ async fn message(
         )
             .into_response();
     }
+    let parts = match resolve_attachments(&d, &id, &b.attachment_ids) {
+        Ok(parts) => parts,
+        Err(response) => return *response,
+    };
     let busy = d
         .sessions
         .get(&id)
@@ -232,6 +443,7 @@ async fn message(
         id: mid.clone(),
         command_id: b.command_id.clone(),
         text: b.text.clone(),
+        attachment_ids: b.attachment_ids.clone(),
         state: state.into(),
         run_id: run_id.clone(),
     });
@@ -260,9 +472,12 @@ async fn message(
         )
         .await;
     if !busy {
-        launch(s.clone(), id, run_id.unwrap(), b.text, surface).await
+        launch(s.clone(), id, run_id.unwrap(), b.text, surface, parts).await
     } else if let Some(c) = s.controls.lock().await.get(&id) {
-        let _ = c.queued.send(b.text.clone());
+        let _ = c.queued.send(crate::agent::QueuedInput {
+            text: b.text.clone(),
+            parts,
+        });
     }
     (StatusCode::ACCEPTED, Json(result)).into_response()
 }
@@ -286,7 +501,14 @@ where
     }
 }
 
-async fn launch(s: Arc<Runtime>, id: String, run: String, text: String, surface: String) {
+async fn launch(
+    s: Arc<Runtime>,
+    id: String,
+    run: String,
+    text: String,
+    surface: String,
+    parts: Vec<crate::log::Part>,
+) {
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
     let queue_rx = Arc::new(tokio::sync::Mutex::new(queue_rx));
@@ -318,6 +540,7 @@ async fn launch(s: Arc<Runtime>, id: String, run: String, text: String, surface:
             ts: crate::log::now(),
             text,
             source: "surface".into(),
+            parts,
         });
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
         let observe = move |sig: crate::agent::SurfaceSignal| {
@@ -599,11 +822,21 @@ mod tests {
             id: "message-id".into(),
             command_id: "command-id".into(),
             text: "original input".into(),
+            attachment_ids: vec!["attachment-id".into()],
             state: "applied".into(),
             run_id: Some("run-id".into()),
         };
-        assert!(same_message_payload(&existing, "original input"));
-        assert!(!same_message_payload(&existing, "changed input"));
+        assert!(same_message_payload(
+            &existing,
+            "original input",
+            &["attachment-id".into()]
+        ));
+        assert!(!same_message_payload(&existing, "original input", &[]));
+        assert!(!same_message_payload(
+            &existing,
+            "changed input",
+            &["attachment-id".into()]
+        ));
     }
 
     fn event(session_id: &str, seq: u64) -> Event {

@@ -25,6 +25,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 fs2 = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
 
 # Только unix: фоновое ревью отвязывается от терминала своей сессией процесса
 # (`setsid`) — это значение платформенной ветки, не общая зависимость.

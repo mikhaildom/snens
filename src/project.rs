@@ -54,7 +54,7 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
 
     for r in log {
         match r {
-            Rec::User { text, source, .. } => {
+            Rec::User { text, source, parts, .. } => {
                 // Инструкции ревью и улучшения — системные по смыслу: это не запрос
                 // пользователя, а рамка задачи. Роль в проекции, лог остаётся как есть.
                 let frame = source == "review" || source == "improve";
@@ -70,7 +70,8 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
                     had_work = true;
                 }
                 let role = if frame { "system" } else { "user" };
-                out.push(json!({"role": role, "content": text}));
+                let content = if parts.is_empty() { json!(text) } else { content_value(text, parts, cfg) };
+                out.push(json!({"role": role, "content": content}));
             }
             Rec::Assistant {
                 text, tool_calls, ..
@@ -177,12 +178,15 @@ fn content_value(text: &str, parts: &[Part], cfg: &Config) -> Value {
         if p.kind != "image" {
             arr.push(json!({
                 "type": "text",
-                "text": format!("[вложение {} не поддерживается провайдером (пока): {} Б]", p.kind, p.bytes)
+                "text": format!("[вложение {}: {} ({}), {} Б]", p.kind, p.path, p.mime, p.bytes)
             }));
             continue;
         }
         match data_url(&p.path, &p.mime) {
-            Some(url) => arr.push(json!({"type": "image_url", "image_url": {"url": url}})),
+            Some(url) => {
+                arr.push(json!({"type": "text", "text": format!("[изображение: {} ({}), {} Б]", p.path, p.mime, p.bytes)}));
+                arr.push(json!({"type": "image_url", "image_url": {"url": url}}));
+            },
             None => arr.push(json!({
                 "type": "text",
                 "text": format!("[вложение недоступно: {}]", p.path)
@@ -290,6 +294,7 @@ mod tests {
             ts: 0,
             text: text.into(),
             source: source.into(),
+                parts: Vec::new(),
         }
     }
 
@@ -374,6 +379,21 @@ mod tests {
     /// Вложение из канала едет как image-часть; без него — плоская строка, как
     /// раньше (совместимость со старыми логами и текстовыми тулами).
     #[test]
+    fn user_attachment_projects_image_and_document_path() {
+        let dir = std::env::temp_dir().join(format!("user-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("managed.png");
+        std::fs::write(&png, [0x89,b'P',b'N',b'G',b'\r',b'\n',0x1a,b'\n',0,0,0,13,b'I',b'H',b'D',b'R',0,0,0,1,0,0,0,1]).unwrap();
+        let image = Part {kind:"image".into(),path:png.to_string_lossy().into_owned(),mime:"image/png".into(),bytes:24,width:1,height:1};
+        let document = Part {kind:"file".into(),path:dir.join("managed.blob").to_string_lossy().into_owned(),mime:"application/octet-stream".into(),bytes:9,width:0,height:0};
+        let log = vec![Rec::User {ts:0,text:"inspect".into(),source:"surface".into(),parts:vec![image,document]}];
+        let projected = msgs(&log,&Config::default());
+        let content = projected.iter().find(|m| m["role"] == "user").unwrap()["content"].as_array().unwrap();
+        assert!(content.iter().any(|p| p["type"] == "image_url"));
+        assert!(content.iter().any(|p| p["type"] == "text" && p["text"].as_str().unwrap().contains("managed.blob")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn attachment_becomes_image_part() {
         let dir = std::env::temp_dir().join(format!("snens-attach-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -425,8 +445,9 @@ mod tests {
             .as_array()
             .expect("вложение не собралось в части");
         assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[1]["type"], "image_url");
-        assert!(content[1]["image_url"]["url"]
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[2]["type"], "image_url");
+        assert!(content[2]["image_url"]["url"]
             .as_str()
             .unwrap()
             .starts_with("data:image/png;base64,"));
@@ -514,10 +535,11 @@ mod tests {
         assert_eq!(tools.len(), 2);
         for (tool, text) in tools.iter().zip(["a", "b"]) {
             let content = tool["content"].as_array().unwrap();
-            assert_eq!(content.len(), 2);
+            assert_eq!(content.len(), 3);
             assert_eq!(content[0], json!({"type": "text", "text": text}));
-            assert_eq!(content[1]["type"], "image_url");
-            assert!(content[1]["image_url"]["url"]
+            assert_eq!(content[1]["type"], "text");
+            assert_eq!(content[2]["type"], "image_url");
+            assert!(content[2]["image_url"]["url"]
                 .as_str()
                 .unwrap()
                 .starts_with("data:image/png;base64,"));

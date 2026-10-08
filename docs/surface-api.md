@@ -80,7 +80,7 @@
 Автоматическая memory и review отключены, тестовая модель — `openai/gpt-6-luna`.
 Это **не sandbox**: инструменты имеют обычные права пользователя; явный вызов memory
 может обращаться к общей внешней памяти, его не использовать для тестовых записей.
-В surface API пока нет attachment upload и remote secret/sudo entry.
+В surface API есть session-owned attachment upload; remote secret/sudo entry пока нет.
 Сервис не подхватывает пересборку сам: после успешных тестов нужен restart.
 
 ## SSE: изоляция и переполнение
@@ -108,3 +108,22 @@ Production binary и config совпали по SHA-256 до/после.
 дочерними процессами; ключ не записывается в runtime.toml/store/log.
 Incremental cache в next-worktree выключен: target-диск общий и заполнен почти
 полностью; удаление next/debug/incremental освободило 1.3 ГБ. Production target не чистили.
+
+## Входящие вложения
+
+`POST /v1/sessions/{id}/attachments?filename=NAME&command_id=UUID` с Bearer и
+raw bytes (`application/octet-stream`). Ответ 201 (200 на точный retry):
+`{attachment_id,name,path,mime,bytes}`. Путь абсолютный, UUID-файл принадлежит
+ядру, каталог приватный. Лимит — `max_attachment_bytes`; превышение 413.
+Имя без `/` и `\`, изображения проверяются по заголовку. Остальные файлы доступны
+модели через путь/инструменты, а не как image. Один upload command ID с другим
+именем/байтами — 409. Metadata и ссылки сообщений сохраняются в SQLite.
+
+`POST /v1/sessions/{id}/messages`: `attachment_ids: []` опционально;
+пустой текст допустим с вложениями. Чужой/неизвестный ID — 400. Повтор message
+command ID обязан совпадать по text и attachment IDs. Busy-очередь сохраняет
+parts; `Rec::User` backward-compatible (отсутствующие parts = []). Изображение
+проецируется как `image_url`, документ — текстовая строка с path/MIME/bytes.
+
+Проверка Telegram: `scripts/media-smoke.py` в отдельном репозитории адаптера
+поднимает настоящее ядро с mock LLM и mock Telegram; реальные ключи не нужны.

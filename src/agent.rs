@@ -64,11 +64,16 @@ pub async fn run_agent<L: Llm>(
 }
 
 /// Optional controls and metadata for running an agent on a surface.
+#[derive(Clone)]
+pub struct QueuedInput {
+    pub text: String,
+    pub parts: Vec<crate::log::Part>,
+}
+
 pub struct SurfaceRunOptions<'a> {
     pub observe: &'a (dyn Fn(SurfaceSignal) + Send + Sync),
     pub cancel: Option<watch::Receiver<bool>>,
-    pub queued:
-        Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>>>,
+    pub queued: Option<std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<QueuedInput>>>>,
     pub surface: Option<&'a str>,
 }
 
@@ -168,11 +173,12 @@ async fn run_loop<L: Llm>(
         turn += 1;
         if let Some(rx) = queued.as_ref() {
             let mut rx = rx.lock().await;
-            while let Ok(text) = rx.try_recv() {
+            while let Ok(input) = rx.try_recv() {
                 sess.append(Rec::User {
                     ts: log::now(),
-                    text,
+                    text: input.text,
                     source: "surface-steer".into(),
+                    parts: input.parts,
                 })?;
             }
         }
@@ -207,6 +213,7 @@ async fn run_loop<L: Llm>(
                 ts: log::now(),
                 source: format!("context-cleanup:{pressure_next}"),
                 text: format!("[Уборка рабочего контекста] Сейчас ~{approx} токенов, экономический бюджет {}. Перед продолжением задачи отредактируй {} и вызови ctx commit. Ориентир после уборки — {} токенов. Удали переваренные выводы и законченные ветки, сохрани полезные точные фрагменты и обнови записку для продолжения: цель, ограничения, решения, точные данные, открытые проверки, следующие действия. Не пересказывай историю ради пересказа. Стратегию и объём правок выбираешь ты.", cfg.context_budget(), mirror.path().display(), cfg.context_target()),
+                    parts: Vec::new(),
             })?;
             msgs = mirror.prepare(&sess.read()?, cfg)?;
             ui.notice(&format!(
@@ -313,16 +320,17 @@ async fn run_loop<L: Llm>(
             if let Some(rx) = queued.as_ref() {
                 let mut rx = rx.lock().await;
                 let mut accepted = Vec::new();
-                while let Ok(text) = rx.try_recv() {
-                    accepted.push(text);
+                while let Ok(input) = rx.try_recv() {
+                    accepted.push(input);
                 }
                 drop(rx);
                 if !accepted.is_empty() {
-                    for text in accepted {
+                    for input in accepted {
                         sess.append(Rec::User {
                             ts: log::now(),
-                            text,
+                            text: input.text,
                             source: "surface-steer".into(),
+                            parts: input.parts,
                         })?;
                     }
                     continue;
@@ -483,6 +491,7 @@ async fn final_answer<L: Llm>(
         ts: log::now(),
         text: LIMIT_NOTE.into(),
         source: "limit".into(),
+            parts: Vec::new(),
     })?;
     let log = sess.read()?;
     let msgs = crate::context::effective(&log, cfg)?;
@@ -639,6 +648,7 @@ mod tests {
             ts: log::now(),
             text: "hello".into(),
             source: "surface".into(),
+                parts: Vec::new(),
         })?;
         let observe = |_| {};
 
@@ -714,6 +724,7 @@ mod tests {
             ts: log::now(),
             text: "поработай".into(),
             source: "test".into(),
+                parts: Vec::new(),
         })?;
         let run_once = || Reply {
             reasoning: String::new(),
@@ -792,6 +803,7 @@ mod tests {
             ts: log::now(),
             text: "поработай".into(),
             source: "test".into(),
+                parts: Vec::new(),
         })?;
         let fake = Fake::new(vec![text_reply(""), text_reply("готово")]);
         run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await?;
@@ -827,6 +839,7 @@ mod tests {
             ts: log::now(),
             text: "поработай".into(),
             source: "test".into(),
+                parts: Vec::new(),
         })?;
         let fake = Fake::new(vec![text_reply(""), text_reply("")]);
         let err = run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await;
