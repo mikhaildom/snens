@@ -87,6 +87,7 @@ async fn app_loop(
     let mut cursor = 0;
     let mut selected_run = None;
     let mut stream: Option<Stream> = None;
+    let mut received_text = String::new();
     if let Some(id) = initial {
         match open_session(&client, &id, &ui).await {
             Ok((s, c)) => {
@@ -147,6 +148,8 @@ async fn app_loop(
                         if should_quit { break; }
                         // A selected-session transition must close old event stream.
                         if current_session_id(session.as_ref()) != subscription_session_id.as_deref() {
+                            stream = None;
+                            received_text.clear();
                             if let Some(task) = subscription.take() { task.abort(); }
                             subscription_session_id = session.as_ref().map(|s| s.id.clone());
                             if session.is_none() { cursor = 0; }
@@ -159,14 +162,40 @@ async fn app_loop(
                 match message {
                     Notice::Event(event, seq) => {
                         if accept_event(&event, seq, session.as_ref().map(|s| s.id.as_str()), &mut cursor) {
+                            if event.kind == "run.started" {
+                                stream = None;
+                                received_text.clear();
+                                selected_run = event.run_id.clone();
+                            }
                             if event.kind == "assistant.delta" {
+                                if event.fields["kind"] != "reasoning" {
+                                    received_text.push_str(event.fields["text"].as_str().unwrap_or(""));
+                                }
                                 display(&event, &ui, Some(stream.get_or_insert_with(|| Stream::new(ui.color, ui.sink()))));
+                            } else if event.kind == "assistant.completed" {
+                                let full_text = event.fields["text"].as_str().unwrap_or("");
+                                let action = completion_action(&received_text, full_text);
+                                let current = stream.get_or_insert_with(|| Stream::new(ui.color, ui.sink()));
+                                match action {
+                                    CompletionAction::Append(suffix) => current.content(suffix),
+                                    CompletionAction::Full(text) => current.content(text),
+                                    CompletionAction::Finish => {},
+                                    CompletionAction::Recover(text) => {
+                                        current.finish();
+                                        ui.line(&format!("Ответ восстановлен целиком:\n{text}"));
+                                    }
+                                }
+                                current.finish();
+                                stream = None;
+                                received_text.clear();
                             } else {
                                 display(&event, &ui, stream.as_mut());
                             }
-                            if event.kind == "assistant.completed" || event.kind == "run.finished" { stream = None; }
-                            if event.kind == "run.started" { selected_run = event.run_id.clone(); }
-                            if event.kind == "run.finished" { selected_run = None; }
+                            if event.kind == "run.finished" {
+                                if let Some(mut current) = stream.take() { current.finish(); }
+                                received_text.clear();
+                                selected_run = None;
+                            }
                         }
                     }
                     Notice::Error(e) => { ui.line(&format!("события недоступны: {e}; переподключаюсь")); }
@@ -178,6 +207,25 @@ async fn app_loop(
         task.abort();
     }
     Ok(())
+}
+
+enum CompletionAction<'a> {
+    Append(&'a str),
+    Full(&'a str),
+    Finish,
+    Recover(&'a str),
+}
+
+fn completion_action<'a>(received: &str, full: &'a str) -> CompletionAction<'a> {
+    if received.is_empty() {
+        CompletionAction::Full(full)
+    } else if received == full {
+        CompletionAction::Finish
+    } else if full.starts_with(received) {
+        CompletionAction::Append(&full[received.len()..])
+    } else {
+        CompletionAction::Recover(full)
+    }
 }
 
 fn accept_event(event: &Event, seq: u64, selected: Option<&str>, cursor: &mut u64) -> bool {
@@ -397,6 +445,30 @@ mod tests {
             kind: "test".into(),
             fields: json!({}),
         }
+    }
+
+    #[test]
+    fn completion_fallback_handles_missing_partial_full_and_mismatched_deltas() {
+        assert!(matches!(
+            completion_action("", "answer"),
+            CompletionAction::Full("answer")
+        ));
+        assert!(matches!(
+            completion_action("ans", "answer"),
+            CompletionAction::Append("wer")
+        ));
+        assert!(matches!(
+            completion_action("answer", "answer"),
+            CompletionAction::Finish
+        ));
+        assert!(matches!(
+            completion_action("answer!", "answer"),
+            CompletionAction::Recover("answer")
+        ));
+        assert!(matches!(
+            completion_action("sw", "answer"),
+            CompletionAction::Recover("answer")
+        ));
     }
 
     #[test]
