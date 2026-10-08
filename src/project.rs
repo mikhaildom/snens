@@ -567,8 +567,7 @@ mod tests {
             0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R',
             0, 0, 0, 1, 0, 0, 0, 1,
         ];
-        let mut cfg = Config::default();
-        cfg.ctx_window = 40_000;
+        let mut cfg = Config { ctx_window: 40_000, ..Config::default() };
         let part = |path: &std::path::Path| Part {
             kind: "image".into(),
             path: path.to_string_lossy().into_owned(),
@@ -652,8 +651,7 @@ mod tests {
     /// картинку (провайдер ответит 400) и говорим об этом текстом.
     #[test]
     fn attachments_off_keeps_placeholder() {
-        let mut cfg = Config::default();
-        cfg.attachments = false;
+        let cfg = Config { attachments: false, ..Config::default() };
         let log = vec![
             user("посмотри", "cli"),
             Rec::Assistant {

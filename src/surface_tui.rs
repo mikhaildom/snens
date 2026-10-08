@@ -221,8 +221,8 @@ fn completion_action<'a>(received: &str, full: &'a str) -> CompletionAction<'a> 
         CompletionAction::Full(full)
     } else if received == full {
         CompletionAction::Finish
-    } else if full.starts_with(received) {
-        CompletionAction::Append(&full[received.len()..])
+    } else if let Some(suffix) = full.strip_prefix(received) {
+        CompletionAction::Append(suffix)
     } else {
         CompletionAction::Recover(full)
     }
@@ -407,85 +407,6 @@ fn command_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn session(id: &str, surface: &str) -> Session {
-        Session {
-            id: id.into(),
-            surface: surface.into(),
-            state: "idle".into(),
-            run_id: None,
-        }
-    }
-
-    #[test]
-    fn default_session_never_crosses_surfaces() {
-        let telegram_only = vec![session("tg", "telegram")];
-        assert!(choose_default_session(&telegram_only).is_none());
-
-        let mixed = vec![
-            session("tg", "telegram"),
-            session("old", "legacy"),
-            session("tui", "tui"),
-        ];
-        assert_eq!(
-            choose_default_session(&mixed).map(|s| s.id.as_str()),
-            Some("tui")
-        );
-    }
-
-    fn event(session_id: &str, seq: u64) -> Event {
-        Event {
-            seq,
-            session_id: session_id.into(),
-            run_id: None,
-            kind: "test".into(),
-            fields: json!({}),
-        }
-    }
-
-    #[test]
-    fn completion_fallback_handles_missing_partial_full_and_mismatched_deltas() {
-        assert!(matches!(
-            completion_action("", "answer"),
-            CompletionAction::Full("answer")
-        ));
-        assert!(matches!(
-            completion_action("ans", "answer"),
-            CompletionAction::Append("wer")
-        ));
-        assert!(matches!(
-            completion_action("answer", "answer"),
-            CompletionAction::Finish
-        ));
-        assert!(matches!(
-            completion_action("answer!", "answer"),
-            CompletionAction::Recover("answer")
-        ));
-        assert!(matches!(
-            completion_action("sw", "answer"),
-            CompletionAction::Recover("answer")
-        ));
-    }
-
-    #[test]
-    fn delivered_cursor_ignores_foreign_and_duplicate_events() {
-        let mut cursor = 2;
-        assert!(!accept_event(&event("b", 20), 20, Some("a"), &mut cursor));
-        assert_eq!(cursor, 2);
-        assert!(!accept_event(&event("a", 2), 2, Some("a"), &mut cursor));
-        assert!(!accept_event(&event("a", 4), 3, Some("a"), &mut cursor));
-        assert_eq!(cursor, 2);
-        assert!(accept_event(&event("a", 3), 3, Some("a"), &mut cursor));
-        assert_eq!(cursor, 3);
-        assert!(!accept_event(&event("a", 3), 3, Some("a"), &mut cursor));
-        assert_eq!(cursor, 3);
-    }
-}
-
 fn display_message(message: &TranscriptMessage, ui: &Ui) {
     match message.role.as_str() {
         "user" => {
@@ -577,5 +498,85 @@ fn display(event: &Event, ui: &Ui, stream: Option<&mut Stream>) {
             fields["text"].as_str().unwrap_or("")
         )),
         _ => {}
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn session(id: &str, surface: &str) -> Session {
+        Session {
+            id: id.into(),
+            surface: surface.into(),
+            state: "idle".into(),
+            run_id: None,
+        }
+    }
+
+    #[test]
+    fn default_session_never_crosses_surfaces() {
+        let telegram_only = vec![session("tg", "telegram")];
+        assert!(choose_default_session(&telegram_only).is_none());
+
+        let mixed = vec![
+            session("tg", "telegram"),
+            session("old", "legacy"),
+            session("tui", "tui"),
+        ];
+        assert_eq!(
+            choose_default_session(&mixed).map(|s| s.id.as_str()),
+            Some("tui")
+        );
+    }
+
+    fn event(session_id: &str, seq: u64) -> Event {
+        Event {
+            seq,
+            session_id: session_id.into(),
+            run_id: None,
+            kind: "test".into(),
+            fields: json!({}),
+        }
+    }
+
+    #[test]
+    fn completion_fallback_handles_missing_partial_full_and_mismatched_deltas() {
+        assert!(matches!(
+            completion_action("", "answer"),
+            CompletionAction::Full("answer")
+        ));
+        assert!(matches!(
+            completion_action("ans", "answer"),
+            CompletionAction::Append("wer")
+        ));
+        assert!(matches!(
+            completion_action("answer", "answer"),
+            CompletionAction::Finish
+        ));
+        assert!(matches!(
+            completion_action("answer!", "answer"),
+            CompletionAction::Recover("answer")
+        ));
+        assert!(matches!(
+            completion_action("sw", "answer"),
+            CompletionAction::Recover("answer")
+        ));
+    }
+
+    #[test]
+    fn delivered_cursor_ignores_foreign_and_duplicate_events() {
+        let mut cursor = 2;
+        assert!(!accept_event(&event("b", 20), 20, Some("a"), &mut cursor));
+        assert_eq!(cursor, 2);
+        assert!(!accept_event(&event("a", 2), 2, Some("a"), &mut cursor));
+        assert!(!accept_event(&event("a", 4), 3, Some("a"), &mut cursor));
+        assert_eq!(cursor, 2);
+        assert!(accept_event(&event("a", 3), 3, Some("a"), &mut cursor));
+        assert_eq!(cursor, 3);
+        assert!(!accept_event(&event("a", 3), 3, Some("a"), &mut cursor));
+        assert_eq!(cursor, 3);
     }
 }

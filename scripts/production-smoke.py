@@ -514,7 +514,8 @@ def check_tui_flows(config, base, token_path, token, legacy_id, llm, checks):
     def legacy_resume():
         text = run_tui(config, base, token_path, legacy_id, ["/sessions", f"/resume {legacy_id}", "/quit"])
         assert f"ты: legacy-user-marker" in text, text[-1800:]
-        assert "legacy-assistant-marker" in text and "[run]" in text and r"\"command\":\"true\"" in text, text[-1800:]
+        expected_call = '[run] ' + json.dumps('{"command":"true"}')
+        assert "legacy-assistant-marker" in text and expected_call in text, text[-1800:]
         assert "[run] exit=0 legacy-tool-marker" in text, text[-1800:]
         assert text.count("legacy-user-marker") == 1, f"explicit --session open renders each transcript row once: {text[-1800:]}"
         assert "/sessions" in text, text[-1800:]

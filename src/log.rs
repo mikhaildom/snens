@@ -363,6 +363,33 @@ pub fn latest(dir: &Path) -> R<String> {
         .ok_or_else(|| format!("сессий нет в {}", dir.display()).into())
 }
 
+
+pub fn list(dir: &Path) -> R<Vec<String>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Some(s) = p.file_stem().and_then(|s| s.to_str()) {
+                ids.push(s.to_string());
+            }
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+pub fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Короткий id сессии: время + pid, читаемо и без коллизий на практике.
+pub fn new_id() -> String {
+    format!("{}-{}", now(), std::process::id() % 100000)
+}
+
 #[cfg(test)]
 mod writer_safety_tests {
     use super::*;
@@ -494,30 +521,4 @@ mod writer_safety_tests {
         assert!(Session::open(&dir.0, "bad").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{}\nnot-json\n{}\n");
     }
-}
-
-pub fn list(dir: &Path) -> R<Vec<String>> {
-    let mut ids = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if let Some(s) = p.file_stem().and_then(|s| s.to_str()) {
-                ids.push(s.to_string());
-            }
-        }
-    }
-    ids.sort();
-    Ok(ids)
-}
-
-pub fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Короткий id сессии: время + pid, читаемо и без коллизий на практике.
-pub fn new_id() -> String {
-    format!("{}-{}", now(), std::process::id() % 100000)
 }

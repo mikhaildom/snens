@@ -108,21 +108,6 @@ fn check_askpass_enabled(disabled: bool) -> R<()> {
     }
 }
 
-#[cfg(test)]
-mod headless_tests {
-    use super::*;
-
-    #[test]
-    fn disabled_guard_fails_before_socket_access_with_actionable_notice() {
-        // This is the same guard called before client_sock_path()/connect, so the
-        // disabled case cannot contact any local askpass socket.
-        assert!(check_askpass_enabled(true)
-            .unwrap_err()
-            .to_string()
-            .contains("headless surface server"));
-        assert!(check_askpass_enabled(false).is_ok());
-    }
-}
 
 /// Путь сокета для клиента: переменная окружения (её ставит харнесс детям) или
 /// путь по умолчанию из конфига.
@@ -200,4 +185,20 @@ pub fn invoked_as() -> String {
                 .unwrap_or(a)
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_guard_fails_before_socket_access_with_actionable_notice() {
+        // This is the same guard called before client_sock_path()/connect, so the
+        // disabled case cannot contact any local askpass socket.
+        assert!(check_askpass_enabled(true)
+            .unwrap_err()
+            .to_string()
+            .contains("headless surface server"));
+        assert!(check_askpass_enabled(false).is_ok());
+    }
 }
