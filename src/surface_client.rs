@@ -40,6 +40,7 @@ pub struct History {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Protocol metadata is decoded even when the terminal renderer does not use it.
 pub struct TranscriptMessage {
     pub seq: u64,
     pub ts: u64,
