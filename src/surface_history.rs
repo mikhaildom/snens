@@ -109,18 +109,8 @@ pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                     exit: None,
                 })
             }
-            Rec::Recall { ts, text } | Rec::ContextNotice { ts, text } => Some(HistoryMessage {
-                seq,
-                ts,
-                role: "system",
-                content: Some(text),
-                source: None,
-                reasoning: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                exit: None,
-            }),
+            // These records are internal prompt context, not transcript.
+            Rec::Recall { .. } | Rec::ContextNotice { .. } => None,
             Rec::Assistant {
                 ts,
                 text,
@@ -188,6 +178,28 @@ mod tests {
     use std::{fs, path::PathBuf};
     fn temp() -> PathBuf {
         std::env::temp_dir().join(format!("surface-history-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn internal_prompt_markers_are_not_serialized_in_history() {
+        let dir = temp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"kind\":\"recall\",\"ts\":1,\"text\":\"PRIVATE_RECALL_MARKER\"}\n",
+                "{\"kind\":\"context_notice\",\"ts\":2,\"text\":\"PRIVATE_CONTEXT_MARKER\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let rows = read(&path, &Config::default()).unwrap();
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(rows.is_empty());
+        assert!(!json.contains("PRIVATE_RECALL_MARKER"));
+        assert!(!json.contains("PRIVATE_CONTEXT_MARKER"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
