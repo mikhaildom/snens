@@ -4,14 +4,15 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Mutex,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
+    R,
     agent::run_agent,
     cfg::Config,
     context,
@@ -19,7 +20,6 @@ use crate::{
     log::{Call, Rec, Session},
     project,
     render::Ui,
-    R,
 };
 
 const GOAL: &str = "Finish the task using exact datum NEEDLE-739.";
@@ -31,7 +31,8 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 struct Fixture {
     dir: PathBuf,
     cfg: Config,
-    sess: Session,
+    sess: Option<Session>,
+    session_id: String,
     original: Vec<u8>,
 }
 
@@ -59,7 +60,12 @@ impl Fixture {
         };
         assert_eq!(cfg.context_budget(), 40_000);
         assert_eq!(cfg.context_target(), 28_000);
-        let sess = Session::open(&dir, "context-loop")?;
+        let session_id = format!(
+            "context-loop-{}-{}",
+            std::process::id(),
+            NEXT_DIR.load(Ordering::Relaxed)
+        );
+        let sess = Session::open(&dir, &session_id)?;
         sess.append(Rec::System {
             ts: 0,
             text: "Small fixed system.".into(),
@@ -68,7 +74,7 @@ impl Fixture {
             ts: 0,
             text: GOAL.into(),
             source: "test".into(),
-                parts: Vec::new(),
+            parts: Vec::new(),
         })?;
         if large {
             // 240k ASCII bytes => at least 80k estimated tokens: 40k + budget.
@@ -77,7 +83,7 @@ impl Fixture {
                 ts: 0,
                 text: format!("{BULK_USER}{}", "x".repeat(120_000)),
                 source: "test".into(),
-                    parts: Vec::new(),
+                parts: Vec::new(),
             })?;
             sess.append(Rec::Assistant {
                 ts: 0,
@@ -96,21 +102,25 @@ impl Fixture {
         Ok(Self {
             dir,
             cfg,
-            sess,
+            sess: Some(sess),
+            session_id,
             original,
         })
     }
 
+    fn log_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.jsonl", self.session_id))
+    }
+
     fn mirror_path(&self) -> PathBuf {
-        self.sess
-            .path()
+        self.log_path()
             .with_extension("out")
             .join("LIVE_CONTEXT.json")
     }
 
     fn assert_append_only(&self) -> R<()> {
         assert!(
-            fs::read(self.sess.path())?.starts_with(&self.original),
+            fs::read(self.log_path())?.starts_with(&self.original),
             "original JSONL rewritten"
         );
         Ok(())
@@ -233,9 +243,11 @@ impl Llm for EditingLlm {
         match (&self.script, turn) {
             (Script::Compact, 0) => {
                 assert!(project::estimate_tokens(&msgs) >= 40_000 + cfg.context_budget());
-                assert!(msgs.iter().any(|m| m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("[Уборка рабочего контекста]"))));
+                assert!(msgs.iter().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("[Уборка рабочего контекста]"))
+                }));
                 // One unedited commit keeps pressure high for another turn, checking
                 // reminder hysteresis rather than only an immediate successful cleanup.
                 Ok(commit("commit-unedited"))
@@ -294,12 +306,18 @@ fn cleanup_count(records: &[Rec]) -> usize {
 
 #[tokio::test]
 async fn forty_k_budget_real_loop_compacts_and_resumes_without_replaying_payload() -> R<()> {
-    let f = Fixture::new("large", true)?;
+    let mut f = Fixture::new("large", true)?;
     let fake = EditingLlm::new(f.mirror_path(), Script::Compact);
-    run_agent(&f.sess, &f.cfg, &fake, &Ui::plain()).await?;
+    run_agent(
+        f.sess.as_ref().expect("session open"),
+        &f.cfg,
+        &fake,
+        &Ui::plain(),
+    )
+    .await?;
     assert_eq!(fake.seen.lock().unwrap().len(), 3);
     f.assert_append_only()?;
-    let raw = f.sess.read()?;
+    let raw = f.sess.as_ref().expect("session open").read()?;
     assert_eq!(cleanup_count(&raw), 1, "reminder repeated above budget");
     assert_eq!(
         raw.iter()
@@ -312,22 +330,24 @@ async fn forty_k_budget_real_loop_compacts_and_resumes_without_replaying_payload
             .any(|r| matches!(r, Rec::ToolResult { tool, exit: 0, .. } if tool == "ctx")),
         "builtin ctx was not dispatched"
     );
-    assert!(raw
-        .iter()
-        .any(|r| matches!(r, Rec::User { text, .. } if text.starts_with(BULK_USER))));
+    assert!(
+        raw.iter()
+            .any(|r| matches!(r, Rec::User { text, .. } if text.starts_with(BULK_USER)))
+    );
     assert!(raw.iter().any(
         |r| matches!(r, Rec::Assistant { text: Some(text), .. } if text.starts_with(BULK_ASSISTANT))
     ));
     assert!(matches!(raw.last(), Some(Rec::Done { status, .. }) if status == "ok"));
 
     // Reopen from disk, append a new task input and create a fresh run_agent/mirror.
-    let before_resume = fs::read(f.sess.path())?;
-    let resumed = Session::open(&f.dir, f.sess.id())?;
+    let before_resume = fs::read(f.sess.as_ref().expect("session open").path())?;
+    f.sess.take();
+    let resumed = Session::open(&f.dir, &f.session_id)?;
     resumed.append(Rec::User {
         ts: 0,
         source: "test-resume".into(),
         text: "Continue from the saved note.".into(),
-            parts: Vec::new(),
+        parts: Vec::new(),
     })?;
     let expected = context::effective(&resumed.read()?, &f.cfg)?;
     let resume_fake = EditingLlm::new(f.mirror_path(), Script::Resume(expected));
@@ -346,10 +366,16 @@ async fn forty_k_budget_real_loop_compacts_and_resumes_without_replaying_payload
 async fn malformed_context_draft_is_visible_and_model_can_recover_in_real_loop() -> R<()> {
     let f = Fixture::new("rejected", false)?;
     let fake = EditingLlm::new(f.mirror_path(), Script::Recover);
-    run_agent(&f.sess, &f.cfg, &fake, &Ui::plain()).await?;
+    run_agent(
+        f.sess.as_ref().expect("session open"),
+        &f.cfg,
+        &fake,
+        &Ui::plain(),
+    )
+    .await?;
     assert_eq!(fake.seen.lock().unwrap().len(), 3);
     f.assert_append_only()?;
-    let raw = f.sess.read()?;
+    let raw = f.sess.as_ref().expect("session open").read()?;
     assert_eq!(
         raw.iter()
             .filter(|r| matches!(r, Rec::ContextRevision { .. }))

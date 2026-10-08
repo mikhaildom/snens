@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex as StdMutex},
 };
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Session {
@@ -73,6 +73,9 @@ pub struct Runtime {
     pub controls: Mutex<BTreeMap<String, Control>>,
     pub pending_tools:
         Mutex<BTreeMap<String, tokio::sync::oneshot::Sender<crate::agent::SurfaceToolResult>>>,
+    /// Exclusive JSONL writer handles. The log lock is held for each Session lifetime.
+    pub writers: Mutex<BTreeMap<String, Arc<crate::log::Session>>>,
+    pub event_seq: Mutex<BTreeMap<String, u64>>,
 }
 impl Runtime {
     pub fn persist(&self, data: &Store) -> crate::R<()> {
@@ -86,20 +89,30 @@ impl Runtime {
         fields: serde_json::Value,
     ) -> crate::R<Event> {
         let mut d = self.data.lock().await;
+        let seq = {
+            let mut sequences = self.event_seq.lock().await;
+            let next = sequences.get(id).copied().unwrap_or_else(|| {
+                d.events
+                    .get(id)
+                    .and_then(|events| events.iter().map(|event| event.seq).max())
+                    .unwrap_or(0)
+            }) + 1;
+            sequences.insert(id.to_string(), next);
+            let db = self.db.lock().unwrap();
+            db.execute("INSERT INTO event_sequences(session_id,seq) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq", params![id, next as i64])?;
+            next
+        };
         let e = Event {
-            seq: d
-                .events
-                .get(id)
-                .and_then(|es| es.last())
-                .map(|x| x.seq + 1)
-                .unwrap_or(1),
+            seq,
             session_id: id.into(),
             run_id: run,
             kind: kind.into(),
             fields,
         };
-        d.events.entry(id.into()).or_default().push(e.clone());
-        self.persist(&d)?;
+        if kind != "assistant.delta" {
+            d.events.entry(id.into()).or_default().push(e.clone());
+            self.persist(&d)?;
+        }
         let _ = self.tx.send(e.clone());
         Ok(e)
     }
@@ -122,7 +135,8 @@ fn schema(c: &Connection) -> crate::R<()> {
       CREATE TABLE IF NOT EXISTS surface_tools(session_id TEXT PRIMARY KEY,definitions TEXT NOT NULL,FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE TABLE IF NOT EXISTS tool_results(action_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tool_requests(action_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS events(session_id TEXT NOT NULL,seq INTEGER NOT NULL,run_id TEXT,kind TEXT NOT NULL,fields TEXT NOT NULL,PRIMARY KEY(session_id,seq),FOREIGN KEY(session_id) REFERENCES sessions(id));")?;
+      CREATE TABLE IF NOT EXISTS events(session_id TEXT NOT NULL,seq INTEGER NOT NULL,run_id TEXT,kind TEXT NOT NULL,fields TEXT NOT NULL,PRIMARY KEY(session_id,seq),FOREIGN KEY(session_id) REFERENCES sessions(id));
+      CREATE TABLE IF NOT EXISTS event_sequences(session_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);")?;
     Ok(())
 }
 pub fn persist_store(c: &Connection, d: &Store) -> crate::R<()> {
@@ -221,6 +235,17 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     }
     tx.commit()?;
     Ok(())
+}
+pub fn event_sequences(c: &Connection) -> crate::R<BTreeMap<String, u64>> {
+    let mut sequences = BTreeMap::new();
+    let mut query = c.prepare("SELECT session_id,seq FROM event_sequences")?;
+    for row in query.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+    })? {
+        let (id, seq) = row?;
+        sequences.insert(id, seq);
+    }
+    Ok(sequences)
 }
 fn read_store(c: &Connection) -> crate::R<Store> {
     let mut d = Store::default();
@@ -377,7 +402,7 @@ pub fn open_store(dir: &Path) -> crate::R<(Store, Connection)> {
 pub fn load(dir: &Path) -> crate::R<Store> {
     Ok(open_store(dir)?.0)
 }
-pub fn interrupt_running(store: &mut Store) {
+pub fn interrupt_running(store: &mut Store, sequences: &mut BTreeMap<String, u64>) {
     let running: Vec<String> = store
         .sessions
         .values()
@@ -401,7 +426,12 @@ pub fn interrupt_running(store: &mut Store) {
             session.run_id = None;
         }
         let events = store.events.entry(id.clone()).or_default();
-        let seq = events.last().map(|e| e.seq + 1).unwrap_or(1);
+        let seq = sequences
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| events.iter().map(|event| event.seq).max().unwrap_or(0))
+            + 1;
+        sequences.insert(id.clone(), seq);
         events.push(Event {
             seq,
             session_id: id.clone(),
@@ -418,7 +448,36 @@ pub fn interrupt_running(store: &mut Store) {
 }
 
 pub fn valid_id(s: &str) -> bool {
-    uuid::Uuid::parse_str(s).is_ok()
+    if uuid::Uuid::parse_str(s).is_ok() {
+        return true;
+    }
+    let Some((stamp, pid)) = s.split_once('-') else {
+        return false;
+    };
+    !stamp.is_empty()
+        && !pid.is_empty()
+        && !pid.contains('-')
+        && stamp.bytes().all(|b| b.is_ascii_digit())
+        && pid.bytes().all(|b| b.is_ascii_digit())
+}
+#[cfg(test)]
+mod legacy_id_tests {
+    use super::valid_id;
+    #[test]
+    fn accepts_production_legacy_ids_but_rejects_paths_and_suffixes() {
+        assert!(valid_id("1791498455-70558"));
+        assert!(valid_id("1791499422-79425"));
+        assert!(valid_id("550e8400-e29b-41d4-a716-446655440000"));
+        for invalid in [
+            "../1791498455-70558",
+            "1791498455-70558.jsonl",
+            "1791498455-70558-review",
+            "-70558",
+            "1791498455-",
+        ] {
+            assert!(!valid_id(invalid), "{invalid}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -471,16 +530,23 @@ mod tests {
         persist(&db, &d).unwrap();
         let got = read_store(&db).unwrap();
         assert_eq!(got.events["s"][0].kind, "test");
+        db.execute(
+            "INSERT INTO event_sequences(session_id,seq) VALUES('s',9)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(event_sequences(&db).unwrap()["s"], 9);
         assert_eq!(got.surface_tools["s"][0]["function"]["name"], "send_file");
         assert_eq!(got.tool_requests["s/r/c"]["status"], "pending");
         assert_eq!(got.messages["s"][0].command_id, "cmd");
         assert_eq!(got.commands["cmd"]["ok"], true);
-        assert!(db
-            .execute(
+        assert!(
+            db.execute(
                 "INSERT INTO messages VALUES('s','m2','cmd',1,'dup','accepted',NULL)",
                 []
             )
-            .is_err());
+            .is_err()
+        );
         drop(db);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -509,11 +575,24 @@ mod tests {
                 run_id: Some("r".into()),
             }],
         );
-        interrupt_running(&mut d);
+        let mut sequences = BTreeMap::from([("s".to_string(), 9)]);
+        d.events.insert(
+            "s".into(),
+            vec![Event {
+                seq: 4,
+                session_id: "s".into(),
+                run_id: None,
+                kind: "assistant.delta".into(),
+                fields: serde_json::Value::Null,
+            }],
+        );
+        interrupt_running(&mut d, &mut sequences);
+        assert_eq!(sequences["s"], 10);
         assert_eq!(d.sessions["s"].state, "interrupted");
         assert_eq!(d.tool_requests["s/r/call"]["status"], "cancelled");
         assert_eq!(d.messages["s"][0].state, "cancelled");
-        assert_eq!(d.events["s"][0].fields["status"], "interrupted");
+        assert_eq!(d.events["s"].last().unwrap().seq, 10);
+        assert_eq!(d.events["s"][1].fields["status"], "interrupted");
     }
     #[test]
     fn attachment_metadata_and_message_references_roundtrip_in_order() {
