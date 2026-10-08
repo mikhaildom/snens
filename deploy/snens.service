@@ -1,0 +1,16 @@
+[Unit]
+Description=snens production HTTP/SSE surface
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/snens
+ExecStart=%h/.local/bin/snens serve --config %h/.config/snens/config.toml --listen 127.0.0.1:7420
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=120s
+UMask=0077
+
+[Install]
+WantedBy=default.target
