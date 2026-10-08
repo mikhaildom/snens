@@ -431,15 +431,15 @@ async fn get_session(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> i
     if !rt::valid_id(&id) {
         return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
     }
-    let d = s.data.lock().await;
-    if let Some(session) = d.sessions.get(&id).cloned() {
-        return Json(session).into_response();
-    }
     let Some(path) = discovery::path(&s.cfg, &id) else {
         unreachable!()
     };
     if !path.is_file() {
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+    }
+    let d = s.data.lock().await;
+    if let Some(session) = d.sessions.get(&id).cloned() {
+        return Json(session).into_response();
     }
     let surface = discovery::load_meta_surface(&path).unwrap_or_else(|| "legacy".into());
     let session = Session {
