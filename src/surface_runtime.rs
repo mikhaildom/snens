@@ -67,6 +67,9 @@ pub struct Runtime {
     pub data: Mutex<Store>,
     pub db: StdMutex<Connection>,
     pub tx: broadcast::Sender<Event>,
+    /// Снимок конфига. Модель здесь — только стартовая: `agent::run_loop`
+    /// перечитывает её из файла на каждом ходу, поэтому правка конфига во время
+    /// жизни сервера видна новым ходам без перезапуска.
     pub cfg: crate::cfg::Config,
     pub llm: Arc<crate::llm::OpenAi>,
     pub locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,

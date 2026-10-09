@@ -12,6 +12,15 @@ pub struct Config {
     pub base_url: String,
     #[serde(default = "d_model")]
     pub model: String,
+    /// Откуда конфиг прочитан. Нужен, чтобы перечитать `model` в рантайме:
+    /// `snens model <slug>` правит файл, а долгоживущие процессы (сервер API)
+    /// держат снимок и без этого не видят смены.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
+    /// Модель задана кодом, а не файлом (подагент на `subagent_model`):
+    /// перечитывать её из конфига нельзя — файл про основную модель.
+    #[serde(skip)]
+    pub model_pinned: bool,
     /// Optional override for detached child agents, never the primary session.
     #[serde(default)]
     pub subagent_model: Option<String>,
@@ -258,6 +267,7 @@ impl Config {
         };
         // ponytail: путь к сессиям из конфига может содержать ~, разворачиваем один раз здесь
         let mut cfg = cfg;
+        cfg.source_path = Some(path);
         cfg.sessions_dir = cfg.sessions_dir.replace('~', &home());
         cfg.tools_dir = cfg.tools_dir.replace('~', &home());
         cfg.tickets_dir = cfg.tickets_dir.replace('~', &home());
@@ -397,6 +407,39 @@ impl Config {
         if check.model != slug {
             return Err(format!("модель не применилась: в конфиге {}", check.model).into());
         }
+        Ok(path)
+    }
+
+    /// Модель для нового хода: перечитать из файла.
+    /// Долгоживущий процесс (сервер API) держит снимок конфига, а `snens model
+    /// <slug>` правит только файл — без перечитки новый ход уходит старой моделью.
+    /// Файла нет или он сломан — остаёмся на снимке: ход не должен падать из-за
+    /// правки конфига под руками.
+    pub fn model_now(&self) -> String {
+        if self.model_pinned {
+            return self.model.clone();
+        }
+        let Some(path) = &self.source_path else {
+            return self.model.clone();
+        };
+        match std::fs::read_to_string(path) {
+            Ok(text) => match toml::from_str::<Config>(&text) {
+                Ok(fresh) => fresh.model,
+                Err(_) => self.model.clone(),
+            },
+            Err(_) => self.model.clone(),
+        }
+    }
+
+    /// Сменить модель в файле и сразу применить её в этом процессе: без второго
+    /// шага сервер продолжал бы ходить старой моделью до перезапуска.
+    pub fn set_model_now(&mut self, slug: &str) -> R<PathBuf> {
+        let path = match self.source_path.clone() {
+            Some(path) => self.set_model(slug, Some(&path.display().to_string()))?,
+            None => self.set_model(slug, None)?,
+        };
+        self.model = slug.trim().to_string();
+        self.model_pinned = false;
         Ok(path)
     }
 
@@ -554,6 +597,45 @@ mod tests {
         std::fs::write(&p, "model = \"x\"\n").unwrap();
         let cfg = Config::load(Some(&p.display().to_string())).unwrap();
         assert!(cfg.set_model("  ", Some(&p.display().to_string())).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn model_now_читает_файл_а_не_снимок() {
+        let p = tmp("fresh");
+        std::fs::write(&p, "model = \"старая\"\n").unwrap();
+        let cfg = Config::load(Some(&p.display().to_string())).unwrap();
+        assert_eq!(cfg.model_now(), "старая");
+        // Правка файла мимо процесса должна быть видна: именно так `snens model`
+        // меняет модель у уже запущенного сервера.
+        std::fs::write(&p, "model = \"новая\"\n").unwrap();
+        assert_eq!(cfg.model_now(), "новая");
+        // Сломанный файл не должен ронять ход: остаёмся на снимке.
+        std::fs::write(&p, "model = [не toml").unwrap();
+        assert_eq!(cfg.model_now(), "старая");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn model_pinned_игнорирует_файл() {
+        let p = tmp("pinned");
+        std::fs::write(&p, "model = \"основная\"\n").unwrap();
+        let mut cfg = Config::load(Some(&p.display().to_string())).unwrap();
+        cfg.model = "подагентская".into();
+        cfg.model_pinned = true;
+        std::fs::write(&p, "model = \"другая\"\n").unwrap();
+        assert_eq!(cfg.model_now(), "подагентская");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn set_model_now_меняет_и_файл_и_снимок() {
+        let p = tmp("apply");
+        std::fs::write(&p, "model = \"старая\"\n").unwrap();
+        let mut cfg = Config::load(Some(&p.display().to_string())).unwrap();
+        cfg.set_model_now("новая/модель").unwrap();
+        assert_eq!(cfg.model, "новая/модель");
+        assert_eq!(cfg.model_now(), "новая/модель");
         let _ = std::fs::remove_file(&p);
     }
 }

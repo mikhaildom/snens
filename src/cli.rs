@@ -192,6 +192,8 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
     let mut cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
     if let Some(model) = &cfg.subagent_model {
         cfg.model = model.clone();
+        // Модель подагента задана кодом: перечитка файла в цикле её затрёт.
+        cfg.model_pinned = true;
     }
     let prompt = std::env::var("SNENS_PROMPT").unwrap_or_default();
     if prompt.trim().is_empty() {

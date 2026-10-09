@@ -93,6 +93,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         .route("/v1/sessions/{id}/stop", post(stop))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/history", get(history))
+        .route("/v1/model", get(get_model).put(put_model))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(token, auth));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -148,6 +149,32 @@ fn err(code: &str, msg: &str, status: StatusCode) -> impl IntoResponse {
         Json(serde_json::json!({"error":{"code":code,"message":msg}})),
     )
 }
+/// Текущая модель: перечитанная из конфига, а не снимок старта сервера.
+/// Тем самым `snens model` и `/model` на любой поверхности видят одно и то же.
+async fn get_model(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
+    Json(serde_json::json!({"model": s.cfg.model_now()})).into_response()
+}
+
+#[derive(Deserialize)]
+struct ModelBody {
+    model: String,
+}
+/// Сменить основную модель: правит `model = "..."` в конфиге и сразу делает её
+/// текущей для новых ходов (перечитка в `run_loop`). Активный ход не трогаем.
+async fn put_model(State(s): State<Arc<Runtime>>, Json(body): Json<ModelBody>) -> impl IntoResponse {
+    let slug = body.model.trim();
+    if slug.is_empty() {
+        return err("invalid", "empty model slug", StatusCode::BAD_REQUEST).into_response();
+    }
+    // Пишем в тот же конфиг, что читает этот процесс (учёт `--config`).
+    let mut cfg = s.cfg.clone();
+    match cfg.set_model_now(slug) {
+        Ok(path) => Json(serde_json::json!({"model": slug, "config": path.display().to_string()}))
+            .into_response(),
+        Err(e) => err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+    }
+}
+
 async fn list(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
     let d = s.data.lock().await;
     match discovery::sessions(&s.cfg.data_path(), &d) {

@@ -149,6 +149,31 @@ impl Client {
         .await
     }
 
+    /// Текущая модель поверхности: сервер читает её из конфига, поэтому
+    /// `snens model` и `/model` возвращают одно и то же.
+    pub async fn model(&self) -> Result<String, String> {
+        let out: Value = self.json(reqwest::Method::GET, "/v1/model", None).await?;
+        out.get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "invalid API response: no model".to_owned())
+    }
+
+    /// Сменить основную модель (то же, что `snens model <slug>`).
+    pub async fn set_model(&self, slug: &str) -> Result<String, String> {
+        let out: Value = self
+            .json(
+                reqwest::Method::PUT,
+                "/v1/model",
+                Some(serde_json::json!({"model": slug})),
+            )
+            .await?;
+        out.get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "invalid API response: no model".to_owned())
+    }
+
     pub async fn get_session(&self, id: &str) -> Result<Session, String> {
         self.json(
             reqwest::Method::GET,

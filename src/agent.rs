@@ -277,10 +277,15 @@ async fn run_loop<L: Llm>(
             return Err("рабочий контекст достиг физического предела; запрос не отправлен. Нужна уборка LIVE_CONTEXT.json или больший размер окна".into());
         }
 
+        // `snens model <slug>` правит файл, а поверхность живёт долго: без
+        // перечитки новый ход уходил бы моделью, снятой при старте процесса.
+        // Подменяем только модель — остальные поля конфига остаются снимком старта.
+        let mut turn_cfg = cfg.clone();
+        turn_cfg.model = cfg.model_now();
         let reply: Reply = if let Some(c) = cancel.as_mut() {
-            tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), r = stream_reply(cfg, msgs, defs.clone(), llm, ui, observe) => r? }
+            tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), r = stream_reply(&turn_cfg, msgs, defs.clone(), llm, ui, observe) => r? }
         } else {
-            stream_reply(cfg, msgs, defs.clone(), llm, ui, observe).await?
+            stream_reply(&turn_cfg, msgs, defs.clone(), llm, ui, observe).await?
         };
 
         // Расход по ходу, а не только в `show` после сессии: в терминале видно,

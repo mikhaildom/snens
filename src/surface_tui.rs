@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-const HELP: &str = "/new · /sessions · /resume ID · /stop · /reasoning · /compact [инструкция] · /help · /quit (Ctrl+D); Ctrl+C — stop текущего run · sudo/секреты пока не поддерживаются";
+const HELP: &str = "/new · /sessions · /resume ID · /stop · /reasoning · /compact [инструкция] · /model [slug] · /help · /quit (Ctrl+D); Ctrl+C — stop текущего run · sudo/секреты пока не поддерживаются";
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 enum Notice {
@@ -349,6 +349,25 @@ async fn command(
     }
     if line == "/stop" {
         stop_current(client, session, selected_run, ui).await;
+        return Ok(false);
+    }
+    if line == "/model" {
+        match client.model().await {
+            Ok(model) => ui.line(&format!("модель: {model}")),
+            Err(e) => ui.line(&format!("ошибка модели: {e}")),
+        }
+        return Ok(false);
+    }
+    if let Some(slug) = line.strip_prefix("/model ") {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            ui.line("использование: /model <slug>");
+            return Ok(false);
+        }
+        match client.set_model(slug).await {
+            Ok(model) => ui.line(&format!("модель: {model} (применится к следующему ходу)")),
+            Err(e) => ui.line(&format!("ошибка модели: {e}")),
+        }
         return Ok(false);
     }
     if let Some(instruction) = line.strip_prefix("/compact") {

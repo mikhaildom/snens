@@ -95,6 +95,21 @@ Adapter registers OpenAI function definitions on an existing session with authen
 
 For a model call, SSE emits `tool.requested` with the ordinary `seq`, `session_id`, `run_id`, and `type` envelope plus string `call_id`, `name`, and `args` (raw JSON argument string). The adapter posts `{"text":"...","exit":0}` to `/v1/sessions/{sid}/runs/{rid}/tools/{call_id}/result`; a first submission and exact retry return 200 `{"accepted":true}`. Unknown calls return 404; expired/cancelled calls and conflicting retries return 409. Result text is capped at 64 KiB. Stop cancels the waiter; a late result is rejected. Tools have a finite 60-second wait; timeout becomes a normal failed tool result. No callback URL is accepted and the core never initiates arbitrary outbound requests. These tools exist only on the HTTP surface; the terminal TUI continues to use its regular core tool set.
 
+## Модель: `/v1/model`
+
+`GET /v1/model` → `{"model":"<slug>"}`; `PUT /v1/model` с `{"model":"<slug>"}`
+меняет основную модель (та же операция, что `snens model <slug>`) и возвращает
+`{"model":"<slug>","config":"<path>"}`. Пустой slug — 400.
+
+Зачем эндпоинт: сервер — долгоживущий процесс со снимком конфига, а `snens model`
+правит только файл. Поэтому `agent::run_loop` на каждом ходу перечитывает `model`
+из конфига (`Config::model_now`, `source_path` хранится в снимке), а PUT пишет в
+тот же файл, что читает процесс (учитывает `--config`). Без этого новый ход уходил
+бы моделью, снятой при старте сервиса.
+
+Подагент (`run-child`) подменяет модель на `subagent_model` — это помечено
+`model_pinned`, и перечитка файла её не трогает (файл про основную модель).
+
 ## SSE: изоляция и переполнение
 
 Снимок событий и подписка берутся под общей блокировкой с emit. Каждая подписка
