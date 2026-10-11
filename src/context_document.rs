@@ -92,8 +92,39 @@ impl View {
             return Err("stale revision; reread LIVE_CONTEXT.json".into());
         }
         let originals: HashSet<&str> = self.document.blocks.iter().map(|b| b.id.as_str()).collect();
+        // Жёсткий запрет на амнезию: запрос пользователя и текст ответа модели —
+        // самая ценная часть контекста, и уборка их не трогает. Правкой зеркала
+        // можно снять результаты инструментов и аргументы вызовов, но не ходы
+        // диалога. Тела скиллов и длинные вставки — отдельный механизм (в файл).
+        let protected = |messages: &[Value]| -> Vec<Value> {
+            messages
+                .iter()
+                .filter(|m| {
+                    m["role"] == "user"
+                        || (m["role"] == "assistant"
+                            && m["content"].as_str().is_some_and(|s| !s.is_empty()))
+                })
+                .cloned()
+                .collect()
+        };
         let mut ids = HashSet::new();
         let mut restored = Vec::new();
+        for original in &self.document.blocks {
+            match edited.blocks.iter().find(|b| b.id == original.id) {
+                None if !protected(&original.messages).is_empty() => {
+                    return Err(
+                        "cannot delete blocks containing user messages or assistant text".into(),
+                    )
+                }
+                Some(block) if protected(&block.messages) != protected(&original.messages) => {
+                    return Err(
+                        "cannot edit or reorder user messages and assistant text; clear tool results instead"
+                            .into(),
+                    )
+                }
+                _ => {}
+            }
+        }
         for block in &edited.blocks {
             if !ids.insert(block.id.as_str()) {
                 return Err("duplicate block id".into());

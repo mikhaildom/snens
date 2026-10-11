@@ -71,8 +71,15 @@ pub fn builtin_defs() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "ctx",
-                "description": "Управление рабочим контекстом: после правки LIVE_CONTEXT.json вызови commit. Правка проверяется и применяется после всех результатов текущего шага; статус принятия придёт перед следующим запросом. status показывает путь и экономический бюджет.",
-                "parameters": {"type":"object", "properties":{"action":{"type":"string","enum":["commit","status"]}}}
+                "description": "Управление рабочим контекстом. commit — применить правку LIVE_CONTEXT.json (после всех результатов шага; статус придёт перед следующим запросом). status — путь и бюджет. clear — хирургически вырезать результаты инструментов, не трогая диалог: либо call_ids (точечно), либо before (всё строго до указанного), либо keep_last (все старше последних N), с масками tool и min_bytes.",
+                "parameters": {"type":"object", "properties":{
+                    "action":{"type":"string","enum":["commit","status","clear"]},
+                    "call_ids":{"type":"array","items":{"type":"string"},"description":"clear: какие результаты вырезать"},
+                    "before":{"type":"string","description":"clear: вырезать всё строго до этого call_id"},
+                    "keep_last":{"type":"integer","description":"clear: оставить N последних результатов"},
+                    "tool":{"type":"string","description":"clear: только результаты этого инструмента"},
+                    "min_bytes":{"type":"integer","description":"clear: только результаты не меньше N байт"}
+                }}
             }
         }),
     ]
@@ -116,6 +123,9 @@ pub async fn dispatch(
     let a: Value = serde_json::from_str(&call.args).unwrap_or_else(|_| json!({}));
     if call.name == "ctx" {
         let action = a.get("action").and_then(Value::as_str).unwrap_or("commit");
+        if action == "clear" {
+            return ctx_clear(sess, &a);
+        }
         let text = match action {
             "commit" => {
                 "Draft отправлен. Следующее системное сообщение [Harness context status] содержит окончательный результат; не вызывай commit повторно ради подтверждения."
@@ -217,5 +227,227 @@ pub async fn dispatch(
     match exec::spawn(sp).await {
         Ok(o) => o,
         Err(e) => fail(format!("{}: {e}", call.name)),
+    }
+}
+/// Хирургическая уборка: вырезать выбранные результаты тулов, не трогая
+/// диалог. Отбор — по `call_id` (голые), `before` (всё до указанного),
+/// `keep_last` (все старше N последних), `tool` и `min_bytes` (маски).
+///
+/// Каждое вырезание пишется записью `Rec::Ctx` с картой заглушек: проекция
+/// накладывает её поверх, исходный результат остаётся в логе, resume сохраняет
+/// уборку. Диалог (user/assistant) не трогается вовсе — жёсткое правило.
+fn ctx_clear(sess: &crate::log::Session, a: &Value) -> exec::Out {
+    use std::collections::BTreeMap;
+    let fail = |msg: String| exec::Out {
+        exit: -1,
+        text: msg,
+        bytes: 0,
+        ms: 0,
+        timed_out: false,
+        parts: Vec::new(),
+    };
+    let log = match sess.read() {
+        Ok(log) => log,
+        Err(e) => return fail(format!("ctx clear: не читается лог: {e}")),
+    };
+    let already = crate::project::cleared_map(&log);
+    let results: Vec<&crate::log::Rec> = log
+        .iter()
+        .filter(|r| matches!(r, crate::log::Rec::ToolResult { .. }))
+        .collect();
+
+    let ids: Vec<&str> = a
+        .get("call_ids")
+        .and_then(Value::as_array)
+        .map(|v| v.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let before = a.get("before").and_then(Value::as_str);
+    let keep_last = a.get("keep_last").and_then(Value::as_u64);
+    let tool = a.get("tool").and_then(Value::as_str);
+    let min_bytes = a.get("min_bytes").and_then(Value::as_u64);
+
+    let mut cleared: BTreeMap<String, String> = BTreeMap::new();
+    let mut freed = 0usize;
+    let keep_from = keep_last
+        .map(|n| results.len().saturating_sub(n as usize))
+        .unwrap_or(0);
+    let mut seen_before = false;
+    for (idx, rec) in results.iter().enumerate() {
+        let crate::log::Rec::ToolResult {
+            call_id,
+            tool: name,
+            argv,
+            bytes,
+            exit,
+            ..
+        } = rec
+        else {
+            continue;
+        };
+        // Позицию "--before" отмечаем до проверки на уже вырезанное: точка
+        // отсечения — это сам call_id, независимо от того, чистили его раньше.
+        // "--before c" вырезает строго до c: сам c остаётся.
+        let is_before_target = before.is_some_and(|b| b == call_id);
+        let selected = if before.is_some() {
+            !seen_before
+        } else if !ids.is_empty() {
+            ids.contains(&call_id.as_str())
+        } else {
+            idx < keep_from
+        };
+        if is_before_target {
+            seen_before = true;
+        }
+        let selected = selected && !is_before_target;
+        if already.contains_key(call_id) || !selected {
+            continue;
+        }
+        if tool.is_some_and(|t| t != name) {
+            continue;
+        }
+        if min_bytes.is_some_and(|min| (*bytes as u64) < min) {
+            continue;
+        }
+        let placeholder = format!(
+            "[результат вырезан уборкой контекста: {name}, {bytes} Б, exit {exit} — {}]",
+            crate::project::command_hint(argv)
+        );
+        freed += bytes;
+        cleared.insert(call_id.clone(), placeholder);
+    }
+    if cleared.is_empty() {
+        return exec::Out {
+            bytes: 0,
+            text: "ctx clear: нечего вырезать (нет подходящих результатов)".into(),
+            exit: 0,
+            ms: 0,
+            timed_out: false,
+            parts: Vec::new(),
+        };
+    }
+    let elided = cleared.len();
+    if let Err(e) = sess.append(crate::log::Rec::Ctx {
+        ts: crate::log::now(),
+        action: "clear".into(),
+        elided,
+        freed_bytes: freed,
+        cleared: cleared.clone(),
+    }) {
+        return fail(format!("ctx clear: не записалась уборка: {e}"));
+    }
+    let text = format!(
+        "ctx clear: вырезано результатов {elided}, освобождено {} Б. Диалог не тронут.",
+        freed
+    );
+    exec::Out {
+        bytes: text.len(),
+        text,
+        exit: 0,
+        ms: 0,
+        timed_out: false,
+        parts: Vec::new(),
+    }
+}#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::{Body, Call, Rec, Session};
+
+    fn fixture() -> (std::path::PathBuf, Session) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "snens-dispatch-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let sess = Session::open(&dir, "test").unwrap();
+        sess.append(Rec::System {
+            ts: 0,
+            text: "sys".into(),
+        })
+        .unwrap();
+        for id in ["a", "b", "c"] {
+            sess.append(Rec::Assistant {
+                ts: 0,
+                text: None,
+                tool_calls: vec![Call {
+                    id: id.into(),
+                    name: "run".into(),
+                    args: "{}".into(),
+                }],
+                reasoning: None,
+            })
+            .unwrap();
+            sess.append(Rec::ToolResult {
+                ts: 0,
+                call_id: id.into(),
+                tool: "run".into(),
+                argv: vec![json!({"command": format!("echo {id}")}).to_string()],
+                exit: 0,
+                bytes: 100,
+                ms: 1,
+                body: Body::Inline {
+                    text: format!("output-{id}"),
+                },
+                parts: vec![],
+            })
+            .unwrap();
+        }
+        (dir, sess)
+    }
+
+    fn kept(sess: &Session) -> usize {
+        let log = sess.read().unwrap();
+        crate::project::msgs(&log, &Config::default())
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .count()
+    }
+
+    #[test]
+    fn clear_keep_last_keeps_dialog_and_recent_results() {
+        let (dir, sess) = fixture();
+        let out = ctx_clear(&sess, &json!({"keep_last": 1}));
+        assert_eq!(out.exit, 0, "{}", out.text);
+        let log = sess.read().unwrap();
+        let cleared = crate::project::cleared_map(&log);
+        assert_eq!(cleared.len(), 2, "должны уйти a и b");
+        let wire = serde_json::to_string(&crate::project::msgs(
+            &log,
+            &Config::default(),
+        ))
+        .unwrap();
+        assert!(!wire.contains("output-a"), "старый результат остался");
+        assert!(wire.contains("output-c"), "свежий результат вырезан");
+        // Диалог и вызовы не тронуты.
+        assert!(wire.contains("\"tool_calls\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clear_by_call_id_and_filters() {
+        let (dir, sess) = fixture();
+        assert_eq!(ctx_clear(&sess, &json!({"call_ids": ["b"]})).exit, 0);
+        let cleared = crate::project::cleared_map(&sess.read().unwrap());
+        assert_eq!(cleared.keys().collect::<Vec<_>>(), vec!["b"]);
+        // Повторный вызов по тому же id не находит ничего.
+        let again = ctx_clear(&sess, &json!({"call_ids": ["b"]}));
+        assert_eq!(again.exit, 0);
+        assert!(again.text.contains("нечего"));
+        // --before вырезает строго до указанного, диалог остаётся.
+        assert_eq!(ctx_clear(&sess, &json!({"before": "c"})).exit, 0);
+        let cleared = crate::project::cleared_map(&sess.read().unwrap());
+        assert_eq!(cleared.len(), 2);
+        assert!(cleared.contains_key("a"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clear_min_bytes_skips_small_results() {
+        let (dir, sess) = fixture();
+        assert_eq!(ctx_clear(&sess, &json!({"min_bytes": 200})).exit, 0);
+        let cleared = crate::project::cleared_map(&sess.read().unwrap());
+        assert!(cleared.is_empty(), "маленькие результаты не должны вырезаться");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = kept(&sess);
     }
 }

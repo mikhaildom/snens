@@ -39,6 +39,15 @@ pub struct Config {
     /// Экономический порог уборки в токенах; 0 — авто по размеру окна.
     #[serde(default)]
     pub context_budget: u64,
+    /// Профили по модели: префикс slug → свои пороги уборки. Нужны потому, что
+    /// цена кеша у моделей разная: дешёвый кеш (deepseek) терпит большой контекст,
+    /// дорогой требует уборки раньше. Побеждает самый длинный префикс.
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelProfile>,
+    /// Сколько последних tool-результатов автоэлизия не трогает: модель работает
+    /// именно с ними. Остальное — переваренный материал.
+    #[serde(default = "d_keep_results")]
+    pub keep_results: usize,
     /// Запас до физического предела окна; для маленьких окон не больше четверти.
     #[serde(default = "d_context_reserve")]
     pub context_reserve: u64,
@@ -105,6 +114,15 @@ pub struct Config {
     pub memory: Memory,
 }
 
+/// Пороги уборки для конкретной модели. Пустое поле = взять общий дефолт.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ModelProfile {
+    #[serde(default)]
+    pub context_budget: u64,
+    #[serde(default)]
+    pub context_target: u64,
+}
+
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct Memory {
     /// Имя программы в каталоге тулов (или путь, если со слэшем).
@@ -135,6 +153,9 @@ fn d_ctx() -> u64 {
 }
 fn d_context_reserve() -> u64 {
     8_192
+}
+fn d_keep_results() -> usize {
+    5
 }
 fn d_max_chars() -> usize {
     24_000
@@ -225,11 +246,30 @@ impl Default for Config {
     }
 }
 
+/// Профиль модели по slug: побеждает самый длинный совпавший префикс, чтобы
+/// `deepseek/deepseek-v4.1-flash` не перехватывался профилем `deepseek`.
+pub fn model_profile<'a>(
+    models: &'a BTreeMap<String, ModelProfile>,
+    model: &str,
+) -> Option<&'a ModelProfile> {
+    models
+        .iter()
+        .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, profile)| profile)
+}
+
 impl Config {
     /// Экономический бюджет, ограниченный окном с запасом для следующего хода.
+    /// Профиль модели (если задан) перебивает авто-оценку по окну.
     pub fn context_budget(&self) -> u64 {
+        // Модель спрашиваем в рантайме: `snens model <slug>` меняет профиль
+        // уборки на следующем ходу, без перезапуска сервиса.
+        let profile = model_profile(&self.models, &self.model_now());
         let budget = if self.context_budget > 0 {
             self.context_budget
+        } else if let Some(p) = profile.filter(|p| p.context_budget > 0) {
+            p.context_budget
         } else if self.ctx_window <= 300_000 {
             100_000
         } else {
@@ -245,8 +285,11 @@ impl Config {
     /// Цель уборки не превышает эффективный экономический бюджет.
     pub fn context_target(&self) -> u64 {
         let budget = self.context_budget();
+        let profile = model_profile(&self.models, &self.model_now());
         let target = if self.context_target > 0 {
             self.context_target
+        } else if let Some(p) = profile.filter(|p| p.context_target > 0) {
+            p.context_target
         } else {
             // u128 сохраняет точные 70% без переполнения даже при u64::MAX.
             (u128::from(budget) * 7 / 10) as u64
@@ -498,6 +541,33 @@ mod tests {
             assert_eq!(cfg.context_budget(), budget);
             assert_eq!(cfg.context_target(), target);
         }
+    }
+
+    #[test]
+    fn model_profiles_override_auto_by_longest_prefix() {
+        let cfg: Config = toml::from_str(
+            "ctx_window = 1000000\nmodel = \"deepseek/deepseek-v4.1-flash\"\n\
+             [models.\"deepseek\"]\ncontext_budget = 300000\n\
+             [models.\"deepseek/deepseek-v4.1-flash\"]\ncontext_budget = 500000\ncontext_target = 350000",
+        )
+        .unwrap();
+        // Побеждает длинный префикс, а не общий `deepseek`.
+        assert_eq!(cfg.context_budget(), 500_000);
+        assert_eq!(cfg.context_target(), 350_000);
+
+        // Модель без профиля — авто по окну.
+        let mut cfg = cfg;
+        cfg.model = "openai/gpt-6-luna".into();
+        cfg.model_pinned = true;
+        assert_eq!(cfg.context_budget(), 200_000);
+
+        // Явный context_budget сильнее профиля.
+        let cfg: Config = toml::from_str(
+            "ctx_window = 1000000\nmodel = \"deepseek/x\"\ncontext_budget = 123456\n\
+             [models.\"deepseek\"]\ncontext_budget = 500000",
+        )
+        .unwrap();
+        assert_eq!(cfg.context_budget(), 123_456);
     }
 
     #[test]

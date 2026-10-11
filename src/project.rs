@@ -22,9 +22,45 @@ pub fn raw_msgs(log: &[Rec], cfg: &Config) -> Vec<Value> {
     build(log, cfg)
 }
 
+/// Карта вырезанных результатов: `call_id -> заглушка`. Собирается из всех
+/// записей `Rec::Ctx`. Элизия — правило проекции, а не перезапись лога:
+/// исходный результат остаётся в файле сессии, и уборка переживает resume.
+pub fn cleared_map(log: &[Rec]) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for rec in log {
+        if let Rec::Ctx { cleared, .. } = rec {
+            map.extend(cleared.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+    }
+    map
+}
+
+/// Заменить содержимое tool-результатов по карте уборки. Применяется и к
+/// свежей проекции, и к базе ревизии: иначе элизия не пережила бы commit.
+pub fn apply_cleared(msgs: &mut [Value], cleared: &std::collections::BTreeMap<String, String>) {
+    if cleared.is_empty() {
+        return;
+    }
+    for m in msgs {
+        if m["role"] != "tool" {
+            continue;
+        }
+        if let Some(id) = m["tool_call_id"].as_str() {
+            if let Some(placeholder) = cleared.get(id) {
+                m["content"] = json!(placeholder);
+            }
+        }
+    }
+}
+
+/// Проекция, которую видит провайдер: база ревизии плюс элизия. Отдельно от
+/// `context::effective` (база для зеркала): в зеркале должны лежать настоящие
+/// результаты, а заглушки уборки накладываются только на провод.
 pub fn msgs(log: &[Rec], cfg: &Config) -> Vec<Value> {
     // Inspection can show the raw journal if a checkpoint was damaged.
-    crate::context::effective(log, cfg).unwrap_or_else(|_| raw_msgs(log, cfg))
+    let mut out = crate::context::effective(log, cfg).unwrap_or_else(|_| raw_msgs(log, cfg));
+    apply_cleared(&mut out, &cleared_map(log));
+    out
 }
 
 fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
@@ -233,6 +269,126 @@ fn data_url(path: &str, mime: &str) -> Option<String> {
         c.push((path.to_string(), url.clone()));
     }
     Some(url)
+}
+
+/// Автоэлизия: какие результаты тулов вырезать, чтобы вернуться к target.
+/// Детерминированная функция лога и конфига — при одном и том же логе даёт
+/// один и тот же ответ, поэтому не «срабатывает каждый ход»: уже вырезанное
+/// лежит в карте `cleared` и в кандидаты не попадает.
+///
+/// Последние `keep_results` результатов не трогаем — модель работает именно
+/// с ними. Вырезаем самое старое вперёд, пока оценка не опустится до цели.
+pub fn plan_elision(log: &[Rec], cfg: &Config) -> std::collections::BTreeMap<String, String> {
+    let already = cleared_map(log);
+    let mut msgs = crate::context::effective(log, cfg).unwrap_or_else(|_| raw_msgs(log, cfg));
+    apply_cleared(&mut msgs, &already);
+    let current = calibrated_tokens(log, &msgs);
+    if current < cfg.context_budget() {
+        return std::collections::BTreeMap::new();
+    }
+
+    // Результаты в порядке появления, без уже вырезанных.
+    let candidates: Vec<(usize, &str)> = log
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            Rec::ToolResult { call_id, .. } if !already.contains_key(call_id) => {
+                Some((i, call_id.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let keep_from = candidates.len().saturating_sub(cfg.keep_results);
+
+    // Размер заглушки для каждого кандидата и текущий размер сообщения.
+    let mut cleared = std::collections::BTreeMap::new();
+    let mut remaining = current;
+    let target = cfg.context_target();
+    for candidate in candidates.iter().take(keep_from) {
+        if remaining <= target {
+            break;
+        }
+        let call_id = candidate.1;
+        let Some(text) = msgs.iter().find_map(|m| {
+            (m["role"] == "tool" && m["tool_call_id"].as_str() == Some(call_id))
+                .then(|| m["content"].clone())
+        }) else {
+            continue;
+        };
+        let placeholder = placeholder_for(log, call_id);
+        let freed = ((estimate_tokens(std::slice::from_ref(&text)) as f64
+            - estimate_tokens(std::slice::from_ref(&json!(placeholder))) as f64)
+            * calibration(log))
+            .max(0.0) as u64;
+        cleared.insert(call_id.to_string(), placeholder);
+        remaining = remaining.saturating_sub(freed);
+    }
+    cleared
+}
+
+/// Заглушка с именем тула, размером и хвостом команды: без неё модель не
+/// знает, что именно вырезано, и не может решить, перезапускать ли вызов.
+fn placeholder_for(log: &[Rec], call_id: &str) -> String {
+    for rec in log {
+        if let Rec::ToolResult {
+            call_id: id,
+            tool,
+            argv,
+            bytes,
+            exit,
+            ..
+        } = rec
+        {
+            if id == call_id {
+                return format!(
+                    "[результат вырезан уборкой контекста: {tool}, {bytes} Б, exit {exit} — {}]",
+                    command_hint(argv)
+                );
+            }
+        }
+    }
+    "[результат вырезан уборкой контекста]".to_string()
+}
+
+/// Команду из лога оставляем в пометке: без неё модель не знает, что именно
+/// было вырезано, и не может решить, перезапускать или нет.
+pub fn command_hint(argv: &[String]) -> String {
+    let raw = argv.join(" ").replace('\n', " ");
+    let mut s: String = raw.chars().take(160).collect();
+    if raw.chars().count() > 160 {
+        s.push('…');
+    }
+    s
+}
+
+/// Множитель оценки по токенам провайдера: `in_tok / est_tok` того же хода.
+/// Свежие ходы весят больше — токенизатор мог смениться вместе с моделью.
+/// Нет ни одного замера — единица, то есть сырая оценка `len/3`.
+pub fn calibration(log: &[Rec]) -> f64 {
+    let mut weighted = 0.0f64;
+    let mut weights = 0.0f64;
+    let mut w = 1.0f64;
+    for rec in log.iter().rev() {
+        if let Rec::Usage { in_tok, est_tok, .. } = rec {
+            if *est_tok > 0 && *in_tok > 0 {
+                weighted += (*in_tok as f64 / *est_tok as f64) * w;
+                weights += w;
+                w *= 0.7;
+            }
+        }
+    }
+    if weights > 0.0 {
+        weighted / weights
+    } else {
+        1.0
+    }
+}
+
+/// Оценка размера проекции в токенах модели: сырая эвристика, помноженная на
+/// откалиброванный множитель. Так порог считается по числам провайдера, а не
+/// по «1 символ ≈ 1/3 токена», которое для кириллицы и CJK завышает вслепую.
+pub fn calibrated_tokens(log: &[Rec], msgs: &[Value]) -> u64 {
+    (estimate_tokens(msgs) as f64 * calibration(log)).round() as u64
 }
 
 /// Грубая оценка токенов проекции: точные числа берём из usage провайдера,
@@ -744,5 +900,100 @@ mod tests {
             serde_json::to_string(&first).unwrap(),
             serde_json::to_string(&second).unwrap()
         );
+    }
+
+    fn tool_rec(call_id: &str, text: &str, bytes: usize) -> Rec {
+        Rec::ToolResult {
+            ts: 0,
+            call_id: call_id.into(),
+            tool: "run".into(),
+            argv: vec![json!({"command": "echo hi"}).to_string()],
+            exit: 0,
+            bytes,
+            ms: 1,
+            body: crate::log::Body::Inline { text: text.into() },
+            parts: vec![],
+        }
+    }
+
+    #[test]
+    fn auto_elision_skips_recent_and_is_idempotent() {
+        let cfg: Config = toml::from_str(
+            "ctx_window = 100000\ncontext_budget = 1000\ncontext_target = 500\nkeep_results = 1\nmax_result_chars = 1000000",
+        )
+        .unwrap();
+        let log = vec![
+            Rec::User {
+                ts: 0,
+                text: "goal".into(),
+                source: "human".into(),
+                parts: vec![],
+            },
+            tool_rec("old", &"x".repeat(6000), 6000),
+            tool_rec("fresh", &"y".repeat(6000), 6000),
+        ];
+        let first = plan_elision(&log, &cfg);
+        // Последний результат защищён: вырезан только старый.
+        assert!(first.contains_key("old"), "старый результат не вырезан");
+        assert!(!first.contains_key("fresh"), "свежий результат тронут");
+
+        // Применение записью Ctx — и повторный план ничего не добавляет.
+        let mut with_ctx = log.clone();
+        with_ctx.push(Rec::Ctx {
+            ts: 0,
+            action: "auto".into(),
+            elided: first.len(),
+            freed_bytes: 0,
+            cleared: first.clone(),
+        });
+        assert!(
+            plan_elision(&with_ctx, &cfg).is_empty(),
+            "элизия срабатывает повторно — та самая петля"
+        );
+    }
+
+    #[test]
+    fn elision_keeps_dialog_and_clears_large_result() {
+        let cfg: Config = toml::from_str(
+            "ctx_window = 100000\ncontext_budget = 1000\ncontext_target = 500\nkeep_results = 0\nmax_result_chars = 1000000",
+        )
+        .unwrap();
+        let log = vec![
+            Rec::User {
+                ts: 0,
+                text: "решение: не переспрашивать".into(),
+                source: "human".into(),
+                parts: vec![],
+            },
+            tool_rec("big", &"z".repeat(6000), 6000),
+        ];
+        let mut messages = raw_msgs(&log, &cfg);
+        apply_cleared(&mut messages, &plan_elision(&log, &cfg));
+        let wire = serde_json::to_string(&messages).unwrap();
+        assert!(!wire.contains(&"z".repeat(100)));
+        assert!(
+            wire.contains("решение: не переспрашивать"),
+            "текст пользователя потерян"
+        );
+    }
+
+    #[test]
+    fn calibration_weights_recent_usage() {
+        let log = vec![Rec::Usage {
+            ts: 0,
+            in_tok: 1000,
+            cached_tok: 0,
+            out_tok: 0,
+            cost_micro: 0,
+            upstream_id: String::new(),
+            fingerprint: String::new(),
+            finish_reason: String::new(),
+            reason_tok: 0,
+            encrypted_reasoning: false,
+            est_tok: 2000,
+        }];
+        assert!((calibration(&log) - 0.5).abs() < 1e-9);
+        // Без замеров — единица, то есть сырая оценка len/3.
+        assert_eq!(calibration(&[]), 1.0);
     }
 }

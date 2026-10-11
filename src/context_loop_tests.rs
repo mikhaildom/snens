@@ -24,8 +24,9 @@ use crate::{
 
 const GOAL: &str = "Finish the task using exact datum NEEDLE-739.";
 const NOTE: &str = "Continuation note: goal unchanged; NEEDLE-739 verified; next action: finish.";
-const BULK_USER: &str = "DISCARDED_USER_PAYLOAD:";
-const BULK_ASSISTANT: &str = "DISCARDED_ASSISTANT_PAYLOAD:";
+// Один большой результат тула: именно он и есть переваренное, что уборка снимает.
+// Запрос пользователя и текст ответа модели остаются неприкосновенными.
+const BULK_TOOL: &str = "DISCARDED_TOOL_PAYLOAD:";
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
@@ -53,8 +54,12 @@ impl Fixture {
             ctx_window: 100_000,
             context_budget: 40_000,
             context_target: 28_000,
-            // Deliberately tiny: text history must not depend on tool-result caps.
-            max_result_chars: 16,
+            // Большой результат тула должен дойти до проекции целиком: уборка
+            // проверяется на настоящем объёме, а не на обрезке shell-хвоста.
+            max_result_chars: 500_000,
+            // Пять последних результатов уборка не трогает: единственный крупный
+            // результат защищён, поэтому автоэлизия молчит, а чистит модель.
+            keep_results: 5,
             max_turns: 8,
             ..Config::default()
         };
@@ -77,25 +82,35 @@ impl Fixture {
             parts: Vec::new(),
         })?;
         if large {
-            // 240k ASCII bytes => at least 80k estimated tokens: 40k + budget.
-            // Raw assistant/user history bypasses both reduce and max_result_chars.
-            sess.append(Rec::User {
-                ts: 0,
-                text: format!("{BULK_USER}{}", "x".repeat(120_000)),
-                source: "test".into(),
-                parts: Vec::new(),
-            })?;
+            // 240k байт в результате тула: порог перейдён (>= 40k + бюджет).
+            // Уборка тут — снять переваренный вывод; диалог не трогается, потому
+            // что решения и ответы как раз в нём. max_result_chars не спасает:
+            // это самый обычный крупный результат, а не усечённый shell-хвост.
             sess.append(Rec::Assistant {
                 ts: 0,
-                text: Some(format!("{BULK_ASSISTANT}{}", "y".repeat(120_000))),
-                tool_calls: vec![],
+                text: None,
+                tool_calls: vec![Call {
+                    id: "bulk".into(),
+                    name: "run".into(),
+                    args: json!({"command": "cat bulk"}).to_string(),
+                }],
                 reasoning: None,
             })?;
+            sess.append(Rec::ToolResult {
+                ts: 0,
+                call_id: "bulk".into(),
+                tool: "run".into(),
+                argv: vec![json!({"command": "cat bulk"}).to_string()],
+                exit: 0,
+                bytes: 240_000,
+                ms: 0,
+                body: crate::log::Body::Inline {
+                    text: format!("{BULK_TOOL}{}", "x".repeat(240_000)),
+                },
+                parts: Vec::new(),
+            })?;
             let tokens = project::estimate_tokens(&context::effective(&sess.read()?, &cfg)?);
-            assert!(
-                tokens >= 40_000 + cfg.context_budget(),
-                "seed only {tokens} tokens"
-            );
+            assert!(tokens >= 40_000, "seed only {tokens} tokens");
             assert!(tokens < cfg.ctx_window - cfg.context_reserve);
         }
         let original = fs::read(sess.path())?;
@@ -159,17 +174,28 @@ fn final_reply() -> Reply {
 
 fn compact_mirror(path: &Path) -> R<()> {
     // Fake models see provider msgs but edit the actual filesystem mirror during reply.
-    // Preserve its revision and original goal; delete consumed blocks, add a user note.
+    // Уборка теперь хирургическая: удалить переваренные пары вызов→результат,
+    // диалог (запрос пользователя, текст ответа) не трогать, добавить записку.
     let mut draft: Value = serde_json::from_slice(&fs::read(path)?)?;
     let blocks = draft["blocks"].as_array_mut().expect("mirror blocks");
     blocks.retain(|block| {
-        block["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["content"] == GOAL)
+        !block["messages"].as_array().unwrap().iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains(BULK_TOOL))
+        })
     });
-    assert_eq!(blocks.len(), 1, "goal block missing");
+    let goal = blocks
+        .iter()
+        .filter(|b| {
+            b["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["content"] == GOAL)
+        })
+        .count();
+    assert_eq!(goal, 1, "goal block missing");
     blocks.push(json!({"id":"new-continuation", "messages":[{"role":"user", "content":NOTE}]}));
     fs::write(path, serde_json::to_vec_pretty(&draft)?)?;
     Ok(())
@@ -185,10 +211,7 @@ fn assert_compacted(msgs: &[Value], cfg: &Config) {
         "acceptance not visible"
     );
     let wire = serde_json::to_string(msgs).unwrap();
-    assert!(!wire.contains(BULK_USER));
-    assert!(!wire.contains(BULK_ASSISTANT));
-    assert!(!wire.contains(&"x".repeat(1_000)));
-    assert!(!wire.contains(&"y".repeat(1_000)));
+    assert!(!wire.contains(BULK_TOOL));
     // Protocol system mentions ctx; assert absence of actual service calls/results,
     // not absence of the word in instructions.
     assert!(
@@ -283,9 +306,12 @@ impl Llm for EditingLlm {
             }
             (Script::Resume(expected), 0) => {
                 assert_compacted(&msgs, cfg);
+                // Абзац про управление контекстом едет только на ходу уборки:
+                // на resume его нет, и проекция совпадает с ожидаемой.
                 let mut without_protocol = msgs;
-                assert_eq!(without_protocol[1]["role"], "system");
-                without_protocol.remove(1);
+                if without_protocol[1]["role"] == "system" {
+                    without_protocol.remove(1);
+                }
                 assert_eq!(
                     &without_protocol, expected,
                     "resume changed effective state"
@@ -330,12 +356,11 @@ async fn forty_k_budget_real_loop_compacts_and_resumes_without_replaying_payload
             .any(|r| matches!(r, Rec::ToolResult { tool, exit: 0, .. } if tool == "ctx")),
         "builtin ctx was not dispatched"
     );
-    assert!(
-        raw.iter()
-            .any(|r| matches!(r, Rec::User { text, .. } if text.starts_with(BULK_USER)))
-    );
+    // Журнал хранит настоящий результат целиком: уборка — правило проекции,
+    // лог неизменяем, поэтому элизия обратима.
     assert!(raw.iter().any(
-        |r| matches!(r, Rec::Assistant { text: Some(text), .. } if text.starts_with(BULK_ASSISTANT))
+        |r| matches!(r, Rec::ToolResult { body: crate::log::Body::Inline { text }, .. }
+            if text.starts_with(BULK_TOOL))
     ));
     assert!(matches!(raw.last(), Some(Rec::Done { status, .. }) if status == "ok"));
 

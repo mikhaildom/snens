@@ -245,12 +245,38 @@ async fn run_loop<L: Llm>(
         }
         let raw = sess.read()?;
         let mut msgs = mirror.prepare(&raw, cfg)?;
+        // Автоэлизия: детерминированный пред-шаг, один раз на переходе через
+        // бюджет. Результаты схлопываются в пометки, диалог не трогается;
+        // решение живёт записью Rec::Ctx и не пересчитывается каждый ход.
+        let cleared = project::plan_elision(&raw, cfg);
+        if !cleared.is_empty() {
+            let elided = cleared.len();
+            sess.append(Rec::Ctx {
+                ts: log::now(),
+                action: "auto".into(),
+                elided,
+                freed_bytes: 0,
+                cleared: cleared.clone(),
+            })?;
+            project::apply_cleared(&mut msgs, &cleared);
+            ui.notice(&format!("автоэлизия: схлопнуто результатов тулов: {elided}"));
+        } else {
+            project::apply_cleared(&mut msgs, &project::cleared_map(&raw));
+        }
         let schema_tokens = serde_json::to_vec(&defs)?.len() as u64 / 3;
-        let approx = project::estimate_tokens(&msgs) + schema_tokens;
+        // Порог — по токенам провайдера: сырая оценка, помноженная на множитель
+        // из последних usage этой сессии (см. project::calibration).
+        let est_raw = project::estimate_tokens(&msgs) + schema_tokens;
+        let approx = (est_raw as f64 * project::calibration(&raw)).round() as u64;
         if approx < cfg.context_target() {
             pressure_next = cfg.context_budget();
         }
+        // Абзац про управление зеркалом — только когда уборка запрошена:
+        // постоянное напоминание на каждом ходу отвлекало модель на размышления
+        // о контексте вместо задачи.
+        let mut cleanup_requested = false;
         if approx >= pressure_next {
+            cleanup_requested = true;
             pressure_next = approx
                 .saturating_add(cfg.context_budget() / 4)
                 .max(approx.saturating_add(1));
@@ -261,14 +287,19 @@ async fn run_loop<L: Llm>(
                     parts: Vec::new(),
             })?;
             msgs = mirror.prepare(&sess.read()?, cfg)?;
+            project::apply_cleared(&mut msgs, &project::cleared_map(&sess.read()?));
             ui.notice(&format!(
                 "контекст ~{approx}: запрос уборки (бюджет {})",
                 cfg.context_budget()
             ));
         }
         // Protocol is constant across requests; outside the editable mirror.
+        // Едет только когда запрошена уборка: постоянное напоминание отвлекало
+        // модель на размышления о контексте.
+        if cleanup_requested {
         msgs.insert(1, serde_json::json!({"role":"system", "content": format!(
             "Ты управляешь своим рабочим контекстом. Зеркало следующего ввода: {} (также SNENS_CONTEXT_PATH в окружении инструментов). Читай его окнами и редактируй обычными read/edit/write/run, затем ctx commit. JSON blocks содержат messages; вызовы и ответы инструмента связаны одним блоком: нельзя оставлять сироты. Можно сокращать аргументы (валидный JSON), ответы, удалять целые пары/блоки, добавлять текстовые user notes с id new-*. Системные сообщения вне зеркала. Правка действует после результатов шага; исходный журнал не меняется. Держи рабочую записку и proactively удаляй ненужное. Бюджет {} токенов, цель уборки {}. Успешные прямые read/edit/write зеркала и ctx commit не остаются в рабочей истории; shell-команды остаются. Не дублируй всё зеркало в ответе.", mirror.path().display(), cfg.context_budget(), cfg.context_target())}));
+        }
 
         let physical_limit = cfg
             .ctx_window
@@ -324,7 +355,7 @@ async fn run_loop<L: Llm>(
         // проекцию), делаем один повтор; второй пустой подряд — явная ошибка,
         // иначе прогон закрывается «успешно», ничего не сделав.
         if reply.calls.is_empty() && reply.text.trim().is_empty() {
-            sess.append(usage_rec(&reply))?;
+            sess.append(usage_rec(&reply, est_raw))?;
             empty_replies += 1;
             let hint = if reply.finish_reason.is_empty() {
                 "провайдер не сообщил finish_reason".to_string()
@@ -357,7 +388,7 @@ async fn run_loop<L: Llm>(
                 Some(reply.reasoning.clone())
             },
         })?;
-        sess.append(usage_rec(&reply))?;
+        sess.append(usage_rec(&reply, est_raw))?;
 
         if reply.calls.is_empty() {
             memory::retain_turn(sess, cfg, &path, &reply.text).await;
@@ -591,11 +622,13 @@ async fn final_answer<L: Llm>(
         parts: Vec::new(),
     })?;
     let log = sess.read()?;
-    let msgs = crate::context::effective(&log, cfg)?;
+    let mut msgs = crate::context::effective(&log, cfg)?;
+    project::apply_cleared(&mut msgs, &project::cleared_map(&log));
+    let est_raw = project::estimate_tokens(&msgs);
     let limit = cfg
         .ctx_window
         .saturating_sub(cfg.context_reserve.min(cfg.ctx_window / 4));
-    if project::estimate_tokens(&msgs) >= limit {
+    if project::calibrated_tokens(&log, &msgs) >= limit {
         return Err("final answer context exceeds physical window; compact before resuming".into());
     }
     let reply = stream_reply(cfg, msgs, Vec::new(), llm, ui, observe).await?;
@@ -613,7 +646,7 @@ async fn final_answer<L: Llm>(
             Some(reply.reasoning.clone())
         },
     })?;
-    sess.append(usage_rec(&reply))?;
+    sess.append(usage_rec(&reply, est_raw))?;
     ui.notice(&format!("лимит {turn} ходов: запрошен промежуточный итог"));
     memory::retain_turn(sess, cfg, path, &reply.text).await;
     Ok(())
@@ -663,7 +696,7 @@ async fn stream_reply<L: Llm>(
 
 /// Запись расхода хода. Отпечаток апстрима кладём рядом с токенами: промах
 /// кеша ищется по тому, сменился ли между ходами бэкенд провайдера.
-fn usage_rec(reply: &Reply) -> Rec {
+fn usage_rec(reply: &Reply, est_tok: u64) -> Rec {
     Rec::Usage {
         ts: log::now(),
         in_tok: reply.usage.in_tok,
@@ -675,8 +708,11 @@ fn usage_rec(reply: &Reply) -> Rec {
         finish_reason: reply.finish_reason.clone(),
         reason_tok: reply.usage.reason_tok,
         encrypted_reasoning: reply.usage.encrypted,
+        est_tok,
     }
 }
+
+
 /// Сколько строк результата показывать человеку в терминале.
 const PREVIEW_LINES: usize = 15;
 

@@ -174,9 +174,19 @@ fn malformed_stale_orphan_and_invalid_arguments_are_rejected_without_log_changes
         .unwrap()
         .contains("valid JSON"));
     assert_eq!(fs::read(f.sess.path()).unwrap(), before);
-    // Replace the complete call batch with plain text; no arguments needed.
+    // Диалог защищён: замена tool-пары на user-заметку отвергается — иначе
+    // уборка возвращала бы себя назад и забывала решения (амнезия).
     let mut d = document(&m);
     d.blocks[1].messages = vec![json!({"role":"user", "content":"summary"})];
+    save(&m, &d);
+    assert!(m
+        .apply(&f.sess, &f.cfg)
+        .unwrap()
+        .unwrap()
+        .contains("cannot"));
+    // Новую заметку добавить можно: это рабочая записка, а не переписывание хода.
+    let mut d = document(&m);
+    note(&mut d, "summary");
     save(&m, &d);
     assert!(m
         .apply(&f.sess, &f.cfg)
@@ -197,11 +207,16 @@ fn opaque_images_restored_and_unknown_references_rejected() {
         .unwrap()
         .contains("SECRET"));
     let mut d = view.document.clone();
+    // Текст запроса пользователя править нельзя — защита от амнезии.
     d.blocks[0].messages[0]["content"][0]["text"] = json!("edited");
-    let restored = view.restore(&d).unwrap();
-    assert_eq!(restored[1]["content"][1], image);
+    assert!(view.restore(&d).is_err());
+    // Ссылка на несуществующее вложение по-прежнему отвергается.
+    let mut d = view.document.clone();
     d.blocks[0].messages[0]["content"][1]["$context_attachment"] = json!("unknown");
     assert!(view.restore(&d).is_err());
+    // Нетронутый документ восстанавливается, вложение на месте.
+    let restored = view.restore(&view.document.clone()).unwrap();
+    assert_eq!(restored[1]["content"][1], image);
 }
 
 #[test]

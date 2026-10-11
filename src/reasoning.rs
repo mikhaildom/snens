@@ -32,10 +32,11 @@ pub fn take_delta(d: &Value, encrypted: &mut bool) -> Option<String> {
 /// ходу стрима (индексы частей различаются), а в конце одним куском
 /// `{"type":"reasoning.encrypted","data":"gAAA…"}`. Текста у блоба нет: это
 /// подпись апстрима, которую клиент по контракту обязан вернуть обратно
-/// дословно.
+/// дословно. Отдельный вид — `reasoning.text`: открытый текст рассуждения,
+/// так его отдаёт DeepSeek через Nous; разбирать его блобом нельзя.
 ///
-/// Возвращает сводку, если она была; `encrypted` — признак, что полный текст
-/// хода нам не читаем, и дальше по цепочке его некуда положить.
+/// Возвращает видимый текст, если он был; `encrypted` — признак, что полный
+/// текст хода нам не читаем, и дальше по цепочке его некуда положить.
 pub fn take_details(d: &Value, encrypted: &mut bool) -> Option<String> {
     let items = d.get("reasoning_details")?.as_array()?;
     let mut out = String::new();
@@ -46,9 +47,17 @@ pub fn take_details(d: &Value, encrypted: &mut bool) -> Option<String> {
                     out.push_str(s);
                 }
             }
-            // Незнакомый тип с данными считаем блобом: лучше пометить ход как
-            // «рассуждение закрыто», чем показать пустоту вместо платного текста.
-            _ => *encrypted = true,
+            // Открытый текст рассуждения (DeepSeek через Nous): раньше попадал
+            // в `_` и ложно помечал ход зашифрованным, хотя текст виден целиком.
+            Some("reasoning.text") => {
+                if let Some(s) = it.get("text").and_then(|s| s.as_str()) {
+                    out.push_str(s);
+                }
+            }
+            Some("reasoning.encrypted") => *encrypted = true,
+            // Незнакомый тип: ни текста, ни признака блоба. Молча пропускаем —
+            // строить догадки о незнакомом формате хуже, чем показать то, что есть.
+            _ => {}
         }
     }
     (!out.is_empty()).then_some(out)
@@ -168,6 +177,31 @@ mod tests {
         );
         assert!(got.is_none());
         assert!(enc);
+    }
+
+    #[test]
+    fn open_reasoning_text_is_read_not_marked_encrypted() {
+        // Живой формат DeepSeek через Nous: текст открыт, шифрования нет.
+        let mut enc = false;
+        let got = take_details(
+            &json!({"reasoning_details": [
+                {"type": "reasoning.text", "text": "We need", "format": "unknown", "index": 0}
+            ]}),
+            &mut enc,
+        );
+        assert_eq!(got.as_deref(), Some("We need"));
+        assert!(!enc, "reasoning.text — не блоб");
+    }
+
+    #[test]
+    fn unknown_detail_type_is_not_assumed_encrypted() {
+        let mut enc = false;
+        assert!(take_details(
+            &json!({"reasoning_details": [{"type": "reasoning.weird", "blah": 1}]}),
+            &mut enc
+        )
+        .is_none());
+        assert!(!enc, "незнакомый тип не повод объявлять текст закрытым");
     }
 
     #[test]
