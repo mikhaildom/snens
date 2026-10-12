@@ -1,0 +1,102 @@
+#!/bin/sh
+# snens-priv — root-owned брокер привилегированных действий агента snens.
+#
+# Зачем брокер, а не россыпь строк в sudoers. Матчинг аргументов в sudoers
+# точный и легко ошибочный; whitelist в одном исполняемом файле виден целиком,
+# читается глазами и одинаково понимается и человеком, и тестом. Ставится
+# root:root 0755 в /usr/local/bin/snens-priv и единственной строкой разрешается
+# в /etc/sudoers.d/snens-priv — агент этот файл не правит (нет прав).
+#
+# Границы: набор действий фиксирован, аргументы валидируются, свободного
+# root-шелла не даёт. Опасное `sudo tee /etc/...`, `cp` в /etc и широкий
+# `apt-get install` намеренно не разрешены — их делает человек.
+#
+# Валидация без выполнения: SNENS_PRIV_DRYRUN=1 snens-priv <действие> … — печатает
+# «ok: <команда>» и выходит 0, либо отказывает кодом 2. Для тестов.
+set -eu
+
+# Единый список управляемых systemd-юнитов. Добавляешь юнит — правишь строку,
+# не гоняясь за точным синтаксисом аргументов sudoers.
+allowed_unit() {
+    case "$1" in
+        ai-chat | ai-chat.service | \
+        hamburg-news-bot | hamburg-news-bot.service | \
+        hamburg-news-bot-dev | hamburg-news-bot-dev.service | \
+        caddy | caddy.service | card-proxy | card-proxy.service)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Каталоги, где агенту разрешена запись/смена владельца. Без выходов вверх (..)
+# и только с префиксом: иначе `mkdir -p /var/www/../../etc/x` обошёл бы границу.
+allowed_path() {
+    case "$1" in
+        /mnt/HC_Volume_106138989/* | /var/www/*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *..*) return 1 ;;
+    esac
+    return 0
+}
+
+die() {
+    echo "snens-priv: $*" >&2
+    exit 2
+}
+
+run() {
+    if [ "${SNENS_PRIV_DRYRUN:-}" = 1 ]; then
+        echo "ok: $*"
+        exit 0
+    fi
+    exec "$@"
+}
+
+action=${1:-}
+[ -n "$action" ] || die "не задано действие (systemctl|mkdir|chown)"
+shift
+
+case "$action" in
+    systemctl)
+        verb=${1:-}
+        unit=${2:-}
+        case "$verb" in
+            restart | reload | start | stop | status) ;;
+            *) die "недопустимый глагол systemctl: '$verb'" ;;
+        esac
+        [ "$#" -eq 2 ] || die "systemctl: ожидалось ровно 2 аргумента"
+        allowed_unit "$unit" || die "юнит не разрешён: '$unit'"
+        run /usr/bin/systemctl "$verb" "$unit"
+        ;;
+    mkdir)
+        [ "${1:-}" = "-p" ] || die "mkdir поддерживается только с -p"
+        shift
+        [ "$#" -ge 1 ] || die "mkdir: нужен хотя бы один путь"
+        for p in "$@"; do
+            allowed_path "$p" || die "путь вне разрешённых корней: '$p'"
+        done
+        run /usr/bin/mkdir -p "$@"
+        ;;
+    chown)
+        recursive=0
+        if [ "${1:-}" = "-R" ]; then
+            recursive=1
+            shift
+        fi
+        spec=${1:-}
+        path=${2:-}
+        [ "$#" -eq 2 ] || die "chown: ожидался <владелец> <путь>"
+        [ "$spec" = "clawdich:clawdich" ] || die "владелец не разрешён: '$spec'"
+        allowed_path "$path" || die "путь вне разрешённых корней: '$path'"
+        if [ "$recursive" = 1 ]; then
+            run /usr/bin/chown -R "$spec" "$path"
+        else
+            run /usr/bin/chown "$spec" "$path"
+        fi
+        ;;
+    *)
+        die "действие не разрешено: '$action'"
+        ;;
+esac
