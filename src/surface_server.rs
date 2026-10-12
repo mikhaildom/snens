@@ -1271,6 +1271,10 @@ async fn launch(
                 crate::agent::SurfaceSignal::Notice(text) => {
                     ("notice", serde_json::json!({"text":text}))
                 }
+                crate::agent::SurfaceSignal::ContextPressure { approx, budget } => (
+                    "context.pressure",
+                    serde_json::json!({"approx":approx,"budget":budget}),
+                ),
             };
             // An unbounded FIFO preserves callback order without blocking the agent.
             let _ = signal_tx.send((kind.to_owned(), fields));
