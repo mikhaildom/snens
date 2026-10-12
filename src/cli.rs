@@ -1,4 +1,5 @@
 mod agent;
+mod approval;
 mod askpass;
 mod attach;
 mod cfg;
@@ -68,7 +69,7 @@ async fn legacy_main() -> R<()> {
     // в каталоге шимов, только в PATH инструментов агента), это не CLI, а
     // трансляция в системный sudo / выдача пароля серверу TUI.
     match askpass::invoked_as().as_str() {
-        "sudo" => return askpass::shim(std::env::args().skip(1).collect()),
+        "sudo" => return approval::privileged_shim(std::env::args().skip(1).collect()),
         "snens-askpass" => {
             // Роль клиента askpass: ошибка (нет сервера) — просто код ≠ 0, без
             // debug-шума: sudo сам поймёт, что пароля нет.

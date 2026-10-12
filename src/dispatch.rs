@@ -37,6 +37,17 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
             &shim,
         ));
     }
+    // Канал одобрений привилегированных действий. Сокет поднимает сервер
+    // поверхности; в живой TUI-сессии его нет, и шим честно уходит в askpass.
+    // Нулевой таймаут выключает очередь: переменную не ставим.
+    if cfg.approval_timeout_seconds > 0 {
+        v.push((
+            "SNENS_APPROVAL_SOCK".into(),
+            crate::approval::sock_path(&cfg.sessions_path())
+                .display()
+                .to_string(),
+        ));
+    }
     v.push((
         "SNENS_CONTEXT_PATH".into(),
         sess.path()

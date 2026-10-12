@@ -71,6 +71,9 @@ pub async fn entry() -> R<()> {
             if !addr.ip().is_loopback() {
                 return Err("experimental server only binds loopback".into());
             }
+            // Headless-разметка: спрашивать пароль негде, привилегированные действия
+            // идут через канал одобрений (синхронно с production-сервером).
+            std::env::set_var("SNENS_ASKPASS_DISABLED", "1");
             eprintln!(
                 "[snens-next] http://{addr} · data {} · token {}",
                 data.display(),

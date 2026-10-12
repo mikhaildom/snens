@@ -5,15 +5,15 @@
 // sudo зовёт программу из `SUDO_ASKPASS` и читает пароль из её stdout — терминал
 // ему не нужен вовсе.
 //
-// Три роли, все здесь:
-//  - **ши́м** (`sudo` в PATH детей): симлинк на сам `snens`; получив это имя,
-//    транслирует вызов в `/usr/bin/sudo -A`. Только в окружении инструментов
-//    агента — обычный интерактивный sudo пользователя не трогается.
+// Две роли здесь, третья — в `approval.rs`:
 //  - **сервер** (в процессе TUI): unix-сокет; на запрос спрашивает пароль у
 //    человека своим читателем БЕЗ ЭХА и отдаёт ответ. Пароль живёт только в
 //    памяти, ни в лог, ни на диск не попадает.
 //  - **клиент** (`snens askpass <prompt>`): то, что зовёт sudo; берёт у сервера
 //    пароль и печатает его на stdout.
+//  - **шим** (`sudo` в PATH детей) переехал в `approval.rs`: в живой TUI он
+//    транслирует в `sudo -A` (пароль у askpass), а в headless-сессии — в очередь
+//    одобрений владельца кнопкой.
 //
 // Сервера нет (headless `snens run`, выключенный TUI) — клиент не находит сокет,
 // молча выходит с кодом ≠ 0, и sudo мгновенно падает «a password is required»,
@@ -132,23 +132,6 @@ pub fn child_env(sock: &Path, shim_dir: &Path) -> Vec<(String, String)> {
         ("SNENS_ASKPASS_SOCK".into(), sock.display().to_string()),
         ("SUDO_ASKPASS".into(), askpass.display().to_string()),
     ]
-}
-
-/// Шим: вызваны под именем `sudo` — транслируем в системный `sudo -A`. `-A` велит
-/// sudo читать пароль у askpass, а не из терминала.
-#[cfg(not(unix))]
-pub fn shim(_args: Vec<String>) -> R<()> {
-    Err("shim: не поддержан на этой платформе".into())
-}
-
-#[cfg(unix)]
-pub fn shim(args: Vec<String>) -> R<()> {
-    use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new("/usr/bin/sudo")
-        .arg("-A")
-        .args(&args)
-        .exec();
-    Err(format!("sudo: не удалось запустить /usr/bin/sudo: {err}").into())
 }
 
 /// Создать каталог шимов: `sudo` (трансляция в `sudo -A`) и `snens-askpass`
