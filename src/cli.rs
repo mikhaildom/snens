@@ -564,18 +564,37 @@ fn cmd_log(flags: &BTreeMap<String, String>) -> R<()> {
     Ok(())
 }
 
-/// Что видит модель: те же summary/usage, что уезжают в определения тулов.
+/// Что видит модель: встроенные тулы ядра + процессы реестра, теми же
+/// summary/usage, что уезжают в определения. Встроенные печатаются первыми и
+/// отдельной секцией: без них ответ на вопрос «есть ли у меня ctx» был ложью
+/// (модель спрашивала именно этой командой и делала вывод, что тула нет).
 async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
     let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
     let tools = registry::discover(&cfg).await;
     let bin = registry::sync_bin_dir(&cfg, &tools)?;
     println!("каталог тулов: {}", cfg.tools_path().display());
     println!("PATH (дети и человек): {}\n", bin.display());
+    println!("встроенные (ядро, всегда в схеме):");
+    for def in dispatch::builtin_defs() {
+        let name = def
+            .pointer("/function/name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?");
+        let summary = def
+            .pointer("/function/description")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("");
+        println!("  {name}\n    {summary}");
+    }
+    println!("\nреестр (процессы в каталоге тулов):");
     if tools.is_empty() {
-        println!("(пусто)");
+        println!("  (пусто)");
     }
     for t in &tools {
-        println!("{}\n  {}\n  {}", t.name, t.summary, t.usage);
+        println!("  {}\n    {}\n    {}", t.name, t.summary, t.usage);
     }
     Ok(())
 }

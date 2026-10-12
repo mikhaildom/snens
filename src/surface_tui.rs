@@ -532,6 +532,8 @@ mod tests {
             surface: surface.into(),
             state: "idle".into(),
             run_id: None,
+            context_budget: None,
+            context_target: None,
         }
     }
 

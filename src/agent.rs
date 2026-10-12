@@ -187,6 +187,12 @@ async fn run_loop<L: Llm>(
     }
     let (mut defs, reg, path) = dispatch::prepare(cfg).await?;
     defs.extend(surface_tools.clone());
+    // Требование уборки ссылается на `ctx commit`. Если тула в схеме нет,
+    // инструктировать им нельзя: модель либо поверит, что тул есть, и потратит
+    // ходы на несуществующий вызов, либо бросит уборку целиком. Проверяем факт.
+    let ctx_tool = defs
+        .iter()
+        .any(|d| d.pointer("/function/name").and_then(Value::as_str) == Some("ctx"));
     // Справка памяти впрыскивается ровно один раз, перед первым ходом сессии, и
     // записью в лог — проекция дальше читает её оттуда, как всё остальное.
     memory::recall_note(sess, cfg, &path).await;
@@ -276,21 +282,30 @@ async fn run_loop<L: Llm>(
         // о контексте вместо задачи.
         let mut cleanup_requested = false;
         if approx >= pressure_next {
-            cleanup_requested = true;
+            // Даже без `ctx` в схеме автоэлизия уже сработала выше — часть
+            // давления снята. Требование правки зеркала шлём только когда
+            // применить её действительно чем: иначе это приглашение в тупик.
+            cleanup_requested = ctx_tool;
             pressure_next = approx
                 .saturating_add(cfg.context_budget() / 4)
                 .max(approx.saturating_add(1));
+            let text = if ctx_tool {
+                format!("[Уборка рабочего контекста] Сейчас ~{approx} токенов, экономический бюджет {}. Перед продолжением задачи отредактируй {} и вызови ctx commit. Ориентир после уборки — {} токенов. Удали переваренные выводы и законченные ветки, сохрани полезные точные фрагменты и обнови записку для продолжения: цель, ограничения, решения, точные данные, открытые проверки, следующие действия. Не пересказывай историю ради пересказа. Стратегию и объём правок выбираешь ты.", cfg.context_budget(), mirror.path().display(), cfg.context_target())
+            } else {
+                format!("[Уборка рабочего контекста] Сейчас ~{approx} токенов, экономический бюджет {}. Инструмента ctx в этой схеме нет, поэтому правка зеркала не применяется: старые результаты уже схлопнуты автоэлизией. Работай дальше; если контекста не хватит, скажи об этом прямо — уборку сделает человек.", cfg.context_budget())
+            };
             sess.append(Rec::User {
                 ts: log::now(),
                 source: format!("context-cleanup:{pressure_next}"),
-                text: format!("[Уборка рабочего контекста] Сейчас ~{approx} токенов, экономический бюджет {}. Перед продолжением задачи отредактируй {} и вызови ctx commit. Ориентир после уборки — {} токенов. Удали переваренные выводы и законченные ветки, сохрани полезные точные фрагменты и обнови записку для продолжения: цель, ограничения, решения, точные данные, открытые проверки, следующие действия. Не пересказывай историю ради пересказа. Стратегию и объём правок выбираешь ты.", cfg.context_budget(), mirror.path().display(), cfg.context_target()),
-                    parts: Vec::new(),
+                text,
+                parts: Vec::new(),
             })?;
             msgs = mirror.prepare(&sess.read()?, cfg)?;
             project::apply_cleared(&mut msgs, &project::cleared_map(&sess.read()?));
             ui.notice(&format!(
-                "контекст ~{approx}: запрос уборки (бюджет {})",
-                cfg.context_budget()
+                "контекст ~{approx}: запрос уборки (бюджет {}, ctx {})",
+                cfg.context_budget(),
+                if ctx_tool { "есть" } else { "нет" }
             ));
         }
         // Protocol is constant across requests; outside the editable mirror.

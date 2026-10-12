@@ -39,12 +39,7 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
                 .unwrap_or_else(|| "legacy".into());
             sessions.insert(
                 id.to_string(),
-                Session {
-                    id: id.to_string(),
-                    surface,
-                    state: "idle".into(),
-                    run_id: None,
-                },
+                Session::new(id.to_string(), surface),
             );
         }
     }

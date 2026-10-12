@@ -149,7 +149,7 @@ pub async fn dispatch(
                     .to_string()
             }
             "status" => format!(
-                "Зеркало: {}\nБюджет: {} токенов; цель уборки: {}\nПоследняя принятая ревизия: {}",
+                "Зеркало: {}\nБюджет: {} токенов; цель уборки: {}\nТул ctx доступен: да (ты его вызвал — значит он в схеме; commit применит правку)\nПоследняя принятая ревизия: {}",
                 out_dir.join("LIVE_CONTEXT.json").display(),
                 cfg.context_budget(),
                 cfg.context_target(),

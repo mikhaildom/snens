@@ -14,6 +14,14 @@ pub struct Session {
     pub surface: String,
     pub state: String,
     pub run_id: Option<String>,
+    /// Экономический бюджет уборки контекста для этой сессии; пусто — общий
+    /// из конфига. Нужен поверхностям с иной ценой контекста: групповой чат
+    /// живёт долго и просит 100k, тогда как TUI-сессии держат свои 500k.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_budget: Option<u64>,
+    /// Цель после уборки для этой сессии; пусто — общая из конфига.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_target: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Event {
@@ -63,6 +71,20 @@ pub struct Store {
     #[serde(default)]
     pub reviews: BTreeMap<String, u64>,
 }
+impl Session {
+    /// Новая сессия поверхности без per-session бюджета: пороги берутся из конфига.
+    pub fn new(id: impl Into<String>, surface: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            surface: surface.into(),
+            state: "idle".into(),
+            run_id: None,
+            context_budget: None,
+            context_target: None,
+        }
+    }
+}
+
 pub struct Control {
     pub cancel: watch::Sender<bool>,
     pub queued: mpsc::UnboundedSender<crate::agent::QueuedInput>,
@@ -141,7 +163,7 @@ impl Runtime {
 
 fn schema(c: &Connection) -> crate::R<()> {
     c.execute_batch("PRAGMA foreign_keys=ON;
-      CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,surface TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT);
+      CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,surface TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,context_budget INTEGER,context_target INTEGER);
       CREATE TABLE IF NOT EXISTS messages(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL UNIQUE,seq INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE TABLE IF NOT EXISTS attachments(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL,filename TEXT NOT NULL,name TEXT NOT NULL,part TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE UNIQUE INDEX IF NOT EXISTS attachments_command ON attachments(session_id,command_id);
@@ -153,6 +175,15 @@ fn schema(c: &Connection) -> crate::R<()> {
       CREATE TABLE IF NOT EXISTS reviews(session_id TEXT PRIMARY KEY,turns INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS events(session_id TEXT NOT NULL,seq INTEGER NOT NULL,run_id TEXT,kind TEXT NOT NULL,fields TEXT NOT NULL,PRIMARY KEY(session_id,seq),FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE TABLE IF NOT EXISTS event_sequences(session_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);")?;
+    // Старые store.sqlite3 созданы до per-session бюджета: колонки добавляем
+    // отдельно, чтобы обновление бинарника не требовало пересоздания store.
+    for column in ["context_budget INTEGER", "context_target INTEGER"] {
+        if let Err(error) = c.execute(&format!("ALTER TABLE sessions ADD COLUMN {column}"), []) {
+            if !error.to_string().to_lowercase().contains("duplicate column") {
+                return Err(error.into());
+            }
+        }
+    }
     Ok(())
 }
 pub fn persist_store(c: &Connection, d: &Store) -> crate::R<()> {
@@ -165,8 +196,15 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     )?;
     for s in d.sessions.values() {
         tx.execute(
-            "INSERT INTO sessions VALUES(?1,?2,?3,?4)",
-            params![s.id, s.surface, s.state, s.run_id],
+            "INSERT INTO sessions VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                s.id,
+                s.surface,
+                s.state,
+                s.run_id,
+                s.context_budget,
+                s.context_target
+            ],
         )?;
     }
     for (sid, ms) in &d.messages {
@@ -272,13 +310,16 @@ pub fn event_sequences(c: &Connection) -> crate::R<BTreeMap<String, u64>> {
 fn read_store(c: &Connection) -> crate::R<Store> {
     let mut d = Store::default();
     {
-        let mut q = c.prepare("SELECT id,surface,state,run_id FROM sessions ORDER BY id")?;
+        let mut q = c
+            .prepare("SELECT id,surface,state,run_id,context_budget,context_target FROM sessions ORDER BY id")?;
         for row in q.query_map([], |r| {
             Ok(Session {
                 id: r.get(0)?,
                 surface: r.get(1)?,
                 state: r.get(2)?,
                 run_id: r.get(3)?,
+                context_budget: r.get(4)?,
+                context_target: r.get(5)?,
             })
         })? {
             let s = row?;
@@ -517,19 +558,55 @@ mod tests {
         std::env::temp_dir().join(format!("surface-{}", uuid::Uuid::new_v4()))
     }
     #[test]
+    #[test]
+    fn per_session_cleanup_limits_survive_persist_roundtrip() {
+        let dir = temp();
+        let (mut d, db) = open_store(&dir).unwrap();
+        let mut s = Session::new("s", "telegram");
+        s.context_budget = Some(100_000);
+        s.context_target = Some(70_000);
+        d.sessions.insert("s".into(), s);
+        persist(&db, &d).unwrap();
+        let got = read_store(&db).unwrap();
+        assert_eq!(got.sessions["s"].context_budget, Some(100_000));
+        assert_eq!(got.sessions["s"].context_target, Some(70_000));
+        // Сессия без своего порога читается как None, а не как ноль.
+        let mut plain = Session::new("p", "tui");
+        plain.context_budget = None;
+        d.sessions.insert("p".into(), plain);
+        persist(&db, &d).unwrap();
+        let got = read_store(&db).unwrap();
+        assert_eq!(got.sessions["p"].context_budget, None);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_store_without_cleanup_columns_is_migrated() {
+        let dir = temp();
+        fs::create_dir_all(&dir).unwrap();
+        // Store старой сборки: колонок бюджета в sessions ещё нет.
+        {
+            let db = Connection::open(dir.join("store.sqlite3")).unwrap();
+            db.execute_batch(
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY,surface TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT);\
+                 INSERT INTO sessions VALUES('s','telegram','idle',NULL);",
+            )
+            .unwrap();
+        }
+        let (store, db) = open_store(&dir).unwrap();
+        assert_eq!(store.sessions["s"].context_budget, None);
+        assert!(store.sessions["s"].context_target.is_none());
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn emit_load_roundtrip_and_dedup_persist() {
         let dir = temp();
         let (mut d, db) = open_store(&dir).unwrap();
         let id = "s".to_string();
-        d.sessions.insert(
-            id.clone(),
-            Session {
-                id: id.clone(),
-                surface: "test".into(),
-                state: "idle".into(),
-                run_id: None,
-            },
-        );
+        d.sessions.insert(id.clone(), Session::new(id.clone(), "test"));
         d.surface_tools.insert(id.clone(),vec![serde_json::json!({"type":"function","function":{"name":"send_file","parameters":{"type":"object"}}})]);
         d.tool_requests
             .insert("s/r/c".into(), serde_json::json!({"status":"pending"}));
@@ -585,10 +662,9 @@ mod tests {
         d.sessions.insert(
             "s".into(),
             Session {
-                id: "s".into(),
-                surface: "test".into(),
-                state: "running".into(),
                 run_id: Some("r".into()),
+                state: "running".into(),
+                ..Session::new("s", "test")
             },
         );
         d.tool_requests
@@ -629,12 +705,7 @@ mod tests {
         let (mut store, db) = open_store(&dir).unwrap();
         store.sessions.insert(
             "s".into(),
-            Session {
-                id: "s".into(),
-                surface: "test".into(),
-                state: "idle".into(),
-                run_id: None,
-            },
+            Session::new("s", "test"),
         );
         let part = |path: &str, bytes| crate::log::Part {
             kind: "image".into(),

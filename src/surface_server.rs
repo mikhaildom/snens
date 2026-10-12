@@ -17,6 +17,7 @@ use axum::{
 use fs2::FileExt;
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
@@ -406,6 +407,13 @@ async fn tool_result(
 struct Create {
     command_id: String,
     surface: String,
+    /// Необязательный per-session бюджет уборки: поверхность с иной ценой
+    /// контекста не должна диктовать порог остальным сессиям. Ноль — общий
+    /// порог из конфига.
+    #[serde(default)]
+    context_budget: Option<u64>,
+    #[serde(default)]
+    context_target: Option<u64>,
 }
 async fn create(State(s): State<Arc<Runtime>>, Json(b): Json<Create>) -> impl IntoResponse {
     if !rt::valid_id(&b.command_id) || b.surface.is_empty() || b.surface.len() > 80 {
@@ -418,7 +426,11 @@ async fn create(State(s): State<Arc<Runtime>>, Json(b): Json<Create>) -> impl In
     }
     let mut d = s.data.lock().await;
     if let Some(v) = d.commands.get(&b.command_id) {
-        let same = v.get("_surface_request").and_then(|x| x.as_str()) == Some(b.surface.as_str());
+        // Повтор команды обязан совпасть и по бюджету: иначе тихий replay
+        // вернул бы сессию с другим порогом уборки.
+        let same = v.get("_surface_request").and_then(|x| x.as_str()) == Some(b.surface.as_str())
+            && v.get("context_budget").and_then(Value::as_u64) == b.context_budget
+            && v.get("context_target").and_then(Value::as_u64) == b.context_target;
         if !same {
             return err(
                 "idempotency_conflict",
@@ -441,12 +453,9 @@ async fn create(State(s): State<Arc<Runtime>>, Json(b): Json<Create>) -> impl In
                 return err("session_owned", &e.to_string(), StatusCode::CONFLICT).into_response();
             }
         };
-    let session = Session {
-        id: id.clone(),
-        surface: b.surface.clone(),
-        state: "idle".into(),
-        run_id: None,
-    };
+    let mut session = Session::new(id.clone(), b.surface.clone());
+    session.context_budget = b.context_budget.filter(|v| *v > 0);
+    session.context_target = b.context_target.filter(|v| *v > 0);
     d.sessions.insert(id.clone(), session.clone());
     d.events.insert(id.clone(), vec![]);
     d.messages.insert(id.clone(), vec![]);
@@ -475,12 +484,7 @@ async fn get_session(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> i
         return Json(session).into_response();
     }
     let surface = discovery::load_meta_surface(&path).unwrap_or_else(|| "legacy".into());
-    let session = Session {
-        id: id.clone(),
-        surface,
-        state: "idle".into(),
-        run_id: None,
-    };
+    let session = Session::new(id.clone(), surface);
     drop(d);
     s.data
         .lock()
@@ -741,12 +745,10 @@ async fn message(
         let Some(path) = discovery::path(&s.cfg, &id).filter(|path| path.is_file()) else {
             return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
         };
-        let session = Session {
-            id: id.clone(),
-            surface: discovery::load_meta_surface(&path).unwrap_or_else(|| "legacy".into()),
-            state: "idle".into(),
-            run_id: None,
-        };
+        let session = Session::new(
+            id.clone(),
+            discovery::load_meta_surface(&path).unwrap_or_else(|| "legacy".into()),
+        );
         let mut data = s.data.lock().await;
         data.sessions.entry(id.clone()).or_insert(session);
         data.events.entry(id.clone()).or_default();
@@ -1111,6 +1113,21 @@ fn schedule_review(s: Arc<Runtime>, id: String) {
     });
 }
 
+/// Порог уборки контекста для запуска: per-session значение сессии, если оно
+/// задано, иначе общее из конфига. Вынесено из `launch` ради теста: развилка
+/// «сессия диктует свой бюджет или живёт на общем» должна быть проверяемой.
+fn session_cleanup_limits(cfg: &Config, session: Option<&Session>) -> (u64, u64) {
+    let budget = session
+        .and_then(|s| s.context_budget)
+        .filter(|b| *b > 0)
+        .unwrap_or(cfg.context_budget);
+    let target = session
+        .and_then(|s| s.context_target)
+        .filter(|t| *t > 0)
+        .unwrap_or(cfg.context_target);
+    (budget, target)
+}
+
 async fn launch(
     s: Arc<Runtime>,
     id: String,
@@ -1132,7 +1149,13 @@ async fn launch(
     // Новое поколение работы: отложенный таймер авторевью, если ждал, увидит
     // изменение и не запустится посреди этого хода.
     *s.review_gen.lock().await.entry(id.clone()).or_insert(0) += 1;
-    let cfg = s.cfg.clone();
+    let mut cfg = s.cfg.clone();
+    // Per-session порог уборки: у поверхности своя цена контекста (групповой
+    // чат живёт долго и просит 100k), у остальных сессий остаётся общий порог.
+    let session = s.data.lock().await.sessions.get(&id).cloned();
+    let (budget, target) = session_cleanup_limits(&cfg, session.as_ref());
+    cfg.context_budget = budget;
+    cfg.context_target = target;
     let llm = s.llm.clone();
     let surface_tools = s
         .data
@@ -1529,6 +1552,29 @@ mod tests {
     use tokio::sync::{Mutex, broadcast, oneshot};
 
     #[test]
+    fn session_cleanup_limits_prefer_own_budget_over_config() {
+        let mut cfg = Config::default();
+        cfg.context_budget = 500_000;
+        cfg.context_target = 350_000;
+        // Без своей сессии — общий порог конфига.
+        assert_eq!(session_cleanup_limits(&cfg, None), (500_000, 350_000));
+        // Сессия без бюджета — тоже общий порог.
+        assert_eq!(
+            session_cleanup_limits(&cfg, Some(&Session::new("s", "telegram"))),
+            (500_000, 350_000)
+        );
+        // Свой бюджет перебивает конфиг: групповая поверхность не диктует его TUI.
+        let mut own = Session::new("s", "telegram");
+        own.context_budget = Some(100_000);
+        own.context_target = Some(70_000);
+        assert_eq!(session_cleanup_limits(&cfg, Some(&own)), (100_000, 70_000));
+        // Ноль — это «не задано», а не «уборка на нуле».
+        let mut zero = Session::new("s", "telegram");
+        zero.context_budget = Some(0);
+        assert_eq!(session_cleanup_limits(&cfg, Some(&zero)), (500_000, 350_000));
+    }
+
+    #[test]
     fn auto_review_needs_threshold_and_new_turns_since_last() {
         // Порог не взят — ревью нет.
         assert!(!review_due(20, 19, 0));
@@ -1616,12 +1662,7 @@ mod tests {
         for id in ["a", "b"] {
             store.sessions.insert(
                 id.into(),
-                Session {
-                    id: id.into(),
-                    surface: "test".into(),
-                    state: "idle".into(),
-                    run_id: None,
-                },
+                Session::new(id, "test"),
             );
             store.events.insert(id.into(), Vec::new());
         }

@@ -17,6 +17,10 @@ pub struct Session {
     pub surface: String,
     pub state: String,
     pub run_id: Option<String>,
+    #[serde(default)]
+    pub context_budget: Option<u64>,
+    #[serde(default)]
+    pub context_target: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
