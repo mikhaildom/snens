@@ -62,12 +62,34 @@ pub fn privileged_shim(args: Vec<String>) -> R<()> {
     if !allowed {
         return Err("sudo: действие не одобрено владельцем (или истёк срок ожидания)".into());
     }
-    // `-n` — без интерактивного запроса пароля: сработает только под NOPASSWD-правилом.
-    let err = std::process::Command::new("/usr/bin/sudo")
-        .arg("-n")
-        .args(&args)
-        .exec();
+    // Одобрено. Исполняем через root-owned broker с его whitelist, если он есть:
+    // тогда работает только разрешённый набор действий и валидация аргументов.
+    // Broker — граница привилегии, кнопка — только согласие владельца.
+    // `-n` — без запроса пароля: сработает под NOPASSWD-правилом на broker.
+    let mut cmd = std::process::Command::new("/usr/bin/sudo");
+    cmd.arg("-n");
+    if let Some(broker) = privileged_broker() {
+        cmd.arg(broker);
+    }
+    let err = cmd.args(&args).exec();
     Err(format!("sudo: не удалось запустить /usr/bin/sudo: {err}").into())
+}
+
+/// Путь к root-owned broker привилегированных действий, если он установлен.
+/// Значение читается из `SNENS_PRIV` (его ставит харнесс детям), дефолт —
+/// стандартное место установки. Наличие файла проверяем, чтобы безусловно не
+/// обещать канал, которого нет.
+pub fn privileged_broker() -> Option<String> {
+    let candidate = std::env::var("SNENS_PRIV").unwrap_or_else(|_| "/usr/local/bin/snens-priv".into());
+    if candidate.is_empty() {
+        return None;
+    }
+    let path = Path::new(&candidate);
+    if path.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// Отправить заявку и дождаться решения. Строка «allow» — согласие, всё прочее

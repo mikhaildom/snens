@@ -48,6 +48,12 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
                 .to_string(),
         ));
     }
+    // Root-owned broker привилегированных действий: узкий whitelist команд.
+    // Одобренный кнопкой шим исполняет команду только через него. Нет файла —
+    // переменную не ставим: шим честно откажет (`sudo -n` без правила).
+    if let Some(broker) = crate::approval::privileged_broker() {
+        v.push(("SNENS_PRIV".into(), broker));
+    }
     v.push((
         "SNENS_CONTEXT_PATH".into(),
         sess.path()
