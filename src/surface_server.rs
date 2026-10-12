@@ -76,6 +76,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         pending_tools: Default::default(),
         writers: Default::default(),
         event_seq: tokio::sync::Mutex::new(discovered_ids),
+        review_gen: Default::default(),
     });
     let app = Router::new()
         .route("/v1/sessions", get(list).post(create))
@@ -891,6 +892,90 @@ async fn finalize_launch_error(s: &Arc<Runtime>, id: &str, run: &str, message: &
         .await;
 }
 
+/// Пора ли запускать авторевью: набрался порог ходов и с прошлого ревью добавлено
+/// не меньше порога новых ходов. Простой (`review_idle_seconds`) проверяется
+/// отдельно таймером; эта функция — только счётная часть.
+fn review_due(min_turns: usize, turns: usize, last_review_turns: u64) -> bool {
+    min_turns > 0 && turns >= min_turns && (turns as u64).saturating_sub(last_review_turns) >= min_turns as u64
+}
+
+/// Число ходов сессии (ответов ассистента) по её JSONL.
+fn session_turns(cfg: &Config, id: &str) -> usize {
+    let path = cfg.sessions_path().join(format!("{id}.jsonl"));
+    crate::log::read_file(&path)
+        .map(|rs| {
+            rs.iter()
+                .filter(|r| matches!(r, crate::log::Rec::Assistant { .. }))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Планирует авторевью после конца хода. Ревью запускается только при двух
+/// условиях сразу: набралось `review_min_turns` ходов и сессия простояла
+/// `review_idle_seconds` без новой работы. Таймер запоминает поколение работы:
+/// если за время простоя начался новый ход, ревью отменяется — оно дождётся
+/// следующей паузы. `review_idle_seconds = 0` выключает авторевью.
+fn schedule_review(s: Arc<Runtime>, id: String) {
+    let idle = s.cfg.review_idle_seconds;
+    if idle == 0 {
+        return;
+    }
+    let min = s.cfg.review_min_turns;
+    tokio::spawn(async move {
+        let gen = s.review_gen.lock().await.get(&id).copied().unwrap_or(0);
+        // Планировщик стартует на конце хода, а не на его старте: поколение только
+        // что установлено. Ждём простой.
+        tokio::time::sleep(Duration::from_secs(idle)).await;
+        // Простой нарушен — новая работа перезапустит планировщик сама.
+        if s.review_gen.lock().await.get(&id).copied().unwrap_or(0) != gen {
+            return;
+        }
+        // Сессия всё ещё занята? Планировщик хода снял бы поколение, но перестрахуемся.
+        if s.data
+            .lock()
+            .await
+            .sessions
+            .get(&id)
+            .map(|x| x.state != "idle")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let turns = session_turns(&s.cfg, &id);
+        let last = s.data.lock().await.reviews.get(&id).copied().unwrap_or(0);
+        if !review_due(min, turns, last) {
+            return;
+        }
+        // Записываем порог до запуска: даже если процесс ревью не стартует, повтор
+        // немедленно не случится — только после нового роста числа ходов.
+        {
+            let mut d = s.data.lock().await;
+            d.reviews.insert(id.clone(), turns as u64);
+            let _ = s.persist(&d);
+        }
+        if let Err(error) = crate::spawn_review(&s.cfg, &id) {
+            s.emit(
+                &id,
+                None,
+                "notice",
+                serde_json::json!({"text":format!("не удалось запустить авторевью: {error}")}),
+            )
+            .await
+            .ok();
+            return;
+        }
+        s.emit(
+            &id,
+            None,
+            "notice",
+            serde_json::json!({"text":"запущено саморевью сессии (фоном)"}),
+        )
+        .await
+        .ok();
+    });
+}
+
 async fn launch(
     s: Arc<Runtime>,
     id: String,
@@ -909,6 +994,9 @@ async fn launch(
             queued: queue_tx,
         },
     );
+    // Новое поколение работы: отложенный таймер авторевью, если ждал, увидит
+    // изменение и не запустится посреди этого хода.
+    *s.review_gen.lock().await.entry(id.clone()).or_insert(0) += 1;
     let cfg = s.cfg.clone();
     let llm = s.llm.clone();
     let surface_tools = s
@@ -1125,6 +1213,12 @@ async fn launch(
             x.run_id = None
         }
         let _ = s.persist(&d);
+        drop(d);
+        // Ход завершён и сессия снова idle — планируем авторевью после простоя.
+        // Считаем только успешные ходы: отменённый/ошибочный ход ревью не стоит.
+        if status == "ok" {
+            schedule_review(s.clone(), id.clone());
+        }
     });
 }
 #[derive(Deserialize)]
@@ -1299,6 +1393,20 @@ mod tests {
     use futures_util::StreamExt;
     use tokio::sync::{Mutex, broadcast, oneshot};
 
+    #[test]
+    fn auto_review_needs_threshold_and_new_turns_since_last() {
+        // Порог не взят — ревью нет.
+        assert!(!review_due(20, 19, 0));
+        // Порог взят, ревью не было — пора.
+        assert!(review_due(20, 20, 0));
+        // Ревью было на 20, набралось только 30 — ещё рано (нужно +20).
+        assert!(!review_due(20, 30, 20));
+        // Ревью было на 20, дошло до 40 — снова пора.
+        assert!(review_due(20, 40, 20));
+        // Нулевой порог выключает авторевью.
+        assert!(!review_due(0, 1000, 0));
+    }
+
     #[tokio::test]
     async fn failed_launch_clears_running_state_and_cancels_queued_messages() {
         let (runtime, dir) = runtime().await;
@@ -1396,6 +1504,7 @@ mod tests {
                 pending_tools: Default::default(),
                 writers: Default::default(),
                 event_seq: Default::default(),
+                review_gen: Default::default(),
             }),
             dir,
         )

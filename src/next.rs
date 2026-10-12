@@ -26,7 +26,7 @@ pub async fn entry() -> R<()> {
     // build/improve/model here: those can overwrite the working installation.
     if matches!(
         cmd,
-        "run" | "run-child" | "steer" | "agents" | "result" | "show" | "log"
+        "run" | "run-child" | "steer" | "agents" | "result" | "show" | "log" | "review"
     ) {
         if std::env::var_os("SNENS_NEXT_INTERNAL").is_none() {
             return Err("internal command: use snens-next tui for the API".into());
@@ -248,9 +248,13 @@ fn isolate(source: &str, data: &Path) -> R<Config> {
             toml::Value::String(data.join(name).display().to_string()),
         );
     }
-    // An experimental run must not schedule production review or retain test memory.
-    doc.insert("review_min_turns".into(), toml::Value::Integer(i64::MAX));
+    // Память экспериментального прогона не трогает общий банк: канал выключен.
     doc.insert("memory".into(), toml::Value::Table(toml::Table::new()));
+    // Авторевью управляется самим runtime.toml. Раньше экспериментальный инстанс
+    // глушил его `review_min_turns = MAX`; при снятом изоляционном конфиге этот
+    // ключ остаётся в source и выключил бы триггер — снимаем его, берётся дефолт.
+    // Ревью читает и пишет только в изолированный data-dir, производства не касается.
+    doc.remove("review_min_turns");
     let runtime = data.join("runtime.toml");
     std::fs::write(&runtime, toml::to_string_pretty(&doc)?)?;
     #[cfg(unix)]

@@ -365,7 +365,7 @@ pub async fn autopilot(cfg: &cfg::Config, id: &str) -> R<()> {
 ///
 /// Ждём только факт запуска, не завершения. Вывод — в файл `<id>-review.log`
 /// рядом с сессией: там видно, чем кончилось фоновое ревью.
-fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
+pub(crate) fn spawn_review(cfg: &cfg::Config, id: &str) -> R<()> {
     // Блокируем SIGHUP на весь критический участок: закрытие окна терминала шлёт
     // SIGHUP всей foreground-группе, и без этого родитель умрёт, не успев даже
     // создать лог, а форкнутый ребёнок — до того, как pre_exec дозвонит setsid.

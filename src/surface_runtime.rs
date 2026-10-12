@@ -58,6 +58,10 @@ pub struct Store {
     pub tool_results: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub tool_requests: BTreeMap<String, serde_json::Value>,
+    /// Сколько ходов было в сессии на момент последнего запуска авторевью.
+    /// Нужно, чтобы ревью не повторялось, пока не наберётся ещё `review_min_turns`.
+    #[serde(default)]
+    pub reviews: BTreeMap<String, u64>,
 }
 pub struct Control {
     pub cancel: watch::Sender<bool>,
@@ -79,6 +83,10 @@ pub struct Runtime {
     /// Exclusive JSONL writer handles. The log lock is held for each Session lifetime.
     pub writers: Mutex<BTreeMap<String, Arc<crate::log::Session>>>,
     pub event_seq: Mutex<BTreeMap<String, u64>>,
+    /// Поколение работы сессии: растёт на каждом старте хода. Отложенный таймер
+    /// авторевью запоминает поколение и отменяется, если оно изменилось — тогда
+    /// за время простоя началась новая работа и ревью ждёт следующей паузы.
+    pub review_gen: Mutex<BTreeMap<String, u64>>,
 }
 impl Runtime {
     pub fn persist(&self, data: &Store) -> crate::R<()> {
@@ -138,6 +146,7 @@ fn schema(c: &Connection) -> crate::R<()> {
       CREATE TABLE IF NOT EXISTS surface_tools(session_id TEXT PRIMARY KEY,definitions TEXT NOT NULL,FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE TABLE IF NOT EXISTS tool_results(action_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tool_requests(action_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS reviews(session_id TEXT PRIMARY KEY,turns INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS events(session_id TEXT NOT NULL,seq INTEGER NOT NULL,run_id TEXT,kind TEXT NOT NULL,fields TEXT NOT NULL,PRIMARY KEY(session_id,seq),FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE TABLE IF NOT EXISTS event_sequences(session_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);")?;
     Ok(())
@@ -148,7 +157,7 @@ pub fn persist_store(c: &Connection, d: &Store) -> crate::R<()> {
 fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     let tx = c.unchecked_transaction()?;
     tx.execute_batch(
-        "DELETE FROM events; DELETE FROM tool_results; DELETE FROM tool_requests; DELETE FROM surface_tools; DELETE FROM message_attachments; DELETE FROM attachments; DELETE FROM messages; DELETE FROM commands; DELETE FROM sessions;",
+        "DELETE FROM events; DELETE FROM tool_results; DELETE FROM tool_requests; DELETE FROM surface_tools; DELETE FROM reviews; DELETE FROM message_attachments; DELETE FROM attachments; DELETE FROM messages; DELETE FROM commands; DELETE FROM sessions;",
     )?;
     for s in d.sessions.values() {
         tx.execute(
@@ -234,6 +243,12 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
         tx.execute(
             "INSERT INTO tool_requests VALUES(?1,?2)",
             params![id, serde_json::to_string(payload)?],
+        )?;
+    }
+    for (id, turns) in &d.reviews {
+        tx.execute(
+            "INSERT INTO reviews VALUES(?1,?2)",
+            params![id, *turns as i64],
         )?;
     }
     tx.commit()?;
@@ -382,6 +397,13 @@ fn read_store(c: &Connection) -> crate::R<Store> {
         for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (id, p) = row?;
             d.commands.insert(id, serde_json::from_str(&p)?);
+        }
+    }
+    {
+        let mut q = c.prepare("SELECT session_id,turns FROM reviews")?;
+        for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))? {
+            let (id, turns) = row?;
+            d.reviews.insert(id, turns);
         }
     }
     Ok(d)
