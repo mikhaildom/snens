@@ -101,6 +101,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/history", get(history))
         .route("/v1/model", get(get_model).put(put_model))
+        .route("/v1/memory", get(get_memory).put(put_memory))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(token, auth));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -180,6 +181,73 @@ async fn put_model(State(s): State<Arc<Runtime>>, Json(body): Json<ModelBody>) -
             .into_response(),
         Err(e) => err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
     }
+}
+
+/// Состояние канала долгой памяти: тумблеры читаются перечитанными из конфига,
+/// как модель. Правки — те же ключи `[memory]`, что у `snens memory …`.
+async fn get_memory(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
+    let mem = s.cfg.memory_now();
+    Json(serde_json::json!({
+        "enabled": mem.enabled,
+        "recall": match mem.recall {
+            crate::cfg::RecallMode::Always => "always",
+            crate::cfg::RecallMode::Session => "session",
+            crate::cfg::RecallMode::Off => "off",
+        },
+        "retain": mem.retain,
+        "cmd": mem.cmd,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct MemoryBody {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    recall: Option<String>,
+    #[serde(default)]
+    retain: Option<bool>,
+}
+
+/// Сменить тумблеры памяти и сразу сделать их текущими для новых ходов
+/// (перечитка в память-модуле). Активный ход не трогаем.
+async fn put_memory(State(s): State<Arc<Runtime>>, Json(body): Json<MemoryBody>) -> impl IntoResponse {
+    if body.enabled.is_none() && body.recall.is_none() && body.retain.is_none() {
+        return err("invalid", "empty memory patch", StatusCode::BAD_REQUEST).into_response();
+    }
+    let mut changes: Vec<(&str, String)> = Vec::new();
+    if let Some(v) = body.enabled {
+        changes.push(("enabled", v.to_string()));
+    }
+    if let Some(v) = &body.recall {
+        if !matches!(v.as_str(), "always" | "session" | "off") {
+            return err("invalid", "recall must be always|session|off", StatusCode::BAD_REQUEST)
+                .into_response();
+        }
+        changes.push(("recall", format!("\"{v}\"")));
+    }
+    if let Some(v) = body.retain {
+        changes.push(("retain", v.to_string()));
+    }
+    for (key, value) in changes {
+        if let Err(e) = s.cfg.set_memory_key(key, &value) {
+            return err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response();
+        }
+    }
+    // Ответ — новое состояние канала.
+    let mem = s.cfg.memory_now();
+    Json(serde_json::json!({
+        "enabled": mem.enabled,
+        "recall": match mem.recall {
+            crate::cfg::RecallMode::Always => "always",
+            crate::cfg::RecallMode::Session => "session",
+            crate::cfg::RecallMode::Off => "off",
+        },
+        "retain": mem.retain,
+    }))
+    .into_response()
 }
 
 async fn list(State(s): State<Arc<Runtime>>) -> impl IntoResponse {

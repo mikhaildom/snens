@@ -315,6 +315,11 @@ pub async fn selftest() -> R<()> {
     );
 
     cfg3.memory.cmd = "memory".into();
+    // Канал включён и справка — на каждый ход: selftest проверяет сам контракт
+    // argv, а не дефолтную политику (она в unit-тестах cfg).
+    cfg3.memory.enabled = true;
+    cfg3.memory.recall = crate::cfg::RecallMode::Always;
+    cfg3.memory.retain = true;
     let sess3 = Session::open(&dir, "t3")?;
     sess3.append(Rec::User {
         ts: log::now(),

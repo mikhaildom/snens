@@ -13,6 +13,7 @@ use std::{collections::BTreeMap, io::IsTerminal, path::PathBuf, sync::Arc};
 use crate::{agent, cfg::Config, input, input::In, llm, log, mail, render::Ui, R};
 
 const HELP: &str = "/new — новая сессия · /reasoning — скрыть/показать рассуждение · \
+/memory [on|off] — долгая память · \
 /compact [инструкция] — уборка контекста · /help · /quit (или Ctrl+D) · Ctrl+C — отменить ход · во время хода строка уходит агенту \
 как steer (после текущего шага)";
 
@@ -86,6 +87,27 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
                         "скрыто"
                     }
                 ));
+                continue;
+            }
+            "/memory" => {
+                let mem = cfg.memory_now();
+                ui.line(&format!(
+                    "память: {} · справка {} · запись хода {}",
+                    if mem.enabled { "вкл" } else { "выкл" },
+                    match mem.recall {
+                        crate::cfg::RecallMode::Always => "каждый ход",
+                        crate::cfg::RecallMode::Session => "раз на сессию",
+                        crate::cfg::RecallMode::Off => "нет",
+                    },
+                    if mem.retain { "да" } else { "нет" },
+                ));
+                ui.line("сменить: /memory on|off (конфиг, действует со следующего хода)");
+                continue;
+            }
+            "/memory on" | "/memory off" => {
+                let on = line.ends_with("on");
+                cfg.set_memory_key("enabled", if on { "true" } else { "false" })?;
+                ui.line(&format!("память: {}", if on { "вкл" } else { "выкл" }));
                 continue;
             }
             _ => {}

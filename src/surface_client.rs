@@ -178,6 +178,18 @@ impl Client {
             .ok_or_else(|| "invalid API response: no model".to_owned())
     }
 
+    /// Состояние канала долгой памяти (тумблеры читаются сервером из конфига).
+    pub async fn memory(&self) -> Result<Value, String> {
+        self.json(reqwest::Method::GET, "/v1/memory", None).await
+    }
+
+    /// Сменить тумблеры памяти (то же, что `snens memory …`). `patch` —
+    /// объект с полями `enabled`/`recall`/`retain`.
+    pub async fn set_memory(&self, patch: Value) -> Result<Value, String> {
+        self.json(reqwest::Method::PUT, "/v1/memory", Some(patch))
+            .await
+    }
+
     pub async fn get_session(&self, id: &str) -> Result<Session, String> {
         self.json(
             reqwest::Method::GET,

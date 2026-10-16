@@ -4,15 +4,24 @@
 use serde_json::json;
 
 use crate::{
-    cfg::Config,
+    cfg::{Config, RecallMode},
     exec,
     log::{self, Rec, Session},
 };
 
+/// Справка памяти — дорогая строка: она уезжает в префикс и остаётся там до
+/// конца сессии (лимит вывода ниже — 8000 байт, ~3–4к токенов). Поэтому
+/// впрыскивается не на каждый ход, а по режиму `memory.recall`.
 pub async fn recall_note(sess: &Session, cfg: &Config, path: &str) {
-    let Some(bin) = cfg.memory_bin() else {
+    // Секцию берём перечитанной из файла: `snens memory …` правит только файл,
+    // а поверхность живёт долго — тумблер должен действовать со следующего хода.
+    let mem = cfg.memory_now();
+    let Some(bin) = cfg.memory_bin_for(&mem) else {
         return;
     };
+    if mem.recall == RecallMode::Off {
+        return;
+    }
     let Ok(log) = sess.read() else { return };
     // Свежий ход = последняя запись — запрос человека. Resume справку не
     // впрыскивает второй раз: запись уже в логе, префикс не сдвигается.
@@ -26,10 +35,27 @@ pub async fn recall_note(sess: &Session, cfg: &Config, path: &str) {
     if source == "review" || source == "improve" {
         return;
     }
+    // Режим `session`: одна справка на сессию. Сессия на поверхности живёт
+    // долго (несколько сообщений человека), и повторять ту же справку на каждое
+    // из них незачем — она уже в контексте. Явный повтор — ручной `memory recall`.
+    if mem.recall == RecallMode::Session {
+        let mut fresh = false;
+        for r in log.iter().rev() {
+            match r {
+                Rec::Recall { .. } => fresh = true,
+                // Справка, впрыснутая до этого запроса, — уже фон, не повторяем.
+                Rec::User { .. } => break,
+                _ => {}
+            }
+        }
+        if fresh {
+            return;
+        }
+    }
     let bin = bin.to_string_lossy().into_owned();
     let mut sp = exec::Spawn::argv(&bin, vec!["recall".into(), text]);
     sp.path = Some(path);
-    sp.timeout_s = cfg.memory.timeout_seconds;
+    sp.timeout_s = mem.timeout_seconds;
     sp.cap = 8000;
     match exec::spawn(sp).await {
         Ok(o) if o.exit == 0 && !o.text.trim().is_empty() => {
@@ -54,9 +80,15 @@ pub async fn recall_note(sess: &Session, cfg: &Config, path: &str) {
 /// Что из хода становится фактом — решает провайдер, а не харнесс: ядро отдаёт
 /// пару «запрос/ответ» JSON-ом и на этом заканчивает.
 pub async fn retain_turn(sess: &Session, cfg: &Config, path: &str, answer: &str) {
-    let Some(bin) = cfg.memory_bin() else {
+    // Запись выключена в конфиге — не зовём провайдера вообще (это сетевой
+    // вызов и запись в чужой стек на каждый ответ). Секцию берём перечитанной.
+    let mem = cfg.memory_now();
+    let Some(bin) = cfg.memory_bin_for(&mem) else {
         return;
     };
+    if !mem.retain {
+        return;
+    }
     if answer.trim().is_empty() {
         return;
     }
@@ -81,7 +113,7 @@ pub async fn retain_turn(sess: &Session, cfg: &Config, path: &str, answer: &str)
         "--context".to_string(),
         format!("сессия snens {session}"),
     ];
-    for t in &cfg.memory.tag {
+    for t in &mem.tag {
         args.push("--tag".into());
         args.push(t.clone());
     }
@@ -89,7 +121,7 @@ pub async fn retain_turn(sess: &Session, cfg: &Config, path: &str, answer: &str)
     let mut sp = exec::Spawn::argv(&bin, args);
     sp.stdin = Some(json!({"user": text, "assistant": answer}).to_string());
     sp.path = Some(path);
-    sp.timeout_s = cfg.memory.timeout_seconds;
+    sp.timeout_s = mem.timeout_seconds;
     sp.cap = 2000;
     match exec::spawn(sp).await {
         Ok(o) if o.exit == 0 => {}

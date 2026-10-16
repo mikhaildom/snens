@@ -15,7 +15,7 @@ use std::{
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-const HELP: &str = "/new · /sessions · /resume ID · /stop · /reasoning · /compact [инструкция] · /model [slug] · /help · /quit (Ctrl+D); Ctrl+C — stop текущего run · sudo/секреты пока не поддерживаются";
+const HELP: &str = "/new · /sessions · /resume ID · /stop · /reasoning · /memory [on|off] · /compact [инструкция] · /model [slug] · /help · /quit (Ctrl+D); Ctrl+C — stop текущего run · sudo/секреты пока не поддерживаются";
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 enum Notice {
@@ -367,6 +367,31 @@ async fn command(
         match client.set_model(slug).await {
             Ok(model) => ui.line(&format!("модель: {model} (применится к следующему ходу)")),
             Err(e) => ui.line(&format!("ошибка модели: {e}")),
+        }
+        return Ok(false);
+    }
+    if line == "/memory" {
+        match client.memory().await {
+            Ok(v) => ui.line(&format!(
+                "память: {} · справка {} · запись хода {} · cmd {}",
+                if v["enabled"] == true { "вкл" } else { "выкл" },
+                v["recall"].as_str().unwrap_or("?"),
+                if v["retain"] == true { "да" } else { "нет" },
+                v["cmd"].as_str().unwrap_or("(нет)"),
+            )),
+            Err(e) => ui.line(&format!("ошибка памяти: {e}")),
+        }
+        ui.line("сменить: /memory on|off (действует со следующего хода)");
+        return Ok(false);
+    }
+    if line == "/memory on" || line == "/memory off" {
+        let on = line.ends_with("on");
+        match client
+            .set_memory(serde_json::json!({"enabled": on}))
+            .await
+        {
+            Ok(_) => ui.line(&format!("память: {}", if on { "вкл" } else { "выкл" })),
+            Err(e) => ui.line(&format!("ошибка памяти: {e}")),
         }
         return Ok(false);
     }

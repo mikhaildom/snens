@@ -51,6 +51,8 @@ snens — узкое ядро агента
   snens tickets show <имя> | grep <текст> | stats
   snens tools
   snens model [slug]             # без аргумента — какая сейчас; со slug — сменить в конфиге
+  snens memory [on|off] [recall always|session|off] [retain on|off]
+                                 # тумблер долгой памяти: справка на ход и запись хода
   snens build [<tool>…]          # без аргументов весь workspace, с аргументами — только названные тулы
   snens review [--session ID]
   snens improve
@@ -104,6 +106,7 @@ async fn legacy_main() -> R<()> {
         Some("tickets") => tickets::cmd(&flags, positional),
         Some("tools") => cmd_tools(&flags).await,
         Some("model") => cmd_model(&flags, positional),
+        Some("memory") => cmd_memory(&flags, positional),
         Some("build") => cmd_build(&flags, positional),
         Some("review") => review::cmd(&flags).await,
         Some("improve") => improve::cmd(&flags).await,
@@ -596,6 +599,68 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
     for t in &tools {
         println!("  {}\n    {}\n    {}", t.name, t.summary, t.usage);
     }
+    Ok(())
+}
+
+/// `snens memory` — состояние канала долгой памяти и правка его ключей.
+/// Без аргументов печатает `enabled`/`recall`/`retain`/`cmd`; с аргументами
+/// правит указанные ключи в `[memory]` конфига. Действует со следующего хода:
+/// живой процесс перечитывает секцию на старте цикла (`Config::memory_now`).
+fn cmd_memory(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
+    if flags.contains_key("help") || flags.contains_key("h") {
+        println!(
+            "snens memory [on|off] [recall always|session|off] [retain on|off]\n\
+             \x20 без аргументов — показать состояние; аргументы правят конфиг"
+        );
+        return Ok(());
+    }
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let mut changes: Vec<(&str, String)> = Vec::new();
+    let mut it = positional.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "on" => changes.push(("enabled", "true".into())),
+            "off" => changes.push(("enabled", "false".into())),
+            "recall" => {
+                let v = it.next().ok_or("memory recall: нужен режим")?;
+                match v.as_str() {
+                    "always" | "session" | "off" => {
+                        changes.push(("recall", format!("\"{v}\"")))
+                    }
+                    other => return Err(format!("memory recall: неизвестный режим {other}").into()),
+                }
+            }
+            "retain" => {
+                let v = it.next().ok_or("memory retain: нужен on|off")?;
+                match v.as_str() {
+                    "on" => changes.push(("retain", "true".into())),
+                    "off" => changes.push(("retain", "false".into())),
+                    other => return Err(format!("memory retain: неизвестно {other}").into()),
+                }
+            }
+            other => return Err(format!("memory: непонятный аргумент {other}").into()),
+        }
+    }
+    if changes.is_empty() {
+        let mem = cfg.memory_now();
+        println!(
+            "enabled={}\nrecall={}\nretain={}\ncmd={}",
+            mem.enabled,
+            match mem.recall {
+                cfg::RecallMode::Always => "always",
+                cfg::RecallMode::Session => "session",
+                cfg::RecallMode::Off => "off",
+            },
+            mem.retain,
+            if mem.cmd.is_empty() { "(нет)" } else { &mem.cmd },
+        );
+        return Ok(());
+    }
+    let mut path = None;
+    for (key, value) in changes {
+        path = Some(cfg.set_memory_key(key, &value)?);
+    }
+    println!("{}", path.map(|p| p.display().to_string()).unwrap_or_default());
     Ok(())
 }
 

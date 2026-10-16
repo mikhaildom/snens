@@ -134,17 +134,59 @@ pub struct ModelProfile {
     pub context_target: u64,
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+/// Как часто справка памяти впрыскивается в контекст. Разница не косметическая:
+/// справка уезжает в префикс навсегда, поэтому `always` на простом чате стоит
+/// ~3–4к токенов на каждое сообщение.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RecallMode {
+    /// Каждый ход: как было до этой правки.
+    Always,
+    /// Одна справка на сессию (дефолт): контекст к следующему сообщению уже накоплен.
+    #[default]
+    Session,
+    /// Не впрыскивать: поиск остаётся доступен модели вызовом тула `memory recall`.
+    Off,
+}
+
+#[derive(Deserialize, Clone, Debug)]
 pub struct Memory {
     /// Имя программы в каталоге тулов (или путь, если со слэшем).
     #[serde(default)]
     pub cmd: String,
+    /// Мастер-выключатель канала: `false` — ни recall, ни retain не зовутся,
+    /// как будто `cmd` пуст. Правки подрежимов при этом сохраняются.
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// Когда впрыскивать справку. Действует только при `enabled`.
+    #[serde(default)]
+    pub recall: RecallMode,
+    /// Писать ли ход в банк. Не влияет на контекст, но это сетевой вызов на
+    /// каждый ответ и запись в чужой стек — для простого чата его выключают.
+    #[serde(default = "d_true")]
+    pub retain: bool,
     /// Таймаут одного вызова, секунды: канал вспомогательный, ход его не ждёт.
     #[serde(default = "d_mem_timeout")]
     pub timeout_seconds: u64,
     /// Теги записи — свой канал в общем банке (у Гермеса свой).
     #[serde(default)]
     pub tag: Vec<String>,
+}
+
+/// Дефолты секции для `#[serde(default)]` на поле: `enabled = true`, режим
+/// справки — раз на сессию, запись включена. Явный `Memory::default()`
+/// (например, у экспериментального инстанса) намеренно даёт выключенный канал.
+impl Default for Memory {
+    fn default() -> Self {
+        Self {
+            cmd: String::new(),
+            enabled: false,
+            recall: RecallMode::Off,
+            retain: false,
+            timeout_seconds: d_mem_timeout(),
+            tag: Vec::new(),
+        }
+    }
 }
 
 fn d_base_url() -> String {
@@ -394,9 +436,18 @@ impl Config {
     }
 
     /// Программа долгой памяти: имя — из каталога тулов (там же, где `bin/`),
-    /// путь со слэшем — как задан. Пусто — канала нет.
+    /// путь со слэшем — как задан. Пусто или канал выключен — канала нет.
     pub fn memory_bin(&self) -> Option<PathBuf> {
-        let cmd = self.memory.cmd.trim();
+        self.memory_bin_for(&self.memory)
+    }
+
+    /// То же, но для секции, перечитанной на ходу (`memory_now`): тумблер должен
+    /// действовать на следующем ходу, а не после перезапуска сервиса.
+    pub fn memory_bin_for(&self, mem: &Memory) -> Option<PathBuf> {
+        if !mem.enabled {
+            return None;
+        }
+        let cmd = mem.cmd.trim();
         if cmd.is_empty() {
             return None;
         }
@@ -474,6 +525,96 @@ impl Config {
         Ok(path)
     }
 
+    /// Правка одного ключа секции `[memory]`: текстовая, как `set_model`, —
+    /// комментарии человека в конфиге не сносим. Секции нет — создаём.
+    /// `value` — готовая строка значения (`true`, `"session"`).
+    pub fn set_memory_key(&self, key: &str, value: &str) -> R<PathBuf> {
+        let path = match &self.source_path {
+            Some(p) => p.clone(),
+            None => config_path(),
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+        };
+        let line = format!("{key} = {value}");
+        let mut out = String::new();
+        let mut in_memory = false;
+        let mut seen_section = false;
+        let mut done = false;
+        // Заголовок следующей секции (или конец файла) — точка, где дописываем
+        // ключ в `[memory]`, если его там не было. Новую секцию здесь не
+        // создаём: до конца файла ещё может встретиться настоящая `[memory]`.
+        let flush = |out: &mut String, in_memory: bool, done: &mut bool| {
+            if in_memory && !*done {
+                out.push_str(&line);
+                out.push('\n');
+                *done = true;
+            }
+        };
+        for raw in text.lines() {
+            let trimmed = raw.trim_start();
+            if trimmed.starts_with('[') {
+                flush(&mut out, in_memory, &mut done);
+                in_memory = trimmed.starts_with("[memory]");
+                seen_section |= in_memory;
+                out.push_str(raw);
+                out.push('\n');
+                continue;
+            }
+            let is_key = in_memory
+                && !done
+                && trimmed
+                    .strip_prefix(key)
+                    .map(|rest| rest.trim_start().starts_with('='))
+                    .unwrap_or(false);
+            if is_key {
+                out.push_str(&line);
+                out.push('\n');
+                done = true;
+                continue;
+            }
+            out.push_str(raw);
+            out.push('\n');
+        }
+        flush(&mut out, in_memory, &mut done);
+        // Ключ не нашёлся и секции не было вовсе — создаём её здесь (flush не
+        // знает про `seen_section`, чтобы не дублировать вставку).
+        if !done && !seen_section {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str("[memory]\n");
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, out)?;
+        // Проверяем, что конфиг остался валидным.
+        Config::load(Some(&path.display().to_string()))?;
+        Ok(path)
+    }
+
+    /// Секция памяти для нового хода: перечитать из файла. Поверхности живут
+    /// долго, а `snens memory …` правит только файл — без перечитки тумблер не
+    /// действовал бы до перезапуска сервиса. Файла нет или он сломан — снимок
+    /// старта: правка конфига под руками не должна ронять ход.
+    pub fn memory_now(&self) -> Memory {
+        let Some(path) = &self.source_path else {
+            return self.memory.clone();
+        };
+        match std::fs::read_to_string(path) {
+            Ok(text) => match toml::from_str::<Config>(&text) {
+                Ok(fresh) => fresh.memory,
+                Err(_) => self.memory.clone(),
+            },
+            Err(_) => self.memory.clone(),
+        }
+    }
+
     /// Модель для нового хода: перечитать из файла.
     /// Долгоживущий процесс (сервер API) держит снимок конфига, а `snens model
     /// <slug>` правит только файл — без перечитки новый ход уходит старой моделью.
@@ -546,6 +687,78 @@ impl Config {
 mod tests {
     use super::*;
 
+    #[test]
+    fn memory_section_defaults_and_switches() {
+        // Секции нет — канал выключен: чистая установка не платит за модуль.
+        let cfg = Config::default();
+        assert!(!cfg.memory.enabled);
+        assert_eq!(cfg.memory.recall, RecallMode::Off);
+        assert!(!cfg.memory.retain);
+        assert!(cfg.memory_bin().is_none());
+
+        // Дефолты полей секции: enabled=true, recall=session, retain=true.
+        let cfg: Config = toml::from_str("[memory]\ncmd = \"memory\"\n").unwrap();
+        assert!(cfg.memory.enabled);
+        assert_eq!(cfg.memory.recall, RecallMode::Session);
+        assert!(cfg.memory.retain);
+
+        // Мастер-выключатель гасит канал даже с заданным cmd.
+        let cfg: Config = toml::from_str(
+            "[memory]\ncmd = \"memory\"\nenabled = false\nrecall = \"always\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.memory.recall, RecallMode::Always);
+        assert!(cfg.memory_bin_for(&cfg.memory).is_none());
+    }
+
+    #[test]
+    fn set_memory_key_edits_section_in_place() {
+        let dir = std::env::temp_dir().join(format!("snens-cfg-mem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "model = \"m\"\n\n[memory]\n# комментарий человека\ncmd = \"memory\"\nretain = true\n\n[models.\"x\"]\ncontext_budget = 1\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path.display().to_string())).unwrap();
+        cfg.set_memory_key("recall", "\"always\"").unwrap();
+        cfg.set_memory_key("retain", "false").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Комментарий человека и вторая секция целы.
+        assert!(text.contains("# комментарий человека"), "{text}");
+        assert!(text.contains("[models.\"x\"]"), "{text}");
+        let reloaded = Config::load(Some(&path.display().to_string())).unwrap();
+        assert_eq!(reloaded.memory.recall, RecallMode::Always);
+        assert!(!reloaded.memory.retain);
+        assert_eq!(reloaded.models["x"].context_budget, 1);
+
+        // Ключа нет — он добавляется в существующую секцию, не создаётся новая.
+        cfg.set_memory_key("enabled", "true").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("[memory]").count(), 1, "{text}");
+        assert!(
+            Config::load(Some(&path.display().to_string()))
+                .unwrap()
+                .memory
+                .enabled,
+            "enabled не применился"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_memory_key_creates_section_when_missing() {
+        let dir = std::env::temp_dir().join(format!("snens-cfg-mem2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"m\"\n").unwrap();
+        let cfg = Config::load(Some(&path.display().to_string())).unwrap();
+        cfg.set_memory_key("enabled", "false").unwrap();
+        let reloaded = Config::load(Some(&path.display().to_string())).unwrap();
+        assert!(!reloaded.memory.enabled);
+        std::fs::remove_dir_all(&dir).ok();
+    }
     #[test]
     fn context_defaults_and_auto_windows() {
         let cfg = Config::default();
