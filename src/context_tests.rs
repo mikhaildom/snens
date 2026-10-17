@@ -82,6 +82,36 @@ fn note(doc: &mut Document, text: &str) {
     });
 }
 
+/// Повтор `ctx commit` без правки обязан говорить, что ревизия уже принята:
+/// голое «unchanged» модель читает как «не прошло» и повторяет вызов.
+#[test]
+fn repeated_commit_reports_already_applied_revision() {
+    let f = Fixture::new();
+    f.user("start");
+    let mut m = Mirror::open(&f.sess, &f.cfg).unwrap();
+    m.prepare(&f.sess.read().unwrap(), &f.cfg).unwrap();
+    assert_eq!(m.apply(&f.sess, &f.cfg).unwrap(), None, "правки нет");
+
+    // До первой ревизии — честное «нечего применять».
+    let first = Mirror::noop_outcome(&f.sess);
+    assert!(first.starts_with("context unchanged"), "{first}");
+
+    let mut d = document(&m);
+    note(&mut d, "записка");
+    save(&m, &d);
+    assert!(m
+        .apply(&f.sess, &f.cfg)
+        .unwrap()
+        .unwrap()
+        .starts_with("context applied:"));
+
+    // После принятой ревизии повторный commit отвечает про принятую ревизию
+    // и явно говорит, что повторять не нужно.
+    let again = Mirror::noop_outcome(&f.sess);
+    assert!(again.starts_with("context already applied: revision "), "{again}");
+    assert!(again.contains("повторять commit не нужно"), "{again}");
+}
+
 #[test]
 fn forty_k_unelided_multiple_revisions_resume_and_append_only() {
     let f = Fixture::new();

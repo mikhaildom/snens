@@ -143,6 +143,27 @@ impl Mirror {
         Ok(messages)
     }
 
+    /// Итог `ctx commit`, когда в зеркале нет правки.
+    ///
+    /// Голое «unchanged» модель читает как «коммит не прошёл» и повторяет его
+    /// (тикет `context-commit-confirmation-loop`: до 7 лишних `ctx commit`
+    /// подряд). Если в журнале уже есть принятая ревизия — говорим об этом
+    /// прямо и с номером: подтверждать нечего, повтор ничего не изменит.
+    pub fn noop_outcome(sess: &Session) -> String {
+        let applied = sess.read().ok().and_then(|raw| {
+            raw.into_iter().rev().find_map(|r| match r {
+                Rec::ContextRevision { anchor, digest, .. } => Some(format!("{anchor}:{digest}")),
+                _ => None,
+            })
+        });
+        match applied {
+            Some(marker) => format!(
+                "context already applied: revision {marker} (принята, повторять commit не нужно)"
+            ),
+            None => "context unchanged: no edit to apply".to_string(),
+        }
+    }
+
     /// Called only after all results of a turn. Rejections reset the mirror;
     /// persistence errors propagate and never activate an unpersisted revision.
     pub fn apply(&mut self, sess: &Session, cfg: &Config) -> R<Option<String>> {

@@ -116,10 +116,58 @@ fn parse_patch(raw: &str) -> Result<Value, serde_json::Error> {
         Ok(v) => return Ok(v),
         Err(e) => e,
     };
-    if !first.to_string().contains("control character") {
-        return Err(first);
+    // Вторая попытка: сырые управляющие символы внутри строк.
+    let escaped = escape_raw_controls(raw);
+    if let Ok(v) = serde_json::from_str(&escaped) {
+        return Ok(v);
     }
-    serde_json::from_str(&escape_raw_controls(raw)).map_err(|_| first)
+    // Третья попытка: незаэкранированные кавычки внутри значений — типичный
+    // случай, когда в правке встречается код с `"` (Go/Rust). Ремонт только
+    // при неудаче парсера: корректный JSON не переписываем никогда.
+    serde_json::from_str(&escape_inner_quotes(&escaped)).map_err(|_| first)
+}
+
+/// Экранировать кавычки, которые открывают/закрывают не строку JSON, а текст
+/// внутри неё. Строка кончается только перед `,` `:` `}` `]` — всё остальное
+/// `"` внутри считаем литеральной кавычкой значения.
+fn escape_inner_quotes(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, c) in chars.iter().enumerate() {
+        if !in_string {
+            out.push(*c);
+            if *c == '"' {
+                in_string = true;
+            }
+            continue;
+        }
+        if escape {
+            out.push(*c);
+            escape = false;
+            continue;
+        }
+        match c {
+            '\\' => {
+                out.push(*c);
+                escape = true;
+            }
+            '"' => {
+                // Следующий непробельный символ решает: терминатор строки или текст.
+                let next = chars[i + 1..].iter().find(|x| !x.is_whitespace()).copied();
+                match next {
+                    Some(',') | Some(':') | Some('}') | Some(']') => {
+                        out.push('"');
+                        in_string = false;
+                    }
+                    _ => out.push_str("\\\""),
+                }
+            }
+            _ => out.push(*c),
+        }
+    }
+    out
 }
 
 /// Заменить сырые управляющие символы внутри строк на их \-экранированные
@@ -316,10 +364,20 @@ fn main() {
         die("edit: пустой stdin — нужен JSON {\"old_string\", \"new_string\"}".into());
     }
     let j: serde_json::Value = parse_patch(&raw).unwrap_or_else(|e| {
-        die(format!(
-            "edit: stdin не JSON: {e}\n(сырые переводы строк и табы внутри строк чинятся сами; \
-             если ошибка про control character всё же осталась — проблема в другом месте)"
-        ))
+        let msg = e.to_string();
+        let hint = if msg.contains("EOF while parsing") {
+            // Незакрытая строка/объект на последнем байте = вход оборван на полуслове,
+            // а не кривой JSON. Раньше модель гадала и уходила переписывать файл целиком.
+            format!(
+                "вход оборван: {} Б, JSON не закрыт (передай stdin одной строкой или разбей правку на куски)",
+                raw.len()
+            )
+        } else if msg.contains("control character") {
+            "сырые переводы строк/табы внутри строк тоже не починились — проверь кавычки в значениях".into()
+        } else {
+            "разбор не удался; кавычки внутри значений чинятся сами — если не помогло, перепиши файл через write".into()
+        };
+        die(format!("edit: stdin не JSON: {e}\n({hint})"))
     });
 
     let path = rest
@@ -481,6 +539,26 @@ mod tests {
         let raw = r#"{"old_string": "let a = \"x\";", "new_string": "let a = \"y\";"}"#;
         let j = parse_patch(raw).expect("валидный JSON не трогаем");
         assert_eq!(j["old_string"], "let a = \"x\";");
+    }
+
+    #[test]
+    fn repairs_unescaped_quotes_inside_values() {
+        // Реальный payload из сессии 1791834511 (вызов 254): кавычка внутри
+        // значения не экранирована — парсер видел конец строки на `v != ""`.
+        let raw = r#"{"old_string": "func envBool(k string, def bool) bool {", "new_string": "func envInt(k string, def int) int {\n\tif v := strings.TrimSpace(os.Getenv(k)); v != "" {\n\t\treturn 1\n\t}"}"#;
+        let j = parse_patch(raw).expect("кавычки внутри значения должны чиниться");
+        assert!(j["new_string"].as_str().unwrap().contains(r#"v != """#));
+        // Корректный JSON с экранированными кавычками не переписывается.
+        let ok = r#"{"old_string": "let a = "x";", "new_string": "let a = "y";"}"#;
+        assert_eq!(parse_patch(ok).unwrap()["new_string"], r#"let a = "y";"#);
+    }
+
+    #[test]
+    fn truncated_input_is_named_as_truncated() {
+        // Незакрытая строка = оборванный вход, а не кривой JSON.
+        let raw = r#"{"old_string": "abc"#;
+        let e = parse_patch(raw).unwrap_err().to_string();
+        assert!(e.contains("EOF"), "{e}");
     }
 
     #[test]

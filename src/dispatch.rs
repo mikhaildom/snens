@@ -234,7 +234,7 @@ pub async fn dispatch(
     };
     let bin = tool.bin.to_string_lossy().into_owned();
     let mut sp = exec::Spawn::argv(&bin, args);
-    sp.stdin = a.get("stdin").and_then(|s| s.as_str()).map(str::to_string);
+    sp.stdin = stdin_of(&a);
     sp.cwd = a.get("cwd").and_then(|c| c.as_str());
     sp.cap = cfg.max_process_chars;
     sp.timeout_s = a
@@ -253,6 +253,23 @@ pub async fn dispatch(
         Err(e) => fail(format!("{}: {e}", call.name)),
     }
 }
+/// stdin вызова. Модель регулярно кладёт сюда **объект** вместо JSON-строки
+/// (`"stdin": {"old_string": …, "new_string": …}`) — схема допускает строку, но
+/// фактически приходит структура. Молча терять её нельзя: тул получал пустой stdin
+/// и отвечал «пустой stdin» либо «не JSON», а модель шла переписывать файл целиком
+/// (тикет `edit-stdin-truncated`). Объект/массив сериализуем обратно в JSON —
+/// это ровно тот текст, который тул и ждал.
+fn stdin_of(a: &Value) -> Option<String> {
+    match a.get("stdin") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(v @ (Value::Object(_) | Value::Array(_))) => Some(v.to_string()),
+        Some(Value::Null) | None => None,
+        // Число/бул в stdin — почти наверняка ошибка вызывающего; отдаём как есть,
+        // тул скажет своё «не JSON» с колонкой.
+        Some(v) => Some(v.to_string()),
+    }
+}
+
 /// exit < 0 = процесс убит сигналом (tokio отдаёт -1 без подробностей). Частая
 /// причина — `pkill -f`: shell-обёртка `run` содержит текст шаблона в собственном
 /// cmdline и `pkill -f` убивает сам себя, а остаток `;`-цепочки не выполняется.
@@ -448,6 +465,21 @@ mod tests {
             .iter()
             .filter(|m| m["role"] == "tool")
             .count()
+    }
+
+    #[test]
+    fn stdin_accepts_object_payload() {
+        // Наблюдённый промах: модель кладёт JSON-объект в `stdin`, а не строку.
+        let a = json!({"args": ["/tmp/x"], "stdin": {"old_string": "a", "new_string": "b"}});
+        let s = stdin_of(&a).expect("объект в stdin не должен теряться");
+        assert!(s.contains("old_string"), "{s}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&s).unwrap()["new_string"],
+            "b"
+        );
+        assert_eq!(stdin_of(&json!({"stdin": "plain"})).unwrap(), "plain");
+        assert!(stdin_of(&json!({})).is_none());
+        assert!(stdin_of(&json!({"stdin": null})).is_none());
     }
 
     #[test]

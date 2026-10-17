@@ -97,6 +97,17 @@ ti edit '{"old_string":"  gamma","new_string":"x"}' "$f"
 want 1 "$rc" "edit: отступ не совпал — код 1"
 has "похоже на строку 3" "$err" "edit: подсказка про отступ"
 
+# Кавычка внутри значения не экранирована моделью — правится, а не отправляет на write.
+printf 'func envBool() {\n' >"$TMP/q.go"
+ti edit '{"old_string": "func envBool() {", "new_string": "func envInt() int {\n\tif v := f(); v != "" {\n\t\treturn 1\n\t}\n\treturn 0\n}\n\nfunc envBool() {"}' "$TMP/q.go"
+want 0 "$rc" "edit: кавычки внутри значения — код 0"
+has 'v != ""' "$(cat "$TMP/q.go")" "edit: кавычки внутри значения сохранены"
+
+# Оборванный вход назван оборванным, а не «кривой JSON».
+ti edit '{"old_string": "abc' "$TMP/a.txt"
+want 1 "$rc" "edit: оборванный вход — код 1"
+has "оборван" "$err" "edit: оборванный вход — так и назван"
+
 printf 'dup\ndup\n' >"$TMP/dup.txt"
 ti edit '{"old_string":"dup","new_string":"x"}' "$TMP/dup.txt"
 want 1 "$rc" "edit: неоднозначность — код 1"

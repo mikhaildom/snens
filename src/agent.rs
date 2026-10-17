@@ -568,7 +568,7 @@ async fn run_loop<L: Llm>(
             Some(
                 mirror
                     .apply(sess, cfg)?
-                    .unwrap_or_else(|| "context unchanged: no edit to apply".to_string()),
+                    .unwrap_or_else(|| crate::context::Mirror::noop_outcome(sess)),
             )
         } else {
             None
