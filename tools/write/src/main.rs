@@ -46,6 +46,28 @@ fn set_mode(p: &std::path::Path, mode: Option<u32>) {
 #[cfg(not(unix))]
 fn set_mode(_p: &std::path::Path, _mode: Option<u32>) {}
 
+/// Последний байт файла — перевод строки? Нечитаемый файл считаем разделённым:
+/// лишняя пустая строка безвредна, склейка — нет.
+fn ends_with_newline(path: &str) -> bool {
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            if len == 0 {
+                return true;
+            }
+            if std::io::Seek::seek(&mut f, std::io::SeekFrom::End(-1)).is_err() {
+                return true;
+            }
+            let mut b = [0u8; 1];
+            match f.read_exact(&mut b) {
+                Ok(()) => b[0] == b'\n',
+                Err(_) => true,
+            }
+        }
+        Err(_) => true,
+    }
+}
+
 /// temp в том же каталоге + rename: обрыв на середине не оставит обрезанный файл.
 fn atomic_write(path: &str, data: &[u8], mode: Option<u32>) {
     let dir = parent(path).unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -91,12 +113,21 @@ fn main() {
     if let Some(dir) = parent(path) {
         let _ = std::fs::create_dir_all(dir);
     }
+    let mut separated = false;
     if append {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .unwrap_or_else(|e| die(format!("write: {path}: {e}")));
+        // Хвост без перевода строки + блок без него = склейка строк
+        // (`}/// комментарий`), которую видно только сборкой. Разделитель
+        // дописываем сами — вызывающему не надо про него помнить.
+        if before > 0 && !data.starts_with(b"\n") && !ends_with_newline(path) {
+            f.write_all(b"\n")
+                .unwrap_or_else(|e| die(format!("write: {path}: {e}")));
+            separated = true;
+        }
         f.write_all(&data)
             .unwrap_or_else(|e| die(format!("write: {path}: {e}")));
     } else {
@@ -110,6 +141,7 @@ fn main() {
             "created": !existed,
             "overwrote": existed && before > 0 && !append,
             "appended": append,
+            "separator_added": separated,
             "bytes_before": before,
             "bytes": data.len(),
         })

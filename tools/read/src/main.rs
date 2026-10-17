@@ -73,10 +73,24 @@ fn parse(argv: &[String]) -> Args {
         }
     }
     Args {
-        path: path.unwrap_or_else(|| die("read: не указан путь".into())),
+        path: tilde(&path.unwrap_or_else(|| die("read: не указан путь".into()))),
         offset,
         limit,
         max_chars,
+    }
+}
+
+/// `~/x` → `$HOME/x`: тул исполняется без оболочки, поэтому `~` до него
+/// доходит буквально. Разворачиваем только ведущий `~` — `~user` и `~` в середине
+/// оставляем как есть (нужен passwd-лукап, а выгода нулевая).
+fn tilde(path: &str) -> String {
+    let rest = match path.strip_prefix("~") {
+        Some(r) if r.is_empty() || r.starts_with('/') => r,
+        _ => return path.to_string(),
+    };
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => format!("{home}{rest}"),
+        _ => path.to_string(),
     }
 }
 

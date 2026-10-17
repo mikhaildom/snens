@@ -158,10 +158,16 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
             false,
         ),
         Ok(Err(e)) => return Err(format!("spawn failed: {e}").into()),
+        // Молчаливый 124 выглядит как падение программы: агент выводит причину из кода
+        // возврата и дробит команду вслепую. Называем причину и что с ней делать.
         Err(_) => (
             124,
             Vec::new(),
-            format!("[timeout after {}s]", sp.timeout_s).into_bytes(),
+            format!(
+                "[таймаут {}s: команда прервана, вывод неполный — не падение. Дроби команду, подними timeout_seconds для этого вызова или уведи в фон]\n",
+                sp.timeout_s
+            )
+            .into_bytes(),
             true,
         ),
     };
@@ -236,6 +242,21 @@ fn dump(dir: &Path, text: &[u8]) -> R<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Обрыв по таймауту объясняет себя: код 124, причина в тексте, не «падение».
+    #[tokio::test]
+    async fn timeout_names_itself() {
+        let mut sp = Spawn::sh(&["sh".into(), "-c".into()], "sleep 5", 1, 10_000);
+        sp.reduce = true;
+        let out = spawn(sp).await.expect("спавн упал");
+        assert_eq!(out.exit, 124, "таймаут должен отдавать 124");
+        assert!(out.timed_out, "флаг timed_out не поднят");
+        assert!(
+            out.text.contains("таймаут 1s") && out.text.contains("timeout_seconds"),
+            "в ответе нет причины и подсказки: {}",
+            out.text
+        );
+    }
 
     /// Обрезанное не теряется: полный вывод лежит в файле, путь уходит модели.
     #[tokio::test]

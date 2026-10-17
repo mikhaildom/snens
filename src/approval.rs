@@ -48,10 +48,14 @@ pub fn privileged_shim(args: Vec<String>) -> R<()> {
     // там уместна кнопка одобрения вместо пароля.
     let headless = std::env::var_os("SNENS_ASKPASS_DISABLED").is_some();
     if !headless {
-        let err = std::process::Command::new("/usr/bin/sudo")
-            .arg("-A")
-            .args(&args)
-            .exec();
+        let mut cmd = std::process::Command::new("/usr/bin/sudo");
+        // `-n`/`-A` пользователя не затираем: `sudo -n` — рабочий способ «откажи,
+        // если нет пароля» (тесты, скрипты, человек отошёл), а подмена на `-A`
+        // превращала его в ожидание человека до таймаута run.
+        if !has_askpass_flag(&args) {
+            cmd.arg("-A");
+        }
+        let err = cmd.args(&args).exec();
         return Err(format!("sudo: не удалось запустить /usr/bin/sudo: {err}").into());
     }
     let approval_sock = std::env::var("SNENS_APPROVAL_SOCK").unwrap_or_default();
@@ -73,6 +77,27 @@ pub fn privileged_shim(args: Vec<String>) -> R<()> {
     }
     let err = cmd.args(&args).exec();
     Err(format!("sudo: не удалось запустить /usr/bin/sudo: {err}").into())
+}
+
+/// Есть ли у пользователя свой выбор способа аутентификации: `-n` (без спроса),
+/// `-A` (askpass), `-S` (stdin) или длинные формы. Короткие флаги sudo допускают
+/// склейку (`-nA`), поэтому проверяем каждый символ после дефиса.
+fn has_askpass_flag(args: &[String]) -> bool {
+    args.iter()
+        // До `--` — флаги sudo, после — аргументы команды (`-n` там не наш).
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| {
+            if a.starts_with("--") {
+            return matches!(
+                a.as_str(),
+                "--non-interactive" | "--askpass" | "--stdin" | "--reset-timestamp"
+            );
+        }
+        a.starts_with('-')
+            && a.chars()
+                .skip(1)
+                .any(|c| matches!(c, 'n' | 'A' | 'S' | 'k' | 'K'))
+    })
 }
 
 /// Путь к root-owned broker привилегированных действий, если он установлен.
@@ -123,6 +148,21 @@ pub fn privileged_shim(_args: Vec<String>) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shim_keeps_user_auth_flags() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Свой выбор способа аутентификации шим не затирает: `sudo -n` должен
+        // отказывать сразу, а не превращаться в ожидание человека.
+        assert!(has_askpass_flag(&s(&["-n", "true"])));
+        assert!(has_askpass_flag(&s(&["-nA", "true"])));
+        assert!(has_askpass_flag(&s(&["--non-interactive", "true"])));
+        assert!(has_askpass_flag(&s(&["-S", "true"])));
+        // Обычный вызов — флага аутентификации нет, шим добавит свой `-A`.
+        assert!(!has_askpass_flag(&s(&["-u", "www-data", "id"])));
+        // После `--` идут аргументы команды, а не флаги sudo.
+        assert!(!has_askpass_flag(&s(&["--", "-n"])));
+    }
 
     #[test]
     fn sock_sits_next_to_sessions() {

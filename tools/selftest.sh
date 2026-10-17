@@ -66,6 +66,14 @@ has "каталог" "$err" "read: каталог — отказ с подска
 t read --help
 has "read —" "$out" "read: --help, строка 1 = суть"
 
+# Тул исполняется без оболочки, `~` доходит буквально — разворачивать должен он сам.
+homefile=$HOME/.snens-selftest-$$
+printf 'домашний\n' >"$homefile"
+t read '~/.snens-selftest-'$$
+want 0 "$rc" "read: ~ разворачивается в \$HOME"
+has "домашний" "$out" "read: ~ прочитал файл из \$HOME"
+rm -f "$homefile"
+
 # ---- edit ----
 # Реестр читает из хелпа признак «нужен stdin» по слову stdin в сути/usage.
 # Потеряется — требование stdin пропадёт из схемы тула.
@@ -162,7 +170,15 @@ has '"overwrote":true' "$out" "write: перезапись отмечена"
 want "ещё" "$(cat "$newf")" "write: перезапись"
 
 ti write "!" "$newf" --append
-want "ещё!" "$(cat "$newf")" "write: --append"
+want "ещё
+!" "$(cat "$newf")" "write: --append"
+
+# Хвост без перевода строки: append не должен склеивать строки (`}/// c`).
+printf 'fn a(){}' >"$TMP/glue.rs"
+ti write '/// c' "$TMP/glue.rs" --append
+has '"separator_added":true' "$out" "write: append сам добавил разделитель"
+want "fn a(){}
+/// c" "$(cat "$TMP/glue.rs")" "write: append не склеивает строки"
 
 # ---- memory ----
 # Живого сервера тесты не требуют: контракт проверяется на мёртвом адресе.
@@ -270,6 +286,20 @@ has "нет SNENS_SESSION" "$err" "agent: list без сессии — текс�
 
 t agent wait "нет-такого" --timeout 1
 want 1 "$rc" "agent: wait несуществующего — код 1"
+
+# status — неблокирующий снимок по логу; ждать живого подагента не нужно.
+mkdir -p "$TMP/sessions"
+printf '{"kind":"assistant","ts":%s,"text":null,"tool_calls":[{"id":"c1","name":"run","args":"{\\"command\\":\\"echo hi\\"}"}]}\n' "$(date +%s)" >"$TMP/sessions/kid.jsonl"
+SNENS_SESSIONS_DIR=$TMP/sessions t agent status kid
+want 0 "$rc" "agent: status — код 0"
+has "ходов: 1" "$out" "agent: status — число ходов"
+has "echo hi" "$out" "agent: status — последний вызов с хинтом"
+has "с назад" "$out" "agent: status — свежесть лога"
+
+# Таймаут wait — не ошибка: код 3 и снимок, а не «сбой» и не тишина.
+SNENS_SESSIONS_DIR=$TMP/sessions t agent wait kid --timeout 1 --progress 5
+want 3 "$rc" "agent: wait по таймауту — код 3, а не 1"
+has "ещё работает" "$err" "agent: wait по таймауту — говорит, что жив"
 
 # Свой ящик: send кладёт сообщение туда, откуда его прочитает сессия.
 SNENS_SESSION=me

@@ -24,6 +24,10 @@ use std::sync::Arc;
 use crate::input::Term;
 use crate::R;
 
+/// Сколько клиент ждёт пароль от человека. Меньше таймаута `run` (120–180 с),
+/// чтобы отказ был от sudo, а не «команда не ответила».
+const ASKPASS_WAIT_SECONDS: u64 = 45;
+
 /// Файл сокета рядом с сессиями: один на инстанс.
 pub fn sock_path(sessions: &Path) -> PathBuf {
     sessions
@@ -90,7 +94,21 @@ pub async fn client(prompt: String) -> R<()> {
     let _ = conn.write_all(b"\n").await;
     let mut reader = BufReader::new(&mut conn);
     let mut pw = String::new();
-    reader.read_line(&mut pw).await?;
+    // Человек мог отойти: без своего таймаута `read_line` висит до таймаута `run`,
+    // и агент видит просто «команда не ответила», а не «нужен пароль, никто не ввёл».
+    // Отказываем сами — sudo скажет «a password is required» сразу.
+    let wait = std::time::Duration::from_secs(ASKPASS_WAIT_SECONDS);
+    match tokio::time::timeout(wait, reader.read_line(&mut pw)).await {
+        Ok(r) => {
+            r?;
+        }
+        Err(_) => {
+            return Err(format!(
+                "askpass: пароль не введён за {ASKPASS_WAIT_SECONDS} с — отказываю, sudo скажет «a password is required»"
+            )
+            .into())
+        }
+    }
     let pw = pw.trim_end_matches(['\n', '\r']);
     if pw.is_empty() {
         return Err("askpass: пустой пароль".into());

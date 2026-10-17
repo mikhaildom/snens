@@ -19,6 +19,10 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
             "SNENS_MAIL_DIR".to_string(),
             cfg.mail_path().display().to_string(),
         ),
+        (
+            "SNENS_SESSIONS_DIR".to_string(),
+            cfg.sessions_path().display().to_string(),
+        ),
     ];
     if !sess.parent().is_empty() {
         v.push(("SNENS_PARENT".to_string(), sess.parent().to_string()));
@@ -198,7 +202,10 @@ pub async fn dispatch(
         sp.max_attachment_bytes = cfg.max_attachment_bytes;
         sp.envs = session_env(sess, cfg);
         return match exec::spawn(sp).await {
-            Ok(o) => o,
+            Ok(mut o) => {
+                o.text = explain_signal_death(o.exit, o.bytes, &o.text, command);
+                o
+            }
             Err(e) => fail(format!("run: {e}")),
         };
     }
@@ -246,6 +253,29 @@ pub async fn dispatch(
         Err(e) => fail(format!("{}: {e}", call.name)),
     }
 }
+/// exit < 0 = процесс убит сигналом (tokio отдаёт -1 без подробностей). Частая
+/// причина — `pkill -f`: shell-обёртка `run` содержит текст шаблона в собственном
+/// cmdline и `pkill -f` убивает сам себя, а остаток `;`-цепочки не выполняется.
+/// Один симптом, две трактовки — говорим об этом в ответе, а не оставляем -1 без слов.
+fn explain_signal_death(exit: i32, bytes: usize, text: &str, command: &str) -> String {
+    if exit >= 0 {
+        return text.to_string();
+    }
+    let mut note = String::from(
+        "[процесс убит сигналом (exit -1): команда не завершилась сама — убийца снаружи или\n   обёртка совпала с собственным шаблоном]",
+    );
+    if command.contains("pkill -f") || command.contains("pgrep -f") {
+        note.push_str(
+            "\n[похоже на `pkill -f`: шаблон встречается в тексте самой команды, обёртка\n   убивает себя и хвост `;`-цепочки не выполняется. Убивай по pid: `pgrep -f <шаблон>\n   | grep -v $$` → kill, либо сузь шаблон до `[p]attern`]",
+        );
+    }
+    if bytes == 0 {
+        note
+    } else {
+        format!("{text}\n{note}")
+    }
+}
+
 /// Хирургическая уборка: вырезать выбранные результаты тулов, не трогая
 /// диалог. Отбор — по `call_id` (голые), `before` (всё до указанного),
 /// `keep_last` (все старше N последних), `tool` и `min_bytes` (маски).
@@ -418,6 +448,19 @@ mod tests {
             .iter()
             .filter(|m| m["role"] == "tool")
             .count()
+    }
+
+    #[test]
+    fn signal_death_is_explained() {
+        let txt = explain_signal_death(-1, 0, "", "pkill -f 'app_live.py'; ls");
+        assert!(txt.contains("убит сигналом"), "{txt}");
+        assert!(txt.contains("pkill -f"), "нет подсказки про самоубийство: {txt}");
+        // Обычный exit не трогаем и текст не дублируем.
+        assert_eq!(explain_signal_death(0, 5, "ok", "echo hi"), "ok");
+        assert_eq!(
+            explain_signal_death(-1, 5, "partial", "kill -9 1"),
+            "partial\n[процесс убит сигналом (exit -1): команда не завершилась сама — убийца снаружи или\n   обёртка совпала с собственным шаблоном]"
+        );
     }
 
     #[test]

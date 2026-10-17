@@ -13,13 +13,17 @@ use serde::{Deserialize, Serialize};
 
 const HELP: &str = "\
 agent — подагенты snens: запустить, ждать, спросить, ответить, посмотреть.
-agent start \"задача\" | wait <id> [--timeout S] | result <id> | ask \"вопрос\" | send <id> \"текст\" | list | kill <id>
+agent start \"задача\" | wait <id> [--timeout S] [--progress S] | status <id> | result <id> | ask \"вопрос\" | send <id> \"текст\" | list | kill <id>
 
 Подагент — отдельная сессия snens со своим логом. start возвращает её id (печатает
 в stdout). Надёжный признак конца — запись Done в логе ребёнка, её пишет харнесс:
 даже если ребёнок не отчитался, wait её увидит. ask ждёт ответа родителя из ящика;
 send отвечает/пишет ребёнку. Контекст (SNENS_SESSION, SNENS_MAIL_DIR, SNENS_PARENT)
-харнесс передаёт переменными окружения.";
+харнесс передаёт переменными окружения.
+
+status — неблокирующий снимок: жив/готов, число ходов, последний вызов инструмента,
+сколько секунд назад была запись в логе. wait печатает прогресс раз в 30 с
+(--progress S), а по таймауту выходит с кодом 3 — «ещё работает», не ошибка.";
 
 fn die(msg: String) -> ! {
     eprintln!("{msg}");
@@ -36,6 +40,7 @@ fn main() {
     match argv[0].as_str() {
         "start" => cmd_start(&cfg, &argv[1..]),
         "wait" => cmd_wait(&cfg, &argv[1..]),
+        "status" => cmd_status(&cfg, &argv[1..]),
         "result" => cmd_result(&cfg, &argv[1..]),
         "ask" => cmd_ask(&cfg, &argv[1..]),
         "send" => cmd_send(&cfg, &argv[1..]),
@@ -80,11 +85,15 @@ impl Cfg {
                 f.mail_dir.replace('~', &home)
             }
         });
-        let sessions = if f.sessions_dir.is_empty() {
-            format!("{home}/.local/share/snens/sessions")
-        } else {
-            f.sessions_dir.replace('~', &home)
-        };
+        // SNENS_SESSIONS_DIR — чтобы status/wait можно было проверять на копии логов
+        // и смотреть чужие инстансы, не трогая свой config.toml.
+        let sessions = std::env::var("SNENS_SESSIONS_DIR").unwrap_or_else(|_| {
+            if f.sessions_dir.is_empty() {
+                format!("{home}/.local/share/snens/sessions")
+            } else {
+                f.sessions_dir.replace('~', &home)
+            }
+        });
         Cfg {
             mail_dir: PathBuf::from(mail),
             sessions_dir: PathBuf::from(sessions),
@@ -195,6 +204,23 @@ enum Rec {
     Other,
 }
 
+/// Снимок живого лога: что ребёнок делает сейчас. `raw` — все строки, включая
+/// те, что не разбираются в `Rec` (usage, steer и прочее), из них берём след
+/// инструмента и время последней записи.
+#[derive(Deserialize)]
+struct LooseRec {
+    #[serde(default)]
+    ts: u64,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<serde_json::Value>,
+    #[serde(default)]
+    argv: Vec<String>,
+}
+
 fn read_log(cfg: &Cfg, id: &str) -> Vec<Rec> {
     let path = cfg.sessions_dir.join(format!("{id}.jsonl"));
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -251,20 +277,130 @@ unsafe fn libc_kill(pid: u32) -> bool {
 }
 
 fn state(cfg: &Cfg, id: &str) -> String {
-    match done_status(cfg, id) {
-        Some(s) if s == "ok" => "готов".into(),
+    if done_status(cfg, id).is_none() {
+        return if is_live(cfg, id) {
+            "работает".into()
+        } else {
+            "убит".into()
+        };
+    }
+    match done_status(cfg, id).as_deref() {
+        Some("ok") => "готов".into(),
         Some(s) => format!("неудача ({s})"),
-        None => {
-            let live = child_pid(cfg, &cfg.parent_or_me(), id)
-                .or_else(|| child_pid(cfg, &cfg.me, id))
-                .map(alive)
-                .unwrap_or(false);
-            if live {
-                "работает".into()
-            } else {
-                "убит".into()
-            }
-        }
+        None => "работает".into(),
+    }
+}
+
+/// Живой ли процесс ребёнка. pid регистрируется у родителя, который его запустил;
+/// для вызовов из чужой сессии пробуем оба ящика.
+fn is_live(cfg: &Cfg, id: &str) -> bool {
+    child_pid(cfg, &cfg.parent_or_me(), id)
+        .or_else(|| child_pid(cfg, &cfg.me, id))
+        .map(alive)
+        .unwrap_or_else(|| log_grows(cfg, id))
+}
+
+/// Запасной признак жизни, когда pid неизвестен: лог менялся последние 90 с.
+/// Ребёнок может думать долго без записей — тогда ответ честно «не знаю».
+fn log_grows(cfg: &Cfg, id: &str) -> bool {
+    std::fs::metadata(cfg.sessions_dir.join(format!("{id}.jsonl")))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|e| e.as_secs() < 90)
+        .unwrap_or(false)
+}
+
+/// Неблокирующий снимок состояния подагента: то, что родитель раньше добывал
+/// `agent list` + `ps aux`.
+fn snapshot(cfg: &Cfg, id: &str) -> String {
+    let path = cfg.sessions_dir.join(format!("{id}.jsonl"));
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let recs: Vec<LooseRec> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<LooseRec>(l).ok())
+        .collect();
+    let steps = recs.iter().filter(|r| r.kind == "assistant").count();
+    let last = recs.iter().rev().find(|r| r.kind == "assistant");
+    let last_tool = recs
+        .iter()
+        .rev()
+        .find_map(|r| {
+            r.tool.clone().or_else(|| {
+                r.tool_calls.first().and_then(|c| {
+                    c.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            c.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_string)
+                        })
+                })
+            })
+        })
+        .unwrap_or_else(|| "—".into());
+    let ago = recs
+        .iter()
+        .rev()
+        .map(|r| r.ts)
+        .find(|t| *t > 0)
+        .map(|t| now().saturating_sub(t))
+        .unwrap_or(0);
+    let hint = last
+        .and_then(|r| r.tool_calls.first())
+        .map(hint_of)
+        .unwrap_or_default();
+    let hint = if hint.is_empty() {
+        last.and_then(|r| r.argv.first().cloned())
+            .unwrap_or_default()
+    } else {
+        hint
+    };
+    let mut out = format!(
+        "подагент {id}: {}\nходов: {steps}; последний инструмент: {last_tool}",
+        state(cfg, id)
+    );
+    if !hint.is_empty() {
+        let short: String = hint.chars().take(120).collect();
+        out.push_str(&format!(" ({short})"));
+    }
+    out.push_str(&format!("\nзапись в логе: {ago} с назад"));
+    out
+}
+
+/// Короткий след вызова: command для run, args для тула — как в TUI.
+fn hint_of(call: &serde_json::Value) -> String {
+    let raw = call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(|a| a.as_str())
+        .map(str::to_string)
+        // Формат лога ядра: {id, name, args} — args это строка с JSON аргументов.
+        .or_else(|| {
+            call.get("args")
+                .and_then(|a| a.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    if let Some(c) = v.get("command").and_then(|c| c.as_str()) {
+        return c.to_string();
+    }
+    match v.get("args") {
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| x.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => String::new(),
     }
 }
 
@@ -330,6 +466,18 @@ fn parse_timeout(args: &[String], default: u64) -> u64 {
     default
 }
 
+fn parse_flag(args: &[String], name: &str, default: u64) -> u64 {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == name {
+            if let Some(v) = it.next() {
+                return v.parse().unwrap_or(default);
+            }
+        }
+    }
+    default
+}
+
 fn first_arg(args: &[String]) -> String {
     args.iter()
         .find(|a| !a.starts_with("--"))
@@ -337,10 +485,22 @@ fn first_arg(args: &[String]) -> String {
         .unwrap_or_else(|| die("agent: нужен id подагента".into()))
 }
 
+fn cmd_status(cfg: &Cfg, args: &[String]) {
+    let id = first_arg(args);
+    if !cfg.sessions_dir.join(format!("{id}.jsonl")).is_file() {
+        die(format!("agent status: нет лога подагента {id}"));
+    }
+    println!("{}", snapshot(cfg, &id));
+}
+
 fn cmd_wait(cfg: &Cfg, args: &[String]) {
     let id = first_arg(args);
     let timeout = parse_timeout(args, 3600);
+    // Прогресс идёт в stderr: stdout остаётся чистым (его читают как результат),
+    // а тишина на 20 минут перестаёт быть нормой.
+    let every = parse_flag(args, "--progress", 30).max(5);
     let deadline = Instant::now() + Duration::from_secs(timeout);
+    let mut last_report = Instant::now();
     loop {
         if let Some(s) = done_status(cfg, &id) {
             let text = final_text(cfg, &id).unwrap_or_default();
@@ -351,19 +511,23 @@ fn cmd_wait(cfg: &Cfg, args: &[String]) {
             return;
         }
         // Нет Done, а процесс мёртв — его сняли (OOM/SIGKILL), а не «ещё думает».
-        let live = child_pid(cfg, &cfg.me, &id)
-            .or_else(|| child_pid(cfg, &cfg.parent, &id))
-            .map(alive)
-            .unwrap_or(false);
-        if !live {
+        if !is_live(cfg, &id) {
             die(format!(
                 "agent wait: процесс подагента {id} мёртв, а Done в логе нет — он был снят"
             ));
         }
+        if last_report.elapsed() >= Duration::from_secs(every) {
+            eprintln!("{}", snapshot(cfg, &id));
+            last_report = Instant::now();
+        }
         if Instant::now() >= deadline {
-            die(format!(
-                "agent wait: {id} ещё работает, истёк таймаут {timeout}s"
-            ));
+            // Таймаут — не сбой, а «ещё работает»: код 3, чтобы вызывающий отличал
+            // от падения (1) и понимал, что повторять бессмысленно только если жив.
+            eprintln!(
+                "agent wait: {id} ещё работает, истёк таймаут {timeout}s (код 3 — не ошибка)\n{}",
+                snapshot(cfg, &id)
+            );
+            std::process::exit(3);
         }
         std::thread::sleep(Duration::from_millis(500));
     }
