@@ -3,7 +3,7 @@
 // так что нужен он ровно один раз: вернуть место на диске.
 //
 // Снаружи workspace намеренно: в `snens build` и в реестре тулов ему делать нечего.
-//   cargo run --manifest-path tools/session-compact/Cargo.toml -- \
+//   cargo run --manifest-path oneoff/session-compact/Cargo.toml -- \
 //       ~/.local/share/snens/sessions --dry-run
 use std::{collections::BTreeMap, path::{Path, PathBuf}};
 
