@@ -306,7 +306,7 @@ fn scan_file(file: &str, path: &Path, args: &Args, budget: usize) -> Option<Foun
     for &m in matched.iter().take(take) {
         let lo = m.saturating_sub(args.context);
         let hi = (m + args.context).min(lines.len().saturating_sub(1));
-        for i in lo..=hi {
+        for (i, line) in lines.iter().enumerate().take(hi + 1).skip(lo) {
             if let Some(prev) = last {
                 if i <= prev {
                     // Строка уже выведена; остаётся уточнить, что она совпадение.
@@ -329,7 +329,7 @@ fn scan_file(file: &str, path: &Path, args: &Args, budget: usize) -> Option<Foun
             }
             rows.push(Row {
                 num: i + 1,
-                text: lines[i].to_string(),
+                text: line.to_string(),
                 is_match: i == m,
             });
             last = Some(i);
@@ -397,7 +397,7 @@ fn main() {
         shown += found.shown;
     }
 
-    if args.files_only {
+    if args.files_only && !listed.is_empty() {
         println!("{}", listed.join("\n"));
         return;
     }
