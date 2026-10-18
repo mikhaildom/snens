@@ -89,7 +89,12 @@ rm -f "$homefile"
 # Реестр читает из хелпа признак «нужен stdin» по слову stdin в сути/usage.
 # Потеряется — требование stdin пропадёт из схемы тула.
 t edit --help
-t has "stdin" "$out" "edit: хелп объявляет stdin (признак для реестра)"
+# Правила матчинга — часть контракта тула: по хелпу модель решает, как дробить
+# правку. Проверяются до t has, который перезаписывает $out.
+help=$out
+has "хвостовых пробелов" "$help" "edit: хелп объявляет fuzzy-матчинг"
+has "ИСХОДНОГО файла" "$help" "edit: хелп объявляет батч от исходного файла"
+t has "stdin" "$help" "edit: хелп объявляет stdin (признак для реестра)"
 
 JSON='{"old_string":"beta","new_string":"BETA"}'
 ti edit "$JSON" "$f"
@@ -164,6 +169,48 @@ printf 'x\nx\n' >"$TMP/multi2.txt"
 ti edit '{"edits":[{"old_string":"x","new_string":"y"}]}' "$TMP/multi2.txt"
 want 1 "$rc" "edit: пачка — неоднозначность внутри правки"
 has "правка 1" "$err" "edit: пачка — номер в ошибке неоднозначности"
+
+# Fuzzy: хвостовые пробелы/CRLF/юникод-кавычки — совпадение с пометкой, файл
+# переписывается только в затронутом месте.
+printf 'head  \nvalue = 1;   \ntail\t\n' >"$TMP/fz.txt"
+ti edit '{"old_string":"value = 1;\ntail","new_string":"value = 2;\ntail"}' "$TMP/fz.txt"
+want 0 "$rc" "edit: fuzzy по хвостовым пробелам — код 0"
+has '"fuzzy":true' "$out" "edit: fuzzy отмечен в событии"
+want "head  
+value = 2;
+tail	" "$(cat "$TMP/fz.txt")" "edit: fuzzy — изменён только участок"
+
+printf 'alpha\r\nbeta\r\n' >"$TMP/crlf.txt"
+ti edit '{"old_string":"alpha\nbeta","new_string":"ALPHA\nBETA"}' "$TMP/crlf.txt"
+want 0 "$rc" "edit: fuzzy по CRLF — код 0"
+want "ALPHA:BETA:" "$(tr -d '\r' <"$TMP/crlf.txt" | tr '\n' ':')" "edit: fuzzy — текст после CRLF в порядке"
+want 2 "$(tr -cd '\r' <"$TMP/crlf.txt" | wc -c | tr -d ' ')" "edit: fuzzy — CRLF сохранён (два CR)"
+
+printf 'let s = \342\200\234x\342\200\235; // a \342\200\224 b\n' >"$TMP/fq.txt"
+ti edit '{"old_string":"let s = \"x\"; // a - b","new_string":"let s = \"y\";"}' "$TMP/fq.txt"
+want 0 "$rc" "edit: fuzzy по кривым кавычкам — код 0"
+want 'let s = "y";' "$(cat "$TMP/fq.txt")" "edit: fuzzy — кавычки заменены"
+
+# Батч: old_string матчатся против исходного файла и не должны пересекаться.
+printf 'abcdef\n' >"$TMP/ov.txt"
+ti edit '{"edits":[{"old_string":"abc","new_string":"X"},{"old_string":"bcd","new_string":"Y"}]}' "$TMP/ov.txt"
+want 1 "$rc" "edit: пересечение правок — код 1"
+has "задевают один и тот же участок" "$err" "edit: пересечение правок — названо"
+want "abcdef" "$(cat "$TMP/ov.txt")" "edit: пересечение — файл не тронут"
+
+printf 'let a = 1;\n' >"$TMP/seq.txt"
+ti edit '{"edits":[{"old_string":"let a = 1;","new_string":"let a = 10;"},{"old_string":"let a = 10;","new_string":"x"}]}' "$TMP/seq.txt"
+want 1 "$rc" "edit: вторая правка не видит результата первой — код 1"
+has "правка 2" "$err" "edit: батч от исходника — номер правки"
+has "ни одна правка не применена" "$err" "edit: батч от исходника — атомарность названа"
+has "правка 1 сошлась бы" "$err" "edit: батч — сказано, какие правки сошлись"
+
+printf 'one\ntwo\n' >"$TMP/one.txt"
+ti edit '{"edits":{"old_string":"one","new_string":"1"}}' "$TMP/one.txt"
+want 0 "$rc" "edit: edits одиночным объектом — код 0"
+want "1
+two" "$(cat "$TMP/one.txt")" "edit: edits одиночным объектом — применён"
+
 
 ti edit '{"old_string":"","new_string":"x"}' "$TMP/dry.txt"
 want 1 "$rc" "edit: пустой old_string — код 1"
