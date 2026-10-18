@@ -35,7 +35,7 @@ libc = "0.2"
 # Тулы — отдельные crate'ы: каждый остаётся самостоятельным будущим репозиторием,
 # а ядро не тащит зависимости тулов. Бинарники кладёт на место tools/build.sh.
 [workspace]
-members = ["tools/agent", "tools/audit", "tools/edit", "tools/fetch", "tools/read", "tools/search", "tools/view", "tools/write"]
+members = ["tools/agent", "tools/audit", "tools/edit", "tools/fetch", "tools/grep", "tools/read", "tools/search", "tools/view", "tools/write"]
 # tools/memory — отдельный репозиторий ~/projects/snens-memory: он подключается
 # симлинком tools/memory/memory, а не как член workspace (иначе его сборка
 # перезаписывает бинарь плагина).

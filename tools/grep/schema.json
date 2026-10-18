@@ -1,0 +1,55 @@
+{
+  "type": "object",
+  "properties": {
+    "pattern": {
+      "type": "string",
+      "description": "Что искать. Поиск литеральный (без регулярок): текст как есть; --word/--ignore-case меняют правило сравнения."
+    },
+    "path": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Каталог или файл для поиска. По умолчанию текущий (.). Каталоги обходятся рекурсивно; .git, target, node_modules, .venv, dist, build, bin и файлы > 1 МБ пропускаются."
+    },
+    "glob": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Фильтр по имени файла: `*` и `?`, например '*.rs'. Можно несколько раз."
+    },
+    "context": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Сколько соседних строк показать вокруг совпадения; они идут с префиксом `путь:строка-`."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Максимум совпадений в выводе (по умолчанию 200). При обрезке печатается пометка «обрезано: показано N из M»."
+    },
+    "ignore_case": {
+      "type": "boolean",
+      "description": "Не учитывать регистр."
+    },
+    "word": {
+      "type": "boolean",
+      "description": "Искать только целое слово: dispatch не совпадёт с dispatch_tool."
+    },
+    "files_only": {
+      "type": "boolean",
+      "description": "Печатать только имена файлов с совпадениями."
+    }
+  },
+  "required": ["pattern"],
+  "x-snens": {
+    "argv": [
+      {"field": "pattern"},
+      {"field": "path"},
+      {"flag": "--glob", "field": "glob"},
+      {"flag": "--context", "field": "context"},
+      {"flag": "--limit", "field": "limit"},
+      {"flag": "--ignore-case", "when_field": "ignore_case"},
+      {"flag": "--word", "when_field": "word"},
+      {"flag": "--files-only", "when_field": "files_only"}
+    ],
+    "stdin": {"mode": "none"}
+  }
+}
