@@ -393,6 +393,80 @@ t fetch "ftp://example.com/x"
 want 2 "$rc" "fetch: не http(s) — код 2"
 has "только http/https" "$err" "fetch: не http(s) — текст"
 
+# ---- grep ----
+# Структурированный поиск вместо ad-hoc `run 'grep -rn ...'`: путь, строка, текст.
+g=$TMP/g
+mkdir -p "$g/sub" "$g/target" "$g/skipme"
+printf 'alpha\nneedle one\nomega\n' >"$g/a.rs"
+printf 'needle two\n' >"$g/b.txt"
+printf 'needle three\n' >"$g/sub/c.rs"
+printf 'needle в служебном каталоге\n' >"$g/target/d.rs"
+printf 'needle \000 бинарник\n' >"$g/bin.dat"
+
+# Находка: формат `путь:строка: текст`, путь относительно переданного корня.
+t grep needle "$g" --glob '*.rs'
+want 0 "$rc" "grep: код 0 на находке"
+has "a.rs:2: needle one" "$out" "grep: формат путь:строка: текст"
+has "sub/c.rs:1: needle three" "$out" "grep: обход рекурсивный"
+case "$out" in
+  *target*) bad "grep: каталог target не пропущен" ;;
+  *) ok "grep: каталог target пропущен" ;;
+esac
+case "$out" in
+  *b.txt*) bad "grep: --glob не отфильтровал .txt" ;;
+  *) ok "grep: --glob фильтрует по имени" ;;
+esac
+case "$out" in
+  *bin.dat*) bad "grep: бинарный файл не пропущен" ;;
+  *) ok "grep: бинарный файл пропущен молча" ;;
+esac
+
+# --no-ignore возвращает служебные каталоги.
+t grep needle "$g" --no-ignore
+has "target/d.rs" "$out" "grep: --no-ignore снимает пропуск каталогов"
+
+# --context: соседние строки с префиксом `-`.
+t grep 'needle one' "$g/a.rs" --context 1
+has "a.rs:1- alpha" "$out" "grep: контекст с префиксом -"
+has "a.rs:2: needle one" "$out" "grep: совпадение с префиксом :"
+
+# --files-only: только имена файлов.
+t grep needle "$g" --files-only
+want "a.rs
+b.txt
+sub/c.rs" "$out" "grep: --files-only — одни имена"
+
+# --limit обрезает с явной пометкой.
+t grep needle "$g" --limit 1
+want 0 "$rc" "grep: --limit — код 0"
+has "обрезано: показано 1 из 3" "$out" "grep: --limit — пометка об обрезке"
+
+# Пустой результат — ответ, а не отказ: код 0.
+t grep 'нетакогослова' "$g"
+want 0 "$rc" "grep: нет совпадений — код 0, а не 1"
+has "нет совпадений: нетакогослова в $g" "$out" "grep: нет совпадений — текст"
+
+t grep needle "$TMP/нет-такого"
+want 1 "$rc" "grep: отсутствующий путь — код 1"
+has "нет такого пути" "$err" "grep: отсутствующий путь — текст"
+
+t grep needle "$g" --nosuch
+want 1 "$rc" "grep: неизвестный аргумент — код 1"
+has "--nosuch" "$err" "grep: неизвестный аргумент назван по имени"
+
+# `~` доходит буквально — разворачивает сам тул.
+ghome=$HOME/.snens-selftest-grep-$$
+printf 'домашняя иголка\n' >"$ghome"
+t grep иголка '~/.snens-selftest-grep-'$$
+want 0 "$rc" "grep: ~ разворачивается в \$HOME"
+has "домашняя иголка" "$out" "grep: ~ — файл из \$HOME найден"
+rm -f "$ghome"
+
+t grep --help
+want 0 "$rc" "grep: --help — код 0"
+has "grep — " "$out" "grep: --help, строка 1 = суть"
+has "grep <шаблон>" "$out" "grep: --help, строка 2 = usage"
+
 # ---- agent ----
 # Тесты могут идти изнутри сессии агента, где dispatch уже выставил SNENS_SESSION
 # и SNENS_MAIL_DIR: снимаем их, иначе проверки «без контекста» видят чужой контекст.

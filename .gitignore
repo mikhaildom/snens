@@ -13,3 +13,4 @@ tools/*/memory
 tools/*/agent
 tools/*/search
 tools/*/fetch
+tools/*/grep
