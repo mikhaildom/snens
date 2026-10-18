@@ -76,7 +76,41 @@ max_tokens = 400
 
 Ключ: `SNENS_API_KEY` (env или `~/.config/snens/.env`), реранкер — `SNENS_OPENROUTER_KEY`.
 
-## Замеры (на этом хосте, 300 фактов из старого банка)
+## Миграция
+
+Старый банк Hindsight → этот файл одним `import` (транзакция, даты `created`
+сохранены, дубли по нормализованному тексту отсеяны — в старом банке 125 групп
+копий). Сделано: **11511 из 11637** фактов, файл 25 МБ.
+
+```sh
+docker exec hindsight-shared-pg psql -U hindsight -d hindsight -tAc "
+  select json_build_object('units', json_agg(u)) from (
+    select text,
+      case fact_type when 'experience' then 'episode' else 'fact' end as kind,
+      case when fact_type='experience' then 'project' else 'world' end as subject,
+      extract(epoch from created_at)::bigint as created
+    from memory_units where length(btrim(text)) > 0 order by created_at) u;" \
+  > /tmp/export.json
+memory import < /tmp/export.json          # ~9 мин: 11.5k эмбеддингов по сети
+```
+
+Повторный импорт отказывается (`уже импортировано N`), принудительно — `--replace`.
+
+## Замеры (на этом хосте, 11.5k фактов после миграции)
+
+| операция | время |
+|---|---|
+| `recall` целиком | 1.1–1.5 с |
+| из них локально (BM25 + вектор + RRF + дедуп) | ~15 мс |
+| из них эмбеддинг запроса (сеть, Nous) | 0.9–2.0 с |
+| `stats` | 0.07 с |
+| RSS процесса | 7–8 МБ |
+| база | 25 МБ на 11.5k фактов |
+
+Латентность упирается в **сеть к эмбеддеру**, не в локальную часть — отсюда
+следующий шаг: локальные модели (`references/local-models.md` скилла harness).
+
+## Замеры (до миграции, 300 фактов)
 
 | операция | время |
 |---|---|
