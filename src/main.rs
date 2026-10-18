@@ -306,15 +306,13 @@ fn flush(cfg: &Cfg, store: &Store) -> Result<i32, String> {
                     if dup {
                         continue;
                     }
-                    let uid = store.insert(
+                    let uid = store.insert(&store::NewFact::auto(
                         &fact.text,
                         &fact.kind,
                         &fact.subject,
-                        "auto",
-                        "",
-                        quant.as_deref(),
+                        quant,
                         cfg.embed_dim,
-                    )?;
+                    ))?;
                     // Перекрытие старым: модель уже видела список known; если
                     // текст нового факта прямо отрицает старый — гасим старый.
                     for (old_uid, old_text) in &known {
@@ -392,15 +390,15 @@ fn import(cfg: &Cfg, store: &Store) -> Result<i32, String> {
                 .get(idx)
                 .and_then(|u| u["subject"].as_str())
                 .unwrap_or("world");
-            store.insert(
-                text,
-                kind,
-                subject,
-                "import",
-                "",
-                Some(&api::quantize(&vectors[i])),
-                cfg.embed_dim,
-            )?;
+            store.insert(&store::NewFact {
+                text: text.clone(),
+                kind: kind.to_string(),
+                subject: subject.to_string(),
+                source: "import".into(),
+                session: String::new(),
+                emb: Some(api::quantize(&vectors[i])),
+                dim: cfg.embed_dim,
+            })?;
         }
         added += chunk.len();
     }

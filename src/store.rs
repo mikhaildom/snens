@@ -12,12 +12,36 @@ pub struct Store {
 pub struct Hit {
     pub uid: String,
     pub text: String,
-    pub kind: String,
-    pub subject: String,
     pub bm25: Option<f64>,
     pub vec: Option<f64>,
     pub rrf: f64,
     pub rerank: Option<f32>,
+}
+
+/// Что положить в базу: факт с метаданными и, если есть, вектором.
+pub struct NewFact {
+    pub text: String,
+    pub kind: String,
+    pub subject: String,
+    pub source: String,
+    pub session: String,
+    pub emb: Option<Vec<u8>>,
+    pub dim: usize,
+}
+
+impl NewFact {
+    /// Автозапись из `flush`: источник и сессия известны коду, не вызывающему.
+    pub fn auto(text: &str, kind: &str, subject: &str, emb: Option<Vec<u8>>, dim: usize) -> Self {
+        Self {
+            text: text.to_string(),
+            kind: kind.to_string(),
+            subject: subject.to_string(),
+            source: "auto".into(),
+            session: String::new(),
+            emb,
+            dim,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -62,9 +86,13 @@ impl Store {
         // Расширение регистрируется один раз на процесс — до первого соединения,
         // иначе `vec0` не появится в схеме.
         unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
+            // Регистрация расширения — до первого соединения: иначе vec0 не будет.
+            let init: unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut std::os::raw::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::os::raw::c_int = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+            sqlite3_auto_extension(Some(init));
         }
         let db = Connection::open(path).map_err(|e| format!("{path:?}: {e}"))?;
         db.pragma_update(None, "journal_mode", "WAL")
@@ -89,11 +117,9 @@ impl Store {
         k: usize,
     ) -> Result<Vec<(i64, f64)>, String> {
         self.ensure_vec(dim)?;
-        let sql = format!(
-            "select f.id, v.distance from facts_vec v join facts f on f.id = v.rowid \
-             where v.emb match vec_int8(?1) and v.k = ?2 and f.valid_to is null"
-        );
-        let mut st = self.db.prepare(&sql).map_err(|e| e.to_string())?;
+        let sql = "select f.id, v.distance from facts_vec v join facts f on f.id = v.rowid \
+                   where v.emb match vec_int8(?1) and v.k = ?2 and f.valid_to is null";
+        let mut st = self.db.prepare(sql).map_err(|e| e.to_string())?;
         let rows = st
             .query_map(params![emb, k as i64], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
@@ -128,22 +154,15 @@ impl Store {
         let mut out = Vec::new();
         let mut st = self
             .db
-            .prepare("select uid, text, kind, subject from facts where id = ?1 and valid_to is null")
+            .prepare("select uid, text from facts where id = ?1 and valid_to is null")
             .map_err(|e| e.to_string())?;
         for id in ids {
             if let Ok(row) = st.query_row(params![id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             }) {
                 out.push(Hit {
                     uid: row.0,
                     text: row.1,
-                    kind: row.2,
-                    subject: row.3,
                     bm25: None,
                     vec: None,
                     rrf: 0.0,
@@ -170,17 +189,16 @@ impl Store {
         Ok(out)
     }
 
-    /// Вставить факт. `supersedes` — uid устаревшего, он закрывается `valid_to`.
-    pub fn insert(
-        &self,
-        text: &str,
-        kind: &str,
-        subject: &str,
-        source: &str,
-        session: &str,
-        emb: Option<&[u8]>,
-        dim: usize,
-    ) -> Result<String, String> {
+    /// Вставить факт. Возвращает uid записи.
+    pub fn insert(&self, f: &NewFact) -> Result<String, String> {
+        let (text, kind, subject, source, session, emb) = (
+            f.text.as_str(),
+            f.kind.as_str(),
+            f.subject.as_str(),
+            f.source.as_str(),
+            f.session.as_str(),
+            f.emb.as_deref(),
+        );
         let now = crate::now();
         let uid = crate::uid();
         self.db
@@ -198,7 +216,7 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         if let Some(emb) = emb {
-            self.ensure_vec(dim)?;
+            self.ensure_vec(f.dim)?;
             self.db
                 .execute(
                     "insert into facts_vec(rowid, emb) values (?1, vec_int8(?2))",
@@ -387,6 +405,18 @@ mod tests {
         p
     }
 
+    fn fact(text: &str, kind: &str, subject: &str, emb: &[u8], dim: usize) -> NewFact {
+        NewFact {
+            text: text.into(),
+            kind: kind.into(),
+            subject: subject.into(),
+            source: "test".into(),
+            session: String::new(),
+            emb: Some(emb.to_vec()),
+            dim,
+        }
+    }
+
     #[test]
     fn fts_and_vectors_fuse_and_supersede() {
         let path = tmp("fuse");
@@ -395,9 +425,9 @@ mod tests {
         let a = crate::api::quantize(&[1.0, 0.0, 0.0, 0.0]);
         let b = crate::api::quantize(&[0.0, 1.0, 0.0, 0.0]);
         let uid_a = s
-            .insert("пользователь живёт в Нидерландах", "fact", "user", "test", "", Some(&a), dim)
+            .insert(&fact("пользователь живёт в Нидерландах", "fact", "user", &a, dim))
             .unwrap();
-        s.insert("сервер VPN стоит в Финляндии", "fact", "world", "test", "", Some(&b), dim)
+        s.insert(&fact("сервер VPN стоит в Финляндии", "fact", "world", &b, dim))
             .unwrap();
 
         let by_text = s.bm25_search("Нидерландах", 5).unwrap();
@@ -408,7 +438,7 @@ mod tests {
 
         // Противоречащий факт закрывает старый, но остаётся в таймлайне.
         let uid_a2 = s
-            .insert("пользователь переехал в Германию", "fact", "user", "test", "", Some(&a), dim)
+            .insert(&fact("пользователь переехал в Германию", "fact", "user", &a, dim))
             .unwrap();
         assert!(s.supersede(&uid_a, &uid_a2).unwrap());
         let live = s.bm25_search("Нидерландах", 5).unwrap();
