@@ -251,8 +251,12 @@ fn isolate(source: &str, data: &Path) -> R<Config> {
             toml::Value::String(data.join(name).display().to_string()),
         );
     }
-    // Память экспериментального прогона не трогает общий банк: канал выключен.
-    doc.insert("memory".into(), toml::Value::Table(toml::Table::new()));
+    // Память экспериментального прогона не трогает общий банк: по умолчанию
+    // канал выключен. Свой банк (свой `db` в memory.toml) включается явно —
+    // `[memory] cmd` в исходном конфиге; ключа нет — секция чистая.
+    if !matches!(doc.get("memory"), Some(toml::Value::Table(m)) if m.contains_key("cmd")) {
+        doc.insert("memory".into(), toml::Value::Table(toml::Table::new()));
+    }
     // Авторевью управляется самим runtime.toml. Раньше экспериментальный инстанс
     // глушил его `review_min_turns = MAX`; при снятом изоляционном конфиге этот
     // ключ остаётся в source и выключил бы триггер — снимаем его, берётся дефолт.
