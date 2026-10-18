@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Файл для правки: абсолютный или относительно рабочего каталога"
+    },
+    "old_string": {
+      "type": "string",
+      "description": "Точный фрагмент, который надо заменить. Должен встречаться ровно один раз, если replace_all не задан. Многострочный текст подавай как есть, с реальными переводами строк."
+    },
+    "new_string": {
+      "type": "string",
+      "description": "Чем заменить old_string"
+    },
+    "replace_all": {
+      "type": "boolean",
+      "description": "Заменить все совпадения old_string, а не требовать единственного"
+    },
+    "edits": {
+      "type": "array",
+      "description": "Несколько правок одного файла одним вызовом: применяются по порядку и атомарно. Вместо old_string/new_string.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "old_string": {"type": "string"},
+          "new_string": {"type": "string"},
+          "replace_all": {"type": "boolean"}
+        },
+        "required": ["old_string", "new_string"]
+      }
+    }
+  },
+  "required": ["path"],
+  "x-snens": {
+    "argv": [{"field": "path"}],
+    "stdin": {
+      "mode": "json",
+      "fields": ["old_string", "new_string", "replace_all", "edits"]
+    }
+  }
+}

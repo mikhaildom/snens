@@ -25,6 +25,7 @@ mod registry;
 mod render;
 mod review;
 mod selftest;
+mod sesscwd;
 mod subagent;
 mod surface_client;
 mod surface_runtime;
@@ -597,7 +598,29 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
         println!("  (пусто)");
     }
     for t in &tools {
-        println!("  {}\n    {}\n    {}", t.name, t.summary, t.usage);
+        println!("  {}\n    {}", t.name, t.summary);
+        match &t.schema {
+            // Схема есть — показываем поля (имя: тип), а не generic usage:
+            // именно их видит модель, и `args` больше не нужен.
+            Some(s) => {
+                let req = s.required();
+                let fields = s
+                    .fields()
+                    .into_iter()
+                    .map(|(n, ty)| {
+                        if req.contains(&n) {
+                            format!("{n}: {ty} (обязательно)")
+                        } else {
+                            format!("{n}: {ty}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("    [схема] поля: {fields}");
+                println!("    {}", t.usage);
+            }
+            None => println!("    [generic args] {}", t.usage),
+        }
     }
     Ok(())
 }

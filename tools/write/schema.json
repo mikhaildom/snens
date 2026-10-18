@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Файл для записи: абсолютный или относительно рабочего каталога. Родительские каталоги создаются."
+    },
+    "content": {
+      "type": "string",
+      "description": "Содержимое целиком: уходит на stdin как есть, без JSON-обёртки и без экранирования"
+    },
+    "append": {
+      "type": "boolean",
+      "description": "Дописать в конец вместо перезаписи"
+    }
+  },
+  "required": ["path", "content"],
+  "x-snens": {
+    "argv": [
+      {"field": "path"},
+      {"flag": "--append", "when_field": "append"}
+    ],
+    "stdin": {"mode": "field", "field": "content"}
+  }
+}

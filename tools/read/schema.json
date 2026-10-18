@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Файл для чтения: абсолютный или относительно рабочего каталога. Ведущий ~ разворачивается."
+    },
+    "offset": {
+      "type": "integer",
+      "description": "С какой строки начать (1-based, по умолчанию 1)"
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Сколько строк показать (по умолчанию 400)"
+    },
+    "max_chars": {
+      "type": "integer",
+      "description": "Потолок символов в ответе (по умолчанию 40000)"
+    }
+  },
+  "required": ["path"],
+  "x-snens": {
+    "argv": [
+      {"field": "path"},
+      {"flag": "--offset", "field": "offset"},
+      {"flag": "--limit", "field": "limit"},
+      {"flag": "--max-chars", "field": "max_chars"}
+    ],
+    "stdin": {"mode": "none"}
+  }
+}
