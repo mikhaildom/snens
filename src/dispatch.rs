@@ -240,8 +240,8 @@ pub async fn dispatch(
     };
     // Типизированный тул: поля схемы → argv/stdin. Generic `args`/`stdin` для
     // него не нужны; если модель всё же их прислала — пробуем спасти вызов.
-    if let Some(schema) = &tool.schema {
-        return dispatch_typed(call, &tool.bin, schema, &a, cfg, path, out_dir, sess).await;
+    if tool.schema.is_some() {
+        return dispatch_typed(call, tool, &a, cfg, path, out_dir, sess).await;
     }
 
     let args: Vec<String> = match a.get("args") {
@@ -357,14 +357,23 @@ pub fn typed_call(
 /// должна суметь исправить вызов, не гадая о контракте.
 async fn dispatch_typed(
     call: &Call,
-    bin: &Path,
-    schema: &registry::ToolSchema,
+    tool: &registry::Tool,
     a: &Value,
     cfg: &Config,
     path: &str,
     out_dir: &Path,
     sess: &Session,
 ) -> exec::Out {
+    let Some(schema) = &tool.schema else {
+        return exec::Out {
+            exit: -1,
+            text: format!("{}: у тула нет схемы", call.name),
+            bytes: 0,
+            ms: 0,
+            timed_out: false,
+            parts: Vec::new(),
+        };
+    };
     let fail = |msg: String| exec::Out {
         exit: -1,
         text: msg,
@@ -380,7 +389,7 @@ async fn dispatch_typed(
         Ok(tc) => tc,
         Err(e) => return fail(e),
     };
-    let bin_s = bin.to_string_lossy().into_owned();
+    let bin_s = tool.bin.to_string_lossy().into_owned();
     let mut sp = exec::Spawn::argv(&bin_s, tc.argv);
     sp.stdin = tc.stdin;
     sp.cwd = tc.cwd.to_str();

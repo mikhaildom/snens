@@ -8,7 +8,7 @@ use crate::{
     llm::{Fake, Reply, Usage},
     log,
     log::{Body, Call, Rec, Session},
-    project, R,
+    project, registry, sesscwd, R,
 };
 
 /// Единственная проверка, которая падает, если цикл сломан: ход с tool_call →
@@ -210,6 +210,156 @@ pub async fn selftest() -> R<()> {
     let a = serde_json::to_string(&project::msgs(&recs, &cfg))?;
     let b = serde_json::to_string(&project::msgs(&sess.read()?, &cfg))?;
     assert_eq!(a, b, "проекция недетерминирована");
+
+    // --- typed-схема: поля вместо generic args/stdin ---
+    // Второй фальшивый тул со schema.json: модель зовёт его полями, ядро само
+    // собирает argv и stdin. Проверяем весь путь — prepare → dispatch → процесс.
+    let tdir2 = dir.join("tools/typed");
+    std::fs::create_dir_all(&tdir2)?;
+    let typed_bin = tdir2.join("typed");
+    std::fs::write(
+        &typed_bin,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--help\" ]; then\n\
+         \x20 echo \"typed — тестовый типизированный тул.\"\n\
+         \x20 echo \"typed <path> [--limit N] [--append]\"\n\
+         \x20 exit 0\n\
+         fi\n\
+         echo \"argv:$*\"\n\
+         echo \"cwd:$(pwd)\"\n\
+         echo \"stdin:$(cat)\"\n",
+    )?;
+    std::fs::set_permissions(&typed_bin, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::write(
+        tdir2.join("schema.json"),
+        r#"{"type":"object",
+            "properties":{
+              "path":{"type":"string","description":"файл"},
+              "limit":{"type":"integer"},
+              "append":{"type":"boolean"},
+              "note":{"type":"string"}},
+            "required":["path"],
+            "x-snens":{
+              "argv":[{"field":"path"},{"flag":"--limit","field":"limit"},
+                      {"flag":"--append","when_field":"append"}],
+              "stdin":{"mode":"json","fields":["note"]}}}"#,
+    )?;
+
+    let (defs2, reg2, path2) = dispatch::prepare(&cfg).await?;
+    let td = defs2
+        .iter()
+        .find(|d| d["function"]["name"] == "typed")
+        .expect("нет определения typed");
+    // В схеме модели — настоящие поля, а не args/stdin.
+    assert!(
+        td["function"]["parameters"]["properties"]["path"].is_object(),
+        "поля схемы не доехали до модели: {td}"
+    );
+    assert!(
+        td["function"]["parameters"]["properties"]["args"].is_null(),
+        "generic args остались у типизированного тула: {td}"
+    );
+    assert_eq!(td["function"]["parameters"]["required"][0], "path");
+
+    let sess_t = Session::open(&dir, "t-typed")?;
+    sess_t.append(Rec::User {
+        ts: log::now(),
+        text: "позови типизированный тул".into(),
+        source: "selftest".into(),
+        parts: Vec::new(),
+    })?;
+    let dir_out = sess_t.path().with_extension("out");
+    let call = |args: &str| Call {
+        id: "t1".into(),
+        name: "typed".into(),
+        args: args.into(),
+    };
+    let typed_tool: Vec<registry::Tool> = reg2.clone();
+    // reg2 нужен целиком ниже (run без схемы), поэтому диспатчим по полному реестру.
+    let ok = dispatch::dispatch(
+        &call(r#"{"path":"/tmp/x","limit":3,"append":true,"note":"привет"}"#),
+        &cfg,
+        &typed_tool,
+        &path2,
+        &dir_out,
+        &sess_t,
+    )
+    .await;
+    assert!(ok.text.contains("argv:/tmp/x --limit 3 --append"), "argv по схеме: {}", ok.text);
+    assert!(ok.text.contains(r#"stdin:{"note":"привет"}"#), "stdin по схеме: {}", ok.text);
+
+    let missing = dispatch::dispatch(
+        &call(r#"{"limit":1}"#),
+        &cfg,
+        &typed_tool,
+        &path2,
+        &dir_out,
+        &sess_t,
+    )
+    .await;
+    assert!(missing.text.contains("path"), "нет имени поля: {}", missing.text);
+    assert_eq!(missing.exit, -1, "процесс не должен запускаться");
+
+    let unknown = dispatch::dispatch(
+        &call(r#"{"path":"/tmp/x","nosuch":1}"#),
+        &cfg,
+        &typed_tool,
+        &path2,
+        &dir_out,
+        &sess_t,
+    )
+    .await;
+    assert!(unknown.text.contains("nosuch"), "нет имени неизвестного поля: {}", unknown.text);
+    assert!(unknown.text.contains("path"), "нет списка допустимых: {}", unknown.text);
+
+    // --- рабочий каталог сессии: cd внутри run виден следующим тулам ---
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work)?;
+    let run_cd = dispatch::dispatch(
+        &Call {
+            id: "cwd1".into(),
+            name: "run".into(),
+            args: format!(r#"{{"command":"cd {} && pwd"}}"#, work.display()),
+        },
+        &cfg,
+        &reg2,
+        &path2,
+        &dir_out,
+        &sess_t,
+    )
+    .await;
+    assert!(run_cd.text.contains(&work.display().to_string()), "cd не сработал: {}", run_cd.text);
+    assert_eq!(sesscwd::read(&sess_t), work, "каталог сессии не записан");
+    // Следующий вызов тула стартует уже из него — ровно то, чего не хватало.
+    let from_cwd = dispatch::dispatch(
+        &call(r#"{"path":"/tmp/x"}"#),
+        &cfg,
+        &typed_tool,
+        &path2,
+        &dir_out,
+        &sess_t,
+    )
+    .await;
+    assert!(
+        from_cwd.text.contains(&format!("cwd:{}", work.display())),
+        "тул не получил каталог сессии: {}",
+        from_cwd.text
+    );
+    // Относительный путь внутри run разрешается от каталога сессии, как в shell.
+    let rel = dispatch::dispatch(
+        &Call {
+            id: "cwd2".into(),
+            name: "run".into(),
+            args: r#"{"command":"pwd"}"#.into(),
+        },
+        &cfg,
+        &reg2,
+        &path2,
+        &dir_out,
+        &sess_t,
+    )
+    .await;
+    assert!(rel.text.contains(&work.display().to_string()), "run не унаследовал cwd: {}", rel.text);
 
     // --- economic cleanup request: no automatic deletion of model context ---
     let mut cfg2 = cfg.clone();

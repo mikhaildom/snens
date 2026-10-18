@@ -50,6 +50,50 @@ ti() {
 f=$TMP/a.txt
 printf 'alpha\nbeta\ngamma\ndelta\n' >"$f"
 
+# ---- схемы тулов (контракт для модели) ----
+# Модель видит не generic args/stdin, а настоящие поля из tools/<имя>/schema.json.
+# Проверяем файлы и то, что `snens tools` их показывает; сборку argv по схеме
+# проверяют unit-тесты (src/dispatch.rs, src/registry.rs).
+for tool in read write edit; do
+  s=$HERE/$tool/schema.json
+  if [ -f "$s" ]; then ok "schema: $tool — schema.json рядом с бинарником"; else bad "schema: у $tool нет schema.json"; fi
+  if grep -q '"x-snens"' "$s" 2>/dev/null; then ok "schema: $tool — есть ключ x-snens"; else bad "schema: в $tool/schema.json нет x-snens"; fi
+done
+has '"path"' "$(cat "$HERE/read/schema.json")" "schema: read объявляет path"
+has '"content"' "$(cat "$HERE/write/schema.json")" "schema: write объявляет content"
+has '"edits"' "$(cat "$HERE/edit/schema.json")" "schema: edit объявляет edits"
+has '"mode": "field"' "$(cat "$HERE/write/schema.json")" "schema: write берёт stdin из поля content"
+has '"mode": "json"' "$(cat "$HERE/edit/schema.json")" "schema: edit собирает stdin как JSON"
+
+# Что видит модель: определения тулов из ядра (dump), а не только файлы схем.
+# Ядро само печатает definitions — так проверка не зависит от бинаря в PATH.
+CORE=${SNENS_SELFTEST_BIN:-}
+if [ -z "$CORE" ]; then
+  for c in "${CARGO_TARGET_DIR:-/nonexistent}/debug/snens" "$(command -v snens 2>/dev/null || true)"; do
+    [ -x "$c" ] && CORE=$c && break
+  done
+fi
+if [ -n "$CORE" ]; then
+  # Свой конфиг: иначе команда читает ~/.config/snens и смотрит в чужой каталог тулов.
+  scfg=$TMP/selftest.toml
+  printf 'tools_dir = "%s"\nsessions_dir = "%s"\n' "$HERE" "$TMP/sessions" >"$scfg"
+  tools_out=$("$CORE" tools --config "$scfg" 2>/dev/null || true)
+  case "$tools_out" in
+    *"[схема] поля:"*) ok "schema: snens tools помечает тулы со схемой" ;;
+    *) bad "schema: snens tools не различает тулы со схемой" ;;
+  esac
+  for field in 'path: string' 'content: string' 'old_string: string'; do
+    case "$tools_out" in
+      *"$field"*) ok "schema: snens tools печатает поле '$field'" ;;
+      *) bad "schema: snens tools не печатает поле '$field'" ;;
+    esac
+  done
+  case "$tools_out" in
+    *"[generic args]"*) ok "schema: snens tools оставляет generic-пометку для тулов без схемы" ;;
+    *) bad "schema: snens tools потерял пометку generic" ;;
+  esac
+fi
+
 # ---- read ----
 t read "$f"
 want 0 "$rc" "read: код 0"
