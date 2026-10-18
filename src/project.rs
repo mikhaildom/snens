@@ -109,6 +109,8 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
     // рамка — это ревью/улучшение поверх транскрипта, и транскрипт надо пометить.
     let mut had_work = false;
     let mut replay_marked = false;
+    // Лог ссылается на транскрипт источника (`Rec::Replay`).
+    let mut replay = false;
     // Какие вызовы получили результат. Нужно, чтобы оборванный ход не уехал
     // провайдеру как assistant с tool_calls без ответов.
     let answered: HashSet<&str> = log
@@ -134,12 +136,15 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
                 // пометки модель принимает запрос из транскрипта за свой живой ход и
                 // выполняет его вместо ревью. Пометка ставится только если транскрипт
                 // есть: у свежего улучшения до рамки ничего, кроме Meta.
-                if frame && !replay_marked && had_work {
-                    replay_marked = true;
-                    out.push(json!({"role": "system", "content": REPLAY_NOTE}));
-                }
                 if !frame {
                     had_work = true;
+                }
+                // Лог-хвост поверх `Replay`: в записях лежит только собственная
+                // работа, а перед ней — чужой транскрипт (или ничего). Без пометки
+                // модель сшивает рамку с транскриптом в один живой диалог.
+                if frame && !replay_marked && (replay || had_work) {
+                    replay_marked = true;
+                    out.push(json!({"role": "system", "content": REPLAY_NOTE}));
                 }
                 let role = if frame { "system" } else { "user" };
                 let content = if parts.is_empty() {
@@ -229,6 +234,10 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
                 };
                 out.push(json!({"role": "user", "content": format!("{label}{text}")}));
             }
+            // У записи нет собственного текста: дальше идёт транскрипт в этом же
+            // логе. Пометку ставим не здесь, а перед рамкой — вставка в начало
+            // сдвинула бы весь транскрипт и убила бы префикс-кеш.
+            Rec::Replay { .. } => replay = true,
             Rec::System { .. }
             | Rec::Meta { .. }
             | Rec::Usage { .. }
@@ -657,9 +666,41 @@ mod tests {
         assert_eq!(msgs[1]["content"], "добавь строку и собери");
     }
 
+    /// Лог со ссылкой на источник (`Replay`): пометка о чужом транскрипте всё
+    /// равно встаёт перед рамкой, но не раньше — вставка в начало сдвинула бы
+    /// транскрипт и убила бы префикс-кеш.
     #[test]
-    fn fresh_frame_without_transcript_gets_no_note() {
+    fn replay_link_marks_the_frame_without_shifting_the_prefix() {
         let cfg = Config::default();
+        let linked = vec![
+            Rec::Meta {
+                ts: 0,
+                model: String::new(),
+                parent: String::new(),
+                surface: None,
+            },
+            Rec::Replay {
+                ts: 0,
+                session: "base".into(),
+                lines: 3,
+            },
+            user("# Ревью сессии", "review"),
+        ];
+        let got = raw_msgs(&linked, &cfg);
+        let note = got
+            .iter()
+            .position(|m| m["content"].as_str().unwrap_or_default().contains(REPLAY_NOTE))
+            .expect("нет пометки о транскрипте");
+        let frame = got
+            .iter()
+            .position(|m| m["content"].as_str() == Some("# Ревью сессии"))
+            .unwrap();
+        assert!(note < frame, "пометка должна стоять перед рамкой");
+        assert_eq!(note, got.len() - 2, "пометка влезла не в конец транскрипта");
+    }
+
+    #[test]
+    fn fresh_frame_without_transcript_gets_no_note() {        let cfg = Config::default();
         let log = vec![user("разбери тикеты", "improve")];
         let msgs = msgs(&log, &cfg);
         // Ищем именно пометку реплея, а не слово «транскрипт»: оно встречается

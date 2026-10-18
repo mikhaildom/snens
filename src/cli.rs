@@ -563,8 +563,14 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
 fn cmd_log(flags: &BTreeMap<String, String>) -> R<()> {
     let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
     let id = session_id(&cfg, flags)?;
-    let path = cfg.sessions_path().join(format!("{id}.jsonl"));
-    print!("{}", std::fs::read_to_string(&path)?);
+    let dir = cfg.sessions_path();
+    let path = dir.join(format!("{id}.jsonl"));
+    // Чтение без лока и без правки хвоста: `log` — просмотрщик, в том числе
+    // битого лога. Префикс ревью раскрывается (`Rec::Replay`), чтобы grep по
+    // выводу видел тот же транскрипт, что раньше лежал копией в файле.
+    for rec in log::expand(&log::read_file(&path)?, &dir) {
+        println!("{}", serde_json::to_string(&rec)?);
+    }
     Ok(())
 }
 

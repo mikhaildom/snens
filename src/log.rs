@@ -34,6 +34,23 @@ pub enum Rec {
     /// из лога: файлы инстанса (soul/user/memory, скиллы) правятся по ходу, и
     /// пересборка промахивалась бы мимо префикс-кеша на каждой правке.
     System { ts: u64, text: String },
+    /// Транскрипт, на котором вырос лог. Ревью — не копия сессии, а хвост поверх
+    /// неё: `session` — источник, `lines` — сколько его первых раскрытых записей
+    /// входит сюда. Живёт второй строкой, сразу после `Meta`; при чтении
+    /// разворачивается обратно в записи источника, поэтому проекция совпадает с
+    /// прежней копией байт-в-байт и префикс-кеш провайдера остаётся тёплым.
+    ///
+    /// Поля с `default` — чтобы `{"kind":"replay"}` (маркер без ссылки, след
+    /// старых экспериментов) читался как запись: префикса в таком логе нет, и
+    /// это надо помнить.
+    Replay {
+        #[serde(default)]
+        ts: u64,
+        #[serde(default)]
+        session: String,
+        #[serde(default)]
+        lines: usize,
+    },
     User {
         ts: u64,
         text: String,
@@ -181,6 +198,8 @@ pub struct Session {
     lines: AtomicU64,
     /// Сессия-родитель, если это подагент; читается из `Meta` при открытии.
     parent: String,
+    /// Каталог, где искать источник `Replay` (он лежит рядом с этим логом).
+    dir: PathBuf,
 }
 
 impl Session {
@@ -219,6 +238,7 @@ impl Session {
         })?;
         recover_tail(&mut file, &path)?;
         let lines = AtomicU64::new(count_lines(&path)?.max(1));
+        let dir = dir.to_path_buf();
         // Родитель неизменяем и живёт в `Meta`: при открытии существующего лога
         // берём его оттуда, а не из аргумента (resume подагента не должен терять связь).
         let parent = if exists {
@@ -241,6 +261,7 @@ impl Session {
                 file: Mutex::new(file),
                 lines,
                 parent: parent.clone(),
+                dir,
             };
             s.append(Rec::Meta {
                 ts: now(),
@@ -256,6 +277,7 @@ impl Session {
             file: Mutex::new(file),
             lines,
             parent,
+            dir,
         };
         Ok(s)
     }
@@ -284,7 +306,79 @@ impl Session {
     }
 
     pub fn read(&self) -> R<Vec<Rec>> {
+        let raw = read_file(&self.path)?;
+        Ok(expand(&raw, &self.dir))
+    }
+
+    /// Записи этого лога без раскрытия префикса `Replay`. Нужно там, где смысл
+    /// имеет именно хвост (например длина хвоста при переносе рамки ревью).
+    pub fn read_raw(&self) -> R<Vec<Rec>> {
         read_file(&self.path)
+    }
+
+    /// Перевести уже раскрытые записи обратно в ссылку на источник. `lines` —
+    /// сколько первых раскрытых записей ссылка покрывает: файл становится
+    /// `Meta` + `Replay{.., lines}` + всё, что в префикс не влезло (при
+    /// уменьшении — просто короче; при увеличении — префикс источника).
+    ///
+    /// Переписывается только сам лог, атомарно (tmp + rename): читатели видят
+    /// либо старый файл целиком, либо новый.
+    pub fn rewrite_with_replay(&self, session: &str, lines: usize) -> R<()> {
+        let raw = self.read_raw()?;
+        // Шапка (`Meta`) и прежняя ссылка пересобираются заново; собственный
+        // хвост — это всё остальное, и он не зависит от старого префикса.
+        let mut rest: Vec<Rec> = raw.iter().skip(1).cloned().collect();
+        if matches!(rest.first(), Some(Rec::Replay { .. })) {
+            rest.remove(0);
+        }
+        let keep = rest.len();
+        let mut out = Vec::with_capacity(keep + 2);
+        match raw.first() {
+            Some(meta @ Rec::Meta { .. }) => out.push(meta.clone()),
+            _ => out.push(Rec::Meta {
+                ts: now(),
+                model: String::new(),
+                parent: self.parent.clone(),
+                surface: None,
+            }),
+        }
+        out.push(Rec::Replay {
+            ts: now(),
+            session: session.to_string(),
+            lines,
+        });
+        out.extend(rest);
+        let tmp = self.path.with_extension("jsonl.tmp");
+        let mut text = String::new();
+        for rec in &out {
+            text.push_str(&serde_json::to_string(rec)?);
+            text.push('\n');
+        }
+        std::fs::write(&tmp, text)?;
+        // Проверка — на содержимом, которое собираемся положить, до подмены: после
+        // rename читать лог по этому пути уже нельзя (а раскрытие сосёт источник
+        // целиком). Атомарность — `rename`, а не запись на место.
+        let expanded = expand(&out, &self.dir);
+        if expanded.len() != lines + keep {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "{session}: ссылка на {} записей не сходится (раскрылось {}) — лог не тронут",
+                lines,
+                expanded.len().saturating_sub(keep)
+            )
+            .into());
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        // Дескриптор указывает на старый (уже отвязанный) инод: дописывать через
+        // него — значит писать в никуда. Переоткрываем сами, пока держим лок.
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        file.try_lock_exclusive()?;
+        *self.file.lock().map_err(|_| "session log lock poisoned")? = file;
+        self.lines.store(out.len() as u64, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -320,6 +414,75 @@ fn recover_tail(file: &mut File, path: &Path) -> R<()> {
         file.sync_data()?;
     }
     Ok(())
+}
+
+/// Первые `n` записей файла без чтения остального. Нужно там, где всё решается
+/// по шапке лога (`Meta`, `Replay`), а сам лог бывает в мегабайты.
+pub fn read_head(path: &Path, n: usize) -> R<Vec<Rec>> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    for line in BufReader::new(File::open(path)?).lines().take(n) {
+        let line = line?;
+        if let Ok(r) = serde_json::from_str::<Rec>(&line) {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+/// Ссылка на источник транскрипта: `(сессия, сколько её раскрытых записей входит
+/// в этот лог)`. Живёт второй строкой, сразу после `Meta`.
+pub fn replay_link(recs: &[Rec]) -> Option<(&str, usize)> {
+    match recs.get(1)? {
+        Rec::Replay { session, lines, .. } if !session.is_empty() => Some((session, *lines)),
+        _ => None,
+    }
+}
+
+fn replay_source(dir: &Path, session: &str, depth: usize) -> Option<Vec<Rec>> {
+    let path = dir.join(format!("{session}.jsonl"));
+    if !path.is_file() {
+        return None;
+    }
+    let raw = read_file(&path).ok()?;
+    Some(expand_depth(&raw, dir, depth))
+}
+
+/// Раскрыть `Replay` в записи источника: на выходе те же записи, что лежали бы
+/// в полной копии лога (маркер в них не входит — он адрес, а не событие).
+/// Ссылка не разрешилась (источник удалён, кольцо ссылок) — отдаём всё, что есть,
+/// кроме маркера, и говорим в stderr: потерянный префикс — это потерянный
+/// транскрипт ревью, и молчать об этом нельзя.
+pub fn expand(recs: &[Rec], dir: &Path) -> Vec<Rec> {
+    expand_depth(recs, dir, 0)
+}
+
+fn expand_depth(recs: &[Rec], dir: &Path, depth: usize) -> Vec<Rec> {
+    const MAX_DEPTH: usize = 8;
+    let Some((session, lines)) = replay_link(recs) else {
+        return recs.to_vec();
+    };
+    let src = if depth >= MAX_DEPTH {
+        eprintln!("[log] префикс `{session}` вложен глубже {MAX_DEPTH} — читаю лог без него");
+        None
+    } else {
+        replay_source(dir, session, depth + 1)
+    };
+    let Some(src) = src else {
+        eprintln!("[log] префикс `{session}` не раскрыт — читаю лог без него");
+        // Маркер без префикса не оставляем: в проекции он дал бы пометку «выше
+        // транскрипт», которого нет. Указатель остаётся только в файле.
+        let mut out = vec![recs[0].clone()];
+        out.extend(recs.iter().skip(2).cloned());
+        return out;
+    };
+    let mut out: Vec<Rec> = src.into_iter().take(lines).collect();
+    // Сама ссылка в раскрытый лог не идёт: она — адрес префикса, а не событие.
+    // На провод (и в проекцию) едет ровно то, что лежало бы в старой копии лога.
+    out.extend(recs.iter().skip(2).cloned());
+    out
 }
 
 pub fn read_file(path: &Path) -> R<Vec<Rec>> {
@@ -533,5 +696,117 @@ mod writer_safety_tests {
         std::fs::write(&path, b"{}\nnot-json\n{}\n").unwrap();
         assert!(Session::open(&dir.0, "bad").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{}\nnot-json\n{}\n");
+    }
+
+    /// Ссылка на префикс: файл лога ревью содержит `Meta` + `Replay` + хвост, но
+    /// читается ровно как прежняя копия. Это и есть контракт старого формата.
+    #[test]
+    fn replay_link_reads_as_the_former_copy() {
+        let dir = TempDir::new();
+        let base = Session::open(&dir.0, "base").unwrap();
+        let full = vec![
+            user("первый ход"),
+            Rec::Assistant {
+                ts: 1,
+                text: Some("ответ".into()),
+                tool_calls: vec![],
+                reasoning: Some("думал".into()),
+            },
+        ];
+        for rec in full {
+            base.append(rec).unwrap();
+        }
+        let n = base.read().unwrap().len();
+        drop(base);
+
+        let review = Session::open(&dir.0, "base-review").unwrap();
+        review.rewrite_with_replay("base", n).unwrap();
+        drop(review);
+
+        let on_disk = std::fs::read_to_string(dir.0.join("base-review.jsonl")).unwrap();
+        assert_eq!(on_disk.lines().count(), 2, "префикс остался в файле: {on_disk}");
+        assert!(
+            read_file(&dir.0.join("base-review.jsonl")).unwrap()
+                .iter()
+                .any(|r| matches!(r, Rec::Replay { .. })),
+            "ссылка не записана"
+        );
+
+        let reopened = Session::open(&dir.0, "base-review").unwrap();
+        let expanded = reopened.read().unwrap();
+        let copy = read_file(&dir.0.join("base.jsonl")).unwrap();
+        assert_eq!(
+            serde_json::to_string(&expanded).unwrap(),
+            serde_json::to_string(&copy).unwrap(),
+            "раскрытый лог не совпал с копией до байта"
+        );
+    }
+
+    /// Хвост — своя работа поверх чужого транскрипта; источник мог вырасти, но
+    /// длина ссылки не меняется: иначе префикс поплывёт.
+    #[test]
+    fn replay_tail_appends_after_prefix_and_survives_source_growth() {
+        let dir = TempDir::new();
+        let base = Session::open(&dir.0, "base").unwrap();
+        base.append(user("общий ход")).unwrap();
+        let n = base.read().unwrap().len();
+        drop(base);
+
+        let review = Session::open(&dir.0, "base-review").unwrap();
+        review.rewrite_with_replay("base", n).unwrap();
+        review.append(user("рамка ревью")).unwrap();
+        drop(review);
+
+        // Сессия дописала свой ход уже после старта ревью.
+        let base = Session::open(&dir.0, "base").unwrap();
+        base.append(user("поздний ход сессии")).unwrap();
+        drop(base);
+
+        let expanded = Session::open(&dir.0, "base-review").unwrap().read().unwrap();
+        let texts: Vec<&str> = expanded
+            .iter()
+            .filter_map(|r| match r {
+                Rec::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["общий ход", "рамка ревью"], "поздний ход утёк в префикс");
+    }
+
+    /// Ссылка, которая не разрешается (источник удалён), не должна раскрываться в
+    /// пустоту молча: лог читается как есть — хвост лучше, чем ничего.
+    #[test]
+    fn broken_replay_link_keeps_the_tail_without_prefix() {
+        let dir = TempDir::new();
+        let meta = "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\",\"parent\":\"\"}";
+        let replay = "{\"kind\":\"replay\",\"ts\":2,\"session\":\"gone\",\"lines\":9}";
+        let tail = "{\"kind\":\"user\",\"ts\":3,\"text\":\"хвост\",\"source\":\"review\",\"parts\":[]}";
+        std::fs::write(
+            dir.0.join("orphan-review.jsonl"),
+            format!("{meta}\n{replay}\n{tail}\n"),
+        )
+        .unwrap();
+        let got = Session::open(&dir.0, "orphan-review").unwrap().read().unwrap();
+        assert_eq!(got.len(), 2, "ссылка растворилась, хвост должен остаться");
+        assert!(matches!(&got[1], Rec::User { text, .. } if text == "хвост"));
+    }
+
+    /// Ссылка на себя или кольцо не должны уводить чтение в бесконечность.
+    #[test]
+    fn replay_cycle_is_bounded() {
+        let dir = TempDir::new();
+        let head = "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\",\"parent\":\"\"}\n";
+        std::fs::write(
+            dir.0.join("a.jsonl"),
+            [head, "{\"kind\":\"replay\",\"ts\":2,\"session\":\"b\",\"lines\":9}\n"].concat(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.0.join("b.jsonl"),
+            [head, "{\"kind\":\"replay\",\"ts\":2,\"session\":\"a\",\"lines\":9}\n"].concat(),
+        )
+        .unwrap();
+        let got = Session::open(&dir.0, "a").unwrap().read().unwrap();
+        assert!(!got.is_empty(), "кольцо не должно обнулять лог");
     }
 }

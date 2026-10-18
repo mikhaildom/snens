@@ -1,5 +1,7 @@
-// Ревью: не свежая сессия, а дубликат лога. Префикс совпадает до байта, поэтому
-// провайдерский кеш тёплый и ревью стартует, уже зная всё, что знала сессия.
+// Ревью: не свежая сессия, а транскрипт этой же сессии. Раньше — полная копия
+// лога, теперь ссылка `Rec::Replay` на его первые записи: проекция получает те
+// же записи до байта (провайдерский кеш остаётся тёплым), а транскрипт лежит в
+// файлах один раз.
 use std::{collections::BTreeMap, path::Path};
 
 use crate::{agent, cfg::Config, exec, llm, log, registry, R};
@@ -21,12 +23,26 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
     }
     let rid = format!("{id}-review");
     let dst = dir.join(format!("{rid}.jsonl"));
-    // Дампы обрезанных выводов не копируем: в логе лежат абсолютные пути к
-    // <id>.out/, они живы и после копии.
-    if dst.exists() {
+    // Не копия, а ссылка на хвост сессии (`Rec::Replay`). Проекция всё равно
+    // получает те же записи — префикс провайдерского кеша остаётся тёплым, — но
+    // байты префикса лежат в одном файле, а не в двух.
+    let existed = dst.exists();
+    let sess = log::Session::open(&dir, &rid)?;
+    // Префикс — раскрытые записи сессии. Повторный прогон по той же сессии
+    // (после первого её работы хвост уже в её логе) остаётся на ревью-логе:
+    // нижняя граница ссылки на префикс не может сдвигаться вперёд, а вместе
+    // лог и хвост — это ровно раскрытый ревью-лог.
+    let src_len = log::Session::open(&dir, id)?.read()?.len();
+    let (link, prefix_len) = match log::replay_link(&log::read_head(&dst, 2)?) {
+        Some((prev, lines)) if prev == id && src_len < lines => (rid.as_str(), lines),
+        _ => (id, src_len),
+    };
+    sess.rewrite_with_replay(link, prefix_len)?;
+    drop(sess);
+    if existed {
         eprintln!("[snens] {rid}: лог перезаписан, прошлый прогон ревью этой сессии потерян");
     }
-    std::fs::copy(&src, &dst)?;
+    let sess = log::Session::open(&dir, &rid)?;
 
     let audit = audit_report(cfg, &src).await?;
     let tickets = ticket_list(&cfg.tickets_path());
@@ -43,7 +59,6 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
         &ymd(log::now()),
     );
 
-    let sess = log::Session::open(&dir, &rid)?;
     sess.append(log::Rec::User {
         ts: log::now(),
         text,
