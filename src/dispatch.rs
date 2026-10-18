@@ -529,6 +529,16 @@ fn legacy_fields(a: &Value, schema: &registry::ToolSchema, out: &mut serde_json:
 
 /// Значение поля в текст argv: числа без хвоста `.0`, bool как 1/true не
 /// выдумываем — берём serde-представление.
+/// Тексты значения: массив разворачивается поэлементно (несколько путей,
+/// несколько `--glob`), остальное — одно значение. JSON-текст массивом одним
+/// куском тул не поймёт: `["/tmp/a"]` приезжал как литерал `[\"/tmp/a\"]`.
+fn each_text(v: &Value) -> Vec<String> {
+    match v {
+        Value::Array(items) => items.iter().filter_map(scalar_text).collect(),
+        other => scalar_text(other).into_iter().collect(),
+    }
+}
+
 fn scalar_text(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
@@ -552,9 +562,7 @@ fn argv_of(
             registry::ArgRule::Const(c) => out.push(c.clone()),
             registry::ArgRule::Field(f) => {
                 if let Some(v) = fields.get(f) {
-                    if let Some(t) = scalar_text(v) {
-                        out.push(t);
-                    }
+                    out.extend(each_text(v));
                 }
             }
             registry::ArgRule::Flag {
@@ -571,9 +579,12 @@ fn argv_of(
                     None => out.push(flag.clone()),
                     Some(f) => {
                         let Some(v) = fields.get(f) else { continue };
-                        let Some(t) = scalar_text(v) else { continue };
-                        out.push(flag.clone());
-                        out.push(t);
+                        // Массив в поле с флагом — повторение флага (`--glob a --glob b`):
+                        // у CLI это отдельные аргументы, а не JSON-текст одним куском.
+                        for t in each_text(v) {
+                            out.push(flag.clone());
+                            out.push(t);
+                        }
                     }
                 }
             }
@@ -944,6 +955,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tc.argv, vec!["run", "/tmp/y"]);
+    }
+
+    /// Массив в поле — это НЕСКОЛЬКО аргументов, а не один JSON-текст: живой
+    /// прогон дал `grep pattern '["/tmp/a"]'` (литерал с кавычками) и «нет такого
+    /// пути». Флаг с массивом повторяется на каждый элемент.
+    #[test]
+    fn typed_argv_expands_array_fields() {
+        let v = json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "array", "items": {"type": "string"}},
+                "glob": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["pattern"],
+            "x-snens": {
+                "argv": [
+                    {"field": "pattern"},
+                    {"field": "path"},
+                    {"flag": "--glob", "field": "glob"}
+                ],
+                "stdin": {"mode": "none"}
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("snens-schema-arr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("grep.json");
+        std::fs::write(&f, v.to_string()).unwrap();
+        let s = registry::read_schema(&f).unwrap().unwrap();
+        let tc = typed_call(
+            "grep",
+            &s,
+            &json!({"pattern": "beta", "path": ["/a", "/b"], "glob": ["*.rs", "*.toml"]}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        assert_eq!(
+            tc.argv,
+            vec!["beta", "/a", "/b", "--glob", "*.rs", "--glob", "*.toml"]
+        );
+        // Один путь массивом из одного элемента — тоже просто путь.
+        let tc = typed_call(
+            "grep",
+            &s,
+            &json!({"pattern": "beta", "path": ["/a"]}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        assert_eq!(tc.argv, vec!["beta", "/a"]);
     }
 
     #[test]
