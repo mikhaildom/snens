@@ -69,9 +69,17 @@ has '"mode": "json"' "$(cat "$HERE/edit/schema.json")" "schema: edit собир�
 # Ядро само печатает definitions — так проверка не зависит от бинаря в PATH.
 CORE=${SNENS_SELFTEST_BIN:-}
 if [ -z "$CORE" ]; then
-  for c in "${CARGO_TARGET_DIR:-/nonexistent}/debug/snens" "$(command -v snens 2>/dev/null || true)"; do
+  # Каталог сборки берём у самого cargo: target-dir живёт в .cargo/config.toml
+  # репозитория, и без этого брался бинарь из PATH — то есть production, а
+  # проверялся бы не тот код.
+  TARGET=$(cd "$HERE/.." && cargo metadata --no-deps --format-version 1 2>/dev/null \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+  for c in "${TARGET:-/nonexistent}/debug/snens" "${CARGO_TARGET_DIR:-/nonexistent}/debug/snens"; do
     [ -x "$c" ] && CORE=$c && break
   done
+  if [ -z "$CORE" ]; then
+    echo "selftest: ядро не собрано (cargo build) — проверки схем пропущены" >&2
+  fi
 fi
 if [ -n "$CORE" ]; then
   # Свой конфиг: иначе команда читает ~/.config/snens и смотрит в чужой каталог тулов.

@@ -367,6 +367,12 @@ pub fn sync_bin_dir(cfg: &Config, tools: &[Tool]) -> R<PathBuf> {
         }
     }
     for (t, name) in tools.iter().zip(&names) {
+        // Тул с именем системной команды в PATH не выкладываем: `run 'grep -n'`
+        // должен звать системный grep, а наш тул ядро запускает по абсолютному
+        // пути. Иначе одна привычная команда в сессии ломается на каждой попытке.
+        if shadows_system_command(&t.name) {
+            continue;
+        }
         let to = bin.join(name);
         #[cfg(unix)]
         let _ = std::os::unix::fs::symlink(&t.bin, &to);
@@ -379,11 +385,23 @@ pub fn sync_bin_dir(cfg: &Config, tools: &[Tool]) -> R<PathBuf> {
 /// PATH детей: разделитель путей свой у каждой платформы, склеиваем им. Каталог
 /// самого харнесса тоже в PATH — иначе изнутри сессии не позвать `snens sessions`.
 /// PATH детей с дополнительными каталогами В НАЧАЛЕ (каталог шимов: `sudo` →
-/// `sudo -A`). Порядок важен: шим должен затенять системный sudo, но только у
-/// процессов-инструментов агента, а не в обычной оболочке пользователя.
-pub fn child_path_with(prefix: &[PathBuf], bin: &Path) -> String {
+/// `sudo -A`): шим должен затенять системный sudo, но только у процессов-
+/// инструментов агента.
+///
+/// Одно правило поверх этого: **каталог с тулом, чьё имя совпадает с системной
+/// командой, в PATH детей не попадает**. `run` запускает честную оболочку, и
+/// `grep -n`, `write`, `view` в ней обязаны оставаться системными. Тулы же ядро
+/// запускает по абсолютному пути (`Tool.bin`) — PATH им для этого не нужен.
+/// Системные каталоги исключение: `/usr/bin` не фильтруется никогда, иначе
+/// пропадает оболочка и `run` падает «No such file or directory» (поймано живьём).
+pub fn child_path_with(prefix: &[PathBuf], bin: &Path, tools: &[Tool]) -> String {
+    let shadowed: Vec<String> = tools
+        .iter()
+        .filter(|t| shadows_system_command(&t.name))
+        .map(|t| format!("{}{}", t.name, std::env::consts::EXE_SUFFIX))
+        .collect();
+
     let mut parts: Vec<PathBuf> = prefix.to_vec();
-    parts.push(bin.to_path_buf());
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -393,9 +411,55 @@ pub fn child_path_with(prefix: &[PathBuf], bin: &Path) -> String {
     if let Some(cur) = std::env::var_os("PATH") {
         parts.extend(std::env::split_paths(&cur));
     }
+    parts.push(bin.to_path_buf());
+
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let parts: Vec<PathBuf> = parts
+        .into_iter()
+        .filter(|p| {
+            if seen.contains(p) {
+                return false;
+            }
+            seen.push(p.clone());
+            true
+        })
+        .filter(|p| is_system_dir(p) || !has_shadow(p, &shadowed))
+        .collect();
     std::env::join_paths(parts)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// В каталоге лежит файл с системным именем нашего тула — каталог в PATH детей
+/// не отдаём. Проверяем именно имена НАШИХ тулов, а не вообще всё: `edit`,
+/// `fetch`, `search` системных двойников не имеют и остаются доступны.
+fn has_shadow(dir: &Path, shadowed: &[String]) -> bool {
+    shadowed.iter().any(|name| dir.join(name).exists())
+}
+
+/// Системные каталоги: там настоящие утилиты, фильтровать их нельзя.
+fn is_system_dir(p: &Path) -> bool {
+    matches!(
+        p.to_str(),
+        Some("/bin")
+            | Some("/sbin")
+            | Some("/usr/bin")
+            | Some("/usr/sbin")
+            | Some("/usr/local/bin")
+            | Some("/usr/local/sbin")
+    )
+}
+
+/// Имя тула совпадает с системной командой — симлинк под этим именем в каталоге
+/// тулов не создаём (и старый убираем). Модель зовёт тул по имени из схемы, но
+/// это диспатч ядра по абсолютному пути; PATH ему для этого не нужен.
+pub fn shadows_system_command(name: &str) -> bool {
+    const SYSTEM: &[&str] = &[
+        "grep", "find", "ls", "cat", "sed", "awk", "sort", "head", "tail", "cut", "date",
+        "view", "write", "test", "patch", "diff", "echo", "printf", "which", "tee", "wc", "tr",
+        "xargs", "mv", "cp", "rm", "true", "false", "yes", "seq", "basename", "dirname",
+    ];
+    SYSTEM.contains(&name)
 }
 
 #[cfg(test)]
@@ -429,6 +493,86 @@ mod tests {
         let p = d.join("schema.json");
         std::fs::write(&p, text).unwrap();
         read_schema(&p).unwrap()
+    }
+
+    /// Каталог тулов уезжает в PATH детей В КОНЦЕ, а каталог, из которого по
+    /// имени зовётся тул с системным именем, в PATH не попадает вовсе.
+    #[test]
+    fn tool_dir_is_last_and_shadowing_dirs_are_dropped() {
+        let bin = PathBuf::from("/opt/tools-bin");
+        let shim = PathBuf::from("/opt/shim");
+        let path = child_path_with(std::slice::from_ref(&shim), &bin, &[]);
+        let parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(parts.first(), Some(&shim), "шимы должны быть первыми");
+        assert_eq!(parts.last(), Some(&bin), "каталог тулов должен быть последним");
+        assert_eq!(
+            parts.iter().filter(|p| **p == bin).count(),
+            1,
+            "каталог тулов не дублируется: {path}"
+        );
+    }
+
+    /// Тулы с именем системной команды распознаются по имени.
+    #[test]
+    fn shadowing_names_are_known() {
+        for n in ["grep", "write", "view", "find", "ls"] {
+            assert!(shadows_system_command(n), "{n} — системное имя");
+        }
+        for n in ["edit", "fetch", "search", "agent", "audit"] {
+            assert!(!shadows_system_command(n), "{n} — не системная команда");
+        }
+    }
+
+    /// Каталог с файлом системного имени (наш тул или копия в `cargo/debug`)
+    /// уходит из PATH детей; системный `/usr/bin` остаётся — иначе пропадает
+    /// оболочка и `run` падает «No such file or directory».
+    #[test]
+    fn dir_with_shadowing_name_is_dropped_but_system_dir_kept() {
+        let dir = tmpdir("shadow-dir");
+        let toolbin = dir.join("debug");
+        std::fs::create_dir_all(&toolbin).unwrap();
+        let names = vec![format!("grep{}", std::env::consts::EXE_SUFFIX)];
+        std::fs::write(toolbin.join(&names[0]), b"x").unwrap();
+        assert!(has_shadow(&toolbin, &names));
+        // Чистый каталог остаётся.
+        let clean = dir.join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        assert!(!has_shadow(&clean, &names));
+        // Системный каталог не фильтруется никогда.
+        assert!(is_system_dir(Path::new("/usr/bin")));
+        assert!(is_system_dir(Path::new("/bin")));
+        assert!(!is_system_dir(Path::new("/home/x/bin")));
+        // Имена наших безопасных тулов фильтр не включают.
+        assert!(!has_shadow(&clean, &[]));
+    }
+
+    /// Симлинк под системным именем каталог тулов не создаёт: PATH не должен
+    /// менять смысл `run`.
+    #[test]
+    fn tool_shadowing_system_command_is_not_linked() {
+        let dir = tmpdir("shadow");
+        let tools_dir = dir.join("tools");
+        std::fs::create_dir_all(tools_dir.join("grep")).unwrap();
+        std::fs::create_dir_all(tools_dir.join("edit")).unwrap();
+        std::fs::write(tools_dir.join("grep/grep"), b"x").unwrap();
+        std::fs::write(tools_dir.join("edit/edit"), b"x").unwrap();
+        let cfg = Config {
+            tools_dir: tools_dir.display().to_string(),
+            ..Default::default()
+        };
+        let mut grep = tool("grep", None);
+        grep.bin = tools_dir.join("grep/grep");
+        let mut edit = tool("edit", None);
+        edit.bin = tools_dir.join("edit/edit");
+        let bin = sync_bin_dir(&cfg, &[grep, edit]).unwrap();
+        assert!(
+            !bin.join(format!("grep{}", std::env::consts::EXE_SUFFIX)).exists(),
+            "симлинк на grep не должен появиться"
+        );
+        assert!(
+            bin.join(format!("edit{}", std::env::consts::EXE_SUFFIX)).exists(),
+            "обычный тул должен быть в PATH"
+        );
     }
 
     #[test]
@@ -525,3 +669,4 @@ mod tests {
         assert_eq!(s.fields(), vec![("edits".to_string(), "array<object>".to_string())]);
     }
 }
+

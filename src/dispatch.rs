@@ -126,7 +126,7 @@ pub async fn prepare(cfg: &Config) -> R<(Vec<Value>, Vec<registry::Tool>, String
     if let Some(s) = &shim {
         parts.push(s.clone());
     }
-    let path = registry::child_path_with(&parts, &bin);
+    let path = registry::child_path_with(&parts, &bin, &tools);
     let mut defs = builtin_defs();
     defs.extend(registry::definitions(&tools));
     Ok((defs, tools, path))
@@ -606,7 +606,12 @@ fn stdin_of_schema(
             let mut o = serde_json::Map::new();
             for n in names {
                 if let Some(v) = fields.get(n) {
-                    if !v.is_null() {
+                    // Пустой массив/объект в stdin не несёт смысла: модель
+                    // заполняет все поля схемы сразу, и `"edits": []` рядом с
+                    // old_string/new_string — это шум, а не вторая форма правки.
+                    let empty = matches!(v, Value::Array(a) if a.is_empty())
+                        || matches!(v, Value::Object(m) if m.is_empty());
+                    if !v.is_null() && !empty {
                         o.insert(n.clone(), v.clone());
                     }
                 }
@@ -1024,6 +1029,18 @@ mod tests {
         // Незаданных полей нет вовсе — объекта тоже (тул скажет про пустой stdin).
         let tc = typed_call("edit", &s, &json!({"path": "/f"}), Path::new("/base")).unwrap();
         assert_eq!(tc.stdin, None);
+        // Пустой массив рядом с одиночной парой — шум вызывающего, а не поле:
+        // тул получал `{"edits":[],"old_string":"a",…}` и отвечал «пустой edits».
+        let tc = typed_call(
+            "edit",
+            &s,
+            &json!({"path": "/f", "old_string": "a", "new_string": "b", "edits": []}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        let sent: Value = serde_json::from_str(tc.stdin.as_deref().unwrap()).unwrap();
+        assert!(sent.get("edits").is_none(), "пустой edits в stdin не едет: {sent}");
+        assert_eq!(sent["old_string"], "a");
     }
 
     #[test]

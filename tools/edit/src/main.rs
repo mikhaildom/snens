@@ -498,7 +498,13 @@ fn parse_edits(j: &Value) -> Result<Vec<Edit>, String> {
     match j.get("edits") {
         None => Ok(vec![Edit::new(j, 0)?]),
         Some(Value::Array(items)) => {
+            // Пустой `edits` рядом с заполненными old_string/new_string — не
+            // отказ, а шум вызывающего: модель заполнила все поля схемы сразу.
+            // Значение есть — берём его, отказ стоил бы лишнего хода.
             if items.is_empty() {
+                if j.get("old_string").and_then(Value::as_str).is_some() {
+                    return Ok(vec![Edit::new(j, 0)?]);
+                }
                 return Err("edit: пустой edits — нечего менять".into());
             }
             items
@@ -1042,6 +1048,22 @@ mod tests {
     }
 
     // ── разбор ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_edits_with_single_pair_is_accepted() {
+        // Живой прогон: модель прислала {"path","old_string","new_string",
+        // "replace_all","edits":[]} — все поля схемы сразу, массив пустой.
+        // Отказ «пустой edits» стоил хода на ровном месте.
+        let j = serde_json::json!({
+            "old_string": "a", "new_string": "b", "replace_all": false, "edits": []
+        });
+        let list = parse_edits(&j).expect("одиночная пара при пустом edits принимается");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].old, "a");
+        // Пустой edits без пары — по-прежнему отказ.
+        let j = serde_json::json!({"edits": []});
+        assert!(parse_edits(&j).is_err(), "менять нечего — это отказ");
+    }
 
     #[test]
     fn edits_accepts_single_object() {
