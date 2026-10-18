@@ -38,10 +38,15 @@ pub fn cmd(flags: &BTreeMap<String, String>, _pos: Vec<String>) -> R<()> {
         .map_err(|_| "--older-than ждёт число дней")?
         .unwrap_or(30);
     let older = Duration::from_secs(days.saturating_mul(86_400));
-    run(&cfg, older, flags.contains_key("dry-run"))
+    run(
+        &cfg,
+        older,
+        flags.contains_key("dry-run"),
+        flags.contains_key("attachments"),
+    )
 }
 
-fn run(cfg: &Config, older: Duration, dry: bool) -> R<()> {
+fn run(cfg: &Config, older: Duration, dry: bool, attachments: bool) -> R<()> {
     let dir = cfg.sessions_path();
     let cutoff = SystemTime::now()
         .checked_sub(older)
@@ -67,7 +72,7 @@ fn run(cfg: &Config, older: Duration, dry: bool) -> R<()> {
             let category = if path.is_dir() && name == "attach" {
                 // Вложения: каталог на вызов, внутри — файлы (иногда в подкаталогах).
                 // Удаляем поштучно: часть вызовов приложила файл, часть нет.
-                if old {
+                if old && attachments {
                     collect_attach(&path, &alive.attach, &mut victims);
                 }
                 continue;
@@ -99,6 +104,9 @@ fn run(cfg: &Config, older: Duration, dry: bool) -> R<()> {
                 let _ = std::fs::remove_file(path);
             }
         }
+    }
+    if !attachments {
+        println!("вложения не трогали: они данные человека (PDF, скриншоты). Нужно — добавь --attachments");
     }
     println!(
         "{}: {} файлов, {:.1} МБ (порог {} дней)",
@@ -249,9 +257,9 @@ mod tests {
             ..Config::default()
         };
         // Файлы только что созданы, поэтому порог «старше» нулевой, а не дефолтный.
-        run(&cfg, Duration::from_secs(0), true).unwrap();
+        run(&cfg, Duration::from_secs(0), true, false).unwrap();
         assert!(old.exists() && open.exists(), "dry-run удалил файлы");
-        run(&cfg, Duration::from_secs(0), false).unwrap();
+        run(&cfg, Duration::from_secs(0), false, false).unwrap();
         assert!(!old.exists(), "зеркало закрытой сессии осталось");
         assert!(open.exists(), "зеркало живой сессии удалено");
         std::fs::remove_dir_all(&dir).ok();

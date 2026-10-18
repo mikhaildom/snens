@@ -49,7 +49,8 @@ snens — узкое ядро агента
   snens show [--session ID]
   snens log  [--session ID]
   snens sessions
-  snens sweep [--older-than DAYS] [--dry-run]   # убрать мёртвое в sessions/
+  snens sweep [--older-than DAYS] [--attachments] [--dry-run]
+                                 # убрать мёртвое в sessions/
   snens tickets [--all] [--target T] [--kind K]
   snens tickets show <имя> | grep <текст> | stats
   snens tools [--json]        # список тулов; --json — определения для модели
