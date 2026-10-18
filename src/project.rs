@@ -60,7 +60,42 @@ pub fn msgs(log: &[Rec], cfg: &Config) -> Vec<Value> {
     // Inspection can show the raw journal if a checkpoint was damaged.
     let mut out = crate::context::effective(log, cfg).unwrap_or_else(|_| raw_msgs(log, cfg));
     apply_cleared(&mut out, &cleared_map(log));
+    // Справка памяти — не часть префикса: её видно только на том ходу, ради
+    // которого она снята. Это делается здесь, а не при сборке из лога, потому
+    // что та же точка применяется и к базе ревизии контекста.
+    append_turn_recall(&mut out, log);
     out
+}
+
+/// Дописать справку памяти последним сообщением хода.
+///
+/// В логе справка лежит сразу после запроса человека (`Rec::User`), а её
+/// содержимое — снимок на момент снятия. В проекцию уходит та, что записана
+/// после **последнего** запроса: у более поздних ходов (.next) хвост окажется
+/// после ответов, но справка старого хода не воскресает.
+pub fn append_turn_recall(out: &mut Vec<Value>, log: &[Rec]) {
+    let mut tail: Option<&str> = None;
+    let mut current = false;
+    for r in log {
+        match r {
+            Rec::User { .. } => {
+                current = true;
+                tail = None;
+            }
+            Rec::Recall { text, .. } => {
+                if current {
+                    tail = Some(text.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(text) = tail.map(str::trim).filter(|t| !t.is_empty()) else {
+        return;
+    };
+    // Роль system: это найденные факты, а не запрос человека, и `user` сразу
+    // после `user` (а также после `tool`) ломает чередование ролей.
+    out.push(json!({"role": "system", "content": text}));
 }
 
 fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
@@ -176,10 +211,13 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
                 let content = content_value(&text, parts, cfg);
                 out.push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
             }
-            // Справка памяти — системная роль: это контекст, а не запрос
-            // пользователя, и второй `user` подряд ломает чередование ролей.
+            // Справка памяти в проекцию из лога НЕ попадает: она живёт ровно
+            // один ход и дописывается в конце (`msgs`), а не оседает в префиксе.
+            // Иначе её токены платятся на каждом следующем ходу и сдвигают кеш.
+            Rec::Recall { .. } => {}
+            // Системные пометки (например «контекст ужат») — контекст, а не
+            // запрос человека: второй `user` подряд ломает чередование ролей.
             Rec::ContextNotice { text, .. } => out.push(json!({"role":"system","content":text})),
-            Rec::Recall { text, .. } => out.push(json!({"role": "system", "content": text})),
             // Сообщение от другой сессии (родителя/ребёнка) или steer человека:
             // это слово, адресованное нам, поэтому роль `user` — но с пометкой
             // отправителя, чтобы модель не спутала его со своим запросом.
@@ -467,6 +505,68 @@ mod tests {
             source: source.into(),
             parts: Vec::new(),
         }
+    }
+
+    fn recall(text: &str) -> Rec {
+        Rec::Recall {
+            ts: 0,
+            text: text.into(),
+        }
+    }
+
+    /// Справка памяти живёт ровно один ход: в проекции она есть только пока
+    /// запрос человека — последний. На следующем ходу её нет, и в префиксе
+    /// остаётся только диалог.
+    #[test]
+    fn recall_is_visible_for_one_turn_only() {
+        let cfg = Config::default();
+        let mut log = vec![user("первый", "cli"), recall("факт про X")];
+        let first = msgs(&log, &cfg);
+        assert_eq!(
+            first.iter().filter(|m| m["content"] == json!("факт про X")).count(),
+            1,
+            "справка не доехала до текущего хода"
+        );
+        log.push(Rec::Assistant {
+            ts: 0,
+            text: Some("ответ".into()),
+            tool_calls: vec![],
+            reasoning: None,
+        });
+        log.push(user("второй", "cli"));
+        log.push(recall("факт про Y"));
+        let second = msgs(&log, &cfg);
+        assert!(!second.iter().any(|m| m["content"] == json!("факт про X")), "старая справка осела в префиксе: {second:#?}");
+        assert_eq!(
+            second.iter().filter(|m| m["content"] == json!("факт про Y")).count(),
+            1
+        );
+    }
+
+    /// Справка внутри одного хода не вытесняется шагами инструментов: она
+    /// снята по запросу человека и остаётся к нему до конца хода.
+    #[test]
+    fn recall_survives_tool_steps_within_the_turn() {
+        let cfg = Config::default();
+        let log = vec![
+            user("первый", "cli"),
+            recall("факт про Z"),
+            Rec::Assistant {
+                ts: 0,
+                text: None,
+                tool_calls: vec![crate::log::Call {
+                    id: "c1".into(),
+                    name: "run".into(),
+                    args: "{}".into(),
+                }],
+                reasoning: None,
+            },
+            tool_rec("c1", "ok", 2),
+        ];
+        let projected = msgs(&log, &cfg);
+        assert!(projected.iter().any(|m| m["content"] == json!("факт про Z")));
+        // И после справки ничего не превращается в orphan: роли валидны.
+        crate::context_document::validate(&projected, true).unwrap();
     }
 
     #[test]
