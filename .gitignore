@@ -2,3 +2,5 @@
 /memory
 *.db
 *.db-journal
+/.cargo
+/.env

@@ -2,6 +2,10 @@
 name = "snens-memory"
 version = "0.1.0"
 edition = "2021"
+description = "Долгая память агента: один бинарь, один SQLite (FTS5 + sqlite-vec), без демона"
+license = "MIT"
+repository = "https://git.svuvi.ch/svuvich/snens-memory"
+readme = "README.md"
 
 [[bin]]
 name = "memory"

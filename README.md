@@ -5,6 +5,35 @@
 Плагин, а не сервис: ядро знает только argv-контракт (`memory recall <текст>`,
 `memory retain` + JSON хода на stdin), всё остальное — здесь.
 
+Лицензия — MIT (см. `LICENSE`). Контракт намеренно узкий, поэтому плагин
+прикручивается к любому харнессу, умеющему позвать программу с argv и stdin `{"user","assistant"}`.
+
+## Быстрый старт
+
+```sh
+cargo build --release              # бинарь target/release/memory
+mkdir -p ~/.config/snens ~/.local/share/snens
+cat > ~/.config/snens/memory.toml <<'TOML'
+db = "~/.local/share/snens/memory.db"
+api_base = "https://inference-api.nousresearch.com/v1"   # любой OpenAI-совместимый
+embed_model = "baai/bge-m3"
+distill_model = "deepseek/deepseek-v4.1-flash"
+rerank_model = "nvidia/llama-nemotron-rerank-vl-1b-v2:free"  # rerank = "off" чтобы выключить
+TOML
+echo 'SNENS_API_KEY=...' >> ~/.config/snens/.env            # ключ эмбеддингов/LLM
+echo 'SNENS_OPENROUTER_KEY=...' >> ~/.config/snens/.env     # ключ реранкера, если он у другого провайдера
+
+memory retain < ход.json     # {"user":"…","assistant":"…"} → очередь
+memory flush                  # очередь → факты (LLM + эмбеддинги)
+memory recall "запрос"        # → строки фактов, пусто = нечего сказать
+```
+
+Пути зашиты как у snens (`~/.config/snens/memory.toml`, ключ из `.env` рядом);
+другой харнесс либо кладёт конфиг туда же, либо правит `cfg::config_path`.
+Провайдер нужен OpenAI-совместимый: `/embeddings`, `/chat/completions`, реранк —
+`/rerank` (OpenRouter/Cohere-совместимый) или `rerank = "off"` вовсе.
+Имя переменной с ключом переопределяется в конфиге (`api_key_env`).
+
 ## Зачем
 
 Hindsight (то, что стояло раньше) инжектил справку размером ~2000 токенов в
@@ -108,7 +137,7 @@ memory import < /tmp/export.json          # ~9 мин: 11.5k эмбеддинг�
 | база | 25 МБ на 11.5k фактов |
 
 Латентность упирается в **сеть к эмбеддеру**, не в локальную часть — отсюда
-следующий шаг: локальные модели (`references/local-models.md` скилла harness).
+следующий шаг: локальные модели (`docs/local-models.md`).
 
 ## Замеры (до миграции, 300 фактов)
 
