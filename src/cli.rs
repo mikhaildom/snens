@@ -27,6 +27,7 @@ mod review;
 mod selftest;
 mod sesscwd;
 mod subagent;
+mod sweep;
 mod surface_client;
 mod surface_runtime;
 mod surface_server;
@@ -48,6 +49,7 @@ snens — узкое ядро агента
   snens show [--session ID]
   snens log  [--session ID]
   snens sessions
+  snens sweep [--older-than DAYS] [--dry-run]   # убрать мёртвое в sessions/
   snens tickets [--all] [--target T] [--kind K]
   snens tickets show <имя> | grep <текст> | stats
   snens tools [--json]        # список тулов; --json — определения для модели
@@ -97,6 +99,7 @@ async fn legacy_main() -> R<()> {
         Some("tui") => tui::cmd(&flags).await,
         Some("show") => cmd_show(&flags),
         Some("log") => cmd_log(&flags),
+        Some("sweep") => sweep::cmd(&flags, positional),
         Some("sessions") => {
             let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
             for id in log::list(&cfg.sessions_path())? {
@@ -128,7 +131,7 @@ fn parse_args(argv: &[String]) -> (Option<String>, BTreeMap<String, String>, Vec
     let cmd = it.next().cloned();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--session" | "--config" | "--parent" => {
+            "--session" | "--config" | "--parent" | "--older-than" => {
                 if let Some(v) = it.next() {
                     flags.insert(a.trim_start_matches("--").to_string(), v.clone());
                 }
