@@ -82,11 +82,7 @@ pub fn append_turn_recall(out: &mut Vec<Value>, log: &[Rec]) {
                 current = true;
                 tail = None;
             }
-            Rec::Recall { text, .. } => {
-                if current {
-                    tail = Some(text.as_str());
-                }
-            }
+            Rec::Recall { text, .. } if current => tail = Some(text.as_str()),
             _ => {}
         }
     }

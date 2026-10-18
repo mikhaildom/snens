@@ -8,8 +8,10 @@ cd "$ROOT"
 
 build() {
     cargo build --features surface-next --bin snens-next
-    cargo build -p agent -p audit -p edit -p fetch -p memory -p read -p search -p view -p write
-    for tool in agent audit edit fetch memory read search view write; do
+    cargo build -p agent -p audit -p edit -p fetch -p read -p search -p view -p write
+    # memory — отдельный репозиторий ~/projects/snens-memory (свой SQLite-плагин),
+    # в workspace не входит; симлинк ставится вручную.
+    for tool in agent audit edit fetch read search view write; do
         cp "$TARGET/debug/$tool" "tools/$tool/$tool.new"
         mv "tools/$tool/$tool.new" "tools/$tool/$tool"
     done

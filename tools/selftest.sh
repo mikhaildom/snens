@@ -26,6 +26,17 @@ t() {
   err=$(cat "$TMP/err")
 }
 
+# th <HOME-каталог> <тул> [args...] → $out, $err, $rc
+# Отдельный HOME нужен тулу памяти: он читает свой конфиг и ключ оттуда.
+th() {
+  home=$1
+  name=$2
+  shift 2
+  rc=0
+  out=$(HOME="$home" "$HERE/$name/$name" "$@" 2>"$TMP/err") || rc=$?
+  err=$(cat "$TMP/err")
+}
+
 # ti <тул> <stdin> [args...] → $out, $err, $rc
 ti() {
   name=$1
@@ -200,24 +211,34 @@ has "memory recall" "$out" "memory: --help, строка 2 = usage"
 
 t memory nosuch
 want 2 "$rc" "memory: неизвестная команда — код 2"
-has "memory recall <запрос>" "$err" "memory: неизвестная команда — usage в stderr"
+has "неизвестная команда nosuch" "$err" "memory: неизвестная команда — названа в stderr"
 
 t memory recall
 want 2 "$rc" "memory: recall без запроса — код 2"
 
-ti memory "" --context c
-want 2 "$rc" "memory: retain без текста — код 2"
+t memory forget
+want 2 "$rc" "memory: forget без uid — код 2"
 
-SNENS_MEMORY_URL=http://127.0.0.1:1
-export SNENS_MEMORY_URL
-t memory recall "что-нибудь"
-want 1 "$rc" "memory: сервер недоступен (recall) — код 1"
-has "Hindsight" "$err" "memory: сервер недоступен — текст ошибки"
-ti memory '{"user":"q","assistant":"a"}' retain --context c
-want 1 "$rc" "memory: сервер недоступен (retain) — код 1"
-t memory stats
-want 1 "$rc" "memory: сервер недоступен (stats) — код 1"
-unset SNENS_MEMORY_URL
+# Пустой ход — не работа для памяти: код 0 и ничего не обещаем.
+ti memory '{"user":"","assistant":""}' retain
+want 0 "$rc" "memory: пустой ход — код 0"
+has "" "$out" "memory: пустой ход — молчит"
+
+# Мусор на stdin — ошибка ввода, а не повод работать.
+ti memory 'не json' retain
+want 1 "$rc" "memory: retain с мусором на stdin — код 1"
+
+# Локальные команды не требуют ключа: ход человека не падает без провайдера.
+MEMHOME="$TMP/home"
+mkdir -p "$MEMHOME/.config/snens"
+th "$MEMHOME" memory stats
+want 0 "$rc" "memory: stats без ключа — код 0"
+has "фактов: 0" "$out" "memory: stats на чистой базе"
+
+# Сеть — только в recall: без ключа он честно отказывает кодом 1.
+th "$MEMHOME" memory recall "что-нибудь"
+want 1 "$rc" "memory: recall без ключа — код 1"
+has "ключ" "$err" "memory: recall без ключа — текст ошибки"
 
 # ---- view ----
 t view --help
