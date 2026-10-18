@@ -12,6 +12,22 @@ use crate::{
 /// Справка памяти — дорогая строка: она уезжает в префикс и остаётся там до
 /// конца сессии (лимит вывода ниже — 8000 байт, ~3–4к токенов). Поэтому
 /// впрыскивается не на каждый ход, а по режиму `memory.recall`.
+/// Нужна ли справка на этом ходу — чистая функция от режима и лога.
+///
+/// Режим `session`: одна справка на сессию. Сессия на поверхности живёт долго
+/// (несколько сообщений человека), и повторять справку на каждое из них
+/// незачем. Проверка — «есть ли в логе хоть одна справка», а не «есть ли она
+/// после последнего запроса»: в момент вызова текущий запрос всегда последний,
+/// и прежняя проверка не срабатывала НИКОГДА — справка впрыскивалась на каждом
+/// ходу. Это и было раздувание контекста.
+pub fn should_recall(mode: RecallMode, log: &[Rec]) -> bool {
+    match mode {
+        RecallMode::Off => false,
+        RecallMode::Always => true,
+        RecallMode::Session => !log.iter().any(|r| matches!(r, Rec::Recall { .. })),
+    }
+}
+
 pub async fn recall_note(sess: &Session, cfg: &Config, path: &str) {
     // Секцию берём перечитанной из файла: `snens memory …` правит только файл,
     // а поверхность живёт долго — тумблер должен действовать со следующего хода.
@@ -35,22 +51,8 @@ pub async fn recall_note(sess: &Session, cfg: &Config, path: &str) {
     if source == "review" || source == "improve" {
         return;
     }
-    // Режим `session`: одна справка на сессию. Сессия на поверхности живёт
-    // долго (несколько сообщений человека), и повторять ту же справку на каждое
-    // из них незачем — она уже в контексте. Явный повтор — ручной `memory recall`.
-    if mem.recall == RecallMode::Session {
-        let mut fresh = false;
-        for r in log.iter().rev() {
-            match r {
-                Rec::Recall { .. } => fresh = true,
-                // Справка, впрыснутая до этого запроса, — уже фон, не повторяем.
-                Rec::User { .. } => break,
-                _ => {}
-            }
-        }
-        if fresh {
-            return;
-        }
+    if !should_recall(mem.recall, &log) {
+        return;
     }
     let bin = bin.to_string_lossy().into_owned();
     let mut sp = exec::Spawn::argv(&bin, vec!["recall".into(), text]);
@@ -127,5 +129,48 @@ pub async fn retain_turn(sess: &Session, cfg: &Config, path: &str, answer: &str)
         Ok(o) if o.exit == 0 => {}
         Ok(o) => eprintln!("[snens] память: retain не прошёл (exit {})", o.exit),
         Err(e) => eprintln!("[snens] память: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(text: &str) -> Rec {
+        Rec::User {
+            ts: 0,
+            text: text.into(),
+            source: "cli".into(),
+            parts: Vec::new(),
+        }
+    }
+
+    fn recall(text: &str) -> Rec {
+        Rec::Recall {
+            ts: 0,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn session_mode_injects_exactly_once_per_session() {
+        let log = vec![user("первый"), recall("справка")];
+        // Текущий запрос уже в логе — раньше это ломало проверку и справка
+        // впрыскивалась на каждом ходу.
+        assert!(!should_recall(RecallMode::Session, &log));
+        // Первый ход сессии — справки ещё нет, снимаем.
+        assert!(should_recall(RecallMode::Session, &[user("первый")]));
+        assert!(should_recall(
+            RecallMode::Session,
+            &[user("первый"), user("второй")]
+        ));
+    }
+
+    #[test]
+    fn always_and_off_ignore_history() {
+        let with = vec![user("первый"), recall("справка")];
+        assert!(should_recall(RecallMode::Always, &with));
+        assert!(!should_recall(RecallMode::Off, &with));
+        assert!(!should_recall(RecallMode::Off, &[]));
     }
 }
