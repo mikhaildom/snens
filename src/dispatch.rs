@@ -1,10 +1,13 @@
 // Диспатч инструментов: вшитый `run` и процессы из реестра. Здесь только то,
 // как вызов модели становится процессом; цикл агента об этом не знает.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::{askpass, cfg::Config, exec, log::Call, log::Session, registry, R};
+use crate::{askpass, cfg::Config, exec, log::Call, log::Session, registry, sesscwd, R};
+
+/// Поля вызова, которые ядро понимает у любого тула (не из schema.json).
+const CORE_FIELDS: [&str; 2] = ["cwd", "timeout_seconds"];
 
 /// Что тул знает о сессии, в которой он вызван. Через env — как канал вложений:
 /// переменной нет — тул просто не знает контекста, ничего не ломается.
@@ -58,6 +61,12 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
     if let Some(broker) = crate::approval::privileged_broker() {
         v.push(("SNENS_PRIV".into(), broker));
     }
+    // Рабочий каталог сессии: тулы, которые сами разрешают пути, должны
+    // видеть ту же точку отсчёта, что и ядро. `run`/typed дополняют его явным cwd.
+    v.push((
+        "SNENS_CWD".into(),
+        sesscwd::read(sess).display().to_string(),
+    ));
     v.push((
         "SNENS_CONTEXT_PATH".into(),
         sess.path()
@@ -193,16 +202,29 @@ pub async fn dispatch(
             .get("timeout_seconds")
             .and_then(|t| t.as_u64())
             .unwrap_or(cfg.timeout_seconds);
+        // Рабочий каталог сессии — точка отсчёта для относительных путей: `cd`
+        // внутри run раньше не доезжало до read/edit/write, и они не находили
+        // файл. Явный cwd вызова сильнее и разрешается от каталога сессии.
+        let session_cwd = sesscwd::read(sess);
+        let explicit = a.get("cwd").and_then(|c| c.as_str());
+        let cwd_owned = explicit
+            .map(|c| sesscwd::resolve(Path::new(c), &session_cwd))
+            .unwrap_or_else(|| session_cwd.clone());
         let mut sp = exec::Spawn::sh(&cfg.shell, command, t, cfg.max_process_chars);
-        sp.cwd = a.get("cwd").and_then(|c| c.as_str());
+        sp.cwd = cwd_owned.to_str();
         sp.path = Some(path);
         sp.reduce = cfg.reduce_output;
         sp.dump_dir = Some(out_dir);
         sp.attach_dir = attach_dir.as_deref();
         sp.max_attachment_bytes = cfg.max_attachment_bytes;
         sp.envs = session_env(sess, cfg);
+        sp.envs
+            .push(("SNENS_CWD".into(), cwd_owned.display().to_string()));
         return match exec::spawn(sp).await {
             Ok(mut o) => {
+                // Каталог записываем только после успешного запуска: битый вызов
+                // не должен незаметно сдвинуть точку отсчёта следующих тулов.
+                sesscwd::after_run(sess, command, explicit);
                 o.text = explain_signal_death(o.exit, o.bytes, &o.text, command);
                 o
             }
@@ -216,6 +238,12 @@ pub async fn dispatch(
             call.name
         ));
     };
+    // Типизированный тул: поля схемы → argv/stdin. Generic `args`/`stdin` для
+    // него не нужны; если модель всё же их прислала — пробуем спасти вызов.
+    if let Some(schema) = &tool.schema {
+        return dispatch_typed(call, &tool.bin, schema, &a, cfg, path, out_dir, sess).await;
+    }
+
     let args: Vec<String> = match a.get("args") {
         Some(Value::Array(v)) => v
             .iter()
@@ -235,7 +263,14 @@ pub async fn dispatch(
     let bin = tool.bin.to_string_lossy().into_owned();
     let mut sp = exec::Spawn::argv(&bin, args);
     sp.stdin = stdin_of(&a);
-    sp.cwd = a.get("cwd").and_then(|c| c.as_str());
+    // cwd сессии — как у `run`: тул видит тот же каталог, откуда шли cd.
+    let session_cwd = sesscwd::read(sess);
+    let cwd_owned = a
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .map(|c| sesscwd::resolve(Path::new(c), &session_cwd))
+        .unwrap_or(session_cwd);
+    sp.cwd = cwd_owned.to_str();
     sp.cap = cfg.max_process_chars;
     sp.timeout_s = a
         .get("timeout_seconds")
@@ -253,6 +288,338 @@ pub async fn dispatch(
         Err(e) => fail(format!("{}: {e}", call.name)),
     }
 }
+/// Готовый к запуску вызов типизированного тула: argv, stdin, cwd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedCall {
+    pub argv: Vec<String>,
+    pub stdin: Option<String>,
+    pub cwd: PathBuf,
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Разбор вызова по схеме — без процессов и без диска. Ошибки до запуска, с
+/// именем поля и перечнем допустимых: модель должна суметь исправить вызов.
+pub fn typed_call(
+    name: &str,
+    schema: &registry::ToolSchema,
+    a: &Value,
+    session_cwd: &Path,
+) -> Result<TypedCall, String> {
+    let allowed = schema.field_names();
+    let (fields, extra) = normalize_fields(a, schema);
+    let missing: Vec<String> = schema
+        .required()
+        .into_iter()
+        .filter(|r| !fields.contains_key(r))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{}: не хватает обязательных полей: {}. Поля тула: {}. Пример: {}",
+            name,
+            missing.join(", "),
+            allowed.join(", "),
+            example_call(schema),
+        ));
+    }
+    // Неизвестное поле — ошибка со списком допустимых: молча выкинуть значит
+    // соврать модели, и она повторит промах.
+    let unknown: Vec<&str> = fields
+        .keys()
+        .filter(|k| !allowed.contains(k) && !CORE_FIELDS.contains(&k.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "{}: неизвестные поля: {}. Допустимые: {}.",
+            name,
+            unknown.join(", "),
+            allowed.join(", "),
+        ));
+    }
+    let mut argv = argv_of(schema, &fields)?;
+    // Хвост generic-`args`, которому не нашлось поля: это готовые argv-элементы
+    // (модель прислала `["/tmp/x", "--offset", "3"]`) — дописываем как есть.
+    argv.extend(extra);
+    Ok(TypedCall {
+        argv,
+        stdin: stdin_of_schema(schema, &fields)?,
+        cwd: fields
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(|c| sesscwd::resolve(Path::new(c), session_cwd))
+            .unwrap_or_else(|| session_cwd.to_path_buf()),
+        timeout_seconds: fields.get("timeout_seconds").and_then(Value::as_u64),
+    })
+}
+
+/// Типизированный тул: собрать argv и stdin из полей по `x-snens` схемы.
+/// Ошибки — до запуска процесса, с именем поля и списком допустимых: модель
+/// должна суметь исправить вызов, не гадая о контракте.
+async fn dispatch_typed(
+    call: &Call,
+    bin: &Path,
+    schema: &registry::ToolSchema,
+    a: &Value,
+    cfg: &Config,
+    path: &str,
+    out_dir: &Path,
+    sess: &Session,
+) -> exec::Out {
+    let fail = |msg: String| exec::Out {
+        exit: -1,
+        text: msg,
+        bytes: 0,
+        ms: 0,
+        timed_out: false,
+        parts: Vec::new(),
+    };
+    // cwd сессии — то, что накопили `cd` в run: относительные пути тулов
+    // должны разрешаться оттуда же, откуда их разрешал бы shell.
+    let session_cwd = sesscwd::read(sess);
+    let tc = match typed_call(&call.name, schema, a, &session_cwd) {
+        Ok(tc) => tc,
+        Err(e) => return fail(e),
+    };
+    let bin_s = bin.to_string_lossy().into_owned();
+    let mut sp = exec::Spawn::argv(&bin_s, tc.argv);
+    sp.stdin = tc.stdin;
+    sp.cwd = tc.cwd.to_str();
+    sp.cap = cfg.max_process_chars;
+    sp.timeout_s = tc.timeout_seconds.unwrap_or(cfg.timeout_seconds);
+    sp.path = Some(path);
+    sp.dump_dir = Some(out_dir);
+    sp.max_attachment_bytes = cfg.max_attachment_bytes;
+    sp.envs = session_env(sess, cfg);
+    sp.envs
+        .push(("SNENS_CWD".into(), tc.cwd.display().to_string()));
+    // Канал вложений — как у generic-тулов.
+    let attach_dir = cfg
+        .attachments
+        .then(|| out_dir.join("attach").join(&call.id));
+    sp.attach_dir = attach_dir.as_deref();
+    match exec::spawn(sp).await {
+        Ok(o) => o,
+        Err(e) => fail(format!("{}: {e}", call.name)),
+    }
+}
+
+/// Поля вызова по схеме: всё, кроме мусора. Объект/массив, приехавшие
+/// JSON-строкой, распаковываются (модель регулярно сериализует вложенное
+/// дважды). Одиночный объект в `edits` принимается как массив из одного —
+/// это наблюдавшийся промах, а не другая правка.
+fn normalize_fields(
+    a: &Value,
+    schema: &registry::ToolSchema,
+) -> (serde_json::Map<String, Value>, Vec<String>) {
+    let mut out = serde_json::Map::new();
+    let Some(obj) = a.as_object() else {
+        return (out, Vec::new());
+    };
+    let types: std::collections::BTreeMap<String, String> = schema.fields().into_iter().collect();
+    for (k, v) in obj {
+        // generic-поля разбираются отдельно: ими модель зовёт тул «по-старому».
+        if k == "args" || k == "stdin" {
+            continue;
+        }
+        let ty = types.get(k).cloned().unwrap_or_default();
+        let mut v = v.clone();
+        // Двойное экранирование: модель прислала JSON-строку там, где схема ждёт
+        // object/array. Она это имела в виду — разбираем.
+        if (ty.starts_with("object") || ty.starts_with("array")) && v.is_string() {
+            if let Ok(parsed) = serde_json::from_str::<Value>(v.as_str().unwrap_or_default()) {
+                if parsed.is_object() || parsed.is_array() {
+                    v = parsed;
+                }
+            }
+        }
+        // Одиночный объект вместо массива (наблюдалось на `edits`): одна правка
+        // без обёртки — это массив из одного элемента.
+        if ty.starts_with("array") && v.is_object() {
+            v = Value::Array(vec![v]);
+        }
+        // Поля вне схемы оставляем: ошибку про них скажем отдельно, с перечнем
+        // допустимых — молча выкинуть значит соврать модели, и она повторит промах.
+        out.insert(k.clone(), v);
+    }
+    legacy_fields(a, schema, &mut out);
+    let extra = legacy_args(a, schema, &mut out);
+    (out, extra)
+}
+
+/// `args` от модели, привыкшей к generic-схеме: первые элементы раскладываем по
+/// позиционным полям (`{"field": X}` в порядке схемы), остальное — готовые
+/// argv-элементы, их допишем как есть. Флаги угадывать не берёмся.
+fn legacy_args(a: &Value, schema: &registry::ToolSchema, out: &mut serde_json::Map<String, Value>) -> Vec<String> {
+    let Some(v) = a.get("args") else {
+        return Vec::new();
+    };
+    let items: Vec<String> = match v {
+        Value::Array(a) => a
+            .iter()
+            .map(|x| match x {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect(),
+        Value::String(s) => s.split_whitespace().map(str::to_string).collect(),
+        _ => return Vec::new(),
+    };
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let positional: Vec<String> = schema
+        .argv
+        .iter()
+        .filter_map(|r| match r {
+            registry::ArgRule::Field(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut rest = items;
+    for f in positional {
+        if rest.is_empty() || out.contains_key(&f) {
+            continue;
+        }
+        let first = rest.remove(0);
+        out.insert(f, Value::String(first));
+    }
+    rest
+}
+
+/// Совместимость с generic-контрактом: модель шлёт `{"args": ..., "stdin": ...}`
+/// тулу, у которого теперь есть схема. `stdin` разбираем как JSON-объект и
+/// раскладываем по полям схемы (не перетирая уже переданные). Спасти не вышло —
+/// дальше сработает ошибка про обязательные поля, процесс не запустится.
+fn legacy_fields(a: &Value, schema: &registry::ToolSchema, out: &mut serde_json::Map<String, Value>) {
+    let Some(stdin) = a.get("stdin") else {
+        return;
+    };
+    let parsed = match stdin {
+        Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+        v @ (Value::Object(_) | Value::Array(_)) => Some(v.clone()),
+        _ => None,
+    };
+    let allowed = schema.field_names();
+    let merge = |o: serde_json::Map<String, Value>, out: &mut serde_json::Map<String, Value>| {
+        for (k, v) in o {
+            if allowed.contains(&k) && !out.contains_key(&k) {
+                out.insert(k, v);
+            }
+        }
+    };
+    match parsed {
+        Some(Value::Object(o)) => merge(o, out),
+        // `stdin` — массив правок: это ровно форма `edits` из схемы edit.
+        Some(Value::Array(items)) if allowed.contains(&"edits".to_string()) => {
+            out.entry("edits".to_string())
+                .or_insert(Value::Array(items));
+        }
+        _ => {}
+    }
+}
+
+/// Значение поля в текст argv: числа без хвоста `.0`, bool как 1/true не
+/// выдумываем — берём serde-представление.
+fn scalar_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// Собрать argv по правилам `x-snens.argv`. Поле не задано (нет в вызове или
+/// null) — ничего не эмитим; bool-поле с `field` и истиной — `1`, с ложью —
+/// ничего (флаг присутствует только когда включён).
+fn argv_of(
+    schema: &registry::ToolSchema,
+    fields: &serde_json::Map<String, Value>,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for rule in &schema.argv {
+        match rule {
+            registry::ArgRule::Const(c) => out.push(c.clone()),
+            registry::ArgRule::Field(f) => {
+                if let Some(v) = fields.get(f) {
+                    if let Some(t) = scalar_text(v) {
+                        out.push(t);
+                    }
+                }
+            }
+            registry::ArgRule::Flag {
+                flag,
+                field,
+                when_field,
+            } => {
+                if let Some(b) = when_field {
+                    if !fields.get(b).and_then(Value::as_bool).unwrap_or(false) {
+                        continue;
+                    }
+                }
+                match field {
+                    None => out.push(flag.clone()),
+                    Some(f) => {
+                        let Some(v) = fields.get(f) else { continue };
+                        let Some(t) = scalar_text(v) else { continue };
+                        out.push(flag.clone());
+                        out.push(t);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// stdin по правилу схемы. `json` — объект из перечисленных полей: ровно та
+/// JSON-строка, которую тул ждал от модели, только собранная ядром.
+fn stdin_of_schema(
+    schema: &registry::ToolSchema,
+    fields: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, String> {
+    Ok(match &schema.stdin {
+        registry::StdinRule::None => None,
+        registry::StdinRule::Field(f) => fields.get(f).and_then(scalar_text),
+        registry::StdinRule::Json(names) => {
+            let mut o = serde_json::Map::new();
+            for n in names {
+                if let Some(v) = fields.get(n) {
+                    if !v.is_null() {
+                        o.insert(n.clone(), v.clone());
+                    }
+                }
+            }
+            if o.is_empty() {
+                None
+            } else {
+                Some(Value::Object(o).to_string())
+            }
+        }
+    })
+}
+
+/// Образец вызова для сообщения об ошибке: обязательные поля с заглушками.
+fn example_call(schema: &registry::ToolSchema) -> String {
+    let mut o = serde_json::Map::new();
+    let types: std::collections::BTreeMap<String, String> = schema.fields().into_iter().collect();
+    for r in schema.required() {
+        let ty = types.get(&r).cloned().unwrap_or_default();
+        let v = if ty.starts_with("array") {
+            json!([])
+        } else if ty.starts_with("integer") {
+            json!(1)
+        } else if ty.starts_with("boolean") {
+            json!(false)
+        } else {
+            json!("...")
+        };
+        o.insert(r, v);
+    }
+    Value::Object(o).to_string()
+}
+
 /// stdin вызова. Модель регулярно кладёт сюда **объект** вместо JSON-строки
 /// (`"stdin": {"old_string": …, "new_string": …}`) — схема допускает строку, но
 /// фактически приходит структура. Молча терять её нельзя: тул получал пустой stdin
@@ -465,6 +832,239 @@ mod tests {
             .iter()
             .filter(|m| m["role"] == "tool")
             .count()
+    }
+
+    /// Схема как у read: поле + флаги с значениями.
+    fn read_schema() -> registry::ToolSchema {
+        let v = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["path"],
+            "x-snens": {
+                "argv": [
+                    {"field": "path"},
+                    {"flag": "--offset", "field": "offset"},
+                    {"flag": "--limit", "field": "limit"}
+                ],
+                "stdin": {"mode": "none"}
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("snens-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("read.json");
+        std::fs::write(&f, v.to_string()).unwrap();
+        registry::read_schema(&f).unwrap().unwrap()
+    }
+
+    /// Схема как у edit: один позиционный аргумент + JSON на stdin.
+    fn edit_schema() -> registry::ToolSchema {
+        let v = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean"},
+                "edits": {"type": "array", "items": {"type": "object"}}
+            },
+            "required": ["path"],
+            "x-snens": {
+                "argv": [{"field": "path"}],
+                "stdin": {"mode": "json", "fields": ["old_string", "new_string", "replace_all", "edits"]}
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("snens-schema2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("edit.json");
+        std::fs::write(&f, v.to_string()).unwrap();
+        registry::read_schema(&f).unwrap().unwrap()
+    }
+
+    #[test]
+    fn typed_argv_builds_all_three_rule_kinds() {
+        let s = read_schema();
+        let tc = typed_call(
+            "read",
+            &s,
+            &json!({"path": "/tmp/x", "offset": 3, "limit": 5}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        assert_eq!(tc.argv, vec!["/tmp/x", "--offset", "3", "--limit", "5"]);
+        assert_eq!(tc.stdin, None, "mode=none должен закрывать stdin");
+        // Незаданное поле не эмитится вовсе (а не пустой строкой).
+        let tc = typed_call("read", &s, &json!({"path": "/tmp/x"}), Path::new("/base")).unwrap();
+        assert_eq!(tc.argv, vec!["/tmp/x"]);
+        // const-литерал и bool-флаг собираются по спеке.
+        let v = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "append": {"type": "boolean"}},
+            "required": ["path"],
+            "x-snens": {
+                "argv": [
+                    {"const": "run"},
+                    {"field": "path"},
+                    {"flag": "--append", "when_field": "append"}
+                ],
+                "stdin": {"mode": "none"}
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("snens-schema3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("w.json");
+        std::fs::write(&f, v.to_string()).unwrap();
+        let w = registry::read_schema(&f).unwrap().unwrap();
+        let tc = typed_call(
+            "write",
+            &w,
+            &json!({"path": "/tmp/y", "append": true}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        assert_eq!(tc.argv, vec!["run", "/tmp/y", "--append"]);
+        // append=false — флага нет.
+        let tc = typed_call(
+            "write",
+            &w,
+            &json!({"path": "/tmp/y", "append": false}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        assert_eq!(tc.argv, vec!["run", "/tmp/y"]);
+    }
+
+    #[test]
+    fn typed_stdin_json_is_built_by_core() {
+        let s = edit_schema();
+        let tc = typed_call(
+            "edit",
+            &s,
+            &json!({"path": "/f", "old_string": "a", "new_string": "b"}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        assert_eq!(tc.argv, vec!["/f"]);
+        let sent: Value = serde_json::from_str(tc.stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["old_string"], "a");
+        assert_eq!(sent["new_string"], "b");
+        assert!(sent.get("replace_all").is_none(), "незаданное поле лишнее");
+        // Незаданных полей нет вовсе — объекта тоже (тул скажет про пустой stdin).
+        let tc = typed_call("edit", &s, &json!({"path": "/f"}), Path::new("/base")).unwrap();
+        assert_eq!(tc.stdin, None);
+    }
+
+    #[test]
+    fn typed_stdin_field_is_raw_value() {
+        let v = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "append": {"type": "boolean"}
+            },
+            "required": ["path", "content"],
+            "x-snens": {
+                "argv": [{"field": "path"}, {"flag": "--append", "when_field": "append"}],
+                "stdin": {"mode": "field", "field": "content"}
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("snens-schema4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("write.json");
+        std::fs::write(&f, v.to_string()).unwrap();
+        let s = registry::read_schema(&f).unwrap().unwrap();
+        let body = "строка 1\nстрока 2 \"в кавычках\"\n";
+        let tc = typed_call(
+            "write",
+            &s,
+            &json!({"path": "/f", "content": body}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        assert_eq!(tc.stdin.as_deref(), Some(body), "содержимое без JSON-обёртки");
+    }
+
+    #[test]
+    fn typed_missing_required_names_field() {
+        let s = read_schema();
+        let e = typed_call("read", &s, &json!({"limit": 5}), Path::new("/base")).unwrap_err();
+        assert!(e.contains("path"), "имя поля не названо: {e}");
+        assert!(e.contains("обязательных"), "{e}");
+        // Процесс не запускался — ошибка вернулась текстом.
+    }
+
+    #[test]
+    fn typed_unknown_field_lists_allowed() {
+        let s = read_schema();
+        let e = typed_call(
+            "read",
+            &s,
+            &json!({"path": "/f", "file": "/f"}),
+            Path::new("/base"),
+        )
+        .unwrap_err();
+        assert!(e.contains("file"), "имя неизвестного поля: {e}");
+        assert!(e.contains("path") && e.contains("offset"), "нет списка допустимых: {e}");
+    }
+
+    #[test]
+    fn typed_tolerates_double_encoded_and_single_object() {
+        let s = edit_schema();
+        // Массив edits приехал JSON-строкой: разбираем.
+        let payload = json!([{"old_string": "a", "new_string": "b"}]);
+        let tc = typed_call(
+            "edit",
+            &s,
+            &json!({"path": "/f", "edits": payload.to_string()}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        let sent: Value = serde_json::from_str(tc.stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["edits"][0]["old_string"], "a", "{sent}");
+        // Одиночный объект вместо массива — массив из одного.
+        let tc = typed_call(
+            "edit",
+            &s,
+            &json!({"path": "/f", "edits": {"old_string": "a", "new_string": "b"}}),
+            Path::new("/base"),
+        )
+        .unwrap();
+        let sent: Value = serde_json::from_str(tc.stdin.as_deref().unwrap()).unwrap();
+        assert!(sent["edits"].is_array(), "{sent}");
+        assert_eq!(sent["edits"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn typed_accepts_legacy_args_stdin() {
+        // Модель зовёт типизированный тул по-старому: stdin строкой с JSON.
+        let s = edit_schema();
+        let a = json!({
+            "args": ["/f"],
+            "stdin": "{\"old_string\":\"a\",\"new_string\":\"b\"}"
+        });
+        let tc = typed_call("edit", &s, &a, Path::new("/base")).unwrap();
+        assert_eq!(tc.argv, vec!["/f"]);
+        let sent: Value = serde_json::from_str(tc.stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["new_string"], "b");
+    }
+
+    #[test]
+    fn typed_cwd_resolves_against_session_cwd() {
+        let s = read_schema();
+        let tc = typed_call("read", &s, &json!({"path": "x"}), Path::new("/sess")).unwrap();
+        assert_eq!(tc.cwd, PathBuf::from("/sess"));
+        let tc = typed_call(
+            "read",
+            &s,
+            &json!({"path": "x", "cwd": "sub"}),
+            Path::new("/sess"),
+        )
+        .unwrap();
+        assert_eq!(tc.cwd, PathBuf::from("/sess/sub"));
     }
 
     #[test]
