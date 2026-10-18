@@ -27,6 +27,9 @@ pub struct NewFact {
     pub session: String,
     pub emb: Option<Vec<u8>>,
     pub dim: usize,
+    /// Когда факт возник в исходной системе. `None` — сейчас. Миграция обязана
+    /// сохранять даты: таймлайн — половина ценности истории.
+    pub created: Option<i64>,
 }
 
 impl NewFact {
@@ -40,6 +43,7 @@ impl NewFact {
             session: String::new(),
             emb,
             dim,
+            created: None,
         }
     }
 }
@@ -199,7 +203,7 @@ impl Store {
             f.session.as_str(),
             f.emb.as_deref(),
         );
-        let now = crate::now();
+        let now = f.created.unwrap_or_else(crate::now);
         let uid = crate::uid();
         self.db
             .execute(
@@ -225,6 +229,82 @@ impl Store {
                 .map_err(|e| e.to_string())?;
         }
         Ok(uid)
+    }
+
+    /// Вставить пачку фактов одной транзакцией. Возвращает число добавленных.
+    /// Повтор того же текста (без учёта регистра и крайних пробелов) пропускается:
+    /// в старом банке дублей хватает, и второй экземпляр только портит выдачу.
+    pub fn insert_batch(&mut self, facts: &[NewFact]) -> Result<usize, String> {
+        // Таблица векторов создаётся до транзакции: `ensure_vec` работает через
+        // &self, а транзакция держит &mut.
+        if let Some(dim) = facts.iter().find_map(|f| f.emb.as_ref().map(|_| f.dim)) {
+            self.ensure_vec(dim)?;
+        }
+        // Дедуп — в Rust, а не SQL: `lower()` и `COLLATE NOCASE` в SQLite
+        // работают только с ASCII, и кириллица в них не складывается.
+        let mut seen: std::collections::HashSet<String> = self
+            .db
+            .prepare("select text from facts")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .map(|t| norm(&t))
+            .collect();
+        let tx = self.db.transaction().map_err(|e| e.to_string())?;
+        let mut added = 0;
+        for f in facts {
+            if !seen.insert(norm(&f.text)) {
+                continue;
+            }
+            let now = f.created.unwrap_or_else(crate::now);
+            let uid = crate::uid();
+            tx.execute(
+                "insert into facts(uid, text, kind, subject, created, valid_from, source, session) \
+                 values (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
+                params![uid, f.text, f.kind, f.subject, now, f.source, f.session],
+            )
+            .map_err(|e| e.to_string())?;
+            let id = tx.last_insert_rowid();
+            tx.execute(
+                "insert into facts_fts(rowid, text, uid) values (?1, ?2, ?3)",
+                params![id, f.text, uid],
+            )
+            .map_err(|e| e.to_string())?;
+            if let Some(emb) = &f.emb {
+                tx.execute(
+                    "insert into facts_vec(rowid, emb) values (?1, vec_int8(?2))",
+                    params![id, emb.clone()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            added += 1;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(added)
+    }
+
+    /// Сколько фактов пришло из конкретного источника: повторный `import`
+    /// не должен удваивать банк.
+    pub fn count_source(&self, source: &str) -> Result<i64, String> {
+        self.db
+            .query_row(
+                "select count(*) from facts where source = ?1",
+                params![source],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// Закрыть всё, что пришло из источника: перед повторным импортом.
+    pub fn close_source(&self, source: &str) -> Result<usize, String> {
+        let now = crate::now();
+        self.db
+            .execute(
+                "update facts set valid_to = ?1 where source = ?2 and valid_to is null",
+                params![now, source],
+            )
+            .map_err(|e| e.to_string())
     }
 
     /// Закрыть факт: `valid_to = now`. Запись остаётся в истории (таймлайн),
@@ -371,6 +451,11 @@ impl Store {
     }
 }
 
+/// Ключ дедупа: без регистра (в том числе кириллицы) и крайних пробелов.
+pub fn norm(text: &str) -> String {
+    text.trim().to_lowercase()
+}
+
 /// FTS5-выражение из свободного запроса: слова длиной ≥ 3 через OR.
 /// Стемминга нет — русский unicode61 режет по буквам, дальше решает фузия.
 pub fn fts_query(query: &str) -> String {
@@ -414,6 +499,7 @@ mod tests {
             session: String::new(),
             emb: Some(emb.to_vec()),
             dim,
+            created: None,
         }
     }
 
@@ -444,6 +530,26 @@ mod tests {
         let live = s.bm25_search("Нидерландах", 5).unwrap();
         assert!(live.is_empty(), "устаревший факт всё ещё выдаётся");
         assert_eq!(s.stats().unwrap().stale, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_import_skips_duplicates_and_keeps_dates() {
+        let path = tmp("batch");
+        let mut s = Store::open(&path).unwrap();
+        let a = crate::api::quantize(&[1.0, 0.0, 0.0, 0.0]);
+        let mut first = fact("пользователь живёт в Нидерландах", "fact", "user", &a, 4);
+        first.created = Some(1_700_000_000);
+        let dup = fact("  Пользователь живёт в Нидерландах ", "fact", "user", &a, 4);
+        assert_eq!(s.insert_batch(&[first, dup]).unwrap(), 1, "дубль не отсеян");
+        let created: i64 = s
+            .db
+            .query_row("select created from facts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(created, 1_700_000_000, "дата исходной записи потеряна");
+        assert_eq!(s.count_source("import").unwrap(), 0, "источник не auto");
+        assert_eq!(s.close_source("test").unwrap(), 1);
+        assert_eq!(s.stats().unwrap().facts, 0);
         let _ = std::fs::remove_file(&path);
     }
 

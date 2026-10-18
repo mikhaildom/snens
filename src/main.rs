@@ -104,12 +104,12 @@ fn dispatch(cmd: &str, args: &[String]) -> Result<i32, Fail> {
         .map_err(Fail::from);
     }
     let cfg = Cfg::load()?;
-    let store = Store::open(&cfg.db)?;
+    let mut store = Store::open(&cfg.db)?;
     let out = match cmd {
         "recall" => recall(&cfg, &store, args),
         "flush" => flush(&cfg, &store),
         "reindex" => reindex(&cfg, &store),
-        "import" => import(&cfg, &store),
+        "import" => import(&cfg, &mut store, args),
         _ => unreachable!("команда проверена выше"),
     };
     out.map_err(Fail::from)
@@ -220,14 +220,21 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
     });
 
     // Бюджет: не больше N фактов и M «токенов» (символы/4 — оценка без токенизатора).
+    // Одна тема в двух-трёх формулировках — это не три факта: в выдаче оставляем
+    // первую, остальные считаем дублями.
+    let mut seen: Vec<String> = Vec::new();
     let mut out = Vec::new();
     let mut used = 0usize;
     for h in ranked {
+        if seen.iter().any(|s| same_fact(s, &h.text)) {
+            continue;
+        }
         let cost = h.text.chars().count() / 4 + 1;
         if out.len() >= cfg.max_facts || used + cost > cfg.max_tokens {
             break;
         }
         used += cost;
+        seen.push(h.text.clone());
         out.push(h.text);
     }
     if out.is_empty() {
@@ -359,50 +366,68 @@ fn contradicts(old: &str, new: &str) -> bool {
     !tail_a.is_empty() && !tail_b.is_empty()
 }
 
-/// Разовый импорт из другой системы: на stdin — JSON `{"company","units":[{"text","kind","subject","created"}]}`.
-/// Нужен для миграции: старый банк не должен потеряться.
-fn import(cfg: &Cfg, store: &Store) -> Result<i32, String> {
+/// Разовый импорт из другой системы (миграция).
+///
+/// stdin — JSON `{"units":[{"text","kind","subject","created","ts"}]}`, где
+/// `created`/`ts` — unix-секунды исходной записи. Всё едет одной пачкой в
+/// транзакции: 11k фактов по одному коммиту — это минуты ожидания.
+/// `--replace` сначала закрывает всё, что пришло прошлыми импортами.
+fn import(cfg: &Cfg, store: &mut Store, args: &[String]) -> Result<i32, String> {
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
         .map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| format!("stdin не JSON: {e}"))?;
     let units = v["units"].as_array().cloned().unwrap_or_default();
-    let mut texts = Vec::new();
-    for u in &units {
-        texts.push(u["text"].as_str().unwrap_or_default().to_string());
+    if units.is_empty() {
+        return Err("import: пустой units".into());
     }
-    let mut added = 0;
-    for chunk in texts.chunks(32) {
-        let Some(vectors) = api::embed_batch(cfg, chunk) else {
+    if args.iter().any(|a| a == "--replace") {
+        let closed = store.close_source("import")?;
+        if closed > 0 {
+            eprintln!("закрыто прошлых импортов: {closed}");
+        }
+    }
+    let already = store.count_source("import")?;
+    if already > 0 {
+        return Err(format!(
+            "import: уже импортировано {already} фактов; повторить — `import --replace`"
+        ));
+    }
+
+    let mut facts = Vec::with_capacity(units.len());
+    for chunk in units.chunks(32) {
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|u| u["text"].as_str().unwrap_or_default().trim().to_string())
+            .collect();
+        let Some(vectors) = api::embed_batch(cfg, &texts) else {
             return Err("эмбеддинги недоступны".into());
         };
-        for (i, text) in chunk.iter().enumerate() {
-            if text.trim().is_empty() {
+        for (i, u) in chunk.iter().enumerate() {
+            if texts[i].is_empty() {
                 continue;
             }
-            let idx = added + i;
-            let kind = units
-                .get(idx)
-                .and_then(|u| u["kind"].as_str())
-                .unwrap_or("fact");
-            let subject = units
-                .get(idx)
-                .and_then(|u| u["subject"].as_str())
-                .unwrap_or("world");
-            store.insert(&store::NewFact {
-                text: text.clone(),
-                kind: kind.to_string(),
-                subject: subject.to_string(),
+            let field = |k: &str, def: &str| {
+                u[k].as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| def.to_string())
+            };
+            facts.push(store::NewFact {
+                text: texts[i].clone(),
+                kind: field("kind", "fact"),
+                subject: field("subject", "world"),
                 source: "import".into(),
                 session: String::new(),
                 emb: Some(api::quantize(&vectors[i])),
                 dim: cfg.embed_dim,
-            })?;
+                created: u["created"].as_i64().or_else(|| u["ts"].as_i64()),
+            });
         }
-        added += chunk.len();
     }
-    println!("импортировано: {added}");
+    let total = facts.len();
+    let added = store.insert_batch(&facts)?;
+    println!("импортировано: {added} из {total} (дубли пропущены)");
     Ok(0)
 }
 
@@ -444,6 +469,29 @@ fn reindex(cfg: &Cfg, store: &Store) -> Result<i32, String> {
     }
     println!("досчитано векторов: {n}");
     Ok(0)
+}
+
+/// Один и тот же факт в разных формулировках: совпадает начало текста
+/// (первые 60 символов без регистра) или набор длинных слов почти тот же.
+fn same_fact(a: &str, b: &str) -> bool {
+    let key = |s: &str| -> String {
+        s.trim()
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.chars().count() >= 4)
+            .take(8)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (ka, kb) = (key(a), key(b));
+    if ka.is_empty() || kb.is_empty() {
+        return a.trim().eq_ignore_ascii_case(b.trim());
+    }
+    let (sa, sb): (std::collections::HashSet<&str>, std::collections::HashSet<&str>) =
+        (ka.split(' ').collect(), kb.split(' ').collect());
+    let common = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    common * 100 / union.max(1) >= 60
 }
 
 /// Время в секундах: у ядра `ts` — unix-секунды, таймлайн памяти живёт в той же шкале.
