@@ -318,21 +318,26 @@ impl Session {
 
     /// Перевести уже раскрытые записи обратно в ссылку на источник. `lines` —
     /// сколько первых раскрытых записей ссылка покрывает: файл становится
-    /// `Meta` + `Replay{.., lines}` + всё, что в префикс не влезло (при
-    /// уменьшении — просто короче; при увеличении — префикс источника).
+    /// `Meta` + `Replay{.., lines}` + собственные записи после ссылки.
+    /// `keep_tail = false` выбрасывает и их — так же, как прежде делал `cp`
+    /// при новом прогоне ревью.
     ///
     /// Переписывается только сам лог, атомарно (tmp + rename): читатели видят
     /// либо старый файл целиком, либо новый.
-    pub fn rewrite_with_replay(&self, session: &str, lines: usize) -> R<()> {
+    pub fn rewrite_with_replay(&self, session: &str, lines: usize, keep_tail: bool) -> R<()> {
         let raw = self.read_raw()?;
         // Шапка (`Meta`) и прежняя ссылка пересобираются заново; собственный
         // хвост — это всё остальное, и он не зависит от старого префикса.
-        let mut rest: Vec<Rec> = raw.iter().skip(1).cloned().collect();
-        if matches!(rest.first(), Some(Rec::Replay { .. })) {
-            rest.remove(0);
-        }
-        let keep = rest.len();
-        let mut out = Vec::with_capacity(keep + 2);
+        let rest: Vec<Rec> = if keep_tail {
+            let mut rest: Vec<Rec> = raw.iter().skip(1).cloned().collect();
+            if matches!(rest.first(), Some(Rec::Replay { .. })) {
+                rest.remove(0);
+            }
+            rest
+        } else {
+            Vec::new()
+        };
+        let keep = rest.len();        let mut out = Vec::with_capacity(keep + 2);
         match raw.first() {
             Some(meta @ Rec::Meta { .. }) => out.push(meta.clone()),
             _ => out.push(Rec::Meta {
@@ -478,6 +483,8 @@ fn expand_depth(recs: &[Rec], dir: &Path, depth: usize) -> Vec<Rec> {
         out.extend(recs.iter().skip(2).cloned());
         return out;
     };
+    // Префикс берётся из источника целиком, вместе с его `Meta`: digest ревизии
+    // контекста считается по первым записям, и любая подмена шапки его ломает.
     let mut out: Vec<Rec> = src.into_iter().take(lines).collect();
     // Сама ссылка в раскрытый лог не идёт: она — адрес префикса, а не событие.
     // На провод (и в проекцию) едет ровно то, что лежало бы в старой копии лога.
@@ -720,7 +727,7 @@ mod writer_safety_tests {
         drop(base);
 
         let review = Session::open(&dir.0, "base-review").unwrap();
-        review.rewrite_with_replay("base", n).unwrap();
+        review.rewrite_with_replay("base", n, true).unwrap();
         drop(review);
 
         let on_disk = std::fs::read_to_string(dir.0.join("base-review.jsonl")).unwrap();
@@ -753,7 +760,7 @@ mod writer_safety_tests {
         drop(base);
 
         let review = Session::open(&dir.0, "base-review").unwrap();
-        review.rewrite_with_replay("base", n).unwrap();
+        review.rewrite_with_replay("base", n, true).unwrap();
         review.append(user("рамка ревью")).unwrap();
         drop(review);
 

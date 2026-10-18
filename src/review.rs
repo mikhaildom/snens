@@ -32,12 +32,14 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
     // (после первого её работы хвост уже в её логе) остаётся на ревью-логе:
     // нижняя граница ссылки на префикс не может сдвигаться вперёд, а вместе
     // лог и хвост — это ровно раскрытый ревью-лог.
-    let src_len = log::Session::open(&dir, id)?.read()?.len();
+    // Длина источника — чтением файла, а не `Session::open`: лок эксклюзивный, и
+    // открытие сессии на запись подняло бы ошибку, если она живёт в поверхности.
+    let src_len = log::expand(&log::read_file(&src)?, &dir).len();
     let (link, prefix_len) = match log::replay_link(&log::read_head(&dst, 2)?) {
         Some((prev, lines)) if prev == id && src_len < lines => (rid.as_str(), lines),
         _ => (id, src_len),
     };
-    sess.rewrite_with_replay(link, prefix_len)?;
+    sess.rewrite_with_replay(link, prefix_len, false)?;
     drop(sess);
     if existed {
         eprintln!("[snens] {rid}: лог перезаписан, прошлый прогон ревью этой сессии потерян");
