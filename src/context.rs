@@ -30,7 +30,20 @@ fn digest(raw: &[Rec]) -> R<String> {
 
 /// Effective unelided projection for every provider path, including resume.
 /// Invalid revisions fail closed rather than silently resurrecting old context.
+///
+/// Справки памяти здесь нет намеренно: она живёт один ход и дописывается только
+/// на провод (`project::msgs`). Зеркало — стабильный префикс, который человек
+/// правит и который переживает resume; впекáть в него одноразовый текст нельзя.
 pub fn effective(raw: &[Rec], cfg: &Config) -> R<Vec<Value>> {
+    match revision(raw)? {
+        Some((messages, anchor)) => append_suffix(messages, raw, anchor, cfg),
+        None => Ok(project::raw_msgs(raw, cfg)),
+    }
+}
+
+/// База ревизии без хвостовой справки: справка снимается заново на каждый
+/// ход и хранить её в ревизии нельзя — иначе `ctx commit` её увековечит.
+fn revision(raw: &[Rec]) -> R<Option<(Vec<Value>, usize)>> {
     for (index, rec) in raw.iter().enumerate().rev() {
         if let Rec::ContextRevision {
             anchor,
@@ -43,11 +56,13 @@ pub fn effective(raw: &[Rec], cfg: &Config) -> R<Vec<Value>> {
                 return Err("context revision anchor/digest mismatch".into());
             }
             context_document::validate(messages, true)?;
-            return append_suffix(messages.clone(), raw, *anchor, cfg);
+            return Ok(Some((messages.clone(), *anchor)));
         }
     }
-    Ok(project::raw_msgs(raw, cfg))
+    Ok(None)
 }
+
+
 
 // Project the suffix WITH its raw prefix: preserves the original system,
 // replay framing and tail repair. A non-projecting revision is ignored by

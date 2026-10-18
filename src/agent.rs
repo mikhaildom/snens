@@ -652,8 +652,9 @@ async fn final_answer<L: Llm>(
         parts: Vec::new(),
     })?;
     let log = sess.read()?;
-    let mut msgs = crate::context::effective(&log, cfg)?;
-    project::apply_cleared(&mut msgs, &project::cleared_map(&log));
+    // `project::msgs`, а не `context::effective`: последний — база зеркала, а на
+    // провод справка памяти дописывается в конце хода (`append_turn_recall`).
+    let msgs = project::msgs(&log, cfg);
     let est_raw = project::estimate_tokens(&msgs);
     let limit = cfg
         .ctx_window
