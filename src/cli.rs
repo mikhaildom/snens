@@ -50,7 +50,7 @@ snens — узкое ядро агента
   snens sessions
   snens tickets [--all] [--target T] [--kind K]
   snens tickets show <имя> | grep <текст> | stats
-  snens tools
+  snens tools [--json]        # список тулов; --json — определения для модели
   snens model [slug]             # без аргумента — какая сейчас; со slug — сменить в конфиге
   snens memory [on|off] [recall always|session|off] [retain on|off]
                                  # тумблер долгой памяти: справка на ход и запись хода
@@ -576,6 +576,17 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
     let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
     let tools = registry::discover(&cfg).await;
     let bin = registry::sync_bin_dir(&cfg, &tools)?;
+    // `--json` — ровно то, что уезжает модели: дамп определений для отладки
+    // контракта (generic vs schema) без догадок по тексту.
+    if flags.contains_key("json") {
+        let mut defs = dispatch::builtin_defs();
+        defs.extend(registry::definitions(&tools));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"tools": defs}))?
+        );
+        return Ok(());
+    }
     println!("каталог тулов: {}", cfg.tools_path().display());
     println!("PATH (дети и человек): {}\n", bin.display());
     println!("встроенные (ядро, всегда в схеме):");
