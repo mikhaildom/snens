@@ -140,10 +140,13 @@ pub struct ModelProfile {
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RecallMode {
-    /// Каждый ход: как было до этой правки.
-    Always,
-    /// Одна справка на сессию (дефолт): контекст к следующему сообщению уже накоплен.
+    /// Каждый ход (дефолт): свежая справка под текущий запрос. Плагин памяти сам
+    /// держит справку компактной (`max_facts`/`max_tokens`), поэтому мусор от
+    /// чужого банка больше не аргумент за экономию.
     #[default]
+    Always,
+    /// Одна справка на сессию: свежая только на первом ходу. Дешевле, но пустой
+    /// реранк на первом (болтливом) ходу оставляет сессию без памяти вообще.
     Session,
     /// Не впрыскивать: поиск остаётся доступен модели вызовом тула `memory recall`.
     Off,
@@ -174,7 +177,7 @@ pub struct Memory {
 }
 
 /// Дефолты секции для `#[serde(default)]` на поле: `enabled = true`, режим
-/// справки — раз на сессию, запись включена. Явный `Memory::default()`
+/// справки — на каждый ход, запись включена. Явный `Memory::default()`
 /// (например, у экспериментального инстанса) намеренно даёт выключенный канал.
 impl Default for Memory {
     fn default() -> Self {
@@ -527,7 +530,7 @@ impl Config {
 
     /// Правка одного ключа секции `[memory]`: текстовая, как `set_model`, —
     /// комментарии человека в конфиге не сносим. Секции нет — создаём.
-    /// `value` — готовая строка значения (`true`, `"session"`).
+    /// `value` — готовая строка значения (`true`, `"always"`).
     pub fn set_memory_key(&self, key: &str, value: &str) -> R<PathBuf> {
         let path = match &self.source_path {
             Some(p) => p.clone(),
@@ -696,10 +699,10 @@ mod tests {
         assert!(!cfg.memory.retain);
         assert!(cfg.memory_bin().is_none());
 
-        // Дефолты полей секции: enabled=true, recall=session, retain=true.
+        // Дефолты полей секции: enabled=true, recall=always, retain=true.
         let cfg: Config = toml::from_str("[memory]\ncmd = \"memory\"\n").unwrap();
         assert!(cfg.memory.enabled);
-        assert_eq!(cfg.memory.recall, RecallMode::Session);
+        assert_eq!(cfg.memory.recall, RecallMode::Always);
         assert!(cfg.memory.retain);
 
         // Мастер-выключатель гасит канал даже с заданным cmd.
