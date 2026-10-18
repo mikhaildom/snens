@@ -558,7 +558,6 @@ mod tests {
         std::env::temp_dir().join(format!("surface-{}", uuid::Uuid::new_v4()))
     }
     #[test]
-    #[test]
     fn per_session_cleanup_limits_survive_persist_roundtrip() {
         let dir = temp();
         let (mut d, db) = open_store(&dir).unwrap();

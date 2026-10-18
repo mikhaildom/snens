@@ -98,7 +98,9 @@ fn parse(argv: &[String]) -> Args {
                     globs.push(v.clone());
                 } else {
                     let n: usize = v.parse().unwrap_or_else(|_| {
-                        die(format!("grep: {a} ждёт неотрицательное число, получено {v}"))
+                        die(format!(
+                            "grep: {a} ждёт неотрицательное число, получено {v}"
+                        ))
                     });
                     if a == "--context" {
                         context = n;
@@ -424,7 +426,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let d = std::env::temp_dir().join(format!("grep-test-{tag}-{}-{nanos}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("grep-test-{tag}-{}-{nanos}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).expect("каталог теста");
         d
@@ -507,7 +510,10 @@ mod tests {
         let mut files = Vec::new();
         walk(&d, "", &b, &mut files);
         assert!(files.iter().any(|(r, _)| r == "target/junk.rs"));
-        assert!(!files.iter().any(|(r, _)| r == "big.rs"), "большой файл не читаем");
+        assert!(
+            !files.iter().any(|(r, _)| r == "big.rs"),
+            "большой файл не читаем"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -1625,9 +1625,11 @@ mod tests {
 
     #[test]
     fn session_cleanup_limits_prefer_own_budget_over_config() {
-        let mut cfg = Config::default();
-        cfg.context_budget = 500_000;
-        cfg.context_target = 350_000;
+        let cfg = Config {
+            context_budget: 500_000,
+            context_target: 350_000,
+            ..Default::default()
+        };
         // Без своей сессии — общий порог конфига.
         assert_eq!(session_cleanup_limits(&cfg, None), (500_000, 350_000));
         // Сессия без бюджета — тоже общий порог.
