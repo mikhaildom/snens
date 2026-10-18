@@ -47,34 +47,72 @@ fn main() {
     }
     let code = match run(cmd, &argv[1..]) {
         Ok(code) => code,
-        Err(e) => {
-            eprintln!("memory: {e}");
-            1
+        Err(Fail(msg, code)) => {
+            eprintln!("memory: {msg}");
+            code
         }
     };
     std::process::exit(code);
 }
 
-fn run(cmd: &str, args: &[String]) -> Result<i32, String> {
+/// Ошибка с кодом: usage-ошибки (неверные аргументы) — 2, всё остальное — 1.
+/// Ядро и selftest различают эти коды, поэтому решение принимается здесь.
+struct Fail(String, i32);
+
+impl From<String> for Fail {
+    fn from(msg: String) -> Self {
+        Fail(msg, 1)
+    }
+}
+
+impl From<&str> for Fail {
+    fn from(msg: &str) -> Self {
+        Fail(msg.to_string(), 1)
+    }
+}
+
+fn usage(msg: impl Into<String>) -> Fail {
+    Fail(msg.into(), 2)
+}
+
+fn run(cmd: &str, args: &[String]) -> Result<i32, Fail> {
+    if !matches!(
+        cmd,
+        "recall" | "retain" | "flush" | "stats" | "reindex" | "forget" | "import"
+    ) {
+        return Err(usage(format!("неизвестная команда {cmd}")));
+    }
+    if cmd == "recall" && args.is_empty() {
+        return Err(usage("recall: нужен запрос"));
+    }
+    if cmd == "forget" && args.is_empty() {
+        return Err(usage("forget: нужен uid"));
+    }
+    dispatch(cmd, args)
+}
+
+fn dispatch(cmd: &str, args: &[String]) -> Result<i32, Fail> {
+    // Локальные команды не требуют ни сети, ни ключа: ход человека не должен
+    // падать из-за того, что провайдер недоступен или ключ не задан.
+    if matches!(cmd, "retain" | "forget" | "stats") {
+        let store = Store::open(&cfg::db_path())?;
+        return match cmd {
+            "retain" => retain(&store),
+            "forget" => forget(&store, args),
+            _ => stats(&store),
+        }
+        .map_err(Fail::from);
+    }
     let cfg = Cfg::load()?;
-    // `forget` не требует сети; остальным нужна база.
     let store = Store::open(&cfg.db)?;
-    match cmd {
+    let out = match cmd {
         "recall" => recall(&cfg, &store, args),
-        "retain" => retain(&cfg, &store),
         "flush" => flush(&cfg, &store),
-        "stats" => stats(&store),
         "reindex" => reindex(&cfg, &store),
         "import" => import(&cfg, &store),
-        "forget" => {
-            let Some(uid) = args.first() else {
-                return Err("forget: нужен uid".into());
-            };
-            println!("{}", if store.forget(uid)? { "закрыт" } else { "не найден" });
-            Ok(0)
-        }
-        other => Err(format!("неизвестная команда {other}")),
-    }
+        _ => unreachable!("команда проверена выше"),
+    };
+    out.map_err(Fail::from)
 }
 
 /// Порог отсева после реранка.
@@ -206,7 +244,7 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
 
 /// Ход в очередь. Ядро зовёт это после каждого ответа, поэтому здесь только
 /// локальная вставка: сеть и LLM — в `flush`, который живёт отдельно.
-fn retain(_cfg: &Cfg, store: &Store) -> Result<i32, String> {
+fn retain(store: &Store) -> Result<i32, String> {
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
@@ -220,8 +258,9 @@ fn retain(_cfg: &Cfg, store: &Store) -> Result<i32, String> {
             .to_string()
     };
     let (user, assistant, context) = (field("user"), field("assistant"), field("context"));
+    // Нечего запоминать — не ошибка: ядро зовёт retain на каждом ответе.
     if user.is_empty() && assistant.is_empty() {
-        return Err("retain: пустой ход".into());
+        return Ok(0);
     }
     if assistant.len() < 80 {
         // Короткий ответ ничего не добавляет к знанию о мире: экономит вызов.
@@ -366,6 +405,14 @@ fn import(cfg: &Cfg, store: &Store) -> Result<i32, String> {
         added += chunk.len();
     }
     println!("импортировано: {added}");
+    Ok(0)
+}
+
+fn forget(store: &Store, args: &[String]) -> Result<i32, String> {
+    let Some(uid) = args.first() else {
+        return Err("forget: нужен uid".into());
+    };
+    println!("{}", if store.forget(uid)? { "закрыт" } else { "не найден" });
     Ok(0)
 }
 

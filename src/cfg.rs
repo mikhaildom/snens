@@ -54,13 +54,23 @@ fn key_from_file(env_name: &str) -> Option<String> {
     None
 }
 
+/// Путь к базе без сети и ключа: `retain`/`forget`/`stats` работают локально,
+/// и падать на отсутствующем ключе им незачем.
+pub fn db_path() -> PathBuf {
+    let f: File = std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok())
+        .unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(f.db.unwrap_or_else(|| format!("{home}/.local/share/snens/memory.db")))
+}
+
 impl Cfg {
     pub fn load() -> Result<Cfg, String> {
         let f: File = std::fs::read_to_string(config_path())
             .ok()
             .and_then(|t| toml::from_str(&t).ok())
             .unwrap_or_default();
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let key_env = f.api_key_env.unwrap_or_else(|| "SNENS_API_KEY".into());
         let api_key = std::env::var(&key_env)
             .ok()
@@ -68,9 +78,10 @@ impl Cfg {
             .or_else(|| key_from_file(&key_env))
             .ok_or_else(|| format!("нет ключа {key_env} (env или ~/.config/snens/.env)"))?;
         Ok(Cfg {
-            db: PathBuf::from(
-                f.db.unwrap_or_else(|| format!("{home}/.local/share/snens/memory.db")),
-            ),
+            db: match f.db {
+                Some(db) => PathBuf::from(db),
+                None => db_path(),
+            },
             api_base: f
                 .api_base
                 .unwrap_or_else(|| "https://inference-api.nousresearch.com/v1".into())
