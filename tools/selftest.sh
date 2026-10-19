@@ -64,6 +64,10 @@ has '"content"' "$(cat "$HERE/write/schema.json")" "schema: write объявля
 has '"edits"' "$(cat "$HERE/edit/schema.json")" "schema: edit объявляет edits"
 has '"mode": "field"' "$(cat "$HERE/write/schema.json")" "schema: write берёт stdin из поля content"
 has '"mode": "json"' "$(cat "$HERE/edit/schema.json")" "schema: edit собирает stdin как JSON"
+# Минимальный валидный вызов по схеме не должен быть пустым: провайдер эмитил
+# {path, replace_all} (required был только path) и девять раз подряд получал отказ.
+has '"anyOf"' "$(cat "$HERE/edit/schema.json")" "schema: edit требует одну из двух форм (anyOf)"
+
 
 # Что видит модель: определения тулов из ядра (dump), а не только файлы схем.
 # Ядро само печатает definitions — так проверка не зависит от бинаря в PATH.
@@ -221,6 +225,14 @@ printf 'x\nx\n' >"$TMP/multi2.txt"
 ti edit '{"edits":[{"old_string":"x","new_string":"y"}]}' "$TMP/multi2.txt"
 want 1 "$rc" "edit: пачка — неоднозначность внутри правки"
 has "правка 1" "$err" "edit: пачка — номер в ошибке неоднозначности"
+
+# Вызов без самой правки: по схеме он валиден (обязателен только path), поэтому
+# отказ обязан назвать обе формы и перечислить пришедшие поля — на коротком
+# «нужны строковые old_string и new_string» модель повторяла тот же скелет.
+ti edit '{"path":"x","replace_all":false}' "$TMP/multi.txt"
+want 1 "$rc" "edit: вызов без правки — код 1"
+has "edits" "$err" "edit: отказ называет вторую форму (edits)"
+has "Пришло в вызове: path, replace_all" "$err" "edit: отказ перечисляет пришедшие поля"
 
 # Fuzzy: хвостовые пробелы/CRLF/юникод-кавычки — совпадение с пометкой, файл
 # переписывается только в затронутом месте.

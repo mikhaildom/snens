@@ -32,6 +32,10 @@
     }
   },
   "required": ["path"],
+  "anyOf": [
+    {"required": ["old_string", "new_string"]},
+    {"required": ["edits"]}
+  ],
   "x-snens": {
     "argv": [{"field": "path"}],
     "stdin": {

@@ -23,8 +23,7 @@ use unicode_normalization::UnicodeNormalization;
 
 const HELP: &str = "\
 edit — заменить точный фрагмент файла (exact match, как Edit/str_replace).
-edit <путь>   — JSON на stdin: {\"old_string\": \"...\", \"new_string\": \"...\", \"replace_all\": false}
-edit <путь>   — либо {\"edits\": [{\"old_string\", \"new_string\", \"replace_all\"}, ...]}
+edit <путь>   — либо old_string + new_string, либо edits[...] (JSON на stdin у самого тула)
 
 Требует ровно одного совпадения old_string, иначе ошибка со списком строк.
 Совпадение: точно, затем с точностью до хвостовых пробелов/CRLF/юникода.
@@ -443,18 +442,42 @@ struct Edit {
     all: bool,
 }
 
+/// Отказ на вызове без самой правки. По схеме такой вызов валиден (обязателен
+/// только `path`), поэтому модель присылала `{path, replace_all}` и по короткому
+/// «нужны строковые old_string и new_string» не понимала, что не доехало:
+/// в отказе не было ни второй формы (`edits`), ни списка пришедших полей.
+fn missing_fields(j: &Value, missing: &str, n: usize) -> String {
+    let came: Vec<&str> = j
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    if n > 0 {
+        return format!(
+            "edit: в правке {n} нет поля \"{missing}\" — у каждой правки пачки нужны old_string и new_string. Пришло: {}",
+            came.join(", ")
+        );
+    }
+    format!(
+        "edit: нет поля \"{missing}\" — правка пустая, менять нечего.\n\
+         Допустимые формы (одна из двух):\n  \
+         {{\"path\": \"…\", \"old_string\": \"…\", \"new_string\": \"…\"}}\n  \
+         {{\"path\": \"…\", \"edits\": [{{\"old_string\": \"…\", \"new_string\": \"…\"}}]}}\n\
+         Пришло в вызове: {}",
+        if came.is_empty() {
+            "ничего".to_string()
+        } else {
+            came.join(", ")
+        }
+    )
+}
+
 impl Edit {
     fn new(j: &Value, n: usize) -> Result<Edit, String> {
         let need = |k: &str| -> Result<String, String> {
             j.get(k)
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
-                .ok_or_else(|| {
-                    format!(
-                        "edit: нужны строковые \"old_string\" и \"new_string\"{}",
-                        where_n(n)
-                    )
-                })
+                .ok_or_else(|| missing_fields(j, k, n))
         };
         let old = need("old_string")?;
         let new = need("new_string")?;
@@ -731,7 +754,7 @@ fn main() {
         .read_to_string(&mut raw)
         .unwrap_or_else(|e| die(format!("edit: stdin: {e}")));
     if raw.trim().is_empty() {
-        die("edit: пустой stdin — нужен JSON {\"old_string\", \"new_string\"}".into());
+        die("edit: пустой stdin — нечего менять. Передай {\"old_string\", \"new_string\"} либо {\"edits\": [{…}]}".into());
     }
     let j: serde_json::Value = parse_patch(&raw).unwrap_or_else(|e| {
         let msg = e.to_string();
