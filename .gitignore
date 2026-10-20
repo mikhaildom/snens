@@ -14,3 +14,5 @@ tools/*/agent
 tools/*/search
 tools/*/fetch
 tools/*/grep
+oneoff/*/.venv/
+oneoff/*/*.db
