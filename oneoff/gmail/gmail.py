@@ -204,6 +204,47 @@ def cmd_index(a):
     print(f"в индексе {n} писем" + (f", не докачано {len(pending)}" if pending else ""))
 
 
+
+def api_ids(svc, qq):
+    ids, page = set(), None
+    while True:
+        r = svc.users().messages().list(userId="me", q=qq, maxResults=500,
+                                        pageToken=page, includeSpamTrash=True).execute()
+        ids |= {x["id"] for x in (r.get("messages") or [])}
+        page = r.get("nextPageToken")
+        if not page:
+            return ids
+
+
+def cmd_sync(a):
+    """sync: докачать индекс и сверить с Gmail по контрольным срезам."""
+    cmd_index(a)
+    svc = build()
+    c = db()
+    checks = [
+        ("in:inbox", "instr(labels,'INBOX')>0"),
+        ("in:trash", "instr(labels,'TRASH')>0"),
+        ("is:unread", "unread=0"),
+        ('label:"Bonnen & Facturen"', "instr(labels,'Label_1')>0"),
+    ]
+    drift = 0
+    for qq, cond in checks:
+        api = api_ids(svc, qq)
+        idx = {r[0] for r in c.execute(f"select id from msg where {cond}")}
+        only_api, only_idx = api - idx, idx - api
+        drift += len(only_api) + len(only_idx)
+        print(f"{qq:26} API {len(api):5}  индекс {len(idx):5}  "
+              f"только API {len(only_api):4}  только индекс {len(only_idx):4}")
+        # метки в индексе устаревают: чиним те, что видны по одному срезу
+        for mid in list(only_idx)[:200]:
+            m = svc.users().messages().get(userId="me", id=mid, format="minimal").execute()
+            ls = m.get("labelIds", [])
+            c.execute("update msg set labels=?, unread=? where id=?",
+                      (",".join(ls), 0 if "UNREAD" in ls else 1, mid))
+        c.commit()
+    print(f"расхождений до правки: {drift}")
+
+
 def cmd_report(a):
     c = db()
     q = lambda s, *p: c.execute(s, p).fetchall()
@@ -428,6 +469,13 @@ def main():
     a.add_argument("--batch", type=int, default=10, help="писем в одном batch-запросе")
     a.add_argument("--sleep", type=float, default=1.0, help="пауза между пачками, сек")
     a.set_defaults(f=cmd_index)
+
+    a = sub.add_parser("sync", help="докачать индекс и сверить с Gmail (in:inbox, in:trash, is:unread)")
+    a.add_argument("--q", default="")
+    a.add_argument("--refresh", action="store_true")
+    a.add_argument("--batch", type=int, default=10)
+    a.add_argument("--sleep", type=float, default=1.0)
+    a.set_defaults(f=cmd_sync)
 
     a = sub.add_parser("report", help="сводка по индексу: отправители, годы, метки")
     a.add_argument("--top", type=int, default=40)
