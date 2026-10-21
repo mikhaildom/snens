@@ -97,11 +97,23 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
             sessions.insert(id.to_string(), session);
         }
     }
-    // Заголовок нужен и сессиям, которые уже в store: у старых записей его нет.
+    // Заголовок и поверхность нужны и сессиям, которые уже в store: старые
+    // записи хранят "legacy" (устаревшее имя локальной сессии) и не знают
+    // заголовка. Метка из `Meta` точнее store — она пишется при создании лога
+    // и не переписывается; store достаётся, только если метки в логе нет.
     for session in sessions.values_mut() {
+        let file = path_from(data_dir, &session.id);
+        if let Some(path) = &file {
+            if let Some(marked) = load_meta_surface(path) {
+                session.surface = marked;
+            }
+        }
+        if session.surface == "legacy" {
+            session.surface = "local".into();
+        }
         if session.title.is_none() {
-            if let Some(path) = path_from(data_dir, &session.id) {
-                session.title = title(&path);
+            if let Some(path) = &file {
+                session.title = title(path);
             }
         }
     }

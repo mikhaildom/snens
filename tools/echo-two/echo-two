@@ -1,0 +1,9 @@
+#!/bin/sh
+# echo-two — напечатать «two» (проверочный тул).
+# echo-two [текст]
+case "$1" in
+  -h|--help)
+    printf '%s\n' 'echo-two — напечатать «two» (проверочный тул).' 'echo-two [текст]' 'Без аргумента печатает «two», с аргументом — его.'
+    exit 0 ;;
+esac
+if [ $# -gt 0 ]; then printf '%s\n' "$*"; else printf '%s\n' 'two'; fi

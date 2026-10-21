@@ -1,0 +1,9 @@
+#!/bin/sh
+# echo-three — напечатать «three» (проверочный тул).
+# echo-three [текст]
+case "$1" in
+  -h|--help)
+    printf '%s\n' 'echo-three — напечатать «three» (проверочный тул).' 'echo-three [текст]' 'Без аргумента печатает «three», с аргументом — его.'
+    exit 0 ;;
+esac
+if [ $# -gt 0 ]; then printf '%s\n' "$*"; else printf '%s\n' 'three'; fi

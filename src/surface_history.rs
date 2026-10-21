@@ -39,7 +39,7 @@ pub struct HistoryMessage {
 
 /// Project transcript records directly from the append-only journal. `seq` is
 /// the 1-based physical JSONL line number, independent of delivery event seq.
-pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
+pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
@@ -73,20 +73,11 @@ pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                 seq,
                 ts,
                 role: "user",
-                content: Some(if parts.is_empty() {
-                    text.clone()
-                } else {
-                    serde_json::to_string(&crate::project::raw_msgs(
-                        &[Rec::User {
-                            ts,
-                            text: text.clone(),
-                            source: source.clone(),
-                            parts,
-                        }],
-                        cfg,
-                    ))
-                    .unwrap_or(text)
-                }),
+                // `content` — только текст сообщения. Раньше при непустых parts
+                // сюда уезжала сериализация сырых сообщений провайдера: в чате
+                // это была простыня JSON с системным промптом вместо реплики.
+                // Вложения едут отдельным полем `parts`.
+                content: Some(text),
                 source: Some(source),
                 reasoning: None,
                 tool_calls: None,
@@ -95,7 +86,7 @@ pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                 exit: None,
                 ms: None,
                 argv: None,
-                parts: None,
+                parts: if parts.is_empty() { None } else { Some(parts) },
             }),
             Rec::Steer {
                 ts,
@@ -225,6 +216,34 @@ mod tests {
         assert!(rows.is_empty());
         assert!(!json.contains("PRIVATE_RECALL_MARKER"));
         assert!(!json.contains("PRIVATE_CONTEXT_MARKER"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn user_message_with_attachments_keeps_plain_text() {
+        let dir = temp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        // Ровно тот случай, что ломал первое сообщение сессии: голосовое/картинка
+        // в телеграме даёт непустые parts, и раньше content подменялся JSON-ом
+        // сырых сообщений провайдера (системный промпт вместо реплики).
+        fs::write(
+            &path,
+            concat!(
+                "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n",
+                "{\"kind\":\"user\",\"ts\":2,\"text\":\"послушай голосовое\",\"source\":\"telegram\",",
+                "\"parts\":[{\"kind\":\"audio\",\"path\":\"/tmp/v.ogg\",\"mime\":\"audio/ogg\",\"bytes\":10}]}\n"
+            ),
+        )
+        .unwrap();
+
+        let rows = read(&path, &Config::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content.as_deref(), Some("послушай голосовое"));
+        let parts = rows[0].parts.as_ref().expect("вложения сохраняются");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].kind, "audio");
+        assert_eq!(parts[0].mime, "audio/ogg");
         fs::remove_dir_all(dir).unwrap();
     }
 
