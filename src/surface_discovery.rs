@@ -91,13 +91,21 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
             if sessions.contains_key(id) {
                 continue;
             }
+            if !has_dialogue(&path) {
+                continue;
+            }
             let surface = surface(&path);
             let mut session = Session::new(id.to_string(), surface);
             session.title = title(&path);
             session.updated_at = mtime(&path);
+            session.parent = parent(&path);
+            session.model = model(&path);
             sessions.insert(id.to_string(), session);
         }
     }
+    // Сессии из store тоже фильтруются: там могли остаться огрызки, созданные
+    // до того, как discovery научился их отбрасывать.
+    sessions.retain(|id, _| path_from(data_dir, id).is_some_and(|p| has_dialogue(&p)));
     // Заголовок и поверхность нужны и сессиям, которые уже в store: старые
     // записи хранят "legacy" (устаревшее имя локальной сессии) и не знают
     // заголовка. Метка из `Meta` точнее store — она пишется при создании лога
@@ -118,6 +126,12 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
             }
         }
         session.updated_at = file.as_ref().and_then(|p| mtime(p));
+        if session.parent.is_none() {
+            session.parent = file.as_ref().and_then(|p| parent(p));
+        }
+        if session.model.is_none() {
+            session.model = file.as_ref().and_then(|p| model(p));
+        }
     }
     // Свежие сверху. Порядок не зависит от поверхности и от формы id
     // (`1234-567` и uuid иначе перемешивались лексикографически).
@@ -131,8 +145,61 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
     Ok(out)
 }
 
+/// Модель сессии: `Meta.model`, иначе последняя запись `usage` с непустым
+/// полем (появилось позже `Meta`), иначе `None` — у старых логов её нет.
+pub fn model(path: &Path) -> Option<String> {
+    let head = crate::log::read_head(path, 4).ok()?;
+    if let Some(m) = head.into_iter().find_map(|rec| match rec {
+        crate::log::Rec::Meta { model, .. } => Some(model),
+        _ => None,
+    }) {
+        let m = m.trim();
+        if !m.is_empty() {
+            return Some(m.to_string());
+        }
+    }
+    // Хвост лога: последний `usage` с моделью. Читаем с конца, но простым
+    // способом — файл открывается один раз и парсится построчно.
+    let text = fs::read_to_string(path).ok()?;
+    for line in text.lines().rev() {
+        if !line.contains("\"model\"") {
+            continue;
+        }
+        if let Ok(crate::log::Rec::Usage { model, .. }) = serde_json::from_str(line) {
+            let model = model.trim();
+            if !model.is_empty() {
+                return Some(model.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Родитель сессии из `Meta` (пусто у пользовательских сессий).
+pub fn parent(path: &Path) -> Option<String> {
+    crate::log::read_head(path, 4)
+        .ok()?
+        .into_iter()
+        .find_map(|rec| match rec {
+            crate::log::Rec::Meta { parent, .. } => Some(parent),
+            _ => None,
+        })
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// Была ли в сессии хоть одна реплика человека или вставка в ход. Сессии без
+/// них — огрызки (создали и бросили, упал запуск): в списке им делать нечего.
+pub fn has_dialogue(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        line.starts_with("{\"kind\":\"user\"") || line.starts_with("{\"kind\":\"steer\"")
+    })
+}
+
 /// Время последней активности сессии — `mtime` её лога.
-fn mtime(path: &Path) -> Option<u64> {
+pub fn mtime(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     modified
         .duration_since(std::time::UNIX_EPOCH)
@@ -177,7 +244,11 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let file = dir.join(format!("{id}.jsonl"));
-        fs::write(&file, "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n").unwrap();
+        fs::write(
+            &file,
+            "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n{\"kind\":\"user\",\"ts\":2,\"text\":\"hi\",\"source\":\"surface\"}\n",
+        )
+        .unwrap();
         fs::write(dir.join("not-a-session.jsonl"), "bad\n").unwrap();
         let before = fs::read(&file).unwrap();
         let found = sessions(&root, &rt::Store::default()).unwrap();
@@ -217,10 +288,18 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let uuid = uuid::Uuid::new_v4().to_string();
         let old = dir.join(format!("{uuid}.jsonl"));
-        fs::write(&old, "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n").unwrap();
+        fs::write(
+            &old,
+            "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n{\"kind\":\"user\",\"ts\":2,\"text\":\"hi\",\"source\":\"surface\"}\n",
+        )
+        .unwrap();
         // uuid лексикографически "больше" номера вида 1234-567, но он старее.
         let stamp = dir.join("1790000000-123.jsonl");
-        fs::write(&stamp, "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n").unwrap();
+        fs::write(
+            &stamp,
+            "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n{\"kind\":\"user\",\"ts\":2,\"text\":\"hi\",\"source\":\"surface\"}\n",
+        )
+        .unwrap();
         let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         let f = fs::OpenOptions::new().write(true).open(&stamp).unwrap();
         f.set_modified(newer).unwrap();
@@ -229,6 +308,52 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].id, "1790000000-123", "свежая — первой");
         assert!(found[0].updated_at.unwrap() > found[1].updated_at.unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_without_dialogue_is_not_listed() {
+        let root = temp();
+        let dir = root.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let created = uuid::Uuid::new_v4().to_string();
+        let used = uuid::Uuid::new_v4().to_string();
+        fs::write(
+            dir.join(format!("{created}.jsonl")),
+            "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n{\"kind\":\"system\",\"ts\":2,\"text\":\"prompt\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format!("{used}.jsonl")),
+            "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n{\"kind\":\"user\",\"ts\":2,\"text\":\"hi\",\"source\":\"surface\"}\n",
+        )
+        .unwrap();
+        let found = sessions(&root, &rt::Store::default()).unwrap();
+        assert_eq!(found.len(), 1, "пустая сессия в списке не нужна");
+        assert_eq!(found[0].id, used);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_and_model_are_read_for_subagent_sessions() {
+        let root = temp();
+        let dir = root.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let file = dir.join(format!("{id}.jsonl"));
+        fs::write(
+            &file,
+            concat!(
+                "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\",\"parent\":\"1790000000-1\"}\n",
+                "{\"kind\":\"user\",\"ts\":2,\"text\":\"задача подагента\",\"source\":\"surface\"}\n",
+                "{\"kind\":\"assistant\",\"ts\":3,\"text\":\"ok\",\"tool_calls\":[]}\n",
+                "{\"kind\":\"usage\",\"ts\":4,\"model\":\"openai/gpt-6-luna\",\"in_tok\":10,\"cached_tok\":8,\"out_tok\":2,\"cost_micro\":7,\"reason_tok\":0,\"encrypted_reasoning\":false,\"upstream_id\":\"\",\"fingerprint\":\"\",\"finish_reason\":\"stop\",\"est_tok\":10}\n"
+            ),
+        )
+        .unwrap();
+        let found = sessions(&root, &rt::Store::default()).unwrap();
+        assert_eq!(found[0].parent.as_deref(), Some("1790000000-1"));
+        assert_eq!(found[0].model.as_deref(), Some("openai/gpt-6-luna"));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -85,7 +85,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
     spawn_approval_server(state.clone());
     let app = Router::new()
         .route("/v1/sessions", get(list).post(create))
-        .route("/v1/sessions/{id}", get(get_session))
+        .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/sessions/{id}/messages", post(message))
         .route(
             "/v1/sessions/{id}/tools",
@@ -95,6 +95,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
             "/v1/sessions/{sid}/runs/{rid}/tools/{call_id}/result",
             post(tool_result),
         )
+        .route("/v1/search", get(search))
         .route("/v1/sessions/{id}/attachments", post(upload_attachment))
         .route("/v1/sessions/{id}/file", get(session_file))
         .route("/v1/sessions/{id}/stop", post(stop))
@@ -273,6 +274,157 @@ async fn list(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
         Err(e) => err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
     }
 }
+#[derive(Deserialize)]
+struct SearchQuery {
+    /// Подстрока для поиска (без учёта регистра). Пусто — пустой результат.
+    q: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Поиск по сессиям: реплики человека и ответы модели, плюс заголовки.
+///
+/// Ищем по журналам (JSONL) — отдельного индекса нет: 480 файлов на 130 МБ
+/// читаются единицы секунд, а индекс потребовал бы инвалидации на каждую
+/// запись хода. Сопоставление — по записям, поэтому в результате видно, что
+/// именно совпало, а не просто «файл подошёл».
+async fn search(
+    State(s): State<Arc<Runtime>>,
+    Query(q): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let needle = q.q.trim().to_lowercase();
+    if needle.is_empty() {
+        return Json(serde_json::json!({"hits": []})).into_response();
+    }
+    let limit = q.limit.unwrap_or(50).min(200);
+    let dir = s.cfg.sessions_path();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return err("storage", "sessions directory is missing", StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response();
+    };
+    let mut hits = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !rt::valid_id(id) {
+            continue;
+        }
+        let Ok(rows) = history::read(&path, &s.cfg) else {
+            continue;
+        };
+        let title = discovery::title(&path);
+        let mut matched = Vec::new();
+        for row in &rows {
+            if row.role != "user" && row.role != "assistant" {
+                continue;
+            }
+            let Some(text) = row.content.as_deref() else {
+                continue;
+            };
+            let lower = text.to_lowercase();
+            let Some(pos) = lower.find(&needle) else {
+                continue;
+            };
+            // Окно вокруг совпадения: символы, а не байты — иначе кириллицу
+            // разрежет посреди буквы.
+            let chars: Vec<char> = text.chars().collect();
+            let byte_pos = lower[..pos].chars().count();
+            let start = byte_pos.saturating_sub(40);
+            let end = (byte_pos + needle.chars().count() + 60).min(chars.len());
+            let snippet: String = chars[start..end].iter().collect();
+            matched.push(serde_json::json!({
+                "seq": row.seq,
+                "role": row.role,
+                "ts": row.ts,
+                "snippet": snippet,
+            }));
+            if matched.len() >= 3 {
+                break;
+            }
+        }
+        let title_hit = title
+            .as_deref()
+            .is_some_and(|t| t.to_lowercase().contains(&needle));
+        if matched.is_empty() && !title_hit {
+            continue;
+        }
+        hits.push(serde_json::json!({
+            "id": id,
+            "title": title,
+            "surface": discovery::surface(&path),
+            "updated_at": discovery::mtime(&path),
+            "matches": matched,
+        }));
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    Json(serde_json::json!({"hits": hits})).into_response()
+}
+
+/// Удаление сессии: журнал, каталоги вложений и запись в store. Только когда
+/// ход не идёт — иначе удалили бы из-под работающего агента.
+async fn delete_session(
+    State(s): State<Arc<Runtime>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !rt::valid_id(&id) {
+        return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
+    }
+    {
+        let d = s.data.lock().await;
+        if let Some(session) = d.sessions.get(&id) {
+            if session.state == "running" || session.state == "stopping" {
+                return err("busy", "session is running", StatusCode::CONFLICT).into_response();
+            }
+        }
+    }
+    let root = s.cfg.sessions_path();
+    let stem = root.join(&id);
+    let mut removed = false;
+    for path in [
+        stem.with_extension("jsonl"),
+        stem.with_extension("jsonl.tmp"),
+        root.join(format!("{id}.out")),
+        root.join(format!("{id}.attachments")),
+        root.join(format!("{id}.attach")),
+    ] {
+        let exists = path.exists();
+        if !exists {
+            continue;
+        }
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => removed = true,
+            Err(e) => {
+                return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                    .into_response();
+            }
+        }
+    }
+    if !removed {
+        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+    }
+    let mut d = s.data.lock().await;
+    d.sessions.remove(&id);
+    d.events.remove(&id);
+    d.messages.remove(&id);
+    d.attachments.remove(&id);
+    drop(d);
+    let d = s.data.lock().await;
+    let _ = s.persist(&d);
+    Json(serde_json::json!({"deleted": id})).into_response()
+}
+
 #[derive(Deserialize)]
 struct ToolDefs {
     tools: Vec<serde_json::Value>,

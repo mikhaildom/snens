@@ -385,7 +385,7 @@ async fn run_loop<L: Llm>(
         // проекцию), делаем один повтор; второй пустой подряд — явная ошибка,
         // иначе прогон закрывается «успешно», ничего не сделав.
         if reply.calls.is_empty() && reply.text.trim().is_empty() {
-            sess.append(usage_rec(&reply, est_raw))?;
+            sess.append(usage_rec(&reply, est_raw, &cfg.model_now()))?;
             empty_replies += 1;
             let hint = if reply.finish_reason.is_empty() {
                 "провайдер не сообщил finish_reason".to_string()
@@ -418,7 +418,7 @@ async fn run_loop<L: Llm>(
                 Some(reply.reasoning.clone())
             },
         })?;
-        sess.append(usage_rec(&reply, est_raw))?;
+        sess.append(usage_rec(&reply, est_raw, &cfg.model_now()))?;
 
         if reply.calls.is_empty() {
             memory::retain_turn(sess, cfg, &path, &reply.text).await;
@@ -677,7 +677,7 @@ async fn final_answer<L: Llm>(
             Some(reply.reasoning.clone())
         },
     })?;
-    sess.append(usage_rec(&reply, est_raw))?;
+    sess.append(usage_rec(&reply, est_raw, &cfg.model_now()))?;
     ui.notice(&format!("лимит {turn} ходов: запрошен промежуточный итог"));
     memory::retain_turn(sess, cfg, path, &reply.text).await;
     Ok(())
@@ -727,9 +727,10 @@ async fn stream_reply<L: Llm>(
 
 /// Запись расхода хода. Отпечаток апстрима кладём рядом с токенами: промах
 /// кеша ищется по тому, сменился ли между ходами бэкенд провайдера.
-fn usage_rec(reply: &Reply, est_tok: u64) -> Rec {
+fn usage_rec(reply: &Reply, est_tok: u64, model: &str) -> Rec {
     Rec::Usage {
         ts: log::now(),
+        model: model.to_string(),
         in_tok: reply.usage.in_tok,
         cached_tok: reply.usage.cached_tok,
         out_tok: reply.usage.out_tok,

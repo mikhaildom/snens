@@ -1119,6 +1119,7 @@ mod tests {
     fn calibration_weights_recent_usage() {
         let log = vec![Rec::Usage {
             ts: 0,
+            model: String::new(),
             in_tok: 1000,
             cached_tok: 0,
             out_tok: 0,

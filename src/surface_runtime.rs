@@ -21,6 +21,14 @@ pub struct Session {
     /// сортируется по нему — поверхность и порядок id тут не при чём.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<u64>,
+    /// Сессия-родитель, если это подагент. Пусто у пользовательских сессий.
+    /// Позволяет поверхности отличить работу подагента от разговора с человеком.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Модель, которой реально шёл ход: из `Meta.model`, иначе из последней
+    /// записи `usage`/`assistant` журнала. У старых логов `Meta.model` пуст.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub state: String,
     pub run_id: Option<String>,
     /// Экономический бюджет уборки контекста для этой сессии; пусто — общий
@@ -88,6 +96,8 @@ impl Session {
             surface: surface.into(),
             title: None,
             updated_at: None,
+            parent: None,
+            model: None,
             state: "idle".into(),
             run_id: None,
             context_budget: None,
@@ -331,6 +341,8 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                 // discovery, чтобы правка Meta.title не требовала миграции.
                 title: None,
                 updated_at: None,
+                parent: None,
+                model: None,
                 state: r.get(2)?,
                 run_id: r.get(3)?,
                 context_budget: r.get(4)?,

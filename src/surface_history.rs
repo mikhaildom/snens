@@ -35,6 +35,28 @@ pub struct HistoryMessage {
     /// поверхность показывает картинку, которую смотрел агент, а не только текст.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parts: Option<Vec<crate::log::Part>>,
+    /// Автор записи: `steer` | `ask` | `report` для вставок в ход (сообщение
+    /// человека, вопрос подагента, его отчёт). `None` — обычная реплика.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Кто вставил: человек/подагент. Для `via: "steer"` пусто.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Расход хода, к которому относится эта запись `assistant`: считается из
+    /// следующей за ней записи `usage` того же хода.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Usage {
+    /// Весь вход хода (включая кешированную часть).
+    pub in_tok: u64,
+    pub cached_tok: u64,
+    pub out_tok: u64,
+    pub reason_tok: u64,
+    /// Стоимость хода, микро-доллары (провайдерская цена).
+    pub cost_micro: u64,
 }
 
 /// Project transcript records directly from the append-only journal. `seq` is
@@ -44,7 +66,7 @@ pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
         return Ok(Vec::new());
     }
     let bytes = std::fs::read(path)?;
-    let mut rows = Vec::new();
+    let mut rows: Vec<HistoryMessage> = Vec::new();
     let mut lines = BufReader::new(bytes.as_slice()).lines().peekable();
     let mut seq = 0u64;
     while let Some(line) = lines.next() {
@@ -87,6 +109,9 @@ pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                 ms: None,
                 argv: None,
                 parts: if parts.is_empty() { None } else { Some(parts) },
+                via: None,
+                from: None,
+                usage: None,
             }),
             Rec::Steer {
                 ts,
@@ -94,19 +119,17 @@ pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                 from,
                 via,
             } => {
-                let prefix = match (from.is_empty(), via.as_str()) {
-                    (true, _) => String::new(),
-                    (false, "ask") => format!("[вопрос от {from}] "),
-                    (false, "report") => format!("[итог от {from}] "),
-                    (false, "steer") => "[сообщение от человека] ".into(),
-                    (false, other) => format!("[{other} от {from}] "),
-                };
+                // Префиксы вида «[сообщение от человека]», «[итог от 1792…]» —
+                // дело поверхности, а не данных: роль и автор едут полями.
+                // В тексте остаётся ровно то, что было сказано.
                 Some(HistoryMessage {
                     seq,
                     ts,
                     role: "user",
-                    content: Some(format!("{prefix}{text}")),
-                    source: Some(from),
+                    content: Some(text),
+                    source: Some(from.clone()),
+                    via: Some(via),
+                    from: Some(from),
                     reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -115,6 +138,7 @@ pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                     ms: None,
                     argv: None,
                     parts: None,
+                    usage: None,
                 })
             }
             // These records are internal prompt context, not transcript.
@@ -148,6 +172,9 @@ pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                     ms: None,
                     argv: None,
                     parts: None,
+                    via: None,
+                    from: None,
+                    usage: None,
                 })
             }
             Rec::ToolResult {
@@ -178,7 +205,32 @@ pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                     ms: Some(ms),
                     argv: Some(argv),
                     parts: if parts.is_empty() { None } else { Some(parts) },
+                    via: None,
+                    from: None,
+                    usage: None,
                 })
+            }
+            // Расход хода лежит отдельной записью сразу после `assistant`.
+            // Приклеиваем его к этой записи: модели интересна цена ответа, а не
+            // отдельная строка «usage» в транскрипте.
+            Rec::Usage {
+                in_tok,
+                cached_tok,
+                out_tok,
+                cost_micro,
+                reason_tok,
+                ..
+            } => {
+                if let Some(last) = rows.iter_mut().rev().find(|r| r.role == "assistant") {
+                    last.usage = Some(Usage {
+                        in_tok,
+                        cached_tok,
+                        out_tok,
+                        reason_tok,
+                        cost_micro,
+                    });
+                }
+                None
             }
             _ => None,
         };
