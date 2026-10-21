@@ -471,8 +471,16 @@ pub fn window_breakdown(log: &[Rec], cfg: &Config) -> WindowBreakdown {
     let mut out = WindowBreakdown::default();
     let mut calls = 0u64;
     for m in &msgs {
-        let size = estimate_message(m);
-        out.total += size;
+        // Картинки считаются отдельной категорией, а не «размазываются» по той,
+        // где лежит сообщение: иначе одна и та же цена входила бы дважды, а
+        // сегмент «картинки» не отвечал бы на вопрос, сколько окна они едят.
+        let images = match m["content"].as_array() {
+            Some(parts) => parts.iter().filter(|p| p["type"] == "image_url").count() as u64 * 4096,
+            None => 0,
+        };
+        let size = estimate_message(m).saturating_sub(images);
+        out.images += images;
+        out.total += size + images;
         match m["role"].as_str().unwrap_or("") {
             "system" => out.prefix += size,
             "tool" => out.tools += size,
@@ -481,15 +489,6 @@ pub fn window_breakdown(log: &[Rec], cfg: &Config) -> WindowBreakdown {
                 calls += m["tool_calls"].as_array().map(|a| a.len() as u64).unwrap_or(0);
             }
             _ => out.history += size,
-        }
-        // Картинки внутри сообщения считаем отдельно от текста: провайдер берёт
-        // за них фиксированную цену, и в «текстовых» категориях они не видны.
-        if let Some(parts) = m["content"].as_array() {
-            for p in parts {
-                if p["type"] == "image_url" {
-                    out.images += 4096;
-                }
-            }
         }
     }
     out.tool_calls = calls;
