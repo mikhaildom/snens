@@ -149,6 +149,125 @@ pub fn pick_port(host: &str, from: u16) -> Result<u16, String> {
     ))
 }
 
+/// Запуск в интерактивной сессии пользователя, чтобы окно было видно на его
+/// экране. Из ssh процесс попадает в сессию 0 (служебную, без экрана) — там у
+/// Chrome нет ни окна, ни GPU-контекста. `schtasks /IT` запускает задачу в
+/// сессии вошедшего пользователя, и окно появляется на его мониторе.
+pub fn start_visible(host: &str, port: u16, profile: Option<&str>) -> Result<(), String> {
+    if remote_os(host)? != "windows" {
+        return Err(
+            "видимое окно сейчас поддержано на Windows (через schtasks /IT). На unix запускай              Chrome внутри своей X/Wayland-сессии — там окно видно по определению"
+                .into(),
+        );
+    }
+    let prof = match profile {
+        Some(p) => p.to_string(),
+        None => r"C:\Users\%USERNAME%\.snens-chrome".to_string(),
+    };
+    let prof = prof.replace("%USERNAME%", "$env:USERNAME");
+    // Обёртка отдельным файлом: путь к chrome.exe с пробелами не проходит в /TR.
+    let wrapper = format!(
+        r#"$prof = "{prof}"
+if ($prof -like '*$env:USERNAME*') {{ $prof = $prof.Replace('$env:USERNAME', $env:USERNAME) }}
+$exe = @('C:\Program Files\Google\Chrome\Application\chrome.exe','C:\Program Files (x86)\Google\Chrome\Application\chrome.exe') | Where-Object {{ Test-Path $_ }} | Select-Object -First 1
+if (-not $exe) {{ exit 2 }}
+$log = Join-Path $env:USERPROFILE 'snens-chrome-visible.out'
+"=== " + (Get-Date -Format o) | Set-Content -Encoding ASCII $log
+"profile=$prof port={port}" | Add-Content -Encoding ASCII $log
+"existing: " + ((Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {{ $_.CommandLine -match 'snens-chrome' -and $_.CommandLine -notmatch '--type=' }} | Measure-Object).Count) | Add-Content -Encoding ASCII $log
+& $exe "--user-data-dir=$prof" --remote-debugging-port={port} --no-first-run --no-default-browser-check --window-size=1440,900 about:blank
+"exit=$LASTEXITCODE" | Add-Content -Encoding ASCII $log
+"#
+    );
+    write_remote_file(host, "snens-chrome-visible.ps1", &wrapper)?;
+    let task = "snens-chrome-visible";
+    let tr = r"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\%USERNAME%\snens-chrome-visible.ps1";
+    let _ = ssh(host, format!("schtasks /Delete /TN {task} /F"));
+    ssh(
+        host,
+        format!(r#"schtasks /Create /TN {task} /TR "{tr}" /SC ONCE /ST 00:00 /IT /F"#),
+    )?;
+    ssh(host, format!("schtasks /Run /TN {task}"))?;
+    wait_port(host, port, Duration::from_secs(25))?;
+    Ok(())
+}
+
+/// Положить файл на ту сторону через stdin ssh: кириллица и кавычки в аргументах
+/// ломаются, а через stdin доезжает как есть.
+fn write_remote_file(host: &str, name: &str, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(host)
+        .arg(format!(r"cmd /c more > C:\Users\%USERNAME%\{}", name))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh {host}: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // Windows-переводы строк: powershell их ждёт.
+        let crlf = content.replace("\r\n", "\n").replace('\n', "\r\n");
+        stdin
+            .write_all(crlf.as_bytes())
+            .map_err(|e| format!("stdin ssh: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("ssh {host}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "не смог записать {name} на {host}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Поднять окно агентского Chrome на экран пользователя (в его сессии).
+pub fn show_window(host: &str) -> Result<(), String> {
+    if remote_os(host)? != "windows" {
+        return Err("показ окна сейчас поддержан на Windows".into());
+    }
+    let script = r#"Add-Type -Namespace W -Name U -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+[DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+public delegate bool EnumProc(IntPtr h, IntPtr p);
+'@
+$found = $false
+$cb = [W.U+EnumProc]{
+  param($h, $p)
+  $sb = New-Object System.Text.StringBuilder 512
+  [void][W.U]::GetWindowText($h, $sb, 512)
+  if ($sb.ToString() -like '*Google Chrome*') {
+    [void][W.U]::ShowWindow($h, 9)
+    [void][W.U]::BringWindowToTop($h)
+    [void][W.U]::SetForegroundWindow($h)
+    $script:found = $true
+  }
+  return $true
+}
+[void][W.U]::EnumWindows($cb, [IntPtr]::Zero)
+if ($found) { 'shown' } else { 'no-window' }
+"#;
+    write_remote_file(host, "snens-chrome-show.ps1", script)?;
+    let task = "snens-chrome-show";
+    let tr = r"powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\%USERNAME%\snens-chrome-show.ps1";
+    let _ = ssh(host, format!("schtasks /Delete /TN {task} /F"));
+    ssh(
+        host,
+        format!(r#"schtasks /Create /TN {task} /TR "{tr}" /SC ONCE /ST 00:00 /IT /F"#),
+    )?;
+    ssh(host, format!("schtasks /Run /TN {task}"))?;
+    Ok(())
+}
+
 /// Запустить отдельный профиль Chrome на той стороне и дождаться порта CDP.
 /// `profile` — каталог профиля (на Windows путь вида `C:\Users\x\.snens-chrome`).
 pub fn start_agent_chrome(host: &str, port: u16, profile: Option<&str>) -> Result<String, String> {
@@ -211,11 +330,19 @@ fn wait_port(host: &str, port: u16, budget: Duration) -> Result<(), String> {
             return Ok(());
         }
         if Instant::now() >= until {
+            let diag = ssh(host, format!("cmd /c type C:\\Users\\%USERNAME%\\snens-chrome-visible.out 2>nul"))
+                .unwrap_or_default();
             return Err(format!(
-                "Chrome на {host} не поднял отладку на порту {port} за {} с.\n\
+                "Chrome на {host} не поднял отладку на порту {port} за {} с.{}\n\
                  Частые причины: порт занят другим Chrome (тогда профиль агента не свой), \
-                 chrome.exe не найден в стандартном месте, на unix не установлен google-chrome.",
-                budget.as_secs()
+                 chrome.exe не найден в стандартном месте, на unix не установлен google-chrome.\n\
+                 Уже запущенные агентские Chrome: `web launch` без --port переиспользует свой.",
+                budget.as_secs(),
+                if diag.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\nвывод запуска:\n{}", diag.trim())
+                }
             ));
         }
         std::thread::sleep(Duration::from_millis(400));

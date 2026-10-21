@@ -28,7 +28,7 @@ const USAGE: &str = "web <команда> … — браузер машины п
 
 const HELP: &str = "\
 web — браузер машины пользователя через CDP: дерево с адресами, действия батчем, скриншот как fallback.
-web connect|status|tabs|use|open|snap|act|shot|eval|text|probe|disconnect|launch|close [аргументы]
+web connect|status|tabs|use|open|snap|act|shot|eval|text|probe|disconnect|launch|show|close [аргументы]
 
 Соединение — к Chrome, разрешённому для отладки по согласию
 (chrome://inspect/#remote-debugging, Chrome 144+), или к отдельному профилю агента.
@@ -47,8 +47,10 @@ web text [--limit N]                   видимый текст страниц�
 web probe                              проверить, что ввод реально доставляется (клик/клавиша/вставка)
 web close                              закрыть текущую вкладку и снять привязку
 web disconnect                         закрыть ssh-туннель (Chrome и вкладки не трогаем)
-web launch [--profile путь] [--port N] запустить ОТДЕЛЬНЫЙ профиль Chrome на машине
-                                       пользователя: без подтверждений, переживает ssh
+web launch [--profile путь] [--port N] [--visible]  запустить ОТДЕЛЬНЫЙ профиль Chrome
+                                       на машине пользователя: без подтверждений, переживает ssh.
+                                       --visible — в сессии пользователя, чтобы окно было видно
+web show                               вывести окно агентского Chrome на экран (Windows)
 
 --tunnel user@machine                  говорить с Chrome на той машине через ssh-туннель:
                                        на той стороне web НЕ нужен, только Chrome с согласием
@@ -152,6 +154,7 @@ fn is_command(s: &str) -> bool {
             | "probe"
             | "disconnect"
             | "launch"
+            | "show"
             | "close"
     )
 }
@@ -657,9 +660,23 @@ fn cmd_launch(args: &Args) -> Result<(), String> {
             }
         }
     }
-    let os = launch::start_agent_chrome(&host, port, profile)?;
+    let visible = args.on("visible");
+    let os = if visible {
+        launch::start_visible(&host, port, profile)?;
+        "windows/видимое окно".to_string()
+    } else {
+        launch::start_agent_chrome(&host, port, profile)?
+    };
     state::save_launch(&host, port);
-    println!("Chrome запущен: {host} ({os}), профиль {}, порт {port}", profile.unwrap_or("по умолчанию"));
+    println!(
+        "Chrome запущен: {host} ({os}), профиль {}, порт {port}{}",
+        profile.unwrap_or("по умолчанию"),
+        if visible {
+            " — окно на экране пользователя"
+        } else {
+            ""
+        }
+    );
     // Дальше — обычный путь: туннель + привязка к вкладке.
     connect_to(&host, port)
 }
@@ -676,6 +693,20 @@ fn connect_to(host: &str, port: u16) -> Result<(), String> {
         has: Vec::new(),
     };
     cmd_connect(&args2)
+}
+
+/// Показать окно агентского Chrome на экране пользователя.
+fn cmd_show(args: &Args) -> Result<(), String> {
+    let host = match args.flag("tunnel") {
+        Some(h) => h.to_string(),
+        None => match state::load_launch() {
+            Some((h, _)) => h,
+            None => return Err("web show: нужен --tunnel user@machine или сначала `web launch`".into()),
+        },
+    };
+    launch::show_window(&host)?;
+    println!("окно показано на {host}");
+    Ok(())
 }
 
 /// Закрыть ssh-туннель. Вкладки и Chrome на той стороне не трогаем: отключение
@@ -847,6 +878,7 @@ fn main() {
         "probe" => cmd_probe(&args),
         "disconnect" => cmd_disconnect(&args),
         "launch" => cmd_launch(&args),
+        "show" => cmd_show(&args),
         "close" => cmd_close(&args),
         other => {
             eprintln!("web: неизвестная команда {other}");
