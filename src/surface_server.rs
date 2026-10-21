@@ -96,6 +96,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
             post(tool_result),
         )
         .route("/v1/search", get(search))
+        .route("/v1/sessions/{id}/context", get(context_breakdown))
         .route("/v1/sessions/{id}/attachments", post(upload_attachment))
         .route("/v1/sessions/{id}/file", get(session_file))
         .route("/v1/sessions/{id}/stop", post(stop))
@@ -274,6 +275,54 @@ async fn list(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
         Err(e) => err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
     }
 }
+
+/// Расклад рабочего окна сессии: из чего состоит проекция промпта.
+///
+/// Считается ядром по тем же записям, что уедут провайдеру в следующем ходе:
+/// клиент не догадывается о размерах, а показывает измеренное. `limit` —
+/// бюджет окна: у сессии может быть свой, иначе из конфига.
+async fn context_breakdown(
+    State(s): State<Arc<Runtime>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !rt::valid_id(&id) {
+        return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
+    }
+    let Some(path) = discovery::path(&s.cfg, &id).filter(|p| p.is_file()) else {
+        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
+    };
+    let log = match crate::log::read_file(&path) {
+        Ok(log) => log,
+        Err(e) => {
+            return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response()
+        }
+    };
+    let mut breakdown = crate::project::window_breakdown(&log, &s.cfg);
+    // Схемы инструментов тоже уезжают в запрос и занимают окно: считаем их
+    // оценкой по JSON, чтобы «прочие» категории не были пустыми.
+    let tools = crate::registry::discover(&s.cfg).await;
+    let schema: u64 = crate::registry::definitions(&tools)
+        .iter()
+        .map(|t| crate::project::estimate_message(t) + 8)
+        .sum();
+    breakdown.tools += schema;
+    breakdown.total += schema;
+    let budget = s
+        .data
+        .lock()
+        .await
+        .sessions
+        .get(&id)
+        .and_then(|x| x.context_target.or(x.context_budget))
+        .unwrap_or_else(|| s.cfg.context_budget());
+    Json(serde_json::json!({
+        "breakdown": breakdown,
+        "limit": budget,
+    }))
+    .into_response()
+}
+
 #[derive(Deserialize)]
 struct SearchQuery {
     /// Подстрока для поиска (без учёта регистра). Пусто — пустой результат.

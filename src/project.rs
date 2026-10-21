@@ -434,6 +434,84 @@ pub fn calibrated_tokens(log: &[Rec], msgs: &[Value]) -> u64 {
     (estimate_tokens(msgs) as f64 * calibration(log)).round() as u64
 }
 
+/// Размер одного сообщения проекции в токенах (та же эвристика, что у
+/// [`estimate_tokens`], выставленная наружу для расклада окна).
+pub fn estimate_message(value: &Value) -> u64 {
+    fn size(value: &Value) -> u64 {
+        match value {
+            Value::Object(_) if value["type"] == "image_url" => 4096,
+            Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| k.len() as u64 / 3 + size(v) + 4)
+                .sum(),
+            Value::Array(items) => items.iter().map(size).sum(),
+            Value::String(s) => s.len() as u64 / 3 + 1,
+            _ => 1,
+        }
+    }
+    size(value)
+}
+
+/// Из чего состоит рабочее окно сессии: расклад проекции по категориям.
+///
+/// Категории — не догадка клиента, а роли сообщений проекции, которые ядро и так
+/// собирает перед каждым ходом:
+/// - `prefix` — системный промпт и пометки рамки (уезжают в префикс кеша);
+/// - `history` — реплики человека и ответы модели (текст диалога);
+/// - `tools` — описания инструментов и результаты их вызовов: самая тяжёлая и
+///   самая изменчивая часть окна, из-за неё промахивает кеш;
+/// - `images` — картинки-вложения (считаются по фиксированной цене части).
+///
+/// `total` — оценка всей проекции; `estimate` — та же эвристика, что у порога
+/// компакции, без калибровки: калибровка подгоняет под провайдера по usage
+/// прошлых ходов, и для расклада важнее сопоставимость частей, чем точное
+/// совпадение с счётом провайдера.
+pub fn window_breakdown(log: &[Rec], cfg: &Config) -> WindowBreakdown {
+    let msgs = build(log, cfg);
+    let mut out = WindowBreakdown::default();
+    let mut calls = 0u64;
+    for m in &msgs {
+        let size = estimate_message(m);
+        out.total += size;
+        match m["role"].as_str().unwrap_or("") {
+            "system" => out.prefix += size,
+            "tool" => out.tools += size,
+            "assistant" => {
+                out.history += size;
+                calls += m["tool_calls"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+            }
+            _ => out.history += size,
+        }
+        // Картинки внутри сообщения считаем отдельно от текста: провайдер берёт
+        // за них фиксированную цену, и в «текстовых» категориях они не видны.
+        if let Some(parts) = m["content"].as_array() {
+            for p in parts {
+                if p["type"] == "image_url" {
+                    out.images += 4096;
+                }
+            }
+        }
+    }
+    out.tool_calls = calls;
+    out.messages = msgs.len() as u64;
+    out
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct WindowBreakdown {
+    pub total: u64,
+    /// Системный промпт и рамки — то, что должно попадать в кеш.
+    pub prefix: u64,
+    /// Диалог: реплики человека и ответы модели.
+    pub history: u64,
+    /// Результаты вызовов инструментов.
+    pub tools: u64,
+    /// Вложения-картинки (фиксированная цена части).
+    pub images: u64,
+    pub messages: u64,
+    pub tool_calls: u64,
+}
+
 /// Грубая оценка токенов проекции: точные числа берём из usage провайдера,
 /// а это — только для порога компакции.
 pub fn estimate_tokens(msgs: &[Value]) -> u64 {
@@ -1113,6 +1191,59 @@ mod tests {
             wire.contains("решение: не переспрашивать"),
             "текст пользователя потерян"
         );
+    }
+
+    #[test]
+    fn window_breakdown_splits_projection_by_role() {
+        let cfg = Config::default();
+        let log = vec![
+            Rec::Meta {
+                ts: 0,
+                model: String::new(),
+                parent: String::new(),
+                surface: None,
+                title: None,
+            },
+            Rec::System {
+                ts: 0,
+                text: "system prompt text".into(),
+            },
+            Rec::User {
+                ts: 0,
+                text: "привет, посмотри файл".into(),
+                source: "surface".into(),
+                parts: Vec::new(),
+            },
+            Rec::Assistant {
+                ts: 0,
+                text: None,
+                reasoning: None,
+                tool_calls: vec![crate::log::Call {
+                    id: "c1".into(),
+                    name: "run".into(),
+                    args: "{}".into(),
+                }],
+            },
+            Rec::ToolResult {
+                ts: 0,
+                call_id: "c1".into(),
+                tool: "run".into(),
+                argv: vec![],
+                exit: 0,
+                bytes: 0,
+                ms: 1,
+                body: crate::log::Body::Inline {
+                    text: "x".repeat(3000),
+                },
+                parts: Vec::new(),
+            },
+        ];
+        let b = window_breakdown(&log, &cfg);
+        assert!(b.prefix > 0, "системный промпт должен попасть в prefix");
+        assert!(b.history > 0, "реплика человека — в history");
+        assert!(b.tools > 0, "результат тула — в tools");
+        assert_eq!(b.tool_calls, 1);
+        assert!(b.total >= b.prefix + b.history + b.tools);
     }
 
     #[test]
