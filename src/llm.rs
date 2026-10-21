@@ -68,6 +68,47 @@ pub trait Llm {
     ) -> R<Reply>;
 }
 
+// ---------- разбор SSE ----------
+
+/// Накопитель кадров SSE. Транспорт (`bytes_stream`) режет поток где угодно — в том
+/// числе посреди многобайтного символа, а кириллица в аргументах вызова (write/edit)
+/// состоит из двухбайтных. Поэтому копим **байты** и декодируем только целый кадр:
+/// граница чанка перестаёт быть границей символа.
+#[derive(Default)]
+struct SseFrames {
+    buf: Vec<u8>,
+}
+
+impl SseFrames {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// Следующий целый кадр (до `\n` включительно). Декодируем **строго**: так
+    /// битые байты видны как ошибка, а не превращаются в U+FFFD внутри аргумента.
+    fn next(&mut self) -> Option<crate::R<String>> {
+        let pos = self.buf.iter().position(|b| *b == b'\n')?;
+        let raw: Vec<u8> = self.buf.drain(..=pos).collect();
+        Some(match std::str::from_utf8(&raw) {
+            Ok(s) => Ok(s.to_string()),
+            Err(e) => Err(format!(
+                "кадр стрима не UTF-8 ({e}) — аргументам вызова доверять нельзя"
+            )
+            .into()),
+        })
+    }
+
+    /// Что осталось после конца потока. Непустой остаток — оборванный кадр:
+    /// стрим закрылся посреди строки, и молча дочитывать его как аргумент нельзя.
+    fn remainder(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let raw = std::mem::take(&mut self.buf);
+        Some(String::from_utf8_lossy(&raw).into_owned())
+    }
+}
+
 // ---------- openai-compatible ----------
 
 pub struct OpenAi {
@@ -155,7 +196,9 @@ impl OpenAi {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        // Кадры SSE копим **байтами**: транспорт режет поток где угодно, в том числе
+        // посреди многобайтного символа. Декодировать надо только целые строки.
+        let mut buf = SseFrames::default();
         let mut text = String::new();
         // Рассуждение — отдельное поле стрима (`delta.reasoning`); держим его в
         // Reply и в логе, но провайдеру обратно не отдаём: контекст он не хранит.
@@ -173,82 +216,148 @@ impl OpenAi {
         // пустой delta, но иногда и раньше — держим последнее значение.
         let mut finish_reason = String::new();
 
-        'outer: while let Some(chunk) = stream.next().await {
+        // Один кадр из стрима. Вынесено замыканием, чтобы одинаково обработать
+        // и кадры с переводом строки, и последний кадр без него (провайдеры его
+        // не всегда дописывают) — без этого хвост либо терялся, либо валил запрос.
+        let frame = |data: &str,
+                         text: &mut String,
+                         reasoning: &mut String,
+                         parts: &mut BTreeMap<usize, (String, String, String)>,
+                         usage: &mut Usage,
+                         encrypted: &mut bool,
+                         upstream: &mut Upstream,
+                         finish_reason: &mut String,
+                         seen: &mut bool,
+                         on_delta: &mut (dyn FnMut(Delta) + Send)|
+         -> bool {
+            let data = data.trim();
+            if data == "[DONE]" {
+                return true;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                return false;
+            };
+            if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                if !id.is_empty() {
+                    upstream.id = id.to_string();
+                }
+            }
+            if let Some(fp) = v.get("system_fingerprint").and_then(|x| x.as_str()) {
+                if !fp.is_empty() {
+                    upstream.fingerprint = fp.to_string();
+                }
+            }
+            if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                *usage = parse_usage(u);
+            }
+            if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
+                if !fr.is_empty() {
+                    *finish_reason = fr.to_string();
+                }
+            }
+            let Some(d) = v.pointer("/choices/0/delta") else {
+                return false;
+            };
+            if let Some(summary) = crate::reasoning::take_delta(d, encrypted) {
+                reasoning.push_str(&summary);
+                *seen = true;
+                on_delta(Delta::Reasoning(&summary));
+            }
+            if let Some(c) = d.get("content").and_then(|c| c.as_str()) {
+                if !c.is_empty() {
+                    text.push_str(c);
+                    *seen = true;
+                    on_delta(Delta::Content(c));
+                }
+            }
+            if let Some(tcs) = d.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tcs {
+                    *seen = true;
+                    let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                    let e = parts.entry(idx).or_default();
+                    if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                        if !id.is_empty() {
+                            e.0 = id.to_string();
+                        }
+                    }
+                    if let Some(n) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
+                        e.1 = format!("{}{}", e.1, n);
+                    }
+                    if let Some(a) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                        e.2.push_str(a);
+                    }
+                }
+            }
+            false
+        };
+
+        let mut stopped = false;
+        while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
                 format!(
                     "стрим оборван после {} символов: {e}",
                     text.len() + parts.values().map(|p| p.2.len()).sum::<usize>()
                 )
             })?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line: String = buf.drain(..=pos).collect();
-                let line = line.trim();
-                let Some(data) = line.strip_prefix("data:") else {
+            buf.push(&chunk);
+            while let Some(line) = buf.next() {
+                let line = line?;
+                let Some(data) = line.trim().strip_prefix("data:") else {
                     continue;
                 };
-                let data = data.trim();
-                if data == "[DONE]" {
-                    break 'outer;
+                if frame(
+                    data,
+                    &mut text,
+                    &mut reasoning,
+                    &mut parts,
+                    &mut usage,
+                    &mut encrypted,
+                    &mut upstream,
+                    &mut finish_reason,
+                    seen,
+                    on_delta,
+                ) {
+                    stopped = true;
+                    break;
                 }
-                let Ok(v) = serde_json::from_str::<Value>(data) else {
-                    continue;
+            }
+            if stopped {
+                break;
+            }
+        }
+
+        // Хвост без перевода строки: у части провайдеров последний кадр так и
+        // приходит. Целый разбираем, недописанный — это обрыв стрима, и
+        // дочитывать его как аргумент нельзя: в файл уедет половина `content`.
+        if let Some(rest) = buf.remainder() {
+            let rest_trimmed = rest.trim();
+            if !rest_trimmed.is_empty() {
+                let Some(data) = rest_trimmed.strip_prefix("data:") else {
+                    return Err(format!(
+                        "стрим оборван: {} байт хвоста без перевода строки",
+                        rest.len()
+                    )
+                    .into());
                 };
-                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
-                    if !id.is_empty() {
-                        upstream.id = id.to_string();
-                    }
+                if serde_json::from_str::<Value>(data.trim()).is_err() {
+                    return Err(format!(
+                        "стрим оборван: последний кадр не разбирается ({} байт) — ответ неполный",
+                        rest.len()
+                    )
+                    .into());
                 }
-                if let Some(fp) = v.get("system_fingerprint").and_then(|x| x.as_str()) {
-                    if !fp.is_empty() {
-                        upstream.fingerprint = fp.to_string();
-                    }
-                }
-                if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                    usage = parse_usage(u);
-                }
-                if let Some(fr) = v
-                    .pointer("/choices/0/finish_reason")
-                    .and_then(|x| x.as_str())
-                {
-                    if !fr.is_empty() {
-                        finish_reason = fr.to_string();
-                    }
-                }
-                let Some(d) = v.pointer("/choices/0/delta") else {
-                    continue;
-                };
-                if let Some(summary) = crate::reasoning::take_delta(d, &mut encrypted) {
-                    reasoning.push_str(&summary);
-                    *seen = true;
-                    on_delta(Delta::Reasoning(&summary));
-                }
-                if let Some(c) = d.get("content").and_then(|c| c.as_str()) {
-                    if !c.is_empty() {
-                        text.push_str(c);
-                        *seen = true;
-                        on_delta(Delta::Content(c));
-                    }
-                }
-                if let Some(tcs) = d.get("tool_calls").and_then(|t| t.as_array()) {
-                    for tc in tcs {
-                        *seen = true;
-                        let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                        let e = parts.entry(idx).or_default();
-                        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                            if !id.is_empty() {
-                                e.0 = id.to_string();
-                            }
-                        }
-                        if let Some(n) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
-                            e.1 = format!("{}{}", e.1, n);
-                        }
-                        if let Some(a) = tc.pointer("/function/arguments").and_then(|a| a.as_str())
-                        {
-                            e.2.push_str(a);
-                        }
-                    }
-                }
+                frame(
+                    data,
+                    &mut text,
+                    &mut reasoning,
+                    &mut parts,
+                    &mut usage,
+                    &mut encrypted,
+                    &mut upstream,
+                    &mut finish_reason,
+                    seen,
+                    on_delta,
+                );
             }
         }
 
@@ -337,5 +446,104 @@ impl Llm for Fake {
             on_delta(Delta::Content(&r.text));
         }
         Ok(r)
+    }
+}
+
+// ---------- тесты ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Кадр стрима с аргументами вызова, как их присылает провайдер.
+    fn frame(cyr: &str) -> String {
+        let v = json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+            "function":{"name":"write","arguments":format!("{{\"content\":\"{cyr}\"}}")}}]}}]});
+        format!("data: {v}\n\n")
+    }
+
+    /// Наблюдённый баг (тикет 2026-10-21-write-cyrillic-content-corrupt): транспорт
+    /// режет поток посреди двухбайтного символа, lossy-декод чанка подменяет оба
+    /// байта на U+FFFD — и битый аргумент молча уезжает в файл.
+    #[test]
+    fn chunk_split_inside_multibyte_char_keeps_content_intact() {
+        let payload = "привет ёжик";
+        let data = frame(payload).into_bytes();
+        // Режем ровно между байтами «ё» (0xD1 0x91) — худший случай.
+        let cut = data
+            .windows(2)
+            .position(|w| w == [0xD1, 0x91])
+            .expect("в кадре нет «ё»")
+            + 1;
+        let mut f = SseFrames::default();
+        f.push(&data[..cut]);
+        f.push(&data[cut..]);
+
+        let mut all = String::new();
+        while let Some(line) = f.next() {
+            all.push_str(&line.unwrap());
+        }
+        assert!(!all.contains('\u{fffd}'), "порча в кадре: {all}");
+        assert!(all.contains(payload), "кириллица не дошла целиком: {all}");
+    }
+
+    /// Хвост без перевода строки не должен теряться молча: неполный кадр — это
+    /// оборванный стрим, а не повод дописать его в аргументы как есть.
+    #[test]
+    fn partial_frame_is_not_emitted() {
+        let mut f = SseFrames::default();
+        f.push(b"data: {\"choices\":[");
+        assert!(f.next().is_none(), "неполный кадр выдан за целый");
+    }
+
+    /// Сквозная проверка production-пути: локальный HTTP-сервер отдаёт SSE, где
+    /// кадр с кириллицей разрезан посреди двухбайтного символа — ровно так, как
+    /// это делает транспорт. До фикса аргументы вызова приезжали с U+FFFD.
+    #[tokio::test]
+    async fn reply_keeps_cyrillic_across_split_chunks() {
+        use std::io::{Read, Write};
+
+        let payload = "// выпълнение: ёжик в тумане, объявление и счётчик";
+        // Один кадр с полным аргументом — режется его уже транспорт (ниже, по 7
+        // байт), как и в жизни: провайдер шлёт целые куски JSON, а чанки режет TCP.
+        let arg = json!({ "content": payload }).to_string();
+        let v = json!({"choices":[{"delta":{"tool_calls":[{"index":0,
+            "function":{"name":"write","arguments":arg}}]}}]});
+        let mut s = format!("data: {v}\n\n");
+        s.push_str("data: [DONE]\n\n");
+        let body = s.into_bytes();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut head = [0u8; 4096];
+            let _ = sock.read(&mut head);
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(hdr.as_bytes()).unwrap();
+            // Режем по байту: границы чанков не совпадают с границами символов.
+            for b in body.chunks(7) {
+                sock.write_all(b).unwrap();
+                sock.flush().unwrap();
+            }
+        });
+
+        let mut cfg = crate::cfg::Config::default();
+        cfg.base_url = format!("http://{addr}");
+        let llm = OpenAi::new("test-key".into()).unwrap();
+        let mut noop = |_: Delta| {};
+        let reply = llm
+            .reply(&cfg, vec![], vec![], &mut noop)
+            .await
+            .expect("запрос к локальному серверу");
+
+        let args = &reply.calls[0].args;
+        assert!(!args.contains('\u{fffd}'), "порча в аргументе: {args}");
+        let v: Value = serde_json::from_str(args).expect("аргумент не JSON");
+        assert_eq!(v["content"].as_str().unwrap(), payload);
+        server.join().unwrap();
     }
 }

@@ -84,6 +84,56 @@ fn atomic_write(path: &str, data: &[u8], mode: Option<u32>) {
     }
 }
 
+/// U+FFFD в content — не текст, а след потерянных байт: где-то по пути вход
+/// прошёл через lossy-декод. Такой файл писать нельзя: порча молча уедет на диск
+/// (тикет 2026-10-21-write-cyrillic-content-corrupt). Сообщаем позицию, а не
+/// просто «нельзя».
+fn check_replacement(data: &[u8]) -> Result<(), String> {
+    let text = match std::str::from_utf8(data) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(format!(
+                "write: stdin не UTF-8 ({e}) — вход побит, файл не записан"
+            ))
+        }
+    };
+    let bad: Vec<usize> = text
+        .char_indices()
+        .filter(|(_, c)| *c == '\u{fffd}')
+        .map(|(i, _)| i)
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let sample: String = text
+        .char_indices()
+        .filter(|(_, c)| *c == '\u{fffd}')
+        .take(1)
+        .map(|(i, _)| {
+            // Хвост вокруг места порчи: по нему видно, какой символ потерялся.
+            let from = text[..i]
+                .char_indices()
+                .rev()
+                .nth(20)
+                .map(|(j, _)| j)
+                .unwrap_or(0);
+            let to = text[i..]
+                .char_indices()
+                .nth(20)
+                .map(|(j, _)| i + j)
+                .unwrap_or(text.len());
+            format!("{:?}", &text[from..to])
+        })
+        .collect();
+    Err(format!(
+        "write: content содержит U+FFFD ({} шт., позиции {:?}) — это след потерянных \
+         байт, файл не записан. Место: {sample}. Пересобери содержимое: при кириллице \
+         такой длины надёжнее `python3 - <<'PY'` в run",
+        bad.len(),
+        bad.iter().take(5).collect::<Vec<_>>()
+    ))
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() || argv[0] == "-h" || argv[0] == "--help" {
@@ -103,6 +153,9 @@ fn main() {
     let mut data = Vec::new();
     if std::io::stdin().read_to_end(&mut data).is_err() {
         die("write: не смог прочитать stdin".into());
+    }
+    if let Err(e) = check_replacement(&data) {
+        die(e);
     }
 
     let meta = std::fs::metadata(path).ok();
@@ -134,6 +187,31 @@ fn main() {
         atomic_write(path, &data, mode);
     }
 
+    // Сверка с тем, что реально легло на диск: длина и число строк. Расхождение —
+    // не «мелочь»: это либо обрыв записи, либо чужая правка между нами и файлом.
+    let on_disk = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => die(format!("write: {path}: не читается после записи: {e}")),
+    };
+    let expect = if append {
+        before as usize + usize::from(separated) + data.len()
+    } else {
+        data.len()
+    };
+    if on_disk.len() != expect {
+        die(format!(
+            "write: {path}: на диске {} байт, ожидалось {expect} — запись не совпала с входом",
+            on_disk.len()
+        ));
+    }
+    let lines_in = data.iter().filter(|b| **b == b'\n').count();
+    let lines_disk = on_disk.iter().filter(|b| **b == b'\n').count();
+    if lines_in != lines_disk && !append {
+        die(format!(
+            "write: {path}: строк на диске {lines_disk}, во входе {lines_in} — содержимое искажено"
+        ));
+    }
+
     println!(
         "{}",
         serde_json::json!({
@@ -144,6 +222,37 @@ fn main() {
             "separator_added": separated,
             "bytes_before": before,
             "bytes": data.len(),
+            "bytes_on_disk": on_disk.len(),
+            "lines": lines_disk,
+            "lines_in": lines_in,
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Наблюдённый баг: битый content (U+FFFD вместо кириллицы) уезжал в файл
+    /// молча. Теперь отказ, и в сообщении видно место — иначе диагностика
+    /// съедает лишние вызовы.
+    #[test]
+    fn replacement_char_is_rejected_with_position() {
+        let e = check_replacement("ab\u{fffd}cd".as_bytes()).unwrap_err();
+        assert!(e.contains("U+FFFD"), "{e}");
+        assert!(e.contains("[2]"), "нет позиции: {e}");
+        assert!(e.contains("файл не записан"), "{e}");
+    }
+
+    #[test]
+    fn clean_cyrillic_passes() {
+        let s = "// выпълнение: ёжик, объявление, счётчик\n".repeat(500);
+        assert!(check_replacement(s.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected() {
+        let e = check_replacement(b"ok \xd1").unwrap_err();
+        assert!(e.contains("не UTF-8"), "{e}");
+    }
 }
