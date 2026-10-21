@@ -167,7 +167,11 @@ fn endpoint(args: &Args) -> Endpoint {
     if let Some(host) = args.flag("tunnel") {
         // Порт на той стороне: --port (по умолчанию 9222).
         match tunnel::start(host, port_from(args)) {
-            Ok(t) => return t.endpoint(),
+            Ok(t) => {
+                let mut ep = t.endpoint();
+                ep.browser_path = tunnel::remote_browser_path(host, ep.port);
+                return ep;
+            }
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(1);
@@ -179,10 +183,13 @@ fn endpoint(args: &Args) -> Endpoint {
             host: "127.0.0.1".into(),
             port: target.port,
             remote_port: target.remote_port,
+            browser_path: target.browser_path.clone(),
         };
     }
     if let Some(t) = tunnel::load() {
-        return t.endpoint();
+        let mut ep = t.endpoint();
+        ep.browser_path = tunnel::remote_browser_path(&t.host, ep.port);
+        return ep;
     }
     Endpoint::direct(port_from(args))
 }
@@ -213,23 +220,77 @@ pub fn live(args: &Args) -> Result<Live, String> {
             host: "127.0.0.1".into(),
             port: target.port,
             remote_port: target.remote_port,
+            browser_path: target.browser_path.clone(),
         }
     };
     let url = ep.ws_url(Some(&tab)).map_err(|e| {
         format!("{e}\nвкладка {tab} пропала — `web status`, чтобы увидеть живые, `web connect` заново")
     })?;
-    let cdp = cdp::Cdp::connect(&url, args.num("timeout", 30.0))?;
+    let host_header = format!("127.0.0.1:{}", ep.remote_port);
+    let timeout = args.num("timeout", 30.0);
+    // Два пути к вкладке. Обычный Chrome пускает по прямому ws вкладки; Chrome
+    // ≥144 в режиме одобрения отвечает на него 403 и пускает только через
+    // сессию (`Target.attachToTarget` в ws браузера).
+    let cdp = match cdp::Cdp::connect_with_host(&url, timeout, Some(&host_header)) {
+        Ok(c) => c,
+        Err(e) if e.contains("403") => {
+            let bws = ep.browser_ws()?;
+            let mut b = cdp::Cdp::connect_with_host(&bws, timeout, Some(&host_header))?;
+            let sid = b.attach(&tab)?;
+            let mut b = b.with_session(sid.clone());
+            // Проверяем, что сессия живая, до того как отдать её вызывающему:
+            // иначе первая же команда упадёт непонятной ошибкой.
+            b.call("Runtime.evaluate", json!({"expression": "1", "returnByValue": true}))?;
+            b
+        }
+        Err(e) => return Err(e),
+    };
     Ok(Live { cdp, tab, port: ep.port, ep })
 }
 
+/// Вкладки: сначала обычный `/json/list`, а если его нет (Chrome ≥144 в режиме
+/// одобрения отдаёт на `/json/*` 404) — `Target.getTargets` по ws браузера.
+/// Форма ответа приводится к одному виду: id/title/url.
 fn page_targets(ep: &Endpoint) -> Result<Vec<Value>, String> {
-    let raw = ep.get("/json/list")?;
-    let v: Value = serde_json::from_str(&raw).map_err(|e| format!("CDP /json/list: {e}"))?;
-    let mut out = Vec::new();
-    for t in v.as_array().cloned().unwrap_or_default() {
-        if t.get("type").and_then(Value::as_str) == Some("page") {
-            out.push(t);
+    if let Ok(raw) = ep.get("/json/list") {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            let out: Vec<Value> = v
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                .collect();
+            return Ok(out);
         }
+    }
+    targets_via_ws(ep)
+}
+
+fn targets_via_ws(ep: &Endpoint) -> Result<Vec<Value>, String> {
+    let ws = ep.browser_ws().map_err(|e| {
+        format!(
+            "{e}\n\nПодсказка: в Chrome на той машине открой chrome://inspect/#remote-debugging \
+             и включи тумблер (Chrome 144+, потребуется Allow в диалоге)."
+        )
+    })?;
+    let mut cdp = cdp::Cdp::connect(&ws, 20.0)?;
+    let r = cdp.call("Target.getTargets", Value::Null)?;
+    let mut out = Vec::new();
+    for t in r
+        .get("targetInfos")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        if t.get("type").and_then(Value::as_str) != Some("page") {
+            continue;
+        }
+        out.push(json!({
+            "id": t.get("targetId").cloned().unwrap_or(Value::Null),
+            "title": t.get("title").cloned().unwrap_or(Value::Null),
+            "url": t.get("url").cloned().unwrap_or(Value::Null),
+        }));
     }
     Ok(out)
 }
@@ -265,8 +326,7 @@ fn cmd_connect(args: &Args) -> Result<(), String> {
     // или отдаёт 403 — тул должен сказать об этом прямо, а не падать на WS.
     let targets = page_targets(&ep).map_err(|e| {
         format!(
-            "{e}\n\nПодсказка: в Chrome открой chrome://inspect/#remote-debugging и включи тумблер \
-             (Chrome 144+, потребуется Allow в диалоге). Отдельный профиль агента:\n  \
+            "{e}\n\nОтдельный профиль агента (если тумблер не подходит):\n  \
              chrome --remote-debugging-port={port} --user-data-dir=~/.local/share/snens/web-profile &"
         )
     })?;
@@ -282,6 +342,7 @@ fn cmd_connect(args: &Args) -> Result<(), String> {
         state::Target {
             port,
             remote_port: ep.remote_port,
+            browser_path: ep.browser_path.clone(),
         },
         &tab,
     )?;
@@ -364,6 +425,7 @@ fn cmd_use(args: &Args) -> Result<(), String> {
         state::Target {
             port: ep.port,
             remote_port: ep.remote_port,
+            browser_path: ep.browser_path.clone(),
         },
         &tab,
     )?;
@@ -384,7 +446,7 @@ fn cmd_open(args: &Args) -> Result<(), String> {
     if args.on("new") {
         // Новая вкладка создаётся браузерным endpoint'ом, а не вкладочным:
         // Target.createTarget доступен только там.
-        let ws = l.ep.ws_url(None)?;
+        let ws = l.ep.browser_ws()?;
         let mut b = cdp::Cdp::connect(&ws, args.num("timeout", 30.0))?;
         let r = b.call("Target.createTarget", json!({"url": url}))?;
         let id = r
@@ -396,6 +458,7 @@ fn cmd_open(args: &Args) -> Result<(), String> {
             state::Target {
                 port: l.ep.port,
                 remote_port: l.ep.remote_port,
+                browser_path: l.ep.browser_path.clone(),
             },
             &tab,
         )?;
@@ -574,7 +637,7 @@ fn cmd_disconnect(_args: &Args) -> Result<(), String> {
 
 fn cmd_close(args: &Args) -> Result<(), String> {
     let l = live(args)?;
-    let ws = l.ep.ws_url(None)?;
+    let ws = l.ep.browser_ws()?;
     let mut b = cdp::Cdp::connect(&ws, args.num("timeout", 30.0))?;
     b.call("Target.closeTarget", json!({"targetId": l.tab}))?;
     state::clear_target();

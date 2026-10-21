@@ -14,6 +14,11 @@ pub struct Cdp {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
     id: u64,
     deadline: Instant,
+    /// Сессия вложенной вкладки. Chrome ≥144 в режиме одобрения не пускает по
+    /// прямому ws вкладки (403 Forbidden), поэтому единственный рабочий путь —
+    /// один ws браузера и `Target.attachToTarget{flatten:true}`; все вызовы
+    /// дальше идут с этим sessionId.
+    session: Option<String>,
 }
 
 fn is_timeout(e: &tungstenite::Error) -> bool {
@@ -109,11 +114,18 @@ pub struct Endpoint {
     pub port: u16,
     /// порт на той стороне — он же в `Host` и его надо подставить в ws-URL
     pub remote_port: u16,
+    /// ws-путь браузера, если `/json/version` недоступен (режим одобрения Chrome)
+    pub browser_path: Option<String>,
 }
 
 impl Endpoint {
     pub fn direct(port: u16) -> Self {
-        Endpoint { host: "127.0.0.1".into(), port, remote_port: port }
+        Endpoint {
+            host: "127.0.0.1".into(),
+            port,
+            remote_port: port,
+            browser_path: None,
+        }
     }
 
     fn host_header(&self) -> String {
@@ -136,18 +148,59 @@ impl Endpoint {
         Ok(format!("ws://{}:{}{}", self.host, self.port, path))
     }
 
+    /// ws браузера: из `/json/version`, а если его нет (режим одобрения) — из
+    /// известного пути `/devtools/browser/<uuid>`.
+    pub fn browser_ws(&self) -> Result<String, String> {
+        if let Ok(ws) = self.ws_url(None) {
+            return Ok(ws);
+        }
+        match &self.browser_path {
+            Some(p) => Ok(format!("ws://{}:{}{}", self.host, self.port, p)),
+            None => Err(
+                "CDP: браузерный endpoint недоступен. Chrome ≥144 в режиме одобрения не отдаёт \
+                 /json/*; путь берётся из файла DevToolsActivePort — проверь, что `web connect --tunnel` \
+                 видит его на той стороне"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn ws_url(&self, target: Option<&str>) -> Result<String, String> {
         if let Some(id) = target {
-            let list = self.get("/json/list")?;
-            let v: Value = serde_json::from_str(&list).map_err(|e| format!("CDP /json/list: {e}"))?;
-            for t in v.as_array().cloned().unwrap_or_default() {
-                if t.get("id").and_then(Value::as_str) == Some(id) {
-                    if let Some(u) = t.get("webSocketDebuggerUrl").and_then(Value::as_str) {
-                        return self.rewrite_ws(u);
+            // Обычный путь — /json/list с готовым ws-адресом.
+            if let Ok(list) = self.get("/json/list") {
+                if let Ok(v) = serde_json::from_str::<Value>(&list) {
+                    for t in v.as_array().cloned().unwrap_or_default() {
+                        if t.get("id").and_then(Value::as_str) == Some(id) {
+                            if let Some(u) = t.get("webSocketDebuggerUrl").and_then(Value::as_str) {
+                                return self.rewrite_ws(u);
+                            }
+                        }
                     }
                 }
             }
-            return Err(format!("CDP: вкладки {id} больше нет"));
+            // Режим одобрения: ws-адрес вкладки строится по её targetId.
+            // Существование проверяем через Target.getTargets — иначе опечатка в
+            // id превращалась бы в непонятную ошибку соединения.
+            let mut b = Cdp::connect(&self.browser_ws()?, 15.0)?;
+            let r = b.call("Target.getTargets", Value::Null)?;
+            let found = r
+                .get("targetInfos")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter().any(|t| {
+                        t.get("targetId").and_then(Value::as_str) == Some(id)
+                            && t.get("type").and_then(Value::as_str) == Some("page")
+                    })
+                })
+                .unwrap_or(false);
+            if !found {
+                return Err(format!("CDP: вкладки {id} больше нет"));
+            }
+            return Ok(format!(
+                "ws://{}:{}/devtools/page/{id}",
+                self.host, self.port
+            ));
         }
         let raw = self.get("/json/version")?;
         let v: Value = serde_json::from_str(&raw).map_err(|e| format!("CDP /json/version: {e}"))?;
@@ -161,14 +214,41 @@ impl Endpoint {
 
 impl Cdp {
     pub fn connect(url: &str, timeout_s: f64) -> Result<Self, String> {
+        Self::connect_with_host(url, timeout_s, None)
+    }
+
+    /// Подключение с подменой `Host`. Через туннель мы стучимся в локальный порт,
+    /// а Chrome сравнивает `Host` с тем портом, на котором слушает сам (9222), и
+    /// на чужой отвечает 403 Forbidden ещё на рукопожатии.
+    pub fn connect_with_host(
+        url: &str,
+        timeout_s: f64,
+        host_header: Option<&str>,
+    ) -> Result<Self, String> {
         let deadline = Instant::now() + Duration::from_secs_f64(timeout_s.max(1.0));
-        let (mut ws, _res) = tungstenite::connect(url).map_err(|e| format!("CDP: {e}"))?;
+        let (mut ws, _res) = match host_header {
+            Some(h) => {
+                use tungstenite::client::IntoClientRequest;
+                let mut req = url
+                    .into_client_request()
+                    .map_err(|e| format!("CDP: адрес {url}: {e}"))?;
+                req.headers_mut()
+                    .insert("Host", h.parse().map_err(|e| format!("CDP: Host {h}: {e}"))?);
+                tungstenite::connect(req).map_err(|e| format!("CDP: {e}"))?
+            }
+            None => tungstenite::connect(url).map_err(|e| format!("CDP: {e}"))?,
+        };
         if let MaybeTlsStream::Plain(s) = ws.get_mut() {
             let left = deadline.saturating_duration_since(Instant::now());
             let _ = s.set_read_timeout(Some(left));
             let _ = s.set_write_timeout(Some(left));
         }
-        Ok(Cdp { ws, id: 0, deadline })
+        Ok(Cdp {
+            ws,
+            id: 0,
+            deadline,
+            session: None,
+        })
     }
 
     fn left(&self) -> Result<Duration, String> {
@@ -180,6 +260,24 @@ impl Cdp {
         }
     }
 
+    /// Вложенная сессия вкладки — все вызовы дальше идут в неё.
+    pub fn with_session(mut self, session: String) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Вложиться в вкладку (режим одобрения Chrome). Возвращает sessionId.
+    pub fn attach(&mut self, target: &str) -> Result<String, String> {
+        let r = self.call(
+            "Target.attachToTarget",
+            json!({"targetId": target, "flatten": true}),
+        )?;
+        r.get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "CDP: attachToTarget не вернул sessionId".to_string())
+    }
+
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.id += 1;
         let id = self.id;
@@ -187,7 +285,10 @@ impl Cdp {
         if let MaybeTlsStream::Plain(s) = self.ws.get_mut() {
             let _ = s.set_write_timeout(Some(left));
         }
-        let msg = json!({"id": id, "method": method, "params": params});
+        let mut msg = json!({"id": id, "method": method, "params": params});
+        if let Some(s) = &self.session {
+            msg["sessionId"] = Value::String(s.clone());
+        }
         self.ws
             .send(Message::Text(msg.to_string().into()))
             .map_err(|e| format!("CDP send {method}: {e}"))?;

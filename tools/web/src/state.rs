@@ -21,18 +21,26 @@ pub fn dir() -> PathBuf {
     base.join("snens/web")
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Target {
     /// порт на нашей стороне (у туннеля — локальный конец)
     pub port: u16,
     /// порт на стороне Chrome: он в Host и в ws-URL
     pub remote_port: u16,
+    /// ws-путь браузера: в режиме одобрения Chrome ≥144 `/json/*` не отдаёт, и
+    /// единственный способ открыть новую вкладку — знать путь из DevToolsActivePort
+    pub browser_path: Option<String>,
 }
 
 pub fn save_target(t: Target, tab: &str) -> Result<(), String> {
     let d = dir();
     fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
-    let v = serde_json::json!({"port": t.port, "remote_port": t.remote_port, "tab": tab});
+    let v = serde_json::json!({
+        "port": t.port,
+        "remote_port": t.remote_port,
+        "browser_path": t.browser_path,
+        "tab": tab,
+    });
     fs::write(d.join("target.json"), v.to_string()).map_err(|e| format!("state: {e}"))
 }
 
@@ -45,7 +53,18 @@ pub fn load_target() -> Option<(Target, String)> {
         .and_then(Value::as_u64)
         .unwrap_or(port as u64) as u16;
     let tab = v.get("tab").and_then(Value::as_str)?.to_string();
-    Some((Target { port, remote_port }, tab))
+    let browser_path = v
+        .get("browser_path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some((
+        Target {
+            port,
+            remote_port,
+            browser_path,
+        },
+        tab,
+    ))
 }
 
 /// Снимает привязку (например вкладку закрыли) — иначе следующий вызов будет

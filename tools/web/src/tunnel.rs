@@ -6,7 +6,7 @@
 // Тунель живёт между вызовами (каждый вызов — свой процесс, адреса в состоянии),
 // поэтому процесс отвязан от терминала и записан pid: иначе после `web connect`
 // туннель умирал бы вместе с ним.
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -34,6 +34,7 @@ impl Tunnel {
             host: "127.0.0.1".into(),
             port: self.local_port,
             remote_port: self.remote_port,
+            browser_path: None,
         }
     }
 }
@@ -127,21 +128,67 @@ pub fn stop(t: &Tunnel) {
     state::clear_tunnel();
 }
 
+/// Порт локального конца отвечает? Именно «порт открыт», без запроса к CDP:
+/// Chrome ≥144 в режиме одобрения не отдаёт `/json/*` (404), и проверка через
+/// HTTP отбрасывала бы живой туннель.
 fn is_open(port: u16) -> bool {
     let addr = format!("127.0.0.1:{port}");
     let Ok(mut sa) = addr.to_socket_addrs() else {
         return false;
     };
     let Some(sa) = sa.next() else { return false };
-    let Ok(mut s) = TcpStream::connect_timeout(&sa, Duration::from_millis(400)) else {
-        return false;
-    };
-    // Порт открыт ещё не значит «CDP живой»: проверяем настоящим запросом.
-    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let req = format!("GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    if s.write_all(req.as_bytes()).is_err() {
-        return false;
+    TcpStream::connect_timeout(&sa, Duration::from_millis(400)).is_ok()
+}
+
+/// Что сказал Chrome на той стороне: порт отладки и ws-путь браузера.
+/// В режиме одобрения (Chrome 144+) HTTP-эндпоинтов `/json/*` нет, но файл
+/// `DevToolsActivePort` в каталоге профиля есть всегда — из него и берём путь.
+pub fn remote_browser_path(host: &str, local_port: u16) -> Option<String> {
+    // Сначала обычный путь: /json/version (старые сборки и отдельные профили).
+    if let Ok(raw) = crate::cdp::http_get_host("127.0.0.1", local_port, "127.0.0.1", "/json/version") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(u) = v.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
+                if let Some(i) = u.find("/devtools/") {
+                    return Some(u[i..].to_string());
+                }
+            }
+        }
     }
-    let mut buf = [0u8; 64];
-    matches!(s.read(&mut buf), Ok(n) if n > 0)
+    for cmd in remote_candidates() {
+        let out = Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(host)
+            .arg(cmd)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(p) = parse_devtools_active_port(&text) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Команда для той стороны. ОС той машины наша сборка не знает, поэтому
+/// пробуем обе формы: powershell (Windows) и sh (Linux/macOS). Лишняя попытка
+/// стоит один ssh-вызов и только тогда, когда `/json/version` уже не ответил.
+fn remote_candidates() -> [&'static str; 2] {
+    [
+        "powershell -NoProfile -Command \"Get-Content (Join-Path $env:LOCALAPPDATA 'Google\\Chrome\\User Data\\DevToolsActivePort') -ErrorAction SilentlyContinue\"",
+        "sh -c 'cat \"$HOME/.config/google-chrome/DevToolsActivePort\" 2>/dev/null || cat \"$HOME/Library/Application Support/Google/Chrome/DevToolsActivePort\" 2>/dev/null'",
+    ]
+}
+
+/// Разбор файла: первая строка — порт, вторая — путь (`/devtools/browser/<uuid>`).
+pub fn parse_devtools_active_port(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("/devtools/") {
+            return Some(l.to_string());
+        }
+    }
+    None
 }
