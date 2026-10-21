@@ -21,13 +21,14 @@ pub mod act;
 pub mod cdp;
 pub mod snap;
 pub mod state;
+pub mod launch;
 pub mod tunnel;
 
 const USAGE: &str = "web <команда> … — браузер машины пользователя через CDP: снимок дерева с адресами, действия по адресам и батчем, скриншот как fallback";
 
 const HELP: &str = "\
 web — браузер машины пользователя через CDP: дерево с адресами, действия батчем, скриншот как fallback.
-web connect|status|tabs|use|open|snap|act|shot|eval|text|probe|disconnect|close [аргументы]
+web connect|status|tabs|use|open|snap|act|shot|eval|text|probe|disconnect|launch|close [аргументы]
 
 Соединение — к Chrome, разрешённому для отладки по согласию
 (chrome://inspect/#remote-debugging, Chrome 144+), или к отдельному профилю агента.
@@ -46,6 +47,8 @@ web text [--limit N]                   видимый текст страниц�
 web probe                              проверить, что ввод реально доставляется (клик/клавиша/вставка)
 web close                              закрыть текущую вкладку и снять привязку
 web disconnect                         закрыть ssh-туннель (Chrome и вкладки не трогаем)
+web launch [--profile путь] [--port N] запустить ОТДЕЛЬНЫЙ профиль Chrome на машине
+                                       пользователя: без подтверждений, переживает ssh
 
 --tunnel user@machine                  говорить с Chrome на той машине через ssh-туннель:
                                        на той стороне web НЕ нужен, только Chrome с согласием
@@ -148,6 +151,7 @@ fn is_command(s: &str) -> bool {
             | "text"
             | "probe"
             | "disconnect"
+            | "launch"
             | "close"
     )
 }
@@ -621,6 +625,32 @@ fn cmd_probe(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Агентский профиль: запуск отдельного Chrome на машине пользователя и
+/// подключение к нему. Это ответ на «подтверждать тумблер каждый раз»: с
+/// собственным `--user-data-dir` Chrome отдаёт отладку без согласия.
+fn cmd_launch(args: &Args) -> Result<(), String> {
+    let host = args
+        .flag("tunnel")
+        .ok_or("web launch: нужен --tunnel user@machine (где поднимать Chrome)")?
+        .to_string();
+    let port = port_from(args);
+    let profile = args.flag("profile");
+    let os = launch::start_agent_chrome(&host, port, profile)?;
+    println!("Chrome запущен: {host} ({os}), профиль {}, порт {port}", profile.unwrap_or("по умолчанию"));
+    // Дальше — обычный путь: туннель + привязка к вкладке.
+    let args2 = Args {
+        positional: vec!["connect".to_string()],
+        flags: [
+            ("tunnel".to_string(), host),
+            ("port".to_string(), port.to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        has: Vec::new(),
+    };
+    cmd_connect(&args2)
+}
+
 /// Закрыть ssh-туннель. Вкладки и Chrome на той стороне не трогаем: отключение
 /// от отладки — это снятие согласия, а не убийство браузера человека.
 fn cmd_disconnect(_args: &Args) -> Result<(), String> {
@@ -789,6 +819,7 @@ fn main() {
         "text" => cmd_text(&args),
         "probe" => cmd_probe(&args),
         "disconnect" => cmd_disconnect(&args),
+        "launch" => cmd_launch(&args),
         "close" => cmd_close(&args),
         other => {
             eprintln!("web: неизвестная команда {other}");

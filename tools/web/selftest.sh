@@ -64,6 +64,11 @@ t connect --port 9
 want 1 "$rc" "connect на закрытый порт: код 1"
 has "chrome://inspect" "$err" "connect на закрытый порт: подсказывает тумблер"
 
+# launch без --tunnel: сказать, чего не хватает, а не лезть в сеть.
+t launch
+want 1 "$rc" "launch без --tunnel: код 1"
+has "tunnel" "$err" "launch без --tunnel: подсказывает --tunnel"
+
 # --host уходит в ssh одним вызовом; без доступного ssh — ошибка, не паника.
 t --host nosuchhost.invalid status
 # ssh отдаёт свой код (255) — пробрасываем как есть, это честнее «своего» 1:
