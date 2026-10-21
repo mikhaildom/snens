@@ -413,6 +413,20 @@ t fetch "ftp://example.com/x"
 want 2 "$rc" "fetch: не http(s) — код 2"
 has "только http/https" "$err" "fetch: не http(s) — текст"
 
+# ---- desk ----
+# Живые проверки (окна, дерево, действия) требуют машину пользователя и ssh:
+# полный набор — tools/desk/selftest.sh с --tunnel. Здесь только контракт.
+t desk --help
+want 0 "$rc" "desk: --help — код 0"
+has "desk — " "$out" "desk: --help, строка 1 = суть"
+
+t desk nosuchcommand
+want 2 "$rc" "desk: неизвестная команда — код 2"
+
+t desk apps
+want 1 "$rc" "desk: apps без --tunnel — код 1"
+has "tunnel" "$err" "desk: apps без --tunnel — подсказка"
+
 # ---- web ----
 # Полный набор живых проверок — рядом (tools/web/selftest.sh, поднимает Chrome и
 # локальную страницу). Здесь — только контракт, который видит модель.

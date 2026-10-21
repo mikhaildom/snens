@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "enum": ["launch", "stop", "apps", "snap", "act", "shot", "focus", "status"],
+      "description": "Что сделать. apps — список окон; snap — дерево окна с адресами e1…eN; act — действия по адресам батчем; shot — скриншот окна; focus — поднять окно; launch/stop — поднять или остановить агента на той машине"
+    },
+    "window": {
+      "type": "string",
+      "description": "Выбор окна: индекс из apps (0,1,2…), подстрока заголовка, или пусто — окно в фокусе"
+    },
+    "json": {
+      "type": "string",
+      "description": "Для act: JSON-массив действий по адресам, напр. [{\"click\":\"e3\"},{\"set\":{\"ref\":\"e1\",\"text\":\"hi\"}}]"
+    },
+    "tunnel": {
+      "type": "string",
+      "description": "Машина, где живёт агент (ssh): например svuvich@192.168.1.10. Нужна для любой команды"
+    },
+    "out": {
+      "type": "string",
+      "description": "Для shot: путь к PNG"
+    },
+    "port": {
+      "type": "integer",
+      "description": "Порт агента (дефолт 9227)"
+    }
+  },
+  "required": ["command", "tunnel"],
+  "x-snens": {
+    "argv": [
+      {"field": "command"},
+      {"flag": "--window", "field": "window"},
+      {"flag": "--json", "field": "json"},
+      {"flag": "--tunnel", "field": "tunnel"},
+      {"flag": "--out", "field": "out"},
+      {"flag": "--port", "field": "port"}
+    ],
+    "stdin": {"mode": "none"}
+  }
+}
