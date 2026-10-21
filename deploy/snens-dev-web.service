@@ -1,0 +1,17 @@
+[Unit]
+Description=snens dev web client (vite :5175 → /api :7440)
+After=network.target snens-dev.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/snens-web
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=SNENS_WEB_PORT=5175
+Environment=SNENS_API_BASE=http://127.0.0.1:7440
+Environment=SNENS_API_TOKEN_FILE=%h/.local/share/snens-dev/api.token
+ExecStart=/usr/local/bin/npx vite
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
