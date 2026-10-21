@@ -26,9 +26,14 @@ pub enum Rec {
         /// Старые логи читаются как есть (serde default).
         #[serde(default)]
         parent: String,
-        /// Поверхность, создавшая сессию. Legacy-логи остаются без метки.
+        /// Поверхность, создавшая сессию. Локальные логи (TUI, `tui-local`,
+        /// `run-child`) метки не получают — читаются как `local`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<String>,
+        /// Заголовок сессии. Пусто — ядро/поверхность его ещё не сгенерировали,
+        /// и читатель подставляет первые слова первого сообщения пользователя.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     /// Системный промпт сессии. Собирается один раз в начале и дальше читается
     /// из лога: файлы инстанса (soul/user/memory, скиллы) правятся по ходу, и
@@ -268,6 +273,7 @@ impl Session {
                 model: String::new(),
                 parent,
                 surface: surface.map(str::to_owned),
+                title: None,
             })?;
             return Ok(s);
         }
@@ -345,6 +351,7 @@ impl Session {
                 model: String::new(),
                 parent: self.parent.clone(),
                 surface: None,
+                title: None,
             }),
         }
         out.push(Rec::Replay {
@@ -512,6 +519,38 @@ pub fn read_file(path: &Path) -> R<Vec<Rec>> {
                 }
                 eprintln!("[log] строка {} пропущена: {e}", i + 1);
             }
+        }
+    }
+    Ok(out)
+}
+
+/// Прочитать только голову лога: до `max_bytes` или до первой нераскрытой
+/// ошибки. Нужно discovery для заголовка сессии — читать 300-килобайтный лог
+/// ради первых двух записей на каждый список сессий слишком дорого.
+pub fn read_head_bytes(path: &Path, max_bytes: u64) -> R<Vec<Rec>> {
+    use std::io::Read;
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let mut buf = Vec::new();
+    File::open(path)?
+        .take(max_bytes)
+        .read_to_end(&mut buf)?;
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        let Some(nl) = buf[offset..].iter().position(|b| *b == b'\n') else {
+            // Неполная последняя строка головы — не ошибка, просто не читаем её.
+            break;
+        };
+        let line = &buf[offset..offset + nl];
+        offset += nl + 1;
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice::<Rec>(line) {
+            Ok(r) => out.push(r),
+            Err(_) => break,
         }
     }
     Ok(out)

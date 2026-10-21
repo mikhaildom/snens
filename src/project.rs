@@ -678,6 +678,7 @@ mod tests {
                 model: String::new(),
                 parent: String::new(),
                 surface: None,
+                title: None,
             },
             Rec::Replay {
                 ts: 0,

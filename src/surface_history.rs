@@ -24,6 +24,17 @@ pub struct HistoryMessage {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<i32>,
+    /// Сколько занял вызов инструмента, мс (пишется в `ToolResult`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+    /// argv вызова — уже подставленный, а не сырой JSON аргументов. Нужен,
+    /// чтобы показать вызов и результат одним блоком без разбора лога на клиенте.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
+    /// Вложения, которые инструмент положил в канал (`SNENS_ATTACH_DIR`): по ним
+    /// поверхность показывает картинку, которую смотрел агент, а не только текст.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<crate::log::Part>>,
 }
 
 /// Project transcript records directly from the append-only journal. `seq` is
@@ -82,6 +93,9 @@ pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                 tool_call_id: None,
                 name: None,
                 exit: None,
+                ms: None,
+                argv: None,
+                parts: None,
             }),
             Rec::Steer {
                 ts,
@@ -107,6 +121,9 @@ pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                     tool_call_id: None,
                     name: None,
                     exit: None,
+                    ms: None,
+                    argv: None,
+                    parts: None,
                 })
             }
             // These records are internal prompt context, not transcript.
@@ -137,6 +154,9 @@ pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                     tool_call_id: None,
                     name: None,
                     exit: None,
+                    ms: None,
+                    argv: None,
+                    parts: None,
                 })
             }
             Rec::ToolResult {
@@ -144,7 +164,10 @@ pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                 call_id,
                 tool,
                 exit,
+                ms,
+                argv,
                 body,
+                parts,
                 ..
             } => {
                 let content = match body {
@@ -161,6 +184,9 @@ pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                     tool_call_id: Some(call_id),
                     name: Some(tool),
                     exit: Some(exit),
+                    ms: Some(ms),
+                    argv: Some(argv),
+                    parts: if parts.is_empty() { None } else { Some(parts) },
                 })
             }
             _ => None,

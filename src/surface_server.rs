@@ -96,6 +96,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
             post(tool_result),
         )
         .route("/v1/sessions/{id}/attachments", post(upload_attachment))
+        .route("/v1/sessions/{id}/file", get(session_file))
         .route("/v1/sessions/{id}/stop", post(stop))
         .route("/v1/sessions/{id}/approvals/{aid}", post(approve))
         .route("/v1/sessions/{id}/events", get(events))
@@ -551,8 +552,8 @@ async fn get_session(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> i
     if let Some(session) = d.sessions.get(&id).cloned() {
         return Json(session).into_response();
     }
-    let surface = discovery::load_meta_surface(&path).unwrap_or_else(|| "legacy".into());
-    let session = Session::new(id.clone(), surface);
+    let mut session = Session::new(id.clone(), discovery::surface(&path));
+    session.title = discovery::title(&path);
     drop(d);
     s.data
         .lock()
@@ -739,6 +740,69 @@ async fn upload_attachment(
     )
         .into_response()
 }
+
+#[derive(Deserialize)]
+struct FileQuery {
+    /// Абсолютный путь к файлу из `parts` записи лога: картинка, которую
+    /// посмотрел `view`, или вложение инструмента. Отдаётся только то, что
+    /// лежит в каталогах этой сессии, — иначе это была бы дырка на весь диск.
+    path: String,
+}
+
+async fn session_file(
+    State(s): State<Arc<Runtime>>,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+) -> impl IntoResponse {
+    if !rt::valid_id(&id) || q.path.is_empty() {
+        return err("invalid", "invalid session id or path", StatusCode::BAD_REQUEST).into_response();
+    }
+    let root = s.cfg.sessions_path();
+    let Ok(canonical) = tokio::fs::canonicalize(&q.path).await else {
+        return err("not_found", "file not found", StatusCode::NOT_FOUND).into_response();
+    };
+    let Ok(root) = tokio::fs::canonicalize(&root).await else {
+        return err("storage", "sessions directory is missing", StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response();
+    };
+    // Файл обязан лежать в каталоге, принадлежащем именно этой сессии:
+    // `<id>.out/…` (канал вложений инструментов) или `<id>.attachments/…`.
+    let in_session_out = canonical.starts_with(root.join(format!("{id}.out")));
+    let in_session_attach = canonical.starts_with(root.join(format!("{id}.attachments")));
+    if !canonical.starts_with(&root) || !(in_session_out || in_session_attach) {
+        return err(
+            "forbidden",
+            "file does not belong to this session",
+            StatusCode::FORBIDDEN,
+        )
+        .into_response();
+    }
+    let Ok(bytes) = tokio::fs::read(&canonical).await else {
+        return err("not_found", "file not found", StatusCode::NOT_FOUND).into_response();
+    };
+    let mime = crate::attach::attachment_kind(&canonical)
+        .map(|(_, mime)| mime.to_string())
+        .unwrap_or_else(|| {
+            match canonical
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "txt" | "md" | "log" | "csv" => "text/plain; charset=utf-8".to_string(),
+                "json" => "application/json".to_string(),
+                _ => "application/octet-stream".to_string(),
+            }
+        });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, mime)],
+        [(header::CACHE_CONTROL, "private, max-age=3600".to_string())],
+        bytes,
+    )
+        .into_response()
+}
 fn resolve_attachments(
     d: &rt::Store,
     sid: &str,
@@ -777,12 +841,13 @@ async fn ensure_writer(s: &Arc<Runtime>, id: &str) -> crate::R<Arc<crate::log::S
         return Ok(writer);
     }
     let path = discovery::path(&s.cfg, id).ok_or("invalid session id")?;
-    let marker = discovery::load_meta_surface(&path);
-    let surface = marker.as_deref().filter(|value| *value != "legacy");
+    // Метка поверхности при открытии существующего лога не переписывается:
+    // отсутствие метки означает локальную сессию, и так её и надо открыть.
+    let surface = discovery::load_meta_surface(&path);
     let writer = Arc::new(crate::log::Session::open_surface(
         &s.cfg.sessions_path(),
         id,
-        surface,
+        surface.as_deref(),
     )?);
     let mut writers = s.writers.lock().await;
     Ok(writers
@@ -815,7 +880,7 @@ async fn message(
         };
         let session = Session::new(
             id.clone(),
-            discovery::load_meta_surface(&path).unwrap_or_else(|| "legacy".into()),
+            discovery::surface(&path),
         );
         let mut data = s.data.lock().await;
         data.sessions.entry(id.clone()).or_insert(session);

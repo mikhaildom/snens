@@ -12,6 +12,11 @@ use tokio::sync::{Mutex, broadcast, mpsc, watch};
 pub struct Session {
     pub id: String,
     pub surface: String,
+    /// Человекочитаемый заголовок. Сгенерированный (моделью или ядром) лежит в
+    /// `Meta.title`; пока его нет, discovery подставляет первые слова первого
+    /// сообщения пользователя. Пусто — ни того, ни другого.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub state: String,
     pub run_id: Option<String>,
     /// Экономический бюджет уборки контекста для этой сессии; пусто — общий
@@ -77,6 +82,7 @@ impl Session {
         Self {
             id: id.into(),
             surface: surface.into(),
+            title: None,
             state: "idle".into(),
             run_id: None,
             context_budget: None,
@@ -316,6 +322,9 @@ fn read_store(c: &Connection) -> crate::R<Store> {
             Ok(Session {
                 id: r.get(0)?,
                 surface: r.get(1)?,
+                // Заголовок не хранится в store: он выводится из лога при
+                // discovery, чтобы правка Meta.title не требовала миграции.
+                title: None,
                 state: r.get(2)?,
                 run_id: r.get(3)?,
                 context_budget: r.get(4)?,
