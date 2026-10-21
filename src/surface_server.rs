@@ -1624,9 +1624,21 @@ async fn launch(
                     call_id,
                     exit,
                     preview,
+                    parts,
+                    ms,
                 } => (
                     "tool.completed",
-                    serde_json::json!({"name":name,"call_id":call_id,"exit":exit,"preview":preview}),
+                    serde_json::json!({"name":name,"call_id":call_id,"exit":exit,"preview":preview,"parts":parts,"ms":ms}),
+                ),
+                crate::agent::SurfaceSignal::Usage {
+                    in_tok,
+                    cached_tok,
+                    out_tok,
+                    reason_tok,
+                    cost_micro,
+                } => (
+                    "usage",
+                    serde_json::json!({"in_tok":in_tok,"cached_tok":cached_tok,"out_tok":out_tok,"reason_tok":reason_tok,"cost_micro":cost_micro}),
                 ),
                 crate::agent::SurfaceSignal::Notice(text) => {
                     ("notice", serde_json::json!({"text":text}))

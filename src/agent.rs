@@ -50,6 +50,22 @@ pub enum SurfaceSignal {
         call_id: String,
         exit: i32,
         preview: String,
+        /// Вложения вызова (картинки и прочее из канала `SNENS_ATTACH_DIR`).
+        /// Без них стрим показывал тул без картинки, а после перечитывания
+        /// истории она появлялась — расхождение стрима и истории.
+        parts: Vec<crate::log::Part>,
+        /// Сколько занял вызов, мс: в журнале это поле есть, в стриме не было.
+        ms: u64,
+    },
+    /// Расход шага (ответа модели): токены и цена. Поверхность показывает его
+    /// в шапке шага — в стриме цифр не было, они появлялись только после
+    /// перечитывания истории.
+    Usage {
+        in_tok: u64,
+        cached_tok: u64,
+        out_tok: u64,
+        reason_tok: u64,
+        cost_micro: u64,
     },
     Notice(String),
     /// Давление рабочего контекста: оценка в токенах и экономический бюджет.
@@ -419,6 +435,13 @@ async fn run_loop<L: Llm>(
             },
         })?;
         sess.append(usage_rec(&reply, est_raw, &cfg.model_now()))?;
+        observe(SurfaceSignal::Usage {
+            in_tok: reply.usage.in_tok,
+            cached_tok: reply.usage.cached_tok,
+            out_tok: reply.usage.out_tok,
+            reason_tok: reply.usage.reason_tok,
+            cost_micro: reply.usage.cost_micro,
+        });
 
         if reply.calls.is_empty() {
             memory::retain_turn(sess, cfg, &path, &reply.text).await;
@@ -513,6 +536,8 @@ async fn run_loop<L: Llm>(
                 call_id: call.id.clone(),
                 exit: out.exit,
                 preview: out.text.chars().take(500).collect(),
+                parts: out.parts.clone(),
+                ms: out.ms,
             });
             ui.tool_call(
                 &call.name,
