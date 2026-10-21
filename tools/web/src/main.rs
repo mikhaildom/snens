@@ -633,15 +633,42 @@ fn cmd_launch(args: &Args) -> Result<(), String> {
         .flag("tunnel")
         .ok_or("web launch: нужен --tunnel user@machine (где поднимать Chrome)")?
         .to_string();
-    let port = port_from(args);
+    // Порт подбираем сами: занятый порт означал бы, что Chrome прилип к уже
+    // запущенному процессу с чужим профилем.
+    let want = port_from(args);
+    let port = if args.flag("port").is_some() {
+        if !launch::port_free(&host, want)? {
+            return Err(format!(
+                "порт {want} на {host} занят — скорее всего там уже Chrome другого профиля. \
+                 Возьми другой: --port {}",
+                want.saturating_add(2)
+            ));
+        }
+        want
+    } else {
+        launch::pick_port(&host, want)?
+    };
     let profile = args.flag("profile");
+    if args.flag("port").is_none() {
+        if let Some((h, p)) = state::load_launch() {
+            if h == host && launch::ours_on_port(&host, p).unwrap_or(false) {
+                println!("Chrome агента уже работает на {host}, порт {p} — переиспользую");
+                return connect_to(&host, p);
+            }
+        }
+    }
     let os = launch::start_agent_chrome(&host, port, profile)?;
+    state::save_launch(&host, port);
     println!("Chrome запущен: {host} ({os}), профиль {}, порт {port}", profile.unwrap_or("по умолчанию"));
     // Дальше — обычный путь: туннель + привязка к вкладке.
+    connect_to(&host, port)
+}
+
+fn connect_to(host: &str, port: u16) -> Result<(), String> {
     let args2 = Args {
         positional: vec!["connect".to_string()],
         flags: [
-            ("tunnel".to_string(), host),
+            ("tunnel".to_string(), host.to_string()),
             ("port".to_string(), port.to_string()),
         ]
         .into_iter()

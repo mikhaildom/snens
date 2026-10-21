@@ -90,16 +90,84 @@ pub fn remote_os(host: &str) -> Result<&'static str, String> {
     ))
 }
 
+/// Наш ли Chrome слушает порт: смотрим командную строку владельца и ищем в ней
+/// каталог профиля агента. Нужно, чтобы `launch` переиспользовал свой браузер, а
+/// не прилипал к чужому и не плодил профили.
+pub fn ours_on_port(host: &str, port: u16) -> Result<bool, String> {
+    if remote_os(host)? == "windows" {
+        let out = powershell(
+            host,
+            &format!(
+                "$p = (Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess; \
+                 if (-not $p) {{ 'no' }} else {{ $cl = (Get-CimInstance Win32_Process -Filter \"ProcessId=$p\").CommandLine; \
+                 if ($cl -like '*snens-chrome*') {{ 'ours' }} else {{ 'foreign' }} }}"
+            ),
+        )?;
+        Ok(out.contains("ours"))
+    } else {
+        let out = ssh(
+            host,
+            format!(
+                "sh -c 'for p in $(pgrep -f \"remote-debugging-port={port}\"); do tr \"\\0\" \" \" < /proc/$p/cmdline | grep -q snens-chrome && echo ours && exit; done; echo no'"
+            ),
+        )?;
+        Ok(out.contains("ours"))
+    }
+}
+
+/// Свободен ли порт на той стороне. Спрашиваем до запуска: если порт занят,
+/// Chrome молча прилипнет к уже запущенному процессу с ЧУЖИМ профилем (проверено:
+/// так и вышло на 9222 с профилем человека), и отладка будет не туда.
+pub fn port_free(host: &str, port: u16) -> Result<bool, String> {
+    if remote_os(host)? == "windows" {
+        let out = powershell(
+            host,
+            &format!(
+                "if (Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue) {{ 'busy' }} else {{ 'free' }}"
+            ),
+        )?;
+        Ok(out.contains("free"))
+    } else {
+        let out = ssh(
+            host,
+            format!("sh -c 'command -v ss >/dev/null && ss -ltn | grep -q \":{port} \" && echo busy || echo free'"),
+        )?;
+        Ok(out.contains("free"))
+    }
+}
+
+/// Первый свободный порт начиная с `from` (не больше десяти попыток).
+pub fn pick_port(host: &str, from: u16) -> Result<u16, String> {
+    for p in from..from.saturating_add(10) {
+        if port_free(host, p)? {
+            return Ok(p);
+        }
+    }
+    Err(format!(
+        "на {host} заняты порты {from}…{}: освободи один или укажи --port",
+        from.saturating_add(9)
+    ))
+}
+
 /// Запустить отдельный профиль Chrome на той стороне и дождаться порта CDP.
 /// `profile` — каталог профиля (на Windows путь вида `C:\Users\x\.snens-chrome`).
 pub fn start_agent_chrome(host: &str, port: u16, profile: Option<&str>) -> Result<String, String> {
     let os = remote_os(host)?;
     match os {
         "windows" => {
-            // Путь с обратными слэшами — в raw-строке, иначе Rust съедает \P.
-            let prof = profile.unwrap_or(r"C:\Users\%USERNAME%\.snens-chrome");
+            // Профиль: свой каталог на машину пользователя. Путь берём из
+            // $env:USERPROFILE на той стороне — `%USERNAME%` Chrome не раскрывает
+            // (проверено: создался каталог с буквальным именем).
+            //
+            // Склейка через конкатенацию, без интерполяции в строке: PowerShell
+            // не подставляет переменные внутрь одинарных кавычек, и `$prof`
+            // уезжал в командную строку Chrome буквально.
+            let prof_expr = match profile {
+                Some(p) => format!("'{}'", p),
+                None => "(Join-Path $env:USERPROFILE '.snens-chrome')".to_string(),
+            };
             let script = format!(
-                r#"$exe = @('C:\Program Files\Google\Chrome\Application\chrome.exe','C:\Program Files (x86)\Google\Chrome\Application\chrome.exe') | Where-Object {{ Test-Path $_ }} | Select-Object -First 1; if (-not $exe) {{ Write-Error 'chrome.exe не найден'; exit 2 }}; $cmd = '"' + $exe + '" --user-data-dir="{prof}" --remote-debugging-port={port} --no-first-run --no-default-browser-check --window-size=1440,900 about:blank'; $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = $cmd }}; if ($r.ReturnValue -ne 0) {{ Write-Error "Create вернул $($r.ReturnValue)"; exit 3 }}; "pid=$($r.ProcessId)""#
+                r#"$exe = @('C:\Program Files\Google\Chrome\Application\chrome.exe','C:\Program Files (x86)\Google\Chrome\Application\chrome.exe') | Where-Object {{ Test-Path $_ }} | Select-Object -First 1; if (-not $exe) {{ Write-Error 'chrome.exe not found'; exit 2 }}; $prof = {prof_expr}; $cmd = '"' + $exe + '" --user-data-dir="' + $prof + '" --remote-debugging-port={port} --no-first-run --no-default-browser-check --window-size=1440,900 about:blank'; $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = $cmd }}; if ($r.ReturnValue -ne 0) {{ Write-Error "Create returned $($r.ReturnValue)"; exit 3 }}; 'pid=' + $r.ProcessId"#
             );
             powershell(host, &script)?;
         }

@@ -101,6 +101,24 @@ pub fn clear_tunnel() {
     let _ = fs::remove_file(dir().join("tunnel.json"));
 }
 
+/// Порт агентского Chrome на машине пользователя: следующий `launch` его
+/// переиспользует, а не поднимает второй профиль.
+pub fn save_launch(host: &str, port: u16) {
+    let d = dir();
+    let _ = fs::create_dir_all(&d);
+    let v = serde_json::json!({"host": host, "port": port});
+    let _ = fs::write(d.join("launch.json"), v.to_string());
+}
+
+pub fn load_launch() -> Option<(String, u16)> {
+    let text = fs::read_to_string(dir().join("launch.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    Some((
+        v.get("host").and_then(Value::as_str)?.to_string(),
+        v.get("port").and_then(Value::as_u64)? as u16,
+    ))
+}
+
 pub fn save_refs(tab: &str, refs: &[Ref]) -> Result<PathBuf, String> {
     let d = dir().join(tab);
     fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
