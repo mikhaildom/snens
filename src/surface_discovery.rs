@@ -94,6 +94,7 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
             let surface = surface(&path);
             let mut session = Session::new(id.to_string(), surface);
             session.title = title(&path);
+            session.updated_at = mtime(&path);
             sessions.insert(id.to_string(), session);
         }
     }
@@ -116,8 +117,27 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
                 session.title = title(path);
             }
         }
+        session.updated_at = file.as_ref().and_then(|p| mtime(p));
     }
-    Ok(sessions.into_values().collect())
+    // Свежие сверху. Порядок не зависит от поверхности и от формы id
+    // (`1234-567` и uuid иначе перемешивались лексикографически).
+    let mut out: Vec<Session> = sessions.into_values().collect();
+    out.sort_by(|a, b| {
+        b.updated_at
+            .unwrap_or(0)
+            .cmp(&a.updated_at.unwrap_or(0))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    Ok(out)
+}
+
+/// Время последней активности сессии — `mtime` её лога.
+fn mtime(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 fn path_from(data_dir: &Path, id: &str) -> Option<std::path::PathBuf> {
@@ -187,6 +207,28 @@ mod tests {
         let t = found[0].title.clone().unwrap();
         assert!(t.starts_with("хочу веб-интерфейс snens,"), "{t}");
         assert!(t.ends_with('…'), "{t}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sessions_sort_by_mtime_independently_of_surface_and_id_shape() {
+        let root = temp();
+        let dir = root.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let old = dir.join(format!("{uuid}.jsonl"));
+        fs::write(&old, "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n").unwrap();
+        // uuid лексикографически "больше" номера вида 1234-567, но он старее.
+        let stamp = dir.join("1790000000-123.jsonl");
+        fs::write(&stamp, "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n").unwrap();
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let f = fs::OpenOptions::new().write(true).open(&stamp).unwrap();
+        f.set_modified(newer).unwrap();
+
+        let found = sessions(&root, &rt::Store::default()).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].id, "1790000000-123", "свежая — первой");
+        assert!(found[0].updated_at.unwrap() > found[1].updated_at.unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

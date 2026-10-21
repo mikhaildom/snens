@@ -17,6 +17,10 @@ pub struct Session {
     /// сообщения пользователя. Пусто — ни того, ни другого.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Время последней активности (unix, сек): `mtime` лога сессии. Список
+    /// сортируется по нему — поверхность и порядок id тут не при чём.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
     pub state: String,
     pub run_id: Option<String>,
     /// Экономический бюджет уборки контекста для этой сессии; пусто — общий
@@ -83,6 +87,7 @@ impl Session {
             id: id.into(),
             surface: surface.into(),
             title: None,
+            updated_at: None,
             state: "idle".into(),
             run_id: None,
             context_budget: None,
@@ -325,6 +330,7 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                 // Заголовок не хранится в store: он выводится из лога при
                 // discovery, чтобы правка Meta.title не требовала миграции.
                 title: None,
+                updated_at: None,
                 state: r.get(2)?,
                 run_id: r.get(3)?,
                 context_budget: r.get(4)?,
