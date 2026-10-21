@@ -32,7 +32,15 @@ fn is_timeout(e: &tungstenite::Error) -> bool {
 /// Читаем по Content-Length, а не «до закрытия»: сервер DevTools держит
 /// соединение открытым (keep-alive), и чтение до EOF упирается в таймаут.
 pub fn http_get(port: u16, path: &str) -> Result<String, String> {
-    let addr = format!("127.0.0.1:{port}");
+    http_get_host("127.0.0.1", port, "127.0.0.1", path)
+}
+
+/// Тот же GET, но с произвольным адресом подключения и `Host`: через ssh-туннель
+/// мы стучимся в локальный порт, а Chrome на той стороне ждёт `Host: 127.0.0.1:<его
+/// порт>` — с чужим Host он отвечает 403 «Host header is specified and is not an
+/// IP address or localhost».
+pub fn http_get_host(host: &str, port: u16, host_header: &str, path: &str) -> Result<String, String> {
+    let addr = format!("{host}:{port}");
     let sa = addr
         .to_socket_addrs()
         .map_err(|e| format!("{addr}: {e}"))?
@@ -42,7 +50,7 @@ pub fn http_get(port: u16, path: &str) -> Result<String, String> {
         format!("Chrome не слушает {addr} ({e}): не включён ли тумблер в chrome://inspect/#remote-debugging?")
     })?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes())
         .map_err(|e| format!("{addr}: {e}"))?;
     let mut buf: Vec<u8> = Vec::new();
@@ -92,27 +100,63 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// WebSocket-адрес вкладки (или браузера, если id не задан).
-pub fn ws_url(port: u16, target: Option<&str>) -> Result<String, String> {
-    if let Some(id) = target {
-        let list = http_get(port, "/json/list")?;
-        let v: Value =
-            serde_json::from_str(&list).map_err(|e| format!("CDP /json/list: {e}"))?;
-        for t in v.as_array().cloned().unwrap_or_default() {
-            if t.get("id").and_then(Value::as_str) == Some(id) {
-                if let Some(u) = t.get("webSocketDebuggerUrl").and_then(Value::as_str) {
-                    return Ok(u.to_string());
+/// Куда и как стучаться: прямой порт либо ssh-туннель к машине пользователя.
+#[derive(Clone)]
+pub struct Endpoint {
+    /// адрес, куда подключаемся (обычно 127.0.0.1 — туннель уже поднят)
+    pub host: String,
+    /// порт на этом конце
+    pub port: u16,
+    /// порт на той стороне — он же в `Host` и его надо подставить в ws-URL
+    pub remote_port: u16,
+}
+
+impl Endpoint {
+    pub fn direct(port: u16) -> Self {
+        Endpoint { host: "127.0.0.1".into(), port, remote_port: port }
+    }
+
+    fn host_header(&self) -> String {
+        format!("127.0.0.1:{}", self.remote_port)
+    }
+
+    pub fn get(&self, path: &str) -> Result<String, String> {
+        http_get_host(&self.host, self.port, &self.host_header(), path)
+    }
+
+    /// ws-URL из ответа DevTools указывает на порт той стороны. При туннеле он
+    /// неверен (там другой локальный порт), поэтому переписываем порт, оставляя
+    /// путь и id.
+    fn rewrite_ws(&self, url: &str) -> Result<String, String> {
+        let rest = url
+            .strip_prefix("ws://")
+            .ok_or_else(|| format!("CDP: неожиданный ws-адрес {url}"))?;
+        let slash = rest.find('/').unwrap_or(rest.len());
+        let path = &rest[slash..];
+        Ok(format!("ws://{}:{}{}", self.host, self.port, path))
+    }
+
+    pub fn ws_url(&self, target: Option<&str>) -> Result<String, String> {
+        if let Some(id) = target {
+            let list = self.get("/json/list")?;
+            let v: Value = serde_json::from_str(&list).map_err(|e| format!("CDP /json/list: {e}"))?;
+            for t in v.as_array().cloned().unwrap_or_default() {
+                if t.get("id").and_then(Value::as_str) == Some(id) {
+                    if let Some(u) = t.get("webSocketDebuggerUrl").and_then(Value::as_str) {
+                        return self.rewrite_ws(u);
+                    }
                 }
             }
+            return Err(format!("CDP: вкладки {id} больше нет"));
         }
-        return Err(format!("CDP: вкладки {id} больше нет"));
+        let raw = self.get("/json/version")?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| format!("CDP /json/version: {e}"))?;
+        let u = v
+            .get("webSocketDebuggerUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "CDP: в /json/version нет webSocketDebuggerUrl".to_string())?;
+        self.rewrite_ws(u)
     }
-    let v = http_get(port, "/json/version")?;
-    let v: Value = serde_json::from_str(&v).map_err(|e| format!("CDP /json/version: {e}"))?;
-    v.get("webSocketDebuggerUrl")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| "CDP: в /json/version нет webSocketDebuggerUrl".to_string())
 }
 
 impl Cdp {

@@ -23,13 +23,16 @@ pub fn dir() -> PathBuf {
 
 #[derive(Clone, Copy)]
 pub struct Target {
+    /// порт на нашей стороне (у туннеля — локальный конец)
     pub port: u16,
+    /// порт на стороне Chrome: он в Host и в ws-URL
+    pub remote_port: u16,
 }
 
 pub fn save_target(t: Target, tab: &str) -> Result<(), String> {
     let d = dir();
     fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
-    let v = serde_json::json!({"port": t.port, "tab": tab});
+    let v = serde_json::json!({"port": t.port, "remote_port": t.remote_port, "tab": tab});
     fs::write(d.join("target.json"), v.to_string()).map_err(|e| format!("state: {e}"))
 }
 
@@ -37,14 +40,46 @@ pub fn load_target() -> Option<(Target, String)> {
     let text = fs::read_to_string(dir().join("target.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let port = v.get("port").and_then(Value::as_u64)? as u16;
+    let remote_port = v
+        .get("remote_port")
+        .and_then(Value::as_u64)
+        .unwrap_or(port as u64) as u16;
     let tab = v.get("tab").and_then(Value::as_str)?.to_string();
-    Some((Target { port }, tab))
+    Some((Target { port, remote_port }, tab))
 }
 
 /// Снимает привязку (например вкладку закрыли) — иначе следующий вызов будет
 /// биться о мёртвый id.
 pub fn clear_target() {
     let _ = fs::remove_file(dir().join("target.json"));
+}
+
+/// Живой ssh-туннель: чтобы следующий вызов (свой процесс) знал, через что идти.
+pub fn save_tunnel(t: &crate::tunnel::Tunnel) -> Result<(), String> {
+    let d = dir();
+    fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+    let v = serde_json::json!({
+        "host": t.host,
+        "local_port": t.local_port,
+        "remote_port": t.remote_port,
+        "pid": t.pid,
+    });
+    fs::write(d.join("tunnel.json"), v.to_string()).map_err(|e| format!("tunnel: {e}"))
+}
+
+pub fn load_tunnel() -> Option<crate::tunnel::Tunnel> {
+    let text = fs::read_to_string(dir().join("tunnel.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    Some(crate::tunnel::Tunnel {
+        host: v.get("host").and_then(Value::as_str)?.to_string(),
+        local_port: v.get("local_port").and_then(Value::as_u64)? as u16,
+        remote_port: v.get("remote_port").and_then(Value::as_u64)? as u16,
+        pid: v.get("pid").and_then(Value::as_u64)? as u32,
+    })
+}
+
+pub fn clear_tunnel() {
+    let _ = fs::remove_file(dir().join("tunnel.json"));
 }
 
 pub fn save_refs(tab: &str, refs: &[Ref]) -> Result<PathBuf, String> {

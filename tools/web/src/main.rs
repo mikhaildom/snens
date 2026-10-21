@@ -14,23 +14,26 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use cdp::Endpoint;
 use serde_json::{json, Value};
 
 pub mod act;
 pub mod cdp;
 pub mod snap;
 pub mod state;
+pub mod tunnel;
 
 const USAGE: &str = "web <команда> … — браузер машины пользователя через CDP: снимок дерева с адресами, действия по адресам и батчем, скриншот как fallback";
 
 const HELP: &str = "\
 web — браузер машины пользователя через CDP: дерево с адресами, действия батчем, скриншот как fallback.
-web connect|status|tabs|use|open|snap|act|shot|eval|text|probe|close [аргументы]
+web connect|status|tabs|use|open|snap|act|shot|eval|text|probe|disconnect|close [аргументы]
 
 Соединение — к Chrome, разрешённому для отладки по согласию
 (chrome://inspect/#remote-debugging, Chrome 144+), или к отдельному профилю агента.
 
 web connect [--port N]                 найти Chrome и запомнить порт (env SNENS_CDP_PORT)
+web connect --tunnel user@machine       то же к Chrome на другой машине через ssh
 web status                             что сейчас подключено и какие вкладки открыты
 web open <url> [--new]                 перейти в текущей вкладке (или открыть новую)
 web tabs [--all]                       список вкладок; --all — включая чужие
@@ -42,9 +45,17 @@ web eval <выражение>                   выполнить JS на ст�
 web text [--limit N]                   видимый текст страницы (дешёвое чтение)
 web probe                              проверить, что ввод реально доставляется (клик/клавиша/вставка)
 web close                              закрыть текущую вкладку и снять привязку
+web disconnect                         закрыть ssh-туннель (Chrome и вкладки не трогаем)
 
---host user@machine                     выполнить ту же команду на другой машине по ssh
+--tunnel user@machine                  говорить с Chrome на той машине через ssh-туннель:
+                                       на той стороне web НЕ нужен, только Chrome с согласием
+--host user@machine                    выполнить ту же команду на другой машине по ssh
                                        (там тоже должен стоять web; вывод — как локально)
+
+Проверка с машины пользователя, где ничего не установлено:
+  web connect --tunnel svuvich@192.168.1.10   # ssh -L к её Chrome, порт 9222
+  web snap / web act …                        # дальше как обычно, туннель уже поднят
+  web disconnect                              # закрыть туннель
 
 Снимок дерева НЕ уезжает в вывод целиком: печатаются путь к файлу, число узлов
 и первые строки — остальное читается через grep/read. Действие возвращает
@@ -136,6 +147,7 @@ fn is_command(s: &str) -> bool {
             | "eval"
             | "text"
             | "probe"
+            | "disconnect"
             | "close"
     )
 }
@@ -149,10 +161,37 @@ fn port_from(args: &Args) -> u16 {
         .unwrap_or(9222)
 }
 
+/// Куда стучаться: живой ssh-туннель (если поднят) или прямой порт.
+/// `--tunnel user@host` поднимает туннель немедленно и дальше всё идёт через него.
+fn endpoint(args: &Args) -> Endpoint {
+    if let Some(host) = args.flag("tunnel") {
+        // Порт на той стороне: --port (по умолчанию 9222).
+        match tunnel::start(host, port_from(args)) {
+            Ok(t) => return t.endpoint(),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some((target, _)) = state::load_target() {
+        return Endpoint {
+            host: "127.0.0.1".into(),
+            port: target.port,
+            remote_port: target.remote_port,
+        };
+    }
+    if let Some(t) = tunnel::load() {
+        return t.endpoint();
+    }
+    Endpoint::direct(port_from(args))
+}
+
 pub struct Live {
     pub cdp: cdp::Cdp,
     pub tab: String,
     pub port: u16,
+    pub ep: Endpoint,
 }
 
 /// Открывает CDP текущей вкладки, поднимая привязку из состояния.
@@ -161,24 +200,30 @@ pub fn live(args: &Args) -> Result<Live, String> {
         Some(t) => t,
         None => {
             return Err(
-                "не подключено: сначала `web connect` (Chrome с тумблером в chrome://inspect/#remote-debugging)"
+                "не подключено: сначала `web connect` (Chrome с тумблером в chrome://inspect/#remote-debugging) \
+                 или `web connect --tunnel user@machine`"
                     .into(),
             )
         }
     };
-    let port = args
-        .flag("port")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(target.port);
-    let url = cdp::ws_url(port, Some(&tab)).map_err(|e| {
+    let ep = if args.flag("tunnel").is_some() {
+        endpoint(args)
+    } else {
+        Endpoint {
+            host: "127.0.0.1".into(),
+            port: target.port,
+            remote_port: target.remote_port,
+        }
+    };
+    let url = ep.ws_url(Some(&tab)).map_err(|e| {
         format!("{e}\nвкладка {tab} пропала — `web status`, чтобы увидеть живые, `web connect` заново")
     })?;
     let cdp = cdp::Cdp::connect(&url, args.num("timeout", 30.0))?;
-    Ok(Live { cdp, tab, port })
+    Ok(Live { cdp, tab, port: ep.port, ep })
 }
 
-fn page_targets(port: u16) -> Result<Vec<Value>, String> {
-    let raw = cdp::http_get(port, "/json/list")?;
+fn page_targets(ep: &Endpoint) -> Result<Vec<Value>, String> {
+    let raw = ep.get("/json/list")?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| format!("CDP /json/list: {e}"))?;
     let mut out = Vec::new();
     for t in v.as_array().cloned().unwrap_or_default() {
@@ -214,10 +259,11 @@ pub fn trunc(s: &str, n: usize) -> String {
 // ---------------------------------------------------------------- команды
 
 fn cmd_connect(args: &Args) -> Result<(), String> {
-    let port = port_from(args);
+    let ep = endpoint(args);
+    let port = ep.port;
     // Проверяем не порт, а живой CDP: без согласия порт открыт, а /json/list пуст
     // или отдаёт 403 — тул должен сказать об этом прямо, а не падать на WS.
-    let targets = page_targets(port).map_err(|e| {
+    let targets = page_targets(&ep).map_err(|e| {
         format!(
             "{e}\n\nПодсказка: в Chrome открой chrome://inspect/#remote-debugging и включи тумблер \
              (Chrome 144+, потребуется Allow в диалоге). Отдельный профиль агента:\n  \
@@ -232,9 +278,22 @@ fn cmd_connect(args: &Args) -> Result<(), String> {
         .and_then(Value::as_str)
         .ok_or("в /json/list нет id вкладки")?
         .to_string();
-    state::save_target(state::Target { port }, &tab)?;
+    state::save_target(
+        state::Target {
+            port,
+            remote_port: ep.remote_port,
+        },
+        &tab,
+    )?;
     println!(
-        "подключено: 127.0.0.1:{port}, вкладка {} ({})",
+        "подключено: 127.0.0.1:{port}{}, вкладка {} ({})",
+        match tunnel::load() {
+            Some(t) if t.local_port == port => format!(
+                " (туннель к {}:{} — на той машине web не нужен)",
+                t.host, t.remote_port
+            ),
+            _ => String::new(),
+        },
         trunc(&tab, 8),
         trunc(targets[0].get("title").and_then(Value::as_str).unwrap_or(""), 60)
     );
@@ -245,17 +304,17 @@ fn cmd_connect(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_status(args: &Args) -> Result<(), String> {
-    let port = match state::load_target() {
+    let ep = endpoint(args);
+    match state::load_target() {
         Some((t, tab)) => {
             println!("привязка: 127.0.0.1:{}, вкладка {}", t.port, trunc(&tab, 8));
-            t.port
+            if let Some(tn) = tunnel::load() {
+                println!("туннель: {} (pid {}), порт там {}", tn.host, tn.pid, tn.remote_port);
+            }
         }
-        None => {
-            println!("привязки нет (`web connect`)");
-            port_from(args)
-        }
-    };
-    let targets = page_targets(port)?;
+        None => println!("привязки нет (`web connect`)"),
+    }
+    let targets = page_targets(&ep)?;
     println!("вкладок: {}", targets.len());
     for (i, t) in targets.iter().enumerate().take(30) {
         println!("{}", tab_line(i, t));
@@ -264,11 +323,8 @@ fn cmd_status(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_tabs(args: &Args) -> Result<(), String> {
-    let port = match state::load_target() {
-        Some((t, _)) => t.port,
-        None => port_from(args),
-    };
-    let targets = page_targets(port)?;
+    let ep = endpoint(args);
+    let targets = page_targets(&ep)?;
     for (i, t) in targets.iter().enumerate() {
         println!("{}", tab_line(i, t));
     }
@@ -280,13 +336,11 @@ fn cmd_use(args: &Args) -> Result<(), String> {
         .positional
         .get(0)
         .ok_or("web use: нужен id вкладки или её номер из `web tabs`")?;
-    let (port, _) = match state::load_target() {
-        Some((t, _)) => (t.port, String::new()),
-        None => {
-            return Err("не подключено: сначала `web connect`".into());
-        }
-    };
-    let targets = page_targets(port)?;
+    let ep = endpoint(args);
+    if state::load_target().is_none() {
+        return Err("не подключено: сначала `web connect`".into());
+    }
+    let targets = page_targets(&ep)?;
     let tab = if let Ok(n) = want.parse::<usize>() {
         targets
             .get(n.saturating_sub(1))
@@ -306,7 +360,13 @@ fn cmd_use(args: &Args) -> Result<(), String> {
             .ok_or_else(|| format!("нет вкладки с id, начинающимся на {want}"))?
             .to_string()
     };
-    state::save_target(state::Target { port }, &tab)?;
+    state::save_target(
+        state::Target {
+            port: ep.port,
+            remote_port: ep.remote_port,
+        },
+        &tab,
+    )?;
     println!("вкладка: {}", trunc(&tab, 8));
     Ok(())
 }
@@ -324,8 +384,7 @@ fn cmd_open(args: &Args) -> Result<(), String> {
     if args.on("new") {
         // Новая вкладка создаётся браузерным endpoint'ом, а не вкладочным:
         // Target.createTarget доступен только там.
-        let port = l.port;
-        let ws = cdp::ws_url(port, None)?;
+        let ws = l.ep.ws_url(None)?;
         let mut b = cdp::Cdp::connect(&ws, args.num("timeout", 30.0))?;
         let r = b.call("Target.createTarget", json!({"url": url}))?;
         let id = r
@@ -333,7 +392,13 @@ fn cmd_open(args: &Args) -> Result<(), String> {
             .and_then(Value::as_str)
             .ok_or("CDP: Target.createTarget не вернул targetId")?;
         let tab = id.to_string();
-        state::save_target(state::Target { port }, &tab)?;
+        state::save_target(
+            state::Target {
+                port: l.ep.port,
+                remote_port: l.ep.remote_port,
+            },
+            &tab,
+        )?;
         l = live(args)?;
     } else {
         let r = l.cdp.call("Page.navigate", json!({"url": url, "transitionType": "typed"}))?;
@@ -493,10 +558,23 @@ fn cmd_probe(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Закрыть ssh-туннель. Вкладки и Chrome на той стороне не трогаем: отключение
+/// от отладки — это снятие согласия, а не убийство браузера человека.
+fn cmd_disconnect(_args: &Args) -> Result<(), String> {
+    match tunnel::load() {
+        Some(t) => {
+            tunnel::stop(&t);
+            state::clear_target();
+            println!("туннель к {} закрыт, привязка снята", t.host);
+        }
+        None => println!("туннеля нет"),
+    }
+    Ok(())
+}
+
 fn cmd_close(args: &Args) -> Result<(), String> {
     let l = live(args)?;
-    let port = l.port;
-    let ws = cdp::ws_url(port, None)?;
+    let ws = l.ep.ws_url(None)?;
     let mut b = cdp::Cdp::connect(&ws, args.num("timeout", 30.0))?;
     b.call("Target.closeTarget", json!({"targetId": l.tab}))?;
     state::clear_target();
@@ -647,6 +725,7 @@ fn main() {
         "eval" => cmd_eval(&args),
         "text" => cmd_text(&args),
         "probe" => cmd_probe(&args),
+        "disconnect" => cmd_disconnect(&args),
         "close" => cmd_close(&args),
         other => {
             eprintln!("web: неизвестная команда {other}");

@@ -1,7 +1,7 @@
 {
   "type": "object",
   "properties": {
-    "command": {"type": "string", "enum": ["connect", "status", "tabs", "use", "open", "snap", "act", "shot", "eval", "text", "probe", "close"], "description": "Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется"},
+    "command": {"type": "string", "enum": ["connect", "status", "tabs", "use", "open", "snap", "act", "shot", "eval", "text", "probe", "disconnect", "close"], "description": "Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется"},
     "url": {"type": "string", "description": "Адрес для open (только http/https/file)"},
     "tab": {"type": "string", "description": "Вкладка для use: id (или его начало) либо номер из tabs"},
     "json": {"type": "string", "description": "Для act: JSON-массив действий, напр. [{\"click\":\"e3\"},{\"type\":{\"ref\":\"e1\",\"text\":\"hi\"}},{\"press\":\"Enter\"}]. Действия: click/hover (адрес или [x,y]), type {ref,text}, clear, press, scroll, navigate, wait, upload {ref,file}, eval"},
@@ -10,12 +10,15 @@
     "depth": {"type": "integer", "description": "Для snap: максимальная глубина дерева (дефолт 30)"},
     "out": {"type": "string", "description": "Для shot: путь к PNG (дефолт — канал вложений или каталог состояния)"},
     "port": {"type": "integer", "description": "Порт CDP (дефолт 9222 или порт из состояния connect)"},
-    "host": {"type": "string", "description": "Машина пользователя для ssh: та же команда выполняется там (там тоже должен стоять web). Пример: svuving или svuvich@192.168.1.10"}
+    "host": {"type": "string", "description": "Машина пользователя для ssh: та же команда выполняется там (там тоже должен стоять web). Пример: svuving или svuvich@192.168.1.10"},
+    "tunnel": {"type": "string", "description": "Машина пользователя для ssh-туннеля к её Chrome: на той стороне web ставить не нужно, только Chrome с включённым тумблером в chrome://inspect/#remote-debugging. Пример: svuvich@192.168.1.10. Дальше все команды идут через туннель"}
+
   },
   "required": ["command"],
   "x-snens": {
     "argv": [
       {"flag": "--host", "field": "host"},
+      {"flag": "--tunnel", "field": "tunnel"},
       {"field": "command"},
       {"field": "url"},
       {"field": "tab"},

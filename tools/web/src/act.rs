@@ -54,7 +54,7 @@ pub fn run_with(l: &mut crate::Live, args: &Args) -> Result<(), String> {
 /// вкладки — и честно предупреждаем, если вкладка сообщает `hidden`: значит
 /// ввод может уйти не туда.
 fn activate(l: &mut crate::Live) -> Result<(), String> {
-    let ws = crate::cdp::ws_url(l.port, None)?;
+    let ws = l.ep.ws_url(None)?;
     let mut b = crate::cdp::Cdp::connect(&ws, 15.0)?;
     let _ = b.call("Target.activateTarget", json!({"targetId": l.tab}));
     let _ = l.cdp.call("Page.bringToFront", Value::Null);
