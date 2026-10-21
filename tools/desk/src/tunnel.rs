@@ -92,6 +92,9 @@ pub fn ensure(host: &str, remote_port: u16) -> Result<u16, String> {
         if h == host && rem == remote_port && alive(pid) && port_open(local) {
             return Ok(local);
         }
+        // Старый туннель к другому порту (или к той же машине после смены порта)
+        // закрываем: иначе процессы копятся и держат порты.
+        let _ = Command::new("kill").arg(pid.to_string()).status();
     }
     let local = free_port()?;
     let mut cmd = Command::new("ssh");
