@@ -9,6 +9,9 @@ CFG="$HOME/.config/snens-dev/config.toml"
 DATA="$HOME/.local/share/snens-dev"
 TOKEN="$DATA/api.token"
 PORT="${SNENS_DEV_PORT:-7440}"
+# 5174 — рабочий порт человека (там браузер с прод-ядром). Стенд ходит своим:
+# иначе он молча занимал чужой порт и глушил чужой vite.
+WEB_PORT="${SNENS_DEV_WEB_PORT:-5175}"
 
 usage() {
     cat <<'EOF'
@@ -19,7 +22,7 @@ snens-dev — стенд разработки (прод :7420 не трогае�
   snens-dev stop      остановить
   snens-dev status    порт, pid, ответ /v1/model
   snens-dev logs      хвост лога
-  snens-dev web       vite на :5174, прокси в :7440
+  snens-dev web       vite на :5175, прокси в :7440 (5174 не трогает)
 
 Данные: ~/.local/share/snens-dev, конфиг: ~/.config/snens-dev/config.toml
 EOF
@@ -59,13 +62,23 @@ logs)
     tail -n "${2:-40}" "$DATA/serve.log"
     ;;
 web)
+    case "$WEB_PORT" in
+        5174)
+            echo "отказ: 5174 — рабочий порт человека, стенду он запрещён." >&2
+            echo "задай другой: SNENS_DEV_WEB_PORT=5176 snens-dev web" >&2
+            exit 1
+            ;;
+    esac
+    # Свой порт — свой процесс. Чужие vite не ищем и не убиваем: раньше
+    # `pkill` по общему шаблону глушил интерфейс, в котором с нами говорили.
+    mine=$(ss -ltnp 2>/dev/null | grep ":$WEB_PORT " | grep -o 'pid=[0-9]*' | cut -d= -f2 | head -1)
+    [ -n "${mine:-}" ] && kill "$mine" 2>/dev/null && sleep 1
     cd "$HOME/projects/snens-web"
-    killvite=$(pgrep -f 'node .*node_modules/.bin/vite' | head -1 || true)
-    [ -n "${killvite:-}" ] && kill "$killvite" 2>/dev/null && sleep 1
+    SNENS_WEB_PORT="$WEB_PORT" \
     SNENS_API_BASE="http://127.0.0.1:$PORT" SNENS_API_TOKEN_FILE="$TOKEN" \
-        setsid npx vite </dev/null >/tmp/snens-dev-vite.log 2>&1 &
+        setsid npx vite </dev/null >"/tmp/snens-dev-vite-$WEB_PORT.log" 2>&1 &
     sleep 4
-    echo "vite: http://100.73.69.107:5174 → /api :$PORT (лог: /tmp/snens-dev-vite.log)"
+    echo "vite: http://100.73.69.107:$WEB_PORT → /api :$PORT (лог: /tmp/snens-dev-vite-$WEB_PORT.log)"
     ;;
 -h|--help|help) usage ;;
 *) usage; exit 2 ;;
