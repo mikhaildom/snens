@@ -76,6 +76,11 @@ async fn serve(flags: &BTreeMap<String, String>) -> R<()> {
     if !addr.ip().is_loopback() {
         return Err("production surface server must bind to loopback".into());
     }
+    // Адрес поверхности — в окружение процесса: дочерние подагенты (`snens
+    // run --detach`) наследуют его и стримят свою работу сюда, в эту же шину.
+    std::env::set_var("SNENS_SURFACE_URL", format!("http://{addr}"));
+    // Токен — тоже: подагент шлёт по нему свои события в `POST …/ingest`.
+    std::env::set_var("SNENS_SURFACE_TOKEN", &token);
     // API runs headless: never inherit/reuse a terminal askpass socket belonging to
     // another local TUI that shares this production data directory. The askpass
     // client fails promptly with an actionable sudo notice instead.

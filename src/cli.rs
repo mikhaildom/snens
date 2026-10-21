@@ -29,6 +29,7 @@ mod sesscwd;
 mod subagent;
 mod sweep;
 mod surface_client;
+mod surface_ingest;
 mod surface_runtime;
 mod surface_server;
 mod surface_tui;
@@ -227,9 +228,18 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
     let key = cfg.api_key()?;
     let llm = llm::OpenAi::new(key)?;
     let ui = render::Ui::plain();
+    // Своей SSE-шины у подагента нет (её держит поверхность), поэтому его
+    // сигналы уезжают в неё по `POST /v1/sessions/{id}/ingest` — иначе работа
+    // ребёнка не стримилась и клиент видел только готовый журнал.
+    let reporter = surface_ingest::Reporter::new(&id, &parent);
+    let observe = |signal| reporter.send(signal);
+    let options = agent::SurfaceRunOptions {
+        observe: &observe,
+        ..Default::default()
+    };
     // Терминатор (`Done`) и доклад родителю пишет харнесс — по факту выхода цикла,
     // а не по вызову модели: `agent report` мог бы не состояться.
-    let res = agent::run_agent(&sess, &cfg, &llm, &ui).await;
+    let res = agent::run_agent_surface(&sess, &cfg, &llm, &ui, options).await;
     if !parent.is_empty() {
         let status = if res.is_ok() { "ok" } else { "error" };
         let text = subagent::final_text(&cfg, &id).unwrap_or_default();
@@ -333,6 +343,10 @@ fn spawn_child(_cfg: &cfg::Config, id: &str, prompt: &str, parent: Option<&str>)
     if let Some(p) = parent.filter(|p| !p.is_empty()) {
         cmd.arg("--parent").arg(p);
     }
+    // Куда стримить свою работу (`SNENS_SURFACE_URL`/`SNENS_SURFACE_TOKEN`):
+    // окружение наследуется от процесса поверхности через вызов тула `agent`.
+    // Если подагента запускают из TUI или `snens run`, переменных нет — он
+    // просто никуда не стримит.
     #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;

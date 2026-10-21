@@ -39,6 +39,20 @@ pub struct Session {
     /// Цель после уборки для этой сессии; пусто — общая из конфига.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_target: Option<u64>,
+    /// Сколько ходов модели уже прошло (ответов ассистента в журнале). Для
+    /// подагентов это главная цифра прогресса: по ней видно, что ребёнок жив
+    /// и работает, не открывая его сессию.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u64>,
+    /// Последняя запись `Done` в журнале: `ok` | `max_turns` | ... Пусто —
+    /// сессия ещё не закрывалась. Нужна, чтобы отличить «закончил» от «упал».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done: Option<String>,
+    /// Сколько занял последний ход, мс (из `ToolResult`/`Done` в журнале нет —
+    /// считаем по `updated_at` и первой записи; оставлено для будущего).
+    /// Сейчас не заполняется: см. `turns`/`done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ms: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Event {
@@ -102,6 +116,9 @@ impl Session {
             run_id: None,
             context_budget: None,
             context_target: None,
+            turns: None,
+            done: None,
+            last_ms: None,
         }
     }
 }
@@ -347,6 +364,10 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                 run_id: r.get(3)?,
                 context_budget: r.get(4)?,
                 context_target: r.get(5)?,
+                // В store не хранятся: выводятся из журнала при discovery.
+                turns: None,
+                done: None,
+                last_ms: None,
             })
         })? {
             let s = row?;

@@ -103,6 +103,11 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         .route("/v1/sessions/{id}/approvals/{aid}", post(approve))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/history", get(history))
+        // Приём событий от процесса подагента: у него нет собственной SSE-шины
+        // (её держит только поверхность), поэтому он шлёт сигналы сюда, а
+        // поверхность эмитит их в общий поток — клиент стримит подагента так же,
+        // как корневую сессию.
+        .route("/v1/sessions/{id}/ingest", post(ingest))
         .route("/v1/model", get(get_model).put(put_model))
         .route("/v1/memory", get(get_memory).put(put_memory))
         .with_state(state.clone())
@@ -1813,6 +1818,98 @@ impl HistoryQuery {
         matches!(self.recall.as_deref(), Some("1") | Some("true") | Some("yes"))
     }
 }
+/// Событие от процесса-подагента. Тело — тот же набор полей, что присылает
+/// `SurfaceSignal` в самой поверхности: `type` + поля.
+#[derive(Deserialize)]
+struct IngestEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(flatten)]
+    fields: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct IngestBody {
+    events: Vec<IngestEvent>,
+}
+
+/// Приём пачки событий подагента: эмитим их в шину под его же `session_id`.
+///
+/// Почему так: SSE-канал есть только у поверхности (`snens serve`), а подагент
+/// живёт отдельным процессом `snens run-child` и своей шины не имеет. Раньше
+/// клиент опрашивал его историю — дешевле и честнее гнать события push'ем.
+async fn ingest(
+    State(s): State<Arc<Runtime>>,
+    Path(id): Path<String>,
+    Json(b): Json<IngestBody>,
+) -> impl IntoResponse {
+    if !rt::valid_id(&id) {
+        return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
+    }
+    if b.events.is_empty() {
+        return Json(serde_json::json!({"accepted":0})).into_response();
+    }
+    // Сессия подагента могла появиться после старта поверхности: её лог пишет
+    // другой процесс, а discovery наполняет store только при старте и в
+    // `GET /v1/sessions`. Поэтому подхватываем её из журнала на месте — иначе
+    // первые события ребёнка уезжали в 404 и стрим начинался с середины.
+    {
+        let known = s.data.lock().await.sessions.contains_key(&id);
+        if !known {
+            // Store не клонируется целиком (там события и сообщения всех
+            // сессий) — discovery нужен только как справочник «кто есть».
+            let found = {
+                let guard = s.data.lock().await;
+                guard.sessions.get(&id).cloned()
+            }
+            .or_else(|| {
+                discovery::session_by_id(&s.cfg.data_path(), &id)
+            });
+            match found {
+                Some(session) => {
+                    let mut d = s.data.lock().await;
+                    d.sessions.insert(id.clone(), session);
+                    d.events.entry(id.clone()).or_default();
+                    let _ = s.persist(&d);
+                }
+                None => {
+                    return err("not_found", "unknown session", StatusCode::NOT_FOUND)
+                        .into_response();
+                }
+            }
+        }
+    }
+    let mut accepted = 0u64;
+    for e in b.events {
+        // `run.started`/`run.finished` подагент не шлёт — состоянием процесса
+        // владеет поверхность; остальное эмитим как есть. Поля события идут
+        // плоско (`flatten`), поэтому одного `Value` достаточно.
+        if s.emit(&id, e.run_id.clone(), &e.kind, e.fields)
+            .await
+            .is_ok()
+        {
+            accepted += 1;
+        }
+    }
+    // Ходы/закрытие подагента меняются с каждым его событием: обновляем запись
+    // в store, чтобы карточка в доке не врала до следующего `GET /v1/sessions`.
+    if accepted > 0 {
+        if let Some(fresh) = discovery::session_by_id(&s.cfg.data_path(), &id) {
+            let mut d = s.data.lock().await;
+            if let Some(slot) = d.sessions.get_mut(&id) {
+                slot.turns = fresh.turns;
+                slot.done = fresh.done;
+                slot.title = slot.title.clone().or(fresh.title);
+                slot.updated_at = fresh.updated_at;
+            }
+            let _ = s.persist(&d);
+        }
+    }
+    Json(serde_json::json!({"accepted":accepted})).into_response()
+}
+
 async fn history(
     State(s): State<Arc<Runtime>>,
     Path(id): Path<String>,

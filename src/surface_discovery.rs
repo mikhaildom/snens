@@ -100,6 +100,14 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
             session.updated_at = mtime(&path);
             session.parent = parent(&path);
             session.model = model(&path);
+            // Прогресс нужен только карточкам подагентов: у пользовательских
+            // сессий ходы не показываются, а полный разбор их логов (бывают по
+            // несколько мегабайт) удорожает каждый список.
+            if session.parent.is_some() {
+                let (turns, done) = progress(&path);
+                session.turns = Some(turns);
+                session.done = done;
+            }
             sessions.insert(id.to_string(), session);
         }
     }
@@ -131,6 +139,14 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
         }
         if session.model.is_none() {
             session.model = file.as_ref().and_then(|p| model(p));
+        }
+        // Ходы и закрытие пересчитываем всегда, а не только когда пусто:
+        // подагент растёт, пока его карточка висит на экране, и «3 хода» без
+        // обновления превращалось бы во враньё.
+        if let (Some(path), Some(_)) = (&file, &session.parent) {
+            let (turns, done) = progress(path);
+            session.turns = Some(turns);
+            session.done = done;
         }
     }
     // Свежие сверху. Порядок не зависит от поверхности и от формы id
@@ -185,6 +201,73 @@ pub fn parent(path: &Path) -> Option<String> {
             _ => None,
         })
         .filter(|p| !p.trim().is_empty())
+}
+
+/// Кэш `progress`: список сессий дёргается на каждое событие SSE и на каждую
+/// смену сессии, а полный разбор сотни логов на каждый запрос — это секунды.
+/// Ключ — путь + mtime + размер: пока файл не менялся, пересчитывать нечего.
+static PROGRESS: std::sync::Mutex<Option<std::collections::HashMap<(std::path::PathBuf, u64, u64), (u64, Option<String>)>>> =
+    std::sync::Mutex::new(None);
+
+/// Ходы и признак закрытия из журнала — для карточки подагента: сколько шагов
+/// прошло и чем кончилось. Читаем лог целиком: `Done` пишется только в конце.
+pub fn progress(path: &Path) -> (u64, Option<String>) {
+    let meta = fs::metadata(path).ok();
+    let key_extra = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let key = (path.to_path_buf(), key_extra, meta.map(|m| m.len()).unwrap_or(0));
+    if let Ok(guard) = PROGRESS.lock() {
+        if let Some(cache) = guard.as_ref() {
+            if let Some(hit) = cache.get(&key) {
+                return hit.clone();
+            }
+        }
+    }
+    let value = progress_uncached(path);
+    if let Ok(mut guard) = PROGRESS.lock() {
+        let cache = guard.get_or_insert_with(Default::default);
+        // Размер кэша ограничен числом сессий с их mtime: старые ключи живут,
+        // пока жив процесс. Это микроскопические значения, но подчистим, чтобы
+        // не копить их при активной работе: одна запись на путь.
+        cache.retain(|(p, _, _), _| p != path);
+        cache.insert(key, value.clone());
+    }
+    value
+}
+
+fn progress_uncached(path: &Path) -> (u64, Option<String>) {
+    let Ok(records) = crate::log::read_file(path) else {
+        return (0, None);
+    };
+    let mut turns = 0u64;
+    let mut done = None;
+    for rec in &records {
+        match rec {
+            crate::log::Rec::Assistant { .. } => turns += 1,
+            crate::log::Rec::Done { status, .. } => done = Some(status.clone()),
+            _ => {}
+        }
+    }
+    // Перезапущенная сессия: `Done` есть, но после него снова работали —
+    // последняя `Assistant` новые ходы добавляет, и закрытие уже не текущее.
+    // Порядок в журнале хронологический, поэтому просто смотрим, что было
+    // последним из двух событий.
+    let last_done = records
+        .iter()
+        .rposition(|r| matches!(r, crate::log::Rec::Done { .. }));
+    let last_assistant = records
+        .iter()
+        .rposition(|r| matches!(r, crate::log::Rec::Assistant { .. }));
+    if let (Some(d), Some(a)) = (last_done, last_assistant) {
+        if a > d {
+            done = None;
+        }
+    }
+    (turns, done)
 }
 
 /// Была ли в сессии хоть одна реплика человека или вставка в ход. Сессии без
@@ -376,4 +459,46 @@ mod tests {
         assert_eq!(found[0].title.as_deref(), Some("мок веб-клиента"));
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn progress_counts_turns_and_sees_done() {
+        let dir = std::env::temp_dir().join(format!("snens-progress-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k.jsonl");
+        let records = [
+            r#"{"kind":"meta","ts":1,"model":"m","parent":"p"}"#,
+            r#"{"kind":"user","ts":2,"text":"q","source":"surface"}"#,
+            r#"{"kind":"assistant","ts":3,"text":"a","tool_calls":[]}"#,
+            r#"{"kind":"assistant","ts":4,"text":"b","tool_calls":[]}"#,
+        ];
+        fs::write(&path, records.join("\n")).unwrap();
+        // Открытая сессия: ходы считаются, закрытия нет.
+        assert_eq!(progress(&path), (2, None));
+        // После `Done` сессия закрыта — это и есть «подагент закончил».
+        let mut text = records.join("\n");
+        text.push_str("\n{\"kind\":\"done\",\"ts\":5,\"status\":\"ok\",\"turns\":2}");
+        fs::write(&path, &text).unwrap();
+        assert_eq!(progress(&path), (2, Some("ok".into())));
+        // Новая работа после `Done` (перезапуск) снимает закрытие.
+        text.push_str("\n{\"kind\":\"assistant\",\"ts\":6,\"text\":\"c\",\"tool_calls\":[]}");
+        fs::write(&path, &text).unwrap();
+        assert_eq!(progress(&path), (3, None));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// Одна сессия по id, собранная из журнала: нужно, когда сессия появилась
+/// позже старта поверхности (подагент пишет свой лог другим процессом), а
+/// `discovery::sessions` наполняет store только целиком и только при старте.
+pub fn session_by_id(data_dir: &Path, id: &str) -> Option<Session> {
+    let path = path_from(data_dir, id).filter(|p| has_dialogue(p))?;
+    let mut session = Session::new(id.to_string(), surface(&path));
+    session.title = title(&path);
+    session.updated_at = mtime(&path);
+    session.parent = parent(&path);
+    session.model = model(&path);
+    let (turns, done) = progress(&path);
+    session.turns = Some(turns);
+    session.done = done;
+    Some(session)
 }
