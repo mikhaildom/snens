@@ -59,9 +59,23 @@ pub struct Usage {
     pub cost_micro: u64,
 }
 
+/// Транскрипт без служебной справки памяти — обычное чтение журнала.
+pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
+    read_with(path, cfg, false)
+}
+
 /// Project transcript records directly from the append-only journal. `seq` is
 /// the 1-based physical JSONL line number, independent of delivery event seq.
-pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
+///
+/// `with_recall` включает служебную справку долгой памяти в выдачу — она нужна
+/// только поверхности, которая решила её показать (веб-клиент, галочка в
+/// настройках). По умолчанию выключено: справка — это контекст промпта, а не
+/// транскрипт, и в общей ленте/поиске ей не место.
+pub fn read_with(
+    path: &Path,
+    _cfg: &Config,
+    with_recall: bool,
+) -> crate::R<Vec<HistoryMessage>> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
@@ -142,6 +156,28 @@ pub fn read(path: &Path, _cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
                 })
             }
             // These records are internal prompt context, not transcript.
+            // Справка памяти — исключение по запросу поверхности: человек вправе
+            // видеть, что агент вспомнил перед ходом (шаг `kind: "recall"`).
+            Rec::Recall { ts, text } if with_recall => Some(HistoryMessage {
+                seq,
+                ts,
+                // Роль `recall` — не `user`/`assistant`, а отдельный вид шага:
+                // клиент рисует её серой строкой и не путает с репликами.
+                role: "recall",
+                content: Some(text),
+                source: None,
+                reasoning: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                exit: None,
+                ms: None,
+                argv: None,
+                parts: None,
+                via: None,
+                from: None,
+                usage: None,
+            }),
             Rec::Recall { .. } | Rec::ContextNotice { .. } => None,
             Rec::Assistant {
                 ts,
@@ -268,6 +304,15 @@ mod tests {
         assert!(rows.is_empty());
         assert!(!json.contains("PRIVATE_RECALL_MARKER"));
         assert!(!json.contains("PRIVATE_CONTEXT_MARKER"));
+
+        // А по запросу поверхности справка памяти отдаётся как шаг `recall`:
+        // человек включает её показ галочкой, и тогда он видит, что агент вспомнил.
+        let shown = read_with(&path, &Config::default(), true).unwrap();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].role, "recall");
+        assert!(shown[0].content.as_deref().unwrap().contains("PRIVATE_RECALL_MARKER"));
+        // `context_notice` остаётся служебным даже с флагом: это не память.
+        assert!(!serde_json::to_string(&shown).unwrap().contains("PRIVATE_CONTEXT_MARKER"));
         fs::remove_dir_all(dir).unwrap();
     }
 

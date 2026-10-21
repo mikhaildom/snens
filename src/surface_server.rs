@@ -362,7 +362,7 @@ async fn search(
         if !rt::valid_id(id) {
             continue;
         }
-        let Ok(rows) = history::read(&path, &s.cfg) else {
+        let Ok(rows) = history::read_with(&path, &s.cfg, false) else {
             continue;
         };
         let title = discovery::title(&path);
@@ -1757,7 +1757,28 @@ async fn stop(
 struct After {
     after: Option<u64>,
 }
-async fn history(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> impl IntoResponse {
+
+/// Что ещё вернуть вместе с транскриптом. `recall` — справку долгой памяти:
+/// человек включает её показ галочкой в настройках клиента, по умолчанию она
+/// остаётся служебным контекстом промпта и в транскрипт не едет.
+#[derive(Deserialize)]
+struct HistoryQuery {
+    /// Строкой, а не `bool`: в адресе пишут и `recall=1`, и `recall=true`, а
+    /// serde ждёт от bool ровно `true`/`false` и отвечает 400 на `1`.
+    #[serde(default)]
+    recall: Option<String>,
+}
+
+impl HistoryQuery {
+    fn with_recall(&self) -> bool {
+        matches!(self.recall.as_deref(), Some("1") | Some("true") | Some("yes"))
+    }
+}
+async fn history(
+    State(s): State<Arc<Runtime>>,
+    Path(id): Path<String>,
+    Query(q): Query<HistoryQuery>,
+) -> impl IntoResponse {
     if !rt::valid_id(&id) {
         return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
     }
@@ -1769,7 +1790,7 @@ async fn history(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> impl 
     if session.is_none() && !path.is_file() {
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     }
-    let messages = match history::read(&path, &s.cfg) {
+    let messages = match history::read_with(&path, &s.cfg, q.with_recall()) {
         Ok(messages) => messages,
         Err(e) => {
             return err(

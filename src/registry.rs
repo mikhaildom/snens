@@ -408,6 +408,13 @@ pub fn child_path_with(prefix: &[PathBuf], bin: &Path, tools: &[Tool]) -> String
     {
         parts.push(dir);
     }
+    // Пользовательские bin-каталоги — до PATH родителя. Когда харнесс поднят
+    // systemd-юнитом (веб-поверхность), его PATH системный: `~/.cargo/bin`,
+    // `~/.local/bin`, `~/.bun/bin` в нём отсутствуют, и `run cargo build` внутри
+    // сессии падал exit=127, хотя в терминале человека cargo работает. Берём
+    // каталоги из HOME, а не из шелла: тогда поведение одинаково для любой
+    // поверхности (сервис, TUI, телеграм).
+    parts.extend(user_bin_dirs());
     if let Some(cur) = std::env::var_os("PATH") {
         parts.extend(std::env::split_paths(&cur));
     }
@@ -435,6 +442,21 @@ pub fn child_path_with(prefix: &[PathBuf], bin: &Path, tools: &[Tool]) -> String
 /// `fetch`, `search` системных двойников не имеют и остаются доступны.
 fn has_shadow(dir: &Path, shadowed: &[String]) -> bool {
     shadowed.iter().any(|name| dir.join(name).exists())
+}
+
+/// Пользовательские каталоги с бинарниками: то, что человек получает в PATH
+/// логин-шелла (`~/.bashrc`/`~/.profile` экспортируют cargo, bun, nix), но не
+/// получает процесс, поднятый systemd. Только существующие каталоги: мёртвый
+/// путь в PATH ничего не стоит, но и смысла в нём нет.
+fn user_bin_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    [".cargo/bin", ".local/bin", "bin", ".bun/bin", ".npm-global/bin"]
+        .iter()
+        .map(|p| home.join(p))
+        .filter(|p| p.is_dir())
+        .collect()
 }
 
 /// Системные каталоги: там настоящие утилиты, фильтровать их нельзя.
@@ -573,6 +595,28 @@ mod tests {
             bin.join(format!("edit{}", std::env::consts::EXE_SUFFIX)).exists(),
             "обычный тул должен быть в PATH"
         );
+    }
+
+    /// Пользовательские bin-каталоги (cargo, local/bin) попадают в PATH детей
+    /// даже когда родитель поднят системным менеджером с системным PATH:
+    /// иначе `run cargo build` из веб-сессии даёт exit=127, а в терминале
+    /// человека тот же cargo работает.
+    #[test]
+    fn user_bin_dirs_are_in_child_path() {
+        let home = tmpdir("home");
+        std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        // Каталог, которого нет, в PATH не уезжает: мёртвый путь только мусорит.
+        let saved = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let dirs = user_bin_dirs();
+        match saved {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(dirs.contains(&home.join(".cargo/bin")), "cargo не в PATH: {dirs:?}");
+        assert!(dirs.contains(&home.join(".local/bin")), "local/bin не в PATH: {dirs:?}");
+        assert!(!dirs.contains(&home.join(".bun/bin")), "несуществующий каталог в PATH");
     }
 
     #[test]

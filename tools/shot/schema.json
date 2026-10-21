@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "Адрес страницы, только http/https"
+    },
+    "selector": {
+      "type": "string",
+      "description": "CSS-селектор элемента: рамка считается в браузере (getBoundingClientRect), отдаётся кроп именно этого элемента. Взаимоисключающе с crop"
+    },
+    "size": {
+      "type": "string",
+      "description": "Размер окна WxH, несколько через запятую: '1440x900,390x844' (дефолт 1440x900)"
+    },
+    "crop": {
+      "type": "string",
+      "description": "Явный кроп X,Y,W,H в CSS-пикселях документа (когда селектора нет)"
+    },
+    "script": {
+      "type": "string",
+      "description": "Путь к .js: содержимое исполняется как тело async-функции на странице, в stdout печатается JSON результата. Так проверяется поведение без probe-HTML"
+    },
+    "wait_ms": {
+      "type": "integer",
+      "description": "Пауза после загрузки, мс (дефолт 300)"
+    },
+    "timeout": {
+      "type": "number",
+      "description": "Внутренний таймаут запуска в секундах (дефолт 20): по истечении тул возвращает ошибку, а не висит"
+    }
+  },
+  "required": ["url"],
+  "x-snens": {
+    "argv": [
+      {"field": "url"},
+      {"flag": "--size", "field": "size"},
+      {"flag": "--selector", "field": "selector"},
+      {"flag": "--crop", "field": "crop"},
+      {"flag": "--script", "field": "script"},
+      {"flag": "--wait-ms", "field": "wait_ms"},
+      {"flag": "--timeout", "field": "timeout"}
+    ],
+    "stdin": {"mode": "none"}
+  }
+}
