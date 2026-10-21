@@ -298,16 +298,15 @@ async fn context_breakdown(
                 .into_response()
         }
     };
-    let mut breakdown = crate::project::window_breakdown(&log, &s.cfg);
+    let breakdown = crate::project::window_breakdown(&log, &s.cfg);
     // Схемы инструментов тоже уезжают в запрос и занимают окно: считаем их
-    // оценкой по JSON, чтобы «прочие» категории не были пустыми.
+    // оценкой по JSON и приводим тем же коэффициентом, что и остальное.
     let tools = crate::registry::discover(&s.cfg).await;
     let schema: u64 = crate::registry::definitions(&tools)
         .iter()
         .map(|t| crate::project::estimate_message(t) + 8)
         .sum();
-    breakdown.tools += schema;
-    breakdown.total += schema;
+    let breakdown = breakdown.with_tool_schema(schema, crate::project::calibration(&log));
     let budget = s
         .data
         .lock()

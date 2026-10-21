@@ -468,47 +468,88 @@ pub fn estimate_message(value: &Value) -> u64 {
 /// совпадение с счётом провайдера.
 pub fn window_breakdown(log: &[Rec], cfg: &Config) -> WindowBreakdown {
     let msgs = build(log, cfg);
-    let mut out = WindowBreakdown::default();
+    // Сырые размеры по категориям, потом один общий коэффициент калибровки:
+    // эвристика len/3 для кириллицы завышает почти вдвое, и без калибровки
+    // расклад врёт ровно настолько, насколько врёт оценка порога компакции.
+    let mut raw = WindowBreakdown::default();
     let mut calls = 0u64;
     for m in &msgs {
-        // Картинки считаются отдельной категорией, а не «размазываются» по той,
-        // где лежит сообщение: иначе одна и та же цена входила бы дважды, а
-        // сегмент «картинки» не отвечал бы на вопрос, сколько окна они едят.
+        // Картинки — отдельная категория: у них фиксированная цена части, и в
+        // текстовых категориях их вес иначе терялся бы среди символов.
         let images = match m["content"].as_array() {
             Some(parts) => parts.iter().filter(|p| p["type"] == "image_url").count() as u64 * 4096,
             None => 0,
         };
         let size = estimate_message(m).saturating_sub(images);
-        out.images += images;
-        out.total += size + images;
+        raw.images += images;
+        raw.total += size + images;
         match m["role"].as_str().unwrap_or("") {
-            "system" => out.prefix += size,
-            "tool" => out.tools += size,
+            // Системный промпт — то, что уезжает в префикс кеша и не меняется.
+            "system" => raw.system += size,
+            // Результат вызова инструмента — самый изменчивый кусок окна.
+            "tool" => raw.tool_results += size,
             "assistant" => {
-                out.history += size;
+                // Вызовы инструментов лежат внутри assistant — считаем их как
+                // отдельную статью: именно они ломают кеш при смене набора тулов.
+                let calls_size: u64 = m["tool_calls"]
+                    .as_array()
+                    .map(|a| a.iter().map(|c| estimate_message(c) + 8).sum())
+                    .unwrap_or(0);
+                raw.tool_calls += calls_size;
+                raw.messages += size.saturating_sub(calls_size);
                 calls += m["tool_calls"].as_array().map(|a| a.len() as u64).unwrap_or(0);
             }
-            _ => out.history += size,
+            _ => raw.messages += size,
         }
     }
-    out.tool_calls = calls;
-    out.messages = msgs.len() as u64;
-    out
+    raw.tool_calls_count = calls;
+    raw.messages_count = msgs.len() as u64;
+
+    // Один коэффициент на всё: части остаются сопоставимыми между собой, а
+    // сумма сходится с тем, что провайдер реально посчитал на последнем ходу.
+    let k = calibration(log);
+    let scale = |v: u64| (v as f64 * k).round() as u64;
+    WindowBreakdown {
+        total: scale(raw.total),
+        system: scale(raw.system),
+        messages: scale(raw.messages),
+        tool_calls: scale(raw.tool_calls),
+        tool_results: scale(raw.tool_results),
+        images: scale(raw.images),
+        messages_count: raw.messages_count,
+        tool_calls_count: raw.tool_calls_count,
+    }
+}
+
+impl WindowBreakdown {
+    /// Добавить описание инструментов в запросе (оно уезжает отдельно от
+    /// сообщений и тоже занимает окно).
+    pub fn with_tool_schema(mut self, schema: u64, scale: f64) -> Self {
+        let scaled = (schema as f64 * scale).round() as u64;
+        self.tool_calls += scaled;
+        self.total += scaled;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct WindowBreakdown {
+    /// Вся проекция промпта, с калибровкой по usage прошлых ходов. Сходится
+    /// с `in_tok` последнего хода с точностью эвристики.
     pub total: u64,
-    /// Системный промпт и рамки — то, что должно попадать в кеш.
-    pub prefix: u64,
-    /// Диалог: реплики человека и ответы модели.
-    pub history: u64,
-    /// Результаты вызовов инструментов.
-    pub tools: u64,
+    /// Системный промпт и рамки.
+    pub system: u64,
+    /// Сообщения: реплики человека и ответы модели (без вызовов тулов).
+    pub messages: u64,
+    /// Вызовы инструментов: имена, аргументы, описания в запросе.
+    pub tool_calls: u64,
+    /// Результаты вызовов — самая тяжёлая и самая изменчивая часть.
+    pub tool_results: u64,
     /// Вложения-картинки (фиксированная цена части).
     pub images: u64,
-    pub messages: u64,
-    pub tool_calls: u64,
+    /// Сколько сообщений в проекции и сколько в них вызовов.
+    pub messages_count: u64,
+    pub tool_calls_count: u64,
 }
 
 /// Грубая оценка токенов проекции: точные числа берём из usage провайдера,
@@ -1238,11 +1279,54 @@ mod tests {
             },
         ];
         let b = window_breakdown(&log, &cfg);
-        assert!(b.prefix > 0, "системный промпт должен попасть в prefix");
-        assert!(b.history > 0, "реплика человека — в history");
-        assert!(b.tools > 0, "результат тула — в tools");
-        assert_eq!(b.tool_calls, 1);
-        assert!(b.total >= b.prefix + b.history + b.tools);
+        assert!(b.system > 0, "системный промпт — в system");
+        assert!(b.messages > 0, "реплика человека — в messages");
+        assert!(b.tool_results > 0, "результат тула — в tool_results");
+        assert!(b.tool_calls > 0, "вызов тула — в tool_calls");
+        assert_eq!(b.tool_calls_count, 1);
+        let parts = b.system + b.messages + b.tool_calls + b.tool_results + b.images;
+        assert_eq!(b.total, parts, "части складываются в total без двойного счёта");
+    }
+
+    #[test]
+    fn window_breakdown_applies_provider_calibration() {
+        let cfg = Config::default();
+        // Сырая эвристика (len/3) завышает для кириллицы почти вдвое: в логе
+        // est_tok 726 805 при фактических 335 892 от провайдера. Расклад обязан
+        // применить тот же коэффициент, иначе шкала врёт ровно на это вдвое.
+        let mut log = vec![
+            Rec::System {
+                ts: 0,
+                text: "s".repeat(3000),
+            },
+            Rec::User {
+                ts: 0,
+                text: "x".repeat(30_000),
+                source: "surface".into(),
+                parts: Vec::new(),
+            },
+        ];
+        let raw = estimate_tokens(&build(&log, &cfg));
+        log.push(Rec::Usage {
+            ts: 0,
+            model: String::new(),
+            in_tok: raw / 2,
+            cached_tok: 0,
+            out_tok: 1,
+            cost_micro: 0,
+            upstream_id: String::new(),
+            fingerprint: String::new(),
+            finish_reason: "stop".into(),
+            reason_tok: 0,
+            encrypted_reasoning: false,
+            est_tok: raw,
+        });
+        let b = window_breakdown(&log, &cfg);
+        assert!(
+            (b.total as f64 / raw as f64 - 0.5).abs() < 0.05,
+            "total={} raw={raw} — калибровка не применена",
+            b.total
+        );
     }
 
     #[test]
