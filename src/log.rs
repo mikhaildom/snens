@@ -197,7 +197,20 @@ pub enum Rec {
 /// Текст отметки ревью для транскрипта. Одна строка, ≤80 символов: её рисует
 /// клиент тонким серым шрифтом, как справку памяти (`role: "recall"`).
 pub fn review_line(turns: u64) -> String {
-    format!("саморевью · {turns} ходов")
+    format!("саморевью · {turns} {}", turns_word(turns))
+}
+
+/// То же склонение для счётчиков ходов в тикетах и подписях.
+pub fn turns_word(turns: u64) -> &'static str {
+    let mod10 = turns % 10;
+    let mod100 = turns % 100;
+    if mod10 == 1 && mod100 != 11 {
+        "ход"
+    } else if (2..=4).contains(&mod10) && !(12..=14).contains(&mod100) {
+        "хода"
+    } else {
+        "ходов"
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
