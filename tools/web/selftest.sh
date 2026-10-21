@@ -64,6 +64,13 @@ t connect --port 9
 want 1 "$rc" "connect на закрытый порт: код 1"
 has "chrome://inspect" "$err" "connect на закрытый порт: подсказывает тумблер"
 
+# --host уходит в ssh одним вызовом; без доступного ssh — ошибка, не паника.
+t --host nosuchhost.invalid status
+# ssh отдаёт свой код (255) — пробрасываем как есть, это честнее «своего» 1:
+# человек видит, что упал именно ssh, а не web.
+[ "$rc" -ne 0 ] && ok "--host с недоступной машиной: код $rc ≠ 0" || bad "--host: код 0 на недоступной машине"
+has "ssh" "$err" "--host: сказал про ssh"
+
 # --- живой Chrome (если есть) ---
 CHROME=${SNENS_CHROME:-}
 if [ -z "$CHROME" ]; then

@@ -43,6 +43,9 @@ web text [--limit N]                   видимый текст страниц�
 web probe                              проверить, что ввод реально доставляется (клик/клавиша/вставка)
 web close                              закрыть текущую вкладку и снять привязку
 
+--host user@machine                     выполнить ту же команду на другой машине по ssh
+                                       (там тоже должен стоять web; вывод — как локально)
+
 Снимок дерева НЕ уезжает в вывод целиком: печатаются путь к файлу, число узлов
 и первые строки — остальное читается через grep/read. Действие возвращает
 дельту состояния, а не всё дерево заново. Адреса живут до следующего `snap`.
@@ -570,9 +573,59 @@ fn allow_sigpipe() {
 #[cfg(not(unix))]
 fn allow_sigpipe() {}
 
+/// `--host user@machine`: та же команда уезжает одним ssh-вызовом на машину
+/// пользователя. Так ядро на сервере без графики работает с браузером на его
+/// компьютере, не держа открытых портов и не требуя сети между демонами.
+fn remote(argv: &[String]) -> Option<(String, Vec<String>)> {
+    let mut host = None;
+    let mut rest: Vec<String> = Vec::with_capacity(argv.len());
+    let mut it = argv.iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "--host" {
+            host = it.next().cloned();
+        } else if let Some(h) = a.strip_prefix("--host=") {
+            host = Some(h.to_string());
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    host.map(|h| (h, rest))
+}
+
+/// Один ssh → один `web` на той машине. Кавычки для удалённого argv собираем
+/// здесь: одинарные кавычки внутри аргумента экранируются по правилам sh.
+fn run_remote(host: &str, argv: &[String]) -> i32 {
+    let mut cmd = String::from("web");
+    for a in argv {
+        cmd.push(' ');
+        cmd.push('\'');
+        cmd.push_str(&a.replace('\'', "'\\''"));
+        cmd.push('\'');
+    }
+    let status = std::process::Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(host)
+        .arg(&cmd)
+        .status();
+    match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("web --host {host}: ssh не запустился: {e}");
+            1
+        }
+    }
+}
+
 fn main() {
     allow_sigpipe();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv_raw: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((host, rest)) = remote(&argv_raw) {
+        std::process::exit(run_remote(&host, &rest));
+    }
+    let argv: Vec<String> = argv_raw;
     if argv.is_empty() || argv[0] == "--help" || argv[0] == "-h" {
         println!("{HELP}");
         return;
