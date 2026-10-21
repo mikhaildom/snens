@@ -1386,6 +1386,11 @@ fn session_turns(cfg: &Config, id: &str) -> usize {
 /// `review_idle_seconds` без новой работы. Таймер запоминает поколение работы:
 /// если за время простоя начался новый ход, ревью отменяется — оно дождётся
 /// следующей паузы. `review_idle_seconds = 0` выключает авторевью.
+///
+/// Граница разбора — число ходов, а не смещение в логе: `review_due` требует
+/// `review_min_turns` НОВЫХ ходов с прошлого запуска. Маркер (`Rec::Review`) в
+/// журнал пишется для человека и для следующего прогона, но порог считается по
+/// `Assistant`, поэтому сама постановка маркера счёт не сдвигает.
 fn schedule_review(s: Arc<Runtime>, id: String) {
     let idle = s.cfg.review_idle_seconds;
     if idle == 0 {
@@ -1423,6 +1428,28 @@ fn schedule_review(s: Arc<Runtime>, id: String) {
             let mut d = s.data.lock().await;
             d.reviews.insert(id.clone(), turns as u64);
             let _ = s.persist(&d);
+        }
+        // Маркер в журнал сессии — до запуска процесса: `review::run` при своём
+        // старте видит уже готовую границу, а если процесс не поднимется, в
+        // транскрипте останется честная строка «здесь планировалось ревью».
+        // Ошибку записи не глотаем молча, но и ревью из-за неё не отменяем: сам
+        // разбор полезнее строки-отметки.
+        let mark_path = s.cfg.sessions_path().join(format!("{id}.jsonl"));
+        let mark = match s.writers.lock().await.get(&id).cloned() {
+            Some(writer) => writer.append(crate::review::mark(&id, turns as u64)),
+            None if mark_path.is_file() => crate::log::Session::open(&s.cfg.sessions_path(), &id)
+                .and_then(|sess| sess.append(crate::review::mark(&id, turns as u64))),
+            None => Ok(0),
+        };
+        if let Err(error) = mark {
+            s.emit(
+                &id,
+                None,
+                "notice",
+                serde_json::json!({"text":format!("маркер ревью не записан: {error}")}),
+            )
+            .await
+            .ok();
         }
         if let Err(error) = crate::spawn_review(&s.cfg, &id) {
             s.emit(
@@ -1946,6 +1973,45 @@ mod tests {
         assert!(review_due(20, 40, 20));
         // Нулевой порог выключает авторевью.
         assert!(!review_due(0, 1000, 0));
+    }
+
+    /// Маркер ревью лежит в журнале сессии, но ходом не считается: `session_turns`
+    /// видит только `Assistant`. Значит, отметка не сдвигает границу — ни вверх
+    /// (ложное «пора»), ни вниз (пропущенное ревью).
+    #[test]
+    fn review_marker_neither_counts_as_a_turn_nor_moves_the_boundary() {
+        let dir = std::env::temp_dir().join(format!("surface-review-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            sessions_dir: dir.display().to_string(),
+            ..Default::default()
+        };
+        let path = dir.join("s.jsonl");
+        let mut lines = vec!["{\"kind\":\"meta\",\"ts\":0,\"model\":\"m\"}".to_string()];
+        for i in 0..20 {
+            lines.push(format!(
+                "{{\"kind\":\"assistant\",\"ts\":{i},\"text\":\"ответ {i}\",\"tool_calls\":[]}}"
+            ));
+        }
+        // Отметка ревью и старая форма записи без `turns`/`text` — лог должен читаться.
+        lines.push("{\"kind\":\"review\",\"ts\":20,\"review_id\":\"s-review\",\"turns\":20,\"text\":\"саморевью · 20 ходов\"}".to_string());
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let turns = session_turns(&cfg, "s");
+        assert_eq!(turns, 20, "маркер посчитался ходом");
+        assert!(review_due(20, turns, 0), "маркер съел границу 0");
+        // Ревью прошло на 20: отметка в журнале не делает ревью «пора» снова.
+        assert!(
+            !review_due(20, turns, 20),
+            "маркер сдвинул границу вверх"
+        );
+        // +20 ходов после отметки — снова пора.
+        assert!(review_due(20, 40, 20));
+
+        // Запись без полей (ручная/будущая правка формата) не роняет чтение.
+        std::fs::write(&path, "{\"kind\":\"review\"}\n").unwrap();
+        assert_eq!(session_turns(&cfg, "s"), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

@@ -22,6 +22,18 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
         return Err(format!("сессии {id} нет: {}", src.display()).into());
     }
     let rid = format!("{id}-review");
+    // Отметка саморевью в журнале самой сессии — ДО счёта длины ниже. После
+    // неё журнал вырос на одну строку, и если считать префикс раньше, он бы
+    // оттяпал последнюю запись сессии (её настоящий ход) или не сошёлся бы с
+    // проверкой длины в `rewrite_with_replay`.
+    //
+    // На поверхности маркер уже поставил `schedule_review` (он держит писательский
+    // лок), и открыть журнал здесь нельзя — это не ошибка, а знак того, что
+    // граница отмечена. Из-за маркера ревью не отменяем:
+    // сам разбор полезнее строки-отметки.
+    if let Err(error) = mark_review_start(cfg, id) {
+        eprintln!("[snens] ревью {rid}: маркер в журнал сессии не записан ({error}) — продолжаю");
+    }
     let dst = dir.join(format!("{rid}.jsonl"));
     // Не копия, а ссылка на хвост сессии (`Rec::Replay`). Проекция всё равно
     // получает те же записи — префикс провайдерского кеша остаётся тёплым, — но
@@ -69,6 +81,37 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
     })?;
     eprintln!("[snens] ревью {rid} → {} ({})", cfg.base_url, cfg.model);
     agent::run_agent(&sess, cfg, llm, &crate::render::Ui::plain()).await
+}
+
+/// Отметка запуска ревью в журнале сессии. Пишется с числом ходов на момент
+/// запуска — это и есть граница зоны ответственности следующего прогона.
+///
+/// Маркер — служебная строка: в проекции промпта её нет (см. `project::build`),
+/// а в транскрипте поверхности она едет отдельной ролью `review`. Поэтому
+/// раскрытый источник растёт ровно на одну запись, а содержимое прежних не
+/// меняется — префикс-кеш провайдера остаётся тёплым: проекция до маркера и
+/// после него совпадает байт-в-байт.
+pub fn mark_review_start(cfg: &Config, id: &str) -> R<()> {
+    let dir = cfg.sessions_path();
+    let path = dir.join(format!("{id}.jsonl"));
+    let turns = log::read_file(&path)?
+        .iter()
+        .filter(|r| matches!(r, log::Rec::Assistant { .. }))
+        .count() as u64;
+    let sess = log::Session::open(&dir, id)?;
+    sess.append(mark(id, turns))?;
+    Ok(())
+}
+
+/// Запись-отметка ревью. Одна и та же для обоих путей запуска (поверхность и
+/// `snens review`): строка в транскрипте не должна зависеть от того, кто начал.
+pub fn mark(id: &str, turns: u64) -> log::Rec {
+    log::Rec::Review {
+        ts: log::now(),
+        review_id: format!("{id}-review"),
+        turns,
+        text: log::review_line(turns),
+    }
 }
 
 /// Разбор сессии делает тул, а не ядро: он живёт в реестре, у него свой репозиторий,
@@ -190,5 +233,84 @@ mod tests {
     #[test]
     fn missing_tickets_dir_is_not_an_error() {
         assert!(ticket_list(Path::new("/нет/такого/каталога")).contains("тикетов нет"));
+    }
+
+    /// Маркер ревью появляется в журнале сессии ровно одной записью и границу
+    /// не сдвигает: источник растёт на одну запись, а префикс (всё до маркера)
+    /// остаётся байт-в-байт прежним.
+    #[test]
+    fn review_marker_is_written_and_does_not_move_the_boundary() {
+        let dir = std::env::temp_dir().join(format!("snens-review-mark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            sessions_dir: dir.display().to_string(),
+            ..Default::default()
+        };
+        let id = "sess";
+        {
+            let sess = log::Session::open(&dir, id).unwrap();
+            for i in 0..3 {
+                sess.append(log::Rec::User {
+                    ts: i,
+                    text: format!("ход {i}"),
+                    source: "cli".into(),
+                    parts: Vec::new(),
+                })
+                .unwrap();
+                sess.append(log::Rec::Assistant {
+                    ts: i,
+                    text: Some(format!("ответ {i}")),
+                    tool_calls: Vec::new(),
+                    reasoning: None,
+                })
+                .unwrap();
+            }
+        }
+        let path = dir.join("sess.jsonl");
+        let before = log::expand(&log::read_file(&path).unwrap(), &dir).len();
+
+        mark_review_start(&cfg, id).unwrap();
+
+        let raw = log::read_file(&path).unwrap();
+        assert_eq!(raw.len(), before + 1, "маркер — ровно одна запись");
+        assert!(
+            matches!(raw.last(), Some(log::Rec::Review { turns, text, .. })
+                if *turns == 3 && text.contains("3 ход")),
+            "маркер записан без числа ходов: {:?}",
+            raw.last()
+        );
+        // Префикс (всё, что было до маркера) не переписан — иначе у провайдера
+        // поехал бы префикс-кеш. Сравниваем ровно тот срез, который уйдёт в
+        // `Replay` следующего прогона.
+        let after = log::expand(&log::read_file(&path).unwrap(), &dir);
+        assert_eq!(after.len(), before + 1);
+        assert_eq!(
+            serde_json::to_string(&after[..before]).unwrap(),
+            serde_json::to_string(&raw[..before]).unwrap()
+        );
+
+        // Проекция промпта маркера не видит: служебная строка, а не сообщение.
+        let wire = serde_json::to_string(&crate::project::raw_msgs(&after, &cfg)).unwrap();
+        assert!(!wire.contains("саморевью"), "маркер уехал в промпт: {wire}");
+        assert_eq!(
+            serde_json::to_string(&crate::project::raw_msgs(&after[..before], &cfg)).unwrap(),
+            wire,
+            "проекция с маркером отличается от проекции без него"
+        );
+
+        // Второй прогон ставит вторую отметку, прежние записи по-прежнему целы:
+        // граница для следующего разбора считается по числу ходов, а не по тексту.
+        mark_review_start(&cfg, id).unwrap();
+        let twice = log::read_file(&path).unwrap();
+        assert_eq!(
+            twice
+                .iter()
+                .filter(|r| matches!(r, log::Rec::Review { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(twice.len(), before + 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

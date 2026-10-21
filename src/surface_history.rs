@@ -179,6 +179,32 @@ pub fn read_with(
                 usage: None,
             }),
             Rec::Recall { .. } | Rec::ContextNotice { .. } => None,
+            // Отметка саморевью — служебная строка журнала, но в транскрипте
+            // ей место: человек должен видеть, где проходила граница разбора.
+            // Отдельная роль `review` (как `recall` у справки памяти): клиент
+            // рисует её тонкой серой строкой и не путает с репликой.
+            Rec::Review { ts, turns, text, .. } => Some(HistoryMessage {
+                seq,
+                ts,
+                role: "review",
+                content: Some(if text.is_empty() {
+                    crate::log::review_line(turns)
+                } else {
+                    text
+                }),
+                source: None,
+                reasoning: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                exit: None,
+                ms: None,
+                argv: None,
+                parts: None,
+                via: None,
+                from: None,
+                usage: None,
+            }),
             Rec::Assistant {
                 ts,
                 text,
@@ -313,6 +339,36 @@ mod tests {
         assert!(shown[0].content.as_deref().unwrap().contains("PRIVATE_RECALL_MARKER"));
         // `context_notice` остаётся служебным даже с флагом: это не память.
         assert!(!serde_json::to_string(&shown).unwrap().contains("PRIVATE_CONTEXT_MARKER"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Маркер саморевью — отдельная роль `review`, а не реплика: клиент рисует её
+    /// тонкой серой строкой, как справку памяти. Сама строка — короткая.
+    #[test]
+    fn review_marker_is_a_separate_thin_row() {
+        let dir = temp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"kind\":\"user\",\"ts\":1,\"text\":\"сделай\",\"source\":\"web\"}\n",
+                "{\"kind\":\"review\",\"ts\":2,\"review_id\":\"s-review\",\"turns\":12,\"text\":\"саморевью · 12 ходов\"}\n",
+                "{\"kind\":\"assistant\",\"ts\":3,\"text\":\"готово\",\"tool_calls\":[]}\n",
+                // Запись без текста (ручная/старая) тоже читается.
+                "{\"kind\":\"review\",\"ts\":4,\"review_id\":\"s-review\",\"turns\":13}\n"
+            ),
+        )
+        .unwrap();
+
+        let rows = read(&path, &Config::default()).unwrap();
+        let roles: Vec<&str> = rows.iter().map(|r| r.role).collect();
+        assert_eq!(roles, ["user", "review", "assistant", "review"], "маркер не отличим от реплики");
+        assert_eq!(rows[1].content.as_deref(), Some("саморевью · 12 ходов"));
+        assert_eq!(rows[1].seq, 2, "seq — физическая строка журнала");
+        // Без текста строка собирается из числа ходов и остаётся короткой.
+        let bare = rows[3].content.as_deref().unwrap();
+        assert!(bare.contains("13") && bare.chars().count() <= 80, "{bare}");
         fs::remove_dir_all(dir).unwrap();
     }
 

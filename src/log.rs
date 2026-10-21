@@ -167,6 +167,37 @@ pub enum Rec {
     /// По нему родитель узнаёт, что ребёнок закончил, и с каким исходом —
     /// даже если модель «забыла» отчитаться.
     Done { ts: u64, status: String, turns: u32 },
+    /// Отметка запуска саморевью в журнале самой сессии. Служебная строка: в
+    /// проекцию промпта не уезжает (это факт о харнессе, а не реплика модели;
+    /// вдобавок её токены платились бы в каждом следующем ходу и сдвигали бы
+    /// префикс-кеш), но видна в транскрипте поверхностью — роль `review`.
+    ///
+    /// Зачем в логе: следующее ревью берёт эту точку за начало своей зоны
+    /// ответственности — `turns` ходов было в момент запуска, всё, что раньше,
+    /// разобрано прошлым прогоном. `text` — короткая строка для показа
+    /// человеку; смысл границы держится на числах, а не на тексте.
+    ///
+    /// Новый вариант, а не расширение `Done`: старые логи читаются как есть
+    /// (неизвестный `kind` в них просто не встречается), а `Done` — терминатор
+    /// сессии, и его семантику мешать с отметкой ревью нельзя.
+    Review {
+        ts: u64,
+        /// Идентификатор запуска: `<сессия>-review`, он же имя лога ревью.
+        review_id: String,
+        /// Сколько ходов (ответов ассистента) было в сессии на момент запуска.
+        #[serde(default)]
+        turns: u64,
+        /// Строка для транскрипта («саморевью · 12 ходов»). `default` — чтобы
+        /// запись без текста читалась, а не роняла лог.
+        #[serde(default)]
+        text: String,
+    },
+}
+
+/// Текст отметки ревью для транскрипта. Одна строка, ≤80 символов: её рисует
+/// клиент тонким серым шрифтом, как справку памяти (`role: "recall"`).
+pub fn review_line(turns: u64) -> String {
+    format!("саморевью · {turns} ходов")
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -858,5 +889,41 @@ mod writer_safety_tests {
         .unwrap();
         let got = Session::open(&dir.0, "a").unwrap().read().unwrap();
         assert!(!got.is_empty(), "кольцо не должно обнулять лог");
+    }
+
+    /// Отметка ревью читается в двух видах и в проекцию не едет.
+    #[test]
+    fn review_marker_reads_back_and_stays_out_of_the_projection() {
+        let dir = TempDir::new();
+        let session = Session::open(&dir.0, "s").unwrap();
+        session.append(user("работа")).unwrap();
+        session
+            .append(Rec::Review {
+                ts: 5,
+                review_id: "s-review".into(),
+                turns: 12,
+                text: review_line(12),
+            })
+            .unwrap();
+        let recs = session.read().unwrap();
+        assert!(matches!(recs.last(), Some(Rec::Review { turns, .. }) if *turns == 12));
+        let cfg = crate::cfg::Config::default();
+        let wire = serde_json::to_string(&crate::project::raw_msgs(&recs, &cfg)).unwrap();
+        assert!(!wire.contains("саморевью"), "маркер уехал в промпт: {wire}");
+        drop(session);
+
+        // Лог, записанный без `turns`/`text` (чужая или будущая запись), читается.
+        std::fs::write(
+            dir.0.join("old.jsonl"),
+            concat!(
+                "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\",\"parent\":\"\"}\n",
+                "{\"kind\":\"review\",\"ts\":2,\"review_id\":\"old-review\"}\n"
+            ),
+        )
+        .unwrap();
+        let old = read_file(&dir.0.join("old.jsonl")).unwrap();
+        assert!(
+            matches!(&old[1], Rec::Review { turns: 0, text, review_id, .. } if text.is_empty() && review_id == "old-review")
+        );
     }
 }
