@@ -15,5 +15,6 @@ tools/*/search
 tools/*/fetch
 tools/*/grep
 tools/*/shot
+tools/*/web
 oneoff/*/.venv/
 oneoff/*/*.db

@@ -413,6 +413,26 @@ t fetch "ftp://example.com/x"
 want 2 "$rc" "fetch: не http(s) — код 2"
 has "только http/https" "$err" "fetch: не http(s) — текст"
 
+# ---- web ----
+# Полный набор живых проверок — рядом (tools/web/selftest.sh, поднимает Chrome и
+# локальную страницу). Здесь — только контракт, который видит модель.
+t web --help
+want 0 "$rc" "web: --help — код 0"
+has "web — " "$out" "web: --help, строка 1 = суть"
+has "web connect" "$out" "web: --help, строка 2 = usage"
+
+t web nosuchcommand
+want 2 "$rc" "web: неизвестная команда — код 2"
+
+# Без привязки тул обязан сказать «connect», а не падать на соединении.
+SNENS_WEB_STATE=$TMP/webstate
+export SNENS_WEB_STATE
+unset SNENS_CDP_PORT
+t web snap
+want 1 "$rc" "web: snap без подключения — код 1"
+has "web connect" "$err" "web: snap без подключения — подсказка"
+unset SNENS_WEB_STATE
+
 # ---- grep ----
 # Структурированный поиск вместо ad-hoc `run 'grep -rn ...'`: путь, строка, текст.
 g=$TMP/g

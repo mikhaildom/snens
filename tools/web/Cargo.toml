@@ -1,0 +1,15 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = "0.30"
+
+# Только unix: SIGPIPE в дефолтное состояние. Без этого `web snap | head`
+# роняет процесс паникой «failed printing to stdout», а не завершает его тихо,
+# как всякий нормальный CLI.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

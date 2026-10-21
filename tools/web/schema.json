@@ -1,0 +1,57 @@
+{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "enum": ["connect", "status", "tabs", "use", "open", "snap", "act", "shot", "eval", "text", "probe", "close"],
+      "description": "Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется"
+    },
+    "url": {
+      "type": "string",
+      "description": "Адрес для open (только http/https/file)"
+    },
+    "tab": {
+      "type": "string",
+      "description": "Вкладка для use: id (или его начало) либо номер из tabs"
+    },
+    "json": {
+      "type": "string",
+      "description": "Для act: JSON-массив действий, напр. [{\"click\":\"e3\"},{\"type\":{\"ref\":\"e1\",\"text\":\"hi\"}},{\"press\":\"Enter\"}]. Действия: click/hover (адрес или [x,y]), type {ref,text}, clear, press, scroll, navigate, wait, upload {ref,file}, eval"
+    },
+    "expr": {
+      "type": "string",
+      "description": "Для eval: JS-выражение; результат печатается как есть (объект — JSON)"
+    },
+    "limit": {
+      "type": "integer",
+      "description": "Для text: сколько символов отдать (дефолт 4000)"
+    },
+    "depth": {
+      "type": "integer",
+      "description": "Для snap: максимальная глубина дерева (дефолт 30)"
+    },
+    "out": {
+      "type": "string",
+      "description": "Для shot: путь к PNG (дефолт — канал вложений или каталог состояния)"
+    },
+    "port": {
+      "type": "integer",
+      "description": "Порт CDP (дефолт 9222 или порт из состояния connect)"
+    }
+  },
+  "required": ["command"],
+  "x-snens": {
+    "argv": [
+      {"field": "command"},
+      {"field": "url"},
+      {"field": "tab"},
+      {"flag": "--json", "field": "json"},
+      {"flag": "--expr", "field": "expr"},
+      {"flag": "--limit", "field": "limit"},
+      {"flag": "--depth", "field": "depth"},
+      {"flag": "--out", "field": "out"},
+      {"flag": "--port", "field": "port"}
+    ],
+    "stdin": {"mode": "none"}
+  }
+}
