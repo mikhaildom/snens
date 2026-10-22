@@ -28,7 +28,18 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-TARGET = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", "/mnt/HC_Volume_106138989/cargo-target/snens-next"))
+def _target_dir() -> pathlib.Path:
+    """Каталог сборки спрашиваем у cargo, а не хардкодим: у каждой машины свой."""
+    if os.environ.get("CARGO_TARGET_DIR"):
+        return pathlib.Path(os.environ["CARGO_TARGET_DIR"])
+    meta = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        cwd=ROOT, capture_output=True, text=True, check=True,
+    )
+    return pathlib.Path(json.loads(meta.stdout)["target_directory"])
+
+
+TARGET = _target_dir()
 BIN = pathlib.Path(os.environ.get("SNENS_BIN", TARGET / "debug/snens"))
 WAIT = 10
 

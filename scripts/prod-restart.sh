@@ -10,13 +10,16 @@
 #   scripts/prod-restart.sh            # собрать, поставить, перезапустить
 #   scripts/prod-restart.sh --dry-run  # показать, что будет сделано, ничего не менять
 #   scripts/prod-restart.sh --no-restart
-#   scripts/prod-restart.sh --service snens-next   # другой юнит (по умолчанию snens)
+#   scripts/prod-restart.sh --service snens-dev  # другой юнит (по умолчанию snens)
+#   scripts/prod-restart.sh --port 7440          # другой порт для проверки живости
 set -eu
 
-REPO="${SNENS_REPO:-$HOME/projects/snens}"
+# Репозиторий — тот, в котором лежит этот скрипт, если не задан явно:
+REPO="${SNENS_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 LAUNCHER="$HOME/.local/bin/snens"
 RELEASES="$HOME/.local/lib/snens/releases"
 SERVICE="snens"
+PORT=7420
 DRY=0
 RESTART=1
 
@@ -26,6 +29,7 @@ while [ $# -gt 0 ]; do
         --no-restart) RESTART=0 ;;
         --service) SERVICE="$2"; shift ;;
         --repo) REPO="$2"; shift ;;
+        --port) PORT="$2"; shift ;;
         -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "неизвестный флаг: $1" >&2; exit 2 ;;
     esac
@@ -94,11 +98,11 @@ i=0
 while [ "$i" -lt 30 ]; do
     i=$((i + 1))
     CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
-        http://127.0.0.1:7420/v1/model || true)"
+        http://127.0.0.1:$PORT/v1/model || true)"
     case "$CODE" in
         200|401) say "сервис отвечает (HTTP $CODE)"; break ;;
     esac
-    [ "$i" -ge 30 ] && die "сервис не отвечает на 127.0.0.1:7420 после рестарта; смотри journalctl --user -u $SERVICE"
+    [ "$i" -ge 30 ] && die "сервис не отвечает на 127.0.0.1:$PORT после рестарта; смотри journalctl --user -u $SERVICE"
     sleep 1
 done
 

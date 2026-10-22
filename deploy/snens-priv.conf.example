@@ -1,0 +1,22 @@
+# Конфигурация брокера привилегий snens-priv (лежит в /etc/snens-priv.conf, root:root 0644)
+#
+# Брокер ставится так (делает человек, не агент):
+#   sudo install -m 0755 -o root -g root scripts/snens-priv /usr/local/bin/snens-priv
+#   sudo install -m 0644 -o root -g root deploy/snens-priv.conf.example /etc/snens-priv.conf
+#   echo "$(whoami) ALL=(root) NOPASSWD: /usr/local/bin/snens-priv" \
+#     | sudo tee /etc/sudoers.d/snens-priv && sudo chmod 0440 /etc/sudoers.d/snens-priv
+#
+# Пока файл пуст (или в нём только комментарии), брокер отказывает во всём:
+# это намеренный дефолт — установка никому ничего не выдаёт.
+
+# Юниты (systemctl --user / system), которые агенту разрешено перезапускать.
+# Через пробел; суффикс .service можно не писать.
+units = ""
+
+# Корни, внутри которых разрешены `mkdir -p` и `chown`. Через пробел.
+# Выход вверх (`..`) запрещён всегда, поэтому `/var/www` не даёт `/etc`.
+roots = ""
+
+# Единственный владелец для `chown` вида `пользователь:группа`.
+# Пусто — chown запрещён.
+owner = ""

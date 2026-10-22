@@ -10,9 +10,9 @@
     "depth": {"type": "integer", "description": "Для snap: максимальная глубина дерева (дефолт 30)"},
     "out": {"type": "string", "description": "Для shot: путь к PNG (дефолт — канал вложений или каталог состояния)"},
     "port": {"type": "integer", "description": "Порт CDP (дефолт 9222 или порт из состояния connect)"},
-    "host": {"type": "string", "description": "Машина пользователя для ssh: та же команда выполняется там (там тоже должен стоять web). Пример: svuving или svuvich@192.168.1.10"},
+    "host": {"type": "string", "description": "Машина пользователя для ssh: та же команда выполняется там (там тоже должен стоять web). Пример: user@machine"},
     "profile": {"type": "string", "description": "Для launch: каталог профиля Chrome на той машине (по умолчанию ~/.snens-chrome). Отдельный профиль = отладка без подтверждений"},
-    "tunnel": {"type": "string", "description": "Машина пользователя для ssh-туннеля к её Chrome: на той стороне web ставить не нужно, только Chrome с включённым тумблером в chrome://inspect/#remote-debugging. Пример: svuvich@192.168.1.10. Дальше все команды идут через туннель"}
+    "tunnel": {"type": "string", "description": "Машина пользователя для ssh-туннеля к её Chrome: на той стороне web ставить не нужно, только Chrome с включённым тумблером в chrome://inspect/#remote-debugging. Пример: user@machine. Дальше все команды идут через туннель"}
 
   },
   "required": ["command"],

@@ -40,7 +40,7 @@ pub struct Config {
     #[serde(default)]
     pub context_budget: u64,
     /// Профили по модели: префикс slug → свои пороги уборки. Нужны потому, что
-    /// цена кеша у моделей разная: дешёвый кеш (deepseek) терпит большой контекст,
+    /// цена кеша у моделей разная: дешёвый кеш терпит большой контекст,
     /// дорогой требует уборки раньше. Побеждает самый длинный префикс.
     #[serde(default)]
     pub models: BTreeMap<String, ModelProfile>,
@@ -111,9 +111,19 @@ pub struct Config {
     /// разгона; при достижении цикл не падает, а просит у модели промежуточный итог.
     #[serde(default = "d_max_turns")]
     pub max_turns: u32,
+    /// Сколько секунд стрим провайдера может молчать между кадрами, прежде чем
+    /// ход считается оборванным. Без этого залипший стрим вешает run навсегда
+    /// (`Done` не пишется, состояние остаётся `running`, авторевью не срабатывает).
+    #[serde(default = "d_stream_idle")]
+    pub stream_idle_seconds: u64,
     /// Свой файл промпта ревью вместо вкомпилированного (для опытов).
     #[serde(default)]
     pub review_prompt: Option<String>,
+    /// Каталог инстанса под git: промпт просит коммитить тикеты сразу.
+    /// Включено только там, где data-dir действительно репозиторий; продукту
+    /// это не нужно и чужого `user.name` в системе не подразумевает.
+    #[serde(default)]
+    pub instance_git: bool,
     /// Ящик сессий: канал между подагентом и родителем. Дефолт — рядом с сессиями,
     /// чтобы всё инстанса жило в одном месте.
     #[serde(default = "d_mail")]
@@ -192,11 +202,14 @@ impl Default for Memory {
     }
 }
 
+/// Провайдер не выбирается за человека: ключ у всех свой, а подставить
+/// чужой base_url значит молча отправить ключ не туда. Пусто — ошибка с
+/// подсказкой (см. `api_key`/`llm`), а не тихая попытка «куда-нибудь».
 fn d_base_url() -> String {
-    "https://inference-api.nousresearch.com/v1".into()
+    String::new()
 }
 fn d_model() -> String {
-    "deepseek/deepseek-v4.1-flash".into()
+    String::new()
 }
 fn d_key_env() -> String {
     "SNENS_API_KEY".into()
@@ -243,9 +256,8 @@ fn d_skills() -> String {
 fn d_review_min() -> usize {
     20
 }
-/// Простой перед авторевью: 10 минут (решение пользователя 2026-…: 4 минуты
-/// дёргали ревью слишком рано — сессия ещё живёт, а следующее отодвигалось).
-/// В конфиге инстанса значение выставлено явно.
+/// Простой перед авторевью: 10 минут. Порог нужен потому, что 4 минуты дёргали
+/// ревью слишком рано: сессия ещё жила, а следующее отодвигалось.
 fn d_review_idle() -> u64 {
     600
 }
@@ -256,6 +268,11 @@ fn d_approval_timeout() -> u64 {
 }
 fn d_max_turns() -> u32 {
     200
+}
+/// Молчание стрима дольше двух минут — уже не «модель думает»: соединение
+/// живое, а данных нет (залипший апстрим). Пустая строка ответа? Нет — обрыв.
+fn d_stream_idle() -> u64 {
+    120
 }
 fn d_mem_timeout() -> u64 {
     60
@@ -280,24 +297,42 @@ pub fn home() -> String {
     ".".into()
 }
 
-/// XDG на unix, APPDATA на Windows. macOS — тоже unix-ветка: `~/.local/share`
-/// не маковская конвенция, но своя раскладка на каждую ОС дороже, чем ноль.
+/// Каталог данных: XDG на unix (`XDG_DATA_HOME`, иначе `~/.local/share`),
+/// APPDATA на Windows. macOS идёт по unix-ветке: своя раскладка на каждую ОС
+/// дороже, чем ноль, а `SNENS_DATA_DIR`/`SNENS_CONFIG_DIR` закрывают остальное
+/// (портативная установка, несколько инстансов, тесты без домашнего каталога).
 pub fn data_dir() -> String {
+    if let Some(p) = env_dir("SNENS_DATA_DIR") {
+        return p;
+    }
     if cfg!(windows) {
         if let Ok(a) = std::env::var("APPDATA") {
             return format!("{a}/snens");
         }
     }
-    format!("{}/.local/share/snens", home())
+    let base = env_dir("XDG_DATA_HOME").unwrap_or_else(|| format!("{}/.local/share", home()));
+    format!("{base}/snens")
 }
 
 fn config_dir() -> String {
+    if let Some(p) = env_dir("SNENS_CONFIG_DIR") {
+        return p;
+    }
     if cfg!(windows) {
         if let Ok(a) = std::env::var("APPDATA") {
             return format!("{a}/snens");
         }
     }
-    format!("{}/.config/snens", home())
+    let base = env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| format!("{}/.config", home()));
+    format!("{base}/snens")
+}
+
+/// Переменная как каталог: пустое значение — «не задано», а не корень ФС.
+fn env_dir(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 pub fn config_path() -> PathBuf {
@@ -628,7 +663,14 @@ impl Config {
                 return Ok(k);
             }
         }
-        let path = config_path().with_file_name(".env");
+        // Рядом с *фактическим* конфигом: при `--config /tmp/x/config.toml`
+        // секрет должен браться из /tmp/x/.env, а не из глобального каталога
+        // пользователя (иначе инстансы обмениваются чужими ключами).
+        let path = self
+            .source_path
+            .clone()
+            .unwrap_or_else(config_path)
+            .with_file_name(".env");
         if let Ok(text) = std::fs::read_to_string(&path) {
             for line in text.lines() {
                 let line = line.trim();

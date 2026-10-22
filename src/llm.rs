@@ -120,8 +120,11 @@ impl OpenAi {
     pub fn new(key: String) -> R<Self> {
         Ok(OpenAi {
             // Некоторые провайдеры (в т.ч. Nous Portal) отдают 403 без User-Agent.
+            // Таймауты обязательны: залипший на середине стрим иначе висит вечно —
+            // ход не закончится, `Done` не запишется, run останется running.
             client: reqwest::Client::builder()
                 .user_agent(concat!("snens/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(std::time::Duration::from_secs(15))
                 .build()?,
             key,
         })
@@ -182,6 +185,14 @@ impl OpenAi {
             body[k] = v.clone();
         }
 
+        if cfg.base_url.trim().is_empty() {
+            return Err("не задан base_url провайдера — укажи его в конфиге \
+                        (например https://openrouter.ai/api/v1)"
+                .into());
+        }
+        if cfg.model.trim().is_empty() {
+            return Err("не задана модель — укажи model в конфиге или `snens model <slug>`".into());
+        }
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
         let mut req = self.client.post(&url).bearer_auth(&self.key).json(&body);
         for (k, v) in &cfg.headers {
@@ -292,7 +303,19 @@ impl OpenAi {
         };
 
         let mut stopped = false;
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = tokio::time::timeout(
+            std::time::Duration::from_secs(cfg.stream_idle_seconds),
+            stream.next(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "стрим молчит дольше {} с после {} символов",
+                cfg.stream_idle_seconds,
+                text.len() + parts.values().map(|p| p.2.len()).sum::<usize>()
+            )
+        })?
+        {
             let chunk = chunk.map_err(|e| {
                 format!(
                     "стрим оборван после {} символов: {e}",
@@ -533,6 +556,8 @@ mod tests {
 
         let mut cfg = crate::cfg::Config::default();
         cfg.base_url = format!("http://{addr}");
+        // Модель и провайдер больше не зашиты в дефолты — тест задаёт их сам.
+        cfg.model = "test/model".into();
         let llm = OpenAi::new("test-key".into()).unwrap();
         let mut noop = |_: Delta| {};
         let reply = llm

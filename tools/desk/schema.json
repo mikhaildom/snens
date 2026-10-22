@@ -16,7 +16,7 @@
     },
     "tunnel": {
       "type": "string",
-      "description": "Машина, где живёт агент (ssh): например svuvich@192.168.1.10. Нужна для любой команды"
+      "description": "Машина, где живёт агент (ssh): например user@machine. Нужна для любой команды"
     },
     "out": {
       "type": "string",

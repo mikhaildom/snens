@@ -11,9 +11,9 @@
 
 ```json
 {
-  "path": "/home/x/.config/snens/config.toml",
+  "path": "/home/user/.config/snens/config.toml",
   "values": {
-    "model": "deepseek/deepseek-v4.1-flash-1017",
+    "model": "vendor/model-name",
     "subagent_model": "",
     "max_turns": 200,
     "review_min_turns": 20,

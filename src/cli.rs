@@ -16,7 +16,6 @@ mod llm;
 mod log;
 mod mail;
 mod memory;
-#[cfg_attr(feature = "surface-next", allow(dead_code))] // Experimental entry retains legacy commands but does not use production defaults.
 mod production;
 mod project;
 mod prompt;

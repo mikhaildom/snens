@@ -58,7 +58,7 @@ web show                               вывести окно агентско�
                                        (там тоже должен стоять web; вывод — как локально)
 
 Проверка с машины пользователя, где ничего не установлено:
-  web connect --tunnel svuvich@192.168.1.10   # ssh -L к её Chrome, порт 9222
+  web connect --tunnel user@machine        # ssh -L к его Chrome, порт 9222
   web snap / web act …                        # дальше как обычно, туннель уже поднят
   web disconnect                              # закрыть туннель
 

@@ -1,8 +1,7 @@
 # Подагенты и steer
 
 Дизайн-документ. Почему подагенты устроены так, а не иначе, и что сознательно
-не сделано. Код: `src/mail.rs`, `src/subagent.rs`, `src/tui.rs`, `tools/agent/`;
-пункты в `docs/backlog.md`.
+не сделано. Код: `src/mail.rs`, `src/subagent.rs`, `src/tui.rs`, `tools/agent/`.
 
 ## Задача
 

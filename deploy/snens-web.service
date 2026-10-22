@@ -6,9 +6,11 @@ After=network.target snens.service
 Type=simple
 WorkingDirectory=%h/projects/snens-web
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-# Прод-клиент на своём порту: 5174 — рабочий порт vite, который человек
-# открывает сам; стенд живёт на 5175 (:7440), эксперименты — дальше.
+# Порт веб-клиента: свой, чтобы не совпасть с тем, который человек держит
+# открытым в браузере (`npm run dev` по умолчанию берёт 5174).
 Environment=SNENS_WEB_PORT=5180
+# Клиент — собранный dist, а не dev-сервер: npx vite в поставке не нужен.
+Environment=SNENS_WEB_DIST=%h/.local/share/snens/web
 Environment=SNENS_API_BASE=http://127.0.0.1:7420
 Environment=SNENS_API_TOKEN_FILE=%h/.local/share/snens/api.token
 ExecStart=/usr/local/bin/npx vite

@@ -5,7 +5,7 @@ use std::{
 };
 
 const HELP: &str = "snens — production entry\n\
-  serve [--config PATH] [--listen 127.0.0.1:7420] [--token-file PATH]\n\
+  serve [--config PATH] [--listen 127.0.0.1:7420] [--token-file PATH] [--data-dir DIR]\n\
   tui [--config PATH] [--endpoint URL] [--token-file PATH] [--session ID]\n\
   tui-local [--session ID] [--config PATH] — прежний локальный TUI\n\
   run, run-child, review, tools, build, config/model и остальные команды — legacy CLI\n\nDefault config: ~/.config/snens/config.toml; API token: <cfg.data_path()>/api.token.\n\
@@ -24,7 +24,7 @@ pub async fn entry() -> R<()> {
     match cmd {
         "serve" => {
             let parsed = flags(&argv[1..])?;
-            validate_options(&parsed, &["config", "listen", "token-file"])?;
+            validate_options(&parsed, &["config", "listen", "token-file", "data-dir"])?;
             serve(&parsed).await
         }
         "tui" => {
@@ -63,6 +63,14 @@ pub async fn entry() -> R<()> {
 
 async fn serve(flags: &BTreeMap<String, String>) -> R<()> {
     set_effective_config(flags.get("config").map(String::as_str))?;
+    // Отдельный инстанс — это отдельный каталог данных, а не вторая сборка:
+    // стенд/эксперимент получает свои сессии, ключ и токен, не задевая рабочие.
+    if let Some(dir) = flags.get("data-dir") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)?;
+        let dir = std::fs::canonicalize(dir)?;
+        std::env::set_var("SNENS_DATA_DIR", &dir);
+    }
     let cfg = Config::load(None)?;
     let data = cfg.data_path();
     std::fs::create_dir_all(&data)?;
@@ -184,7 +192,7 @@ fn flags(args: &[String]) -> R<BTreeMap<String, String>> {
     while let Some(key) = args.next() {
         if !matches!(
             key.as_str(),
-            "--config" | "--listen" | "--token-file" | "--endpoint" | "--session"
+            "--config" | "--listen" | "--token-file" | "--endpoint" | "--session" | "--data-dir"
         ) {
             return Err(format!("unknown option {key}").into());
         }

@@ -1,9 +1,0 @@
-#!/bin/sh
-# echo-one — напечатать «one» (проверочный тул).
-# echo-one [текст]
-case "$1" in
-  -h|--help)
-    printf '%s\n' 'echo-one — напечатать «one» (проверочный тул).' 'echo-one [текст]' 'Без аргумента печатает «one», с аргументом — его.'
-    exit 0 ;;
-esac
-if [ $# -gt 0 ]; then printf '%s\n' "$*"; else printf '%s\n' 'one'; fi

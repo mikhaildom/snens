@@ -104,7 +104,6 @@ pub struct SurfaceRunOptions<'a> {
     pub tool_tx: Option<tokio::sync::mpsc::UnboundedSender<SurfaceToolRequest>>,
 }
 
-// Each binary is linted independently; only snens-next consumes these fields.
 pub struct SurfaceToolRequest {
     #[allow(dead_code)]
     pub call_id: String,
@@ -116,7 +115,6 @@ pub struct SurfaceToolRequest {
     pub result: tokio::sync::oneshot::Sender<SurfaceToolResult>,
 }
 #[derive(Clone)]
-#[cfg_attr(not(feature = "surface-next"), allow(dead_code))] // Result is delivered by the experimental HTTP/SSE surface.
 pub struct SurfaceToolResult {
     pub text: String,
     pub exit: i32,
