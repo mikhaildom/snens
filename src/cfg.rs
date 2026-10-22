@@ -466,10 +466,8 @@ impl Config {
         }
     }
 
-    /// Сменить основную модель: правит строку `model = "..."` в конфиге.
-    /// Текстом, а не пере-сериализацией TOML: комментарии и порядок полей
-    /// человека — часть конфига, `toml::to_string` их сносит. Ключа в файле
-    /// нет — вставляем до первой `[секции]`, чтобы остался top-level.
+    /// Сменить основную модель: правит `model` в конфиге как документ (см.
+    /// `cfg_edit`), так что комментарии и порядок полей человека остаются.
     /// Возвращает путь конфига (что именно поправили).
     pub fn set_model(&self, slug: &str, override_path: Option<&str>) -> R<PathBuf> {
         let slug = slug.trim();
@@ -478,50 +476,17 @@ impl Config {
         }
         let path = match override_path {
             Some(p) => PathBuf::from(p),
-            None => config_path(),
+            None => self.source_path.clone().unwrap_or_else(config_path),
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("{}: {e}", path.display()).into()),
-        };
-        let line = format!("model = \"{slug}\"");
-        let mut out = String::new();
-        let mut replaced = false;
-        let mut inserted = false;
-        for raw in text.lines() {
-            let key = raw.trim_start();
-            let is_model = key
-                .strip_prefix("model")
-                .map(|rest| rest.trim_start().starts_with('='))
-                .unwrap_or(false);
-            if !replaced && is_model {
-                out.push_str(&line);
-                out.push('\n');
-                replaced = true;
-                continue;
-            }
-            // Нет ключа: вставляем перед первой секцией (иначе ключ уедет в неё).
-            if !replaced && !inserted && key.starts_with('[') {
-                out.push_str(&line);
-                out.push('\n');
-                inserted = true;
-            }
-            out.push_str(raw);
-            out.push('\n');
-        }
-        if !replaced && !inserted {
-            if !out.is_empty() && !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-            out.push_str(&line);
-            out.push('\n');
-        }
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, out)?;
-        // Проверяем, что конфиг остался валидным и модель действительно та.
+        crate::cfg_edit::write(
+            &path,
+            &[crate::cfg_edit::Edit::top(
+                "model",
+                crate::cfg_edit::string(slug),
+            )],
+        )?;
+        // Проверяем, что модель действительно та: правка могла не совпасть с
+        // тем, что прочитает ядро (например, ключ перекрыт секцией).
         let check = Config::load(Some(&path.display().to_string()))?;
         if check.model != slug {
             return Err(format!("модель не применилась: в конфиге {}", check.model).into());
@@ -529,77 +494,56 @@ impl Config {
         Ok(path)
     }
 
-    /// Правка одного ключа секции `[memory]`: текстовая, как `set_model`, —
-    /// комментарии человека в конфиге не сносим. Секции нет — создаём.
-    /// `value` — готовая строка значения (`true`, `"always"`).
+    /// Правка одного ключа секции `[memory]` (совместимость с `snens memory`).
     pub fn set_memory_key(&self, key: &str, value: &str) -> R<PathBuf> {
-        let path = match &self.source_path {
-            Some(p) => p.clone(),
-            None => config_path(),
-        };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("{}: {e}", path.display()).into()),
-        };
-        let line = format!("{key} = {value}");
-        let mut out = String::new();
-        let mut in_memory = false;
-        let mut seen_section = false;
-        let mut done = false;
-        // Заголовок следующей секции (или конец файла) — точка, где дописываем
-        // ключ в `[memory]`, если его там не было. Новую секцию здесь не
-        // создаём: до конца файла ещё может встретиться настоящая `[memory]`.
-        let flush = |out: &mut String, in_memory: bool, done: &mut bool| {
-            if in_memory && !*done {
-                out.push_str(&line);
-                out.push('\n');
-                *done = true;
-            }
-        };
-        for raw in text.lines() {
-            let trimmed = raw.trim_start();
-            if trimmed.starts_with('[') {
-                flush(&mut out, in_memory, &mut done);
-                in_memory = trimmed.starts_with("[memory]");
-                seen_section |= in_memory;
-                out.push_str(raw);
-                out.push('\n');
-                continue;
-            }
-            let is_key = in_memory
-                && !done
-                && trimmed
-                    .strip_prefix(key)
-                    .map(|rest| rest.trim_start().starts_with('='))
-                    .unwrap_or(false);
-            if is_key {
-                out.push_str(&line);
-                out.push('\n');
-                done = true;
-                continue;
-            }
-            out.push_str(raw);
-            out.push('\n');
+        self.set_section_key("memory", key, value)
+    }
+
+    /// Правка одного ключа секции: `value` — готовая TOML-строка значения,
+    /// разбираемая в документ (например `"always"` или `true`).
+    pub fn set_section_key(&self, section: &str, key: &str, value: &str) -> R<PathBuf> {
+        self.set_keys(&[(Some(section.to_string()), key.to_string(), value.to_string())])
+    }
+
+    /// Правка одного ключа верхнего уровня.
+    pub fn set_top_key(&self, key: &str, value: &str, path: Option<&Path>) -> R<PathBuf> {
+        let target = path.map(Path::to_path_buf);
+        let edits = self.parse_edits(&[(None, key.to_string(), value.to_string())])?;
+        let path = target.unwrap_or_else(|| self.source_path.clone().unwrap_or_else(config_path));
+        crate::cfg_edit::write(&path, &edits)
+    }
+
+    /// Пачка правок: одна запись файла, поэтому пачка либо применяется целиком,
+    /// либо не применяется вовсе. `(секция, ключ, TOML-значение)`.
+    pub fn set_keys(&self, changes: &[(Option<String>, String, String)]) -> R<PathBuf> {
+        let edits = self.parse_edits(changes)?;
+        let path = self.source_path.clone().unwrap_or_else(config_path);
+        crate::cfg_edit::write(&path, &edits)
+    }
+
+    /// Текст значения → правка документа. Строки разбираются как TOML, так что
+    /// экранирование (перевод строки, кавычки) делает сам парсер, а не мы.
+    fn parse_edits(
+        &self,
+        changes: &[(Option<String>, String, String)],
+    ) -> R<Vec<crate::cfg_edit::Edit>> {
+        let mut out = Vec::new();
+        for (section, key, value) in changes {
+            let parsed: toml::Value = format!("v = {value}")
+                .parse()
+                .map_err(|e| format!("{key}: значение не разбирается как TOML: {e}"))?;
+            let value = match parsed.get("v") {
+                Some(toml::Value::String(s)) => crate::cfg_edit::string(s),
+                Some(toml::Value::Integer(n)) => crate::cfg_edit::int(*n as u64)?,
+                Some(toml::Value::Boolean(b)) => crate::cfg_edit::boolean(*b),
+                _ => return Err(format!("{key}: неподдерживаемый тип значения {value}").into()),
+            };
+            out.push(match section.as_deref() {
+                None => crate::cfg_edit::Edit::top(key.clone(), value),
+                Some(section) => crate::cfg_edit::Edit::section(section, key.clone(), value),
+            });
         }
-        flush(&mut out, in_memory, &mut done);
-        // Ключ не нашёлся и секции не было вовсе — создаём её здесь (flush не
-        // знает про `seen_section`, чтобы не дублировать вставку).
-        if !done && !seen_section {
-            if !out.is_empty() && !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-            out.push_str("[memory]\n");
-            out.push_str(&line);
-            out.push('\n');
-        }
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, out)?;
-        // Проверяем, что конфиг остался валидным.
-        Config::load(Some(&path.display().to_string()))?;
-        Ok(path)
+        Ok(out)
     }
 
     /// Секция памяти для нового хода: перечитать из файла. Поверхности живут
@@ -607,16 +551,49 @@ impl Config {
     /// действовал бы до перезапуска сервиса. Файла нет или он сломан — снимок
     /// старта: правка конфига под руками не должна ронять ход.
     pub fn memory_now(&self) -> Memory {
-        let Some(path) = &self.source_path else {
-            return self.memory.clone();
-        };
-        match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(fresh) => fresh.memory,
-                Err(_) => self.memory.clone(),
-            },
-            Err(_) => self.memory.clone(),
+        self.fresh().map(|f| f.memory).unwrap_or_else(|| self.memory.clone())
+    }
+
+    /// Конфиг на следующий ход: перечитанный из файла, но с моделями снимка
+    /// старта, если они закреплены кодом (`subagent_model` подагента) — они не
+    /// в файле и перечиткой затёрлись бы.
+    ///
+    /// Единое место для всего, что живо меняется без рестарта сервиса: модель,
+    /// память, лимит ходов, пороги уборки, оболочка, вложения. Поверхность
+    /// живёт днями, а правит файл кто угодно — UI настроек, `snens config`,
+    /// человек в редакторе. Файла нет или он сломан — снимок старта: правка
+    /// конфига под руками не должна ронять ход.
+    pub fn live(&self) -> Config {
+        let mut fresh = self.fresh().unwrap_or_else(|| self.clone());
+        if self.model_pinned {
+            fresh.model = self.model.clone();
+            fresh.model_pinned = true;
         }
+        // Поля, заданные кодом на этот запуск, а не файлом: их перечитка
+        // затёрла бы. `context_budget`/`context_target` выставляет поверхность
+        // per-session (групповой чат живёт с своим порогом уборки) — это не
+        // настройка инстанса, а параметр сессии.
+        fresh.context_budget = self.context_budget;
+        fresh.context_target = self.context_target;
+        fresh.source_path = self.source_path.clone();
+        fresh
+    }
+
+    /// Конфиг, каким он сейчас лежит в файле. `None` — файла нет или он не
+    /// разбирается.
+    pub fn fresh(&self) -> Option<Config> {
+        let path = self.source_path.as_ref()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let mut fresh: Config = toml::from_str(&text).ok()?;
+        // Пути раскрываются один раз в `load`; перечитанный конфиг их не теряет,
+        // только если получит тот же `~`-разворот.
+        fresh.sessions_dir = self.sessions_dir.clone();
+        fresh.tools_dir = self.tools_dir.clone();
+        fresh.tickets_dir = self.tickets_dir.clone();
+        fresh.skills_dir = self.skills_dir.clone();
+        fresh.mail_dir = self.mail_dir.clone();
+        fresh.source_path = self.source_path.clone();
+        Some(fresh)
     }
 
     /// Модель для нового хода: перечитать из файла.
@@ -628,16 +605,7 @@ impl Config {
         if self.model_pinned {
             return self.model.clone();
         }
-        let Some(path) = &self.source_path else {
-            return self.model.clone();
-        };
-        match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(fresh) => fresh.model,
-                Err(_) => self.model.clone(),
-            },
-            Err(_) => self.model.clone(),
-        }
+        self.fresh().map(|f| f.model).unwrap_or_else(|| self.model.clone())
     }
 
     /// Сменить модель в файле и сразу применить её в этом процессе: без второго

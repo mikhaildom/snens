@@ -53,6 +53,14 @@ pub struct Session {
     /// Сейчас не заполняется: см. `turns`/`done`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_ms: Option<u64>,
+    /// Когда подагент начал работу: unix-время первой записи журнала. Вместе с
+    /// `done_at` даёт длительность — клиент рисует «работает 4 мин» или
+    /// «заняло 12 мин», не опрашивая ядро повторно.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    /// Когда подагент закрылся (запись `Done`). Пусто — ещё работает.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Event {
@@ -103,6 +111,12 @@ pub struct Store {
     pub reviews: BTreeMap<String, u64>,
 }
 impl Session {
+    /// Подагент ли это: у него есть родитель. Признак берётся из `parent`
+    /// (`Meta` журнала) — store его не хранит.
+    pub fn is_child(&self) -> bool {
+        self.parent.as_deref().is_some_and(|p| !p.trim().is_empty())
+    }
+
     /// Новая сессия поверхности без per-session бюджета: пороги берутся из конфига.
     pub fn new(id: impl Into<String>, surface: impl Into<String>) -> Self {
         Self {
@@ -119,6 +133,8 @@ impl Session {
             turns: None,
             done: None,
             last_ms: None,
+            started_at: None,
+            done_at: None,
         }
     }
 }
@@ -151,6 +167,10 @@ pub struct Runtime {
     /// Живут только в памяти: заявка одноразовая и короткоживущая, рестарт её
     /// отменяет (шим получит отказ).
     pub approvals: Mutex<BTreeMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// Поток изменений списка сессий (`GET /v1/events`): клиент делает upsert
+    /// вместо опроса `GET /v1/sessions`. Несёт уже собранный JSON события:
+    /// разный вид у разных подписчиков не нужен.
+    pub tx_updates: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 impl Runtime {
     pub fn persist(&self, data: &Store) -> crate::R<()> {
@@ -188,9 +208,67 @@ impl Runtime {
             d.events.entry(id.into()).or_default().push(e.clone());
             self.persist(&d)?;
         }
+        drop(d);
+        // Карточка подагента живёт потоком (`GET /v1/sessions` без запроса), но
+        // обновляется отдельным шагом: событий у ребёнка много, а меняется из
+        // них немногое. Признак «это подагент» проверяет сам шаг — по журналу.
+        self.refresh_child(id).await;
         let _ = self.tx.send(e.clone());
         Ok(e)
     }
+
+    /// Пересчитать запись подагента по журналу и pid и, если карточке есть что
+    /// перерисовать, опубликовать её в поток списка.
+    ///
+    /// Вынесено из `emit` отдельным шагом: событий у ребёнка много (дельты идут
+    /// пачками по 32), а меняется при этом только счётчик ходов и состояние —
+    /// кадр на каждую дельту был бы теми же данными тридцать два раза.
+    pub async fn refresh_child(&self, id: &str) {
+        let Some(mut fresh) = crate::surface_server::discovery::session_by_id(&self.cfg, id) else {
+            return;
+        };
+        // Подагент ли это — по журналу (`Meta.parent`), а не по store: в store
+        // запись могла лечь до того, как метка появилась, и признак там пустой.
+        if !fresh.is_child() {
+            return;
+        }
+        let before = {
+            let d = self.data.lock().await;
+            match d.sessions.get(id) {
+                Some(s) => (s.turns, s.done.clone(), s.state.clone()),
+                None => (None, None, String::new()),
+            }
+        };
+        let changed = {
+            let mut d = self.data.lock().await;
+            if let Some(slot) = d.sessions.get_mut(id) {
+                // `state` берём из журнала и pid (это и есть правда про
+                // подагента: работает/готов/прерван), из слота — только то,
+                // чего в журнале нет. Раньше здесь перетиралось состояние, и SSE
+                // говорил «running» там, где `GET /v1/sessions` уже отдавал «idle».
+                fresh.run_id = slot.run_id.clone();
+                fresh.title = slot.title.clone().or(fresh.title);
+            }
+            let after = (fresh.turns, fresh.done.clone(), fresh.state.clone());
+            d.sessions.insert(id.to_string(), fresh.clone());
+            let _ = self.persist(&d);
+            before != after
+        };
+        if changed {
+            self.publish_session(fresh).await;
+        }
+    }
+
+    /// Разослать подписчикам свежую запись списка сессий. Отдельный канал, а не
+    /// шина событий транскрипта: у тех `session_id` один, а тут меняется сам
+    /// список.
+    pub async fn publish_session(&self, session: Session) {
+        let _ = self.tx_updates.send(serde_json::json!({
+            "type": "session.updated",
+            "session": session,
+        }));
+    }
+
     pub async fn session_lock(&self, id: &str) -> Arc<Mutex<()>> {
         let mut m = self.locks.lock().await;
         m.entry(id.into())
@@ -215,7 +293,9 @@ fn schema(c: &Connection) -> crate::R<()> {
       CREATE TABLE IF NOT EXISTS event_sequences(session_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);")?;
     // Старые store.sqlite3 созданы до per-session бюджета: колонки добавляем
     // отдельно, чтобы обновление бинарника не требовало пересоздания store.
-    for column in ["context_budget INTEGER", "context_target INTEGER"] {
+    // `parent` — признак подагента. Без него store не отличал ребёнка от
+    // пользовательской сессии, и обновление карточки молча не срабатывало.
+    for column in ["context_budget INTEGER", "context_target INTEGER", "parent TEXT"] {
         if let Err(error) = c.execute(&format!("ALTER TABLE sessions ADD COLUMN {column}"), []) {
             if !error.to_string().to_lowercase().contains("duplicate column") {
                 return Err(error.into());
@@ -234,14 +314,15 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     )?;
     for s in d.sessions.values() {
         tx.execute(
-            "INSERT INTO sessions VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
                 s.id,
                 s.surface,
                 s.state,
                 s.run_id,
                 s.context_budget,
-                s.context_target
+                s.context_target,
+                s.parent
             ],
         )?;
     }
@@ -349,7 +430,7 @@ fn read_store(c: &Connection) -> crate::R<Store> {
     let mut d = Store::default();
     {
         let mut q = c
-            .prepare("SELECT id,surface,state,run_id,context_budget,context_target FROM sessions ORDER BY id")?;
+            .prepare("SELECT id,surface,state,run_id,context_budget,context_target,parent FROM sessions ORDER BY id")?;
         for row in q.query_map([], |r| {
             Ok(Session {
                 id: r.get(0)?,
@@ -358,7 +439,7 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                 // discovery, чтобы правка Meta.title не требовала миграции.
                 title: None,
                 updated_at: None,
-                parent: None,
+                parent: r.get(6)?,
                 model: None,
                 state: r.get(2)?,
                 run_id: r.get(3)?,
@@ -368,6 +449,8 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                 turns: None,
                 done: None,
                 last_ms: None,
+                started_at: None,
+                done_at: None,
             })
         })? {
             let s = row?;

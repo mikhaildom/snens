@@ -59,6 +59,21 @@ fn done_of(cfg: &Config, id: &str) -> Option<String> {
         })
 }
 
+/// Что журнал ребёнка говорит о его жизни: pid из записи `Started` и время
+/// старта. `None` — запись не писалась (лог старый или процесс умер, не начав).
+fn started_of(cfg: &Config, id: &str) -> Option<u32> {
+    log::read_file(&cfg.sessions_path().join(format!("{id}.jsonl")))
+        .ok()?
+        .into_iter()
+        .find_map(|r| match r {
+            log::Rec::Started { pid, .. } => Some(pid),
+            _ => None,
+        })
+}
+
+/// Индекс детей в ящике: pid из регистрации при спавне. Нужен только когда в
+/// журнале нет `Started` — то есть процесс умер, не успев записать первую строку
+/// (или лог остался от версии до этой записи).
 fn pid_of(mail_dir: &Path, parent: &str, child: &str) -> Option<u32> {
     std::fs::read_to_string(children_dir(mail_dir, parent).join(child))
         .ok()?
@@ -67,24 +82,52 @@ fn pid_of(mail_dir: &Path, parent: &str, child: &str) -> Option<u32> {
         .ok()
 }
 
-/// Дети этой сессии и их состояние. Единственный источник правды — лог ребёнка
-/// (`Done`), файл регистрации нужен только для случая «убили наглухо».
+/// Дети этой сессии и их состояние.
+///
+/// Источник списка — журналы: `Meta.parent` в логе ребёнка и есть его связь с
+/// родителем. Ящик (`<mail>/<parent>/children/<child>` = pid) остаётся
+/// **индексом**, а не правдой: он появляется только у детей, запущенных с
+/// `--parent`, и легко расходится с журналом (подагент, поднятый вручную или
+/// переехавший при resume, в индексе отсутствует). Поэтому оба источника
+/// складываются, а состояние всё равно считается по журналу.
 pub fn children(cfg: &Config, parent: &str) -> Vec<Child> {
-    let mail_dir = cfg.mail_path();
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(children_dir(&mail_dir, parent))
+    let mut ids: std::collections::BTreeSet<String> = Default::default();
+    for e in std::fs::read_dir(children_dir(&cfg.mail_path(), parent))
         .into_iter()
         .flatten()
         .flatten()
     {
-        let Some(id) = e.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let state = state_of(cfg, parent, &id);
-        out.push(Child { id, state });
+        if let Some(id) = e.file_name().to_str() {
+            ids.insert(id.to_string());
+        }
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    out
+    for id in log::list(&cfg.sessions_path()).unwrap_or_default() {
+        if ids.contains(&id) {
+            continue;
+        }
+        if meta_parent(cfg, &id).as_deref() == Some(parent) {
+            ids.insert(id);
+        }
+    }
+    ids.into_iter()
+        .map(|id| Child {
+            state: state_of(cfg, parent, &id),
+            id,
+        })
+        .collect()
+}
+
+/// Родитель из `Meta` журнала. Читаем шапку, а не весь лог: у детей журналы
+/// бывают длинными, а метка лежит второй строкой.
+fn meta_parent(cfg: &Config, id: &str) -> Option<String> {
+    log::read_head(&cfg.sessions_path().join(format!("{id}.jsonl")), 3)
+        .ok()?
+        .into_iter()
+        .find_map(|r| match r {
+            log::Rec::Meta { parent, .. } => Some(parent),
+            _ => None,
+        })
+        .filter(|p| !p.trim().is_empty())
 }
 
 /// Финальный текст ребёнка: последний `Assistant` без вызовов. Его пишет сам
@@ -114,21 +157,23 @@ pub fn describe(state: &State) -> &'static str {
     }
 }
 
-/// Состояние одного ребёнка (не по регистру всех, а по его логу/pid).
+/// Состояние одного ребёнка: `Done` в журнале решает всё, а до него — жив ли
+/// процесс, чей pid записан самим ребёнком (`Started`). Файл регистрации в ящике
+/// читается только как запасной источник pid.
+///
+/// Раньше pid был единственным признаком жизни, и поверхность узнавала о ребёнке
+/// третьей стороной. Теперь состояние подагента — факт его журнала, а ящик лишь
+/// индекс.
 pub fn state_of(cfg: &Config, parent: &str, id: &str) -> State {
+    let pid = started_of(cfg, id).or_else(|| pid_of(&cfg.mail_path(), parent, id));
+    let live = pid.map(alive).unwrap_or(false);
     match done_of(cfg, id) {
         Some(s) if s == "ok" => State::Done,
+        // `Done` есть — процесс закрылся сам, даже если pid ещё не вышел.
         Some(s) => State::Failed(s),
-        None => {
-            let live = pid_of(&cfg.mail_path(), parent, id)
-                .map(alive)
-                .unwrap_or(false);
-            if live {
-                State::Running
-            } else {
-                State::Crashed
-            }
-        }
+        None if live => State::Running,
+        // Процесса нет, а `Done` не записан: снесли (OOM, SIGKILL).
+        None => State::Crashed,
     }
 }
 
@@ -168,6 +213,48 @@ mod tests {
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].state, State::Done, "Done должен победить pid");
         assert_eq!(final_text(&cfg, "kid").as_deref(), Some("готово"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Живость подагента — из его же журнала (`Started`), а не из файла в ящике:
+    /// процесс сам объявляет, что жив, и состояние не зависит от третьей стороны.
+    #[test]
+    fn state_comes_from_own_started_record() {
+        let dir = std::env::temp_dir().join(format!("snens-sub-st-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let cfg = Config {
+            sessions_dir: dir.join("sessions").to_string_lossy().into_owned(),
+            mail_dir: dir.join("mail").to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        // Свой pid в `Started`, и никакой регистрации в ящике вовсе.
+        let me = std::process::id();
+        let s = log::Session::open_child(&cfg.sessions_path(), "kid", "me").unwrap();
+        s.append(log::Rec::Started { ts: 1, pid: me }).unwrap();
+        assert_eq!(state_of(&cfg, "me", "kid"), State::Running);
+
+        // Запись соврала про pid — процесса нет: значит снесли наглухо.
+        let s2 = log::Session::open_child(&cfg.sessions_path(), "dead", "me").unwrap();
+        s2.append(log::Rec::Started {
+            ts: 1,
+            pid: 999_999_999,
+        })
+        .unwrap();
+        assert_eq!(state_of(&cfg, "me", "dead"), State::Crashed);
+
+        // Старый лог без `Started`: остаётся запасной путь через ящик.
+        let s3 = log::Session::open_child(&cfg.sessions_path(), "old", "me").unwrap();
+        s3.append(log::Rec::User {
+            ts: 1,
+            text: "задача".into(),
+            source: "agent".into(),
+            parts: vec![],
+        })
+        .unwrap();
+        register_child(&cfg.mail_path(), "me", "old", me).unwrap();
+        assert_eq!(state_of(&cfg, "me", "old"), State::Running);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3,6 +3,7 @@ mod approval;
 mod askpass;
 mod attach;
 mod cfg;
+mod cfg_edit;
 mod context;
 mod context_document;
 #[cfg(test)]
@@ -26,6 +27,7 @@ mod render;
 mod review;
 mod selftest;
 mod sesscwd;
+mod settings;
 mod subagent;
 mod sweep;
 mod surface_client;
@@ -56,6 +58,8 @@ snens — узкое ядро агента
   snens tickets show <имя> | grep <текст> | stats
   snens tools [--json]        # список тулов; --json — определения для модели
   snens model [slug]             # без аргумента — какая сейчас; со slug — сменить в конфиге
+  snens config [ключ=значение …]  # без аргументов — текущие значения; с ними — правка на ходу
+                                 # ключи: model, max_turns (0 — без лимита), memory_recall, …
   snens memory [on|off] [recall always|session|off] [retain on|off]
                                  # тумблер долгой памяти: справка на ход и запись хода
   snens build [<tool>…]          # без аргументов весь workspace, с аргументами — только названные тулы
@@ -112,6 +116,7 @@ async fn legacy_main() -> R<()> {
         Some("tickets") => tickets::cmd(&flags, positional),
         Some("tools") => cmd_tools(&flags).await,
         Some("model") => cmd_model(&flags, positional),
+        Some("config") => settings::cmd(&flags, positional),
         Some("memory") => cmd_memory(&flags, positional),
         Some("build") => cmd_build(&flags, positional),
         Some("review") => review::cmd(&flags).await,
@@ -219,6 +224,16 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
         .or_else(|| std::env::var("SNENS_PARENT").ok())
         .unwrap_or_default();
     let sess = log::Session::open_child(&cfg.sessions_path(), &id, &parent)?;
+    // Первая запись ребёнка — о том, что он жив: pid и время старта. Журнал
+    // становится единственным источником правды о состоянии подагента, и
+    // поверхность читает `running`/`done` из него, а не угадывает по
+    // `kill(pid, 0)` третьей стороной. Файл в ящике (`register_child`)
+    // остаётся индексом детей и подсказкой на случай, когда процесс снесли
+    // наглухо и `Done` не появился.
+    sess.append(log::Rec::Started {
+        ts: log::now(),
+        pid: std::process::id(),
+    })?;
     sess.append(log::Rec::User {
         ts: log::now(),
         text: prompt,

@@ -20,6 +20,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 toml = "0.8"
+# Правка конфига как документа: комментарии, порядок полей и многострочные
+# строки человека остаются на месте (см. src/cfg_edit.rs).
+toml_edit = "0.22"
 axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 fs2 = "0.4"

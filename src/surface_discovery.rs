@@ -72,7 +72,8 @@ pub fn surface(path: &Path) -> String {
 
 /// Merge durable delivery sessions with JSONL transcripts. JSONL-only sessions
 /// never get rewritten as a side effect of discovery.
-pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
+pub fn sessions(cfg: &Config, store: &rt::Store) -> crate::R<Vec<Session>> {
+    let data_dir = &cfg.data_path();
     let mut sessions = store.sessions.clone();
     let dir = data_dir.join("sessions");
     if dir.is_dir() {
@@ -103,10 +104,14 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
             // Прогресс нужен только карточкам подагентов: у пользовательских
             // сессий ходы не показываются, а полный разбор их логов (бывают по
             // несколько мегабайт) удорожает каждый список.
-            if session.parent.is_some() {
-                let (turns, done) = progress(&path);
-                session.turns = Some(turns);
-                session.done = done;
+            if let Some(parent) = session.parent.as_deref() {
+                let p = progress(&path);
+                session.turns = Some(p.turns);
+                session.started_at = p.started_at;
+                session.done_at = p.done_at;
+                session.state =
+                    child_state(&crate::subagent::state_of(cfg, parent, id)).into();
+                session.done = p.done;
             }
             sessions.insert(id.to_string(), session);
         }
@@ -143,10 +148,14 @@ pub fn sessions(data_dir: &Path, store: &rt::Store) -> crate::R<Vec<Session>> {
         // Ходы и закрытие пересчитываем всегда, а не только когда пусто:
         // подагент растёт, пока его карточка висит на экране, и «3 хода» без
         // обновления превращалось бы во враньё.
-        if let (Some(path), Some(_)) = (&file, &session.parent) {
-            let (turns, done) = progress(path);
-            session.turns = Some(turns);
-            session.done = done;
+        if let (Some(path), Some(parent)) = (&file, session.parent.clone()) {
+            let p = progress(path);
+            session.turns = Some(p.turns);
+            session.started_at = p.started_at;
+            session.done_at = p.done_at;
+            session.state =
+                child_state(&crate::subagent::state_of(cfg, &parent, &session.id)).into();
+            session.done = p.done;
         }
     }
     // Свежие сверху. Порядок не зависит от поверхности и от формы id
@@ -206,12 +215,27 @@ pub fn parent(path: &Path) -> Option<String> {
 /// Кэш `progress`: список сессий дёргается на каждое событие SSE и на каждую
 /// смену сессии, а полный разбор сотни логов на каждый запрос — это секунды.
 /// Ключ — путь + mtime + размер: пока файл не менялся, пересчитывать нечего.
-static PROGRESS: std::sync::Mutex<Option<std::collections::HashMap<(std::path::PathBuf, u64, u64), (u64, Option<String>)>>> =
-    std::sync::Mutex::new(None);
+static PROGRESS: std::sync::Mutex<
+    Option<std::collections::HashMap<(std::path::PathBuf, u64, u64), Progress>>,
+> = std::sync::Mutex::new(None);
 
-/// Ходы и признак закрытия из журнала — для карточки подагента: сколько шагов
-/// прошло и чем кончилось. Читаем лог целиком: `Done` пишется только в конце.
-pub fn progress(path: &Path) -> (u64, Option<String>) {
+/// Что видно про подагента по его журналу: сколько ходов, когда начал, когда
+/// закончил и чем. Границы нужны для длительности — по ним клиент рисует «работает
+/// 3 мин» без опроса.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub turns: u64,
+    pub done: Option<String>,
+    /// Время первой записи журнала (unix, сек) — старт подагента.
+    pub started_at: Option<u64>,
+    /// Время записи `Done` — конец работы.
+    pub done_at: Option<u64>,
+}
+
+/// Ходы, признаки закрытия и границы работы из журнала — для карточки
+/// подагента: сколько шагов прошло, чем кончилось и сколько это заняло.
+/// Читаем лог целиком: `Done` пишется только в конце.
+pub fn progress(path: &Path) -> Progress {
     let meta = fs::metadata(path).ok();
     let key_extra = meta
         .as_ref()
@@ -239,18 +263,26 @@ pub fn progress(path: &Path) -> (u64, Option<String>) {
     value
 }
 
-fn progress_uncached(path: &Path) -> (u64, Option<String>) {
+fn progress_uncached(path: &Path) -> Progress {
     let Ok(records) = crate::log::read_file(path) else {
-        return (0, None);
+        return Progress::default();
     };
     let mut turns = 0u64;
     let mut done = None;
+    let mut started_at = records.first().map(|r| r.ts());
+    let mut done_at = None;
     for rec in &records {
         match rec {
             crate::log::Rec::Assistant { .. } => turns += 1,
-            crate::log::Rec::Done { status, .. } => done = Some(status.clone()),
+            crate::log::Rec::Done { status, .. } => {
+                done = Some(status.clone());
+                done_at = Some(rec.ts());
+            }
             _ => {}
         }
+    }
+    if started_at == Some(0) {
+        started_at = records.iter().map(|r| r.ts()).find(|t| *t > 0);
     }
     // Перезапущенная сессия: `Done` есть, но после него снова работали —
     // последняя `Assistant` новые ходы добавляет, и закрытие уже не текущее.
@@ -265,9 +297,15 @@ fn progress_uncached(path: &Path) -> (u64, Option<String>) {
     if let (Some(d), Some(a)) = (last_done, last_assistant) {
         if a > d {
             done = None;
+            done_at = None;
         }
     }
-    (turns, done)
+    Progress {
+        turns,
+        done,
+        started_at,
+        done_at,
+    }
 }
 
 /// Была ли в сессии хоть одна реплика человека или вставка в ход. Сессии без
@@ -279,6 +317,23 @@ pub fn has_dialogue(path: &Path) -> bool {
     text.lines().any(|line| {
         line.starts_with("{\"kind\":\"user\"") || line.starts_with("{\"kind\":\"steer\"")
     })
+}
+
+/// Состояние подагента так, как его ждёт поверхность: `running` — ещё работает,
+/// `idle` — закрылся нормально, `failed` — с ошибкой/по лимиту, `interrupted` —
+/// процесса нет, а `Done` так и не записан.
+///
+/// Вход берётся из `subagent::State` — единого разбора журнала и pid: раньше
+/// поверхность собирала это сама по файлу регистрации, и правило состояния
+/// жило в двух местах, расходясь в мелочах.
+pub fn child_state(state: &crate::subagent::State) -> &'static str {
+    use crate::subagent::State;
+    match state {
+        State::Running => "running",
+        State::Done => "idle",
+        State::Failed(_) => "failed",
+        State::Crashed => "interrupted",
+    }
 }
 
 /// Время последней активности сессии — `mtime` её лога.
@@ -320,6 +375,15 @@ mod tests {
     fn temp() -> PathBuf {
         std::env::temp_dir().join(format!("surface-discovery-{}", uuid::Uuid::new_v4()))
     }
+
+    /// Конфиг теста: сессии и ящик внутри временного каталога.
+    fn test_cfg(root: &Path) -> Config {
+        Config {
+            sessions_dir: root.join("sessions").display().to_string(),
+            mail_dir: root.join("mail").display().to_string(),
+            ..Config::default()
+        }
+    }
     #[test]
     fn finds_jsonl_without_changing_bytes_and_ignores_non_uuid() {
         let root = temp();
@@ -334,7 +398,7 @@ mod tests {
         .unwrap();
         fs::write(dir.join("not-a-session.jsonl"), "bad\n").unwrap();
         let before = fs::read(&file).unwrap();
-        let found = sessions(&root, &rt::Store::default()).unwrap();
+        let found = sessions(&test_cfg(&root), &rt::Store::default()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, id);
         assert_eq!(found[0].surface, "local");
@@ -357,7 +421,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let found = sessions(&root, &rt::Store::default()).unwrap();
+        let found = sessions(&test_cfg(&root), &rt::Store::default()).unwrap();
         let t = found[0].title.clone().unwrap();
         assert!(t.starts_with("хочу веб-интерфейс snens,"), "{t}");
         assert!(t.ends_with('…'), "{t}");
@@ -387,11 +451,23 @@ mod tests {
         let f = fs::OpenOptions::new().write(true).open(&stamp).unwrap();
         f.set_modified(newer).unwrap();
 
-        let found = sessions(&root, &rt::Store::default()).unwrap();
+        let found = sessions(&test_cfg(&root), &rt::Store::default()).unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].id, "1790000000-123", "свежая — первой");
         assert!(found[0].updated_at.unwrap() > found[1].updated_at.unwrap());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Состояние подагента — по двум источникам: журнал говорит, чем кончилось,
+    /// pid — жив ли процесс. Ни один из них не решает в одиночку: без `Done`
+    /// живой процесс значит «работает», а мёртвый — «сняли».
+    #[test]
+    fn child_state_maps_agent_state() {
+        use crate::subagent::State;
+        assert_eq!(child_state(&State::Running), "running");
+        assert_eq!(child_state(&State::Done), "idle");
+        assert_eq!(child_state(&State::Failed("limit".into())), "failed");
+        assert_eq!(child_state(&State::Crashed), "interrupted");
     }
 
     #[test]
@@ -411,7 +487,7 @@ mod tests {
             "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n{\"kind\":\"user\",\"ts\":2,\"text\":\"hi\",\"source\":\"surface\"}\n",
         )
         .unwrap();
-        let found = sessions(&root, &rt::Store::default()).unwrap();
+        let found = sessions(&test_cfg(&root), &rt::Store::default()).unwrap();
         assert_eq!(found.len(), 1, "пустая сессия в списке не нужна");
         assert_eq!(found[0].id, used);
         fs::remove_dir_all(root).unwrap();
@@ -434,7 +510,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let found = sessions(&root, &rt::Store::default()).unwrap();
+        let found = sessions(&test_cfg(&root), &rt::Store::default()).unwrap();
         assert_eq!(found[0].parent.as_deref(), Some("1790000000-1"));
         assert_eq!(found[0].model.as_deref(), Some("openai/gpt-6-luna"));
         fs::remove_dir_all(root).unwrap();
@@ -455,7 +531,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let found = sessions(&root, &rt::Store::default()).unwrap();
+        let found = sessions(&test_cfg(&root), &rt::Store::default()).unwrap();
         assert_eq!(found[0].title.as_deref(), Some("мок веб-клиента"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -472,17 +548,25 @@ mod tests {
             r#"{"kind":"assistant","ts":4,"text":"b","tool_calls":[]}"#,
         ];
         fs::write(&path, records.join("\n")).unwrap();
-        // Открытая сессия: ходы считаются, закрытия нет.
-        assert_eq!(progress(&path), (2, None));
+        // Открытая сессия: ходы считаются, закрытия нет. Старт — первая запись
+        // журнала: по нему клиент считает, сколько подагент уже работает.
+        let open = progress(&path);
+        assert_eq!((open.turns, open.done.as_deref()), (2, None));
+        assert_eq!(open.started_at, Some(1));
+        assert_eq!(open.done_at, None);
         // После `Done` сессия закрыта — это и есть «подагент закончил».
         let mut text = records.join("\n");
         text.push_str("\n{\"kind\":\"done\",\"ts\":5,\"status\":\"ok\",\"turns\":2}");
         fs::write(&path, &text).unwrap();
-        assert_eq!(progress(&path), (2, Some("ok".into())));
+        let closed = progress(&path);
+        assert_eq!((closed.turns, closed.done.as_deref()), (2, Some("ok")));
+        assert_eq!(closed.done_at, Some(5), "длительность считается по Done");
         // Новая работа после `Done` (перезапуск) снимает закрытие.
         text.push_str("\n{\"kind\":\"assistant\",\"ts\":6,\"text\":\"c\",\"tool_calls\":[]}");
         fs::write(&path, &text).unwrap();
-        assert_eq!(progress(&path), (3, None));
+        let resumed = progress(&path);
+        assert_eq!((resumed.turns, resumed.done.as_deref()), (3, None));
+        assert_eq!(resumed.done_at, None);
         fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -490,15 +574,20 @@ mod tests {
 /// Одна сессия по id, собранная из журнала: нужно, когда сессия появилась
 /// позже старта поверхности (подагент пишет свой лог другим процессом), а
 /// `discovery::sessions` наполняет store только целиком и только при старте.
-pub fn session_by_id(data_dir: &Path, id: &str) -> Option<Session> {
-    let path = path_from(data_dir, id).filter(|p| has_dialogue(p))?;
+pub fn session_by_id(cfg: &Config, id: &str) -> Option<Session> {
+    let path = path_from(&cfg.data_path(), id).filter(|p| has_dialogue(p))?;
     let mut session = Session::new(id.to_string(), surface(&path));
     session.title = title(&path);
     session.updated_at = mtime(&path);
     session.parent = parent(&path);
     session.model = model(&path);
-    let (turns, done) = progress(&path);
-    session.turns = Some(turns);
-    session.done = done;
+    let p = progress(&path);
+    session.turns = Some(p.turns);
+    session.started_at = p.started_at;
+    session.done_at = p.done_at;
+    if let Some(parent) = session.parent.clone() {
+        session.state = child_state(&crate::subagent::state_of(cfg, &parent, id)).into();
+    }
+    session.done = p.done;
     Some(session)
 }

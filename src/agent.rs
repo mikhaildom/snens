@@ -246,6 +246,12 @@ async fn run_loop<L: Llm>(
             return Err("cancelled".into());
         }
         turn += 1;
+        // Конфиг на этот ход — из файла: меню настроек, `snens config` и человек
+        // в редакторе правят файл, а поверхность живёт днями и снимком старта
+        // ничего бы не увидела до рестарта сервиса. Файл сломан — остаётся
+        // снимок старта, ход из-за чужой правки не падает.
+        let live = cfg.live();
+        let cfg = &live;
         if let Some(rx) = queued.as_ref() {
             let mut rx = rx.lock().await;
             while let Ok(input) = rx.try_recv() {
@@ -357,8 +363,8 @@ async fn run_loop<L: Llm>(
         // `snens model <slug>` правит файл, а поверхность живёт долго: без
         // перечитки новый ход уходил бы моделью, снятой при старте процесса.
         // Подменяем только модель — остальные поля конфига остаются снимком старта.
-        let mut turn_cfg = cfg.clone();
-        turn_cfg.model = cfg.model_now();
+        // Модель уже подставлена `live()`; остальные поля — тоже из файла.
+        let turn_cfg = cfg.clone();
         let reply: Reply = if let Some(c) = cancel.as_mut() {
             tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), r = stream_reply(&turn_cfg, msgs, defs.clone(), llm, ui, observe) => r? }
         } else {
@@ -608,7 +614,8 @@ async fn run_loop<L: Llm>(
 
         // Лимит исчерпан — не падаем и не закрываем поверхность: просим
         // промежуточный итог и на этом заканчиваем запуск (см. final_answer).
-        if turn >= cfg.max_turns {
+        // `0` — лимита нет: остаются бюджет контекста и поведение провайдера.
+        if cfg.max_turns > 0 && turn >= cfg.max_turns {
             final_answer(sess, cfg, llm, ui, &path, turn, observe).await?;
             return Ok(Finish::Limit);
         }

@@ -1,7 +1,7 @@
 use crate::cfg::Config;
 use crate::surface_runtime::{self as rt, Event, Runtime, Session};
 #[path = "surface_discovery.rs"]
-mod discovery;
+pub mod discovery;
 #[path = "surface_history.rs"]
 mod history;
 use axum::{
@@ -39,12 +39,25 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
     lock.try_lock_exclusive()
         .map_err(|e| format!("surface store already locked: {e}"))?;
     let (tx, _) = tokio::sync::broadcast::channel(1024);
+    // Отдельный канал для списка сессий: событие транскрипта несёт `session_id`
+    // одной сессии, а тут меняется сам список (подагент начал/закончил).
+    let (tx_updates, _) = tokio::sync::broadcast::channel(256);
     let (mut store, db) = rt::open_store(&dir)?;
-    for discovered in discovery::sessions(&cfg.data_path(), &store)? {
-        store
-            .sessions
-            .entry(discovered.id.clone())
-            .or_insert(discovered);
+    for discovered in discovery::sessions(&cfg, &store)? {
+        // Не `or_insert`: запись в store могла лечь до появления метки в журнале
+        // (и до колонки `parent`), и тогда признак «это подагент» терялся —
+        // карточка в доке не обновлялась вовсе. Метаданные журнала точнее,
+        // поэтому обновляем их, а состояние процесса остаётся от поверхности.
+        match store.sessions.get_mut(&discovered.id) {
+            Some(slot) => {
+                slot.parent = discovered.parent;
+                slot.title = slot.title.take().or(discovered.title);
+                slot.surface = discovered.surface;
+            }
+            None => {
+                store.sessions.insert(discovered.id.clone(), discovered);
+            }
+        }
     }
     let mut discovered_ids = rt::event_sequences(&db)?;
     for (id, events) in &store.events {
@@ -79,6 +92,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         event_seq: tokio::sync::Mutex::new(discovered_ids),
         review_gen: Default::default(),
         approvals: Default::default(),
+        tx_updates,
     });
     // Канал одобрений привилегированных действий: headless-сессия не может спросить
     // пароль, поэтому `sudo`-шим спрашивает согласие владельца кнопкой в чате.
@@ -110,6 +124,10 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         .route("/v1/sessions/{id}/ingest", post(ingest))
         .route("/v1/model", get(get_model).put(put_model))
         .route("/v1/memory", get(get_memory).put(put_memory))
+        .route("/v1/config", get(get_config).put(put_config))
+        // Список сессий без опроса: подагент растёт, пока его карточка на экране,
+        // и клиент должен видеть ходы и конец работы, а не снимок на загрузке.
+        .route("/v1/events", get(session_updates))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(token, auth));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -191,6 +209,40 @@ async fn put_model(State(s): State<Arc<Runtime>>, Json(body): Json<ModelBody>) -
     }
 }
 
+/// Меню настроек инстанса: все правленые ключи одним ответом.
+///
+/// Ответ — то, что лежит в файле, а не снимок старта сервиса: поверхность
+/// показывает реальность, а действие правки («со следующего хода»)
+/// обеспечено перечиткой в `agent::run_loop` (`Config::live`).
+async fn get_config(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
+    let path = s
+        .cfg
+        .source_path
+        .clone()
+        .unwrap_or_else(crate::cfg::config_path);
+    Json(crate::settings::state(&s.cfg, &path)).into_response()
+}
+
+/// Правка настроек пачкой: `{"max_turns": 0}`. Одно битое поле — ни одна правка
+/// не применяется: проверка целиком до записи.
+async fn put_config(
+    State(s): State<Arc<Runtime>>,
+    Json(patch): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Разбор правки и запись — два разных ответа: неверный ключ/тип — вина
+    // клиента (400), несостоявшаяся запись — сервера (500). Слитый ответ не даёт
+    // человеку понять, повторять запрос или менять данные.
+    let edits = match crate::settings::prepare(&s.cfg, &patch) {
+        Ok(edits) => edits,
+        Err(e) => return err("invalid", &e.to_string(), StatusCode::BAD_REQUEST).into_response(),
+    };
+    let path = match crate::settings::commit(&s.cfg, &edits) {
+        Ok(path) => path,
+        Err(e) => return err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+    };
+    Json(crate::settings::state(&s.cfg, &path)).into_response()
+}
+
 /// Состояние канала долгой памяти: тумблеры читаются перечитанными из конфига,
 /// как модель. Правки — те же ключи `[memory]`, что у `snens memory …`.
 async fn get_memory(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
@@ -260,7 +312,7 @@ async fn put_memory(State(s): State<Arc<Runtime>>, Json(body): Json<MemoryBody>)
 
 async fn list(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
     let d = s.data.lock().await;
-    match discovery::sessions(&s.cfg.data_path(), &d) {
+    match discovery::sessions(&s.cfg, &d) {
         Ok(sessions) => {
             let sessions = sessions
                 .into_iter()
@@ -1157,6 +1209,9 @@ async fn message(
     if let Err(e) = s.persist(&d) {
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
     }
+    if let Some(live) = d.sessions.get(&id).cloned() {
+        s.publish_session(live).await;
+    }
     drop(d);
     let _ = s
         .emit(
@@ -1397,11 +1452,15 @@ fn session_turns(cfg: &Config, id: &str) -> usize {
 /// журнал пишется для человека и для следующего прогона, но порог считается по
 /// `Assistant`, поэтому сама постановка маркера счёт не сдвигает.
 fn schedule_review(s: Arc<Runtime>, id: String) {
-    let idle = s.cfg.review_idle_seconds;
+    // Пороги — из файла, а не из снимка старта: они есть в меню настроек, и
+    // обещание «действует со следующего хода» должно быть правдой. Планировщик
+    // стартует на конце хода, так что правка успевает вступить в силу.
+    let live = s.cfg.live();
+    let idle = live.review_idle_seconds;
     if idle == 0 {
         return;
     }
-    let min = s.cfg.review_min_turns;
+    let min = live.review_min_turns;
     tokio::spawn(async move {
         let gen = s.review_gen.lock().await.get(&id).copied().unwrap_or(0);
         // Планировщик стартует на конце хода, а не на его старте: поколение только
@@ -1752,6 +1811,9 @@ async fn launch(
             x.run_id = None
         }
         let _ = s.persist(&d);
+        if let Some(live) = d.sessions.get(&id).cloned() {
+            s.publish_session(live).await;
+        }
         drop(d);
         // Ход завершён и сессия снова idle — планируем авторевью после простоя.
         // Считаем только успешные ходы: отменённый/ошибочный ход ревью не стоит.
@@ -1792,6 +1854,7 @@ async fn stop(
     }
     let _ = s.persist(&d);
     drop(d);
+    s.publish_session(out.clone()).await;
     if let Some(c) = s.controls.lock().await.get(&id) {
         let _ = c.cancel.send(true);
     }
@@ -1865,7 +1928,7 @@ async fn ingest(
                 guard.sessions.get(&id).cloned()
             }
             .or_else(|| {
-                discovery::session_by_id(&s.cfg.data_path(), &id)
+                discovery::session_by_id(&s.cfg, &id)
             });
             match found {
                 Some(session) => {
@@ -1893,19 +1956,11 @@ async fn ingest(
             accepted += 1;
         }
     }
-    // Ходы/закрытие подагента меняются с каждым его событием: обновляем запись
-    // в store, чтобы карточка в доке не врала до следующего `GET /v1/sessions`.
+    // Карточка подагента: пересчитать по журналу и pid и опубликовать, если
+    // есть что перерисовать. Пачка — один всплеск работы ребёнка, поэтому кадр
+    // один на пачку, а не на каждое из 32 событий внутри неё.
     if accepted > 0 {
-        if let Some(fresh) = discovery::session_by_id(&s.cfg.data_path(), &id) {
-            let mut d = s.data.lock().await;
-            if let Some(slot) = d.sessions.get_mut(&id) {
-                slot.turns = fresh.turns;
-                slot.done = fresh.done;
-                slot.title = slot.title.clone().or(fresh.title);
-                slot.updated_at = fresh.updated_at;
-            }
-            let _ = s.persist(&d);
-        }
+        s.refresh_child(&id).await;
     }
     Json(serde_json::json!({"accepted":accepted})).into_response()
 }
@@ -2037,6 +2092,37 @@ fn sse(e: Event) -> SseEvent {
         .id(e.seq.to_string())
         .json_data(e)
         .unwrap_or_else(|_| SseEvent::default())
+}
+
+/// `GET /v1/events` — поток изменений списка сессий.
+///
+/// Зачем отдельно от `/v1/sessions/{id}/events`: тот поток про транскрипт одной
+/// сессии, а карточки подагентов в доке живут другим списком. Раньше клиент видел
+/// только снимок на загрузке и работающий подагент висел «ждёт» — без опроса
+/// списка этого не починить.
+async fn session_updates(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
+    // Подписка до отдачи заголовков: клиент, подключившийся посреди хода, не
+    // должен пропустить ближайшее изменение.
+    let rx = s.tx_updates.subscribe();
+    let live = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(value) => {
+                    let frame = SseEvent::default()
+                        .json_data(value)
+                        .unwrap_or_else(|_| SseEvent::default());
+                    return Some((Ok::<_, std::convert::Infallible>(frame), rx));
+                }
+                // Медленный клиент теряет кадры, а не поток: полный список он
+                // перечитывает на старте и может перечитать после обрыва.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(live)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 #[cfg(test)]
@@ -2203,6 +2289,7 @@ mod tests {
         }
         rt::persist_store(&db, &store).unwrap();
         let (tx, _) = broadcast::channel(1024);
+        let (tx_updates, _) = broadcast::channel(256);
         (
             Arc::new(Runtime {
                 data: Mutex::new(store),
@@ -2217,6 +2304,7 @@ mod tests {
                 event_seq: Default::default(),
                 review_gen: Default::default(),
                 approvals: Default::default(),
+                tx_updates,
             }),
             dir,
         )

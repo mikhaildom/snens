@@ -247,6 +247,7 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
             | Rec::Usage { .. }
             | Rec::ContextRevision { .. }
             | Rec::Ctx { .. }
+            | Rec::Started { .. }
             | Rec::Done { .. } => {}
         }
     }
