@@ -23,9 +23,8 @@ use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
 
 pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()> {
-    if !addr.ip().is_loopback() {
-        return Err("surface server must bind to loopback".into());
-    }
+    // Адрес проверил вызывающий (`production::serve`): здесь политики нет, иначе
+    // правило разъехалось бы по двум местам (см. src/remote.rs, docs/pairing.md).
     let key = cfg.api_key()?;
     let llm = Arc::new(crate::llm::OpenAi::new(key)?);
     let dir = cfg.data_path().join("surface-api");
@@ -129,7 +128,21 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         // и клиент должен видеть ходы и конец работы, а не снимок на загрузке.
         .route("/v1/events", get(session_updates))
         .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(token, auth));
+        // Порядок слоёв важен: в axum последний `.layer` оказывается СНАРУЖИ.
+        // Значит auth регистрируется первым (внутри), CORS — вторым (снаружи):
+        // preflight `OPTIONS` не несёт Authorization, и если его первым встречает
+        // auth, браузер получает 401 ещё до запроса. Доступ при этом закрыт
+        // токеном на самих запросах, а не на preflight.
+        .layer(axum::middleware::from_fn_with_state(token, auth))
+        // Парный клиент — браузер/оболочка на другом origin (телефон, десктоп с
+        // другим портом). Список origin'ов не ограничиваем: он ломал бы pairing,
+        // а защита — bearer-токен, не origin.
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tokio::select! {
         r=axum::serve(listener,app)=>{r?;},

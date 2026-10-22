@@ -17,28 +17,50 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::R;
 
-/// Одна правка: значение по ключу верхнего уровня (`section: None`), в секции —
-/// или удаление ключа (`value: None`).
-pub struct Edit {
-    pub section: Option<String>,
-    pub key: String,
-    pub value: Option<Value>,
+/// Одна правка документа. Путь — цепочка таблиц (`["providers", "nous"]`);
+/// пустой путь — верхний уровень. Профили провайдеров живут в `[providers.<имя>]`,
+/// и без вложенных путей профиль нельзя ни завести, ни удалить целиком.
+pub enum Edit {
+    Set {
+        path: Vec<String>,
+        key: String,
+        value: Value,
+    },
+    Remove {
+        path: Vec<String>,
+        key: String,
+    },
+    /// Убрать таблицу вместе с содержимым: удаление профиля не должно оставлять
+    /// пустой `[providers.<имя>]` — иначе имя остаётся занятым.
+    RemoveTable {
+        path: Vec<String>,
+    },
+}
+
+/// Путь из строки: `"providers.nous"` → `["providers", "nous"]`. Точки в имени
+/// профиля запрещены валидацией (`providers::validate_name`), поэтому разделитель
+/// однозначен.
+fn split(path: &str) -> Vec<String> {
+    path.split('.')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 impl Edit {
     pub fn top(key: impl Into<String>, value: Value) -> Self {
-        Self {
-            section: None,
+        Self::Set {
+            path: Vec::new(),
             key: key.into(),
-            value: Some(value),
+            value,
         }
     }
 
     pub fn section(section: impl Into<String>, key: impl Into<String>, value: Value) -> Self {
-        Self {
-            section: Some(section.into()),
+        Self::Set {
+            path: split(&section.into()),
             key: key.into(),
-            value: Some(value),
+            value,
         }
     }
 
@@ -46,10 +68,22 @@ impl Edit {
     /// нужно именно второе (пустая модель подагента означала бы модель с пустым
     /// именем).
     pub fn remove_top(key: impl Into<String>) -> Self {
-        Self {
-            section: None,
+        Self::Remove {
+            path: Vec::new(),
             key: key.into(),
-            value: None,
+        }
+    }
+
+    pub fn remove_section_key(section: impl Into<String>, key: impl Into<String>) -> Self {
+        Self::Remove {
+            path: split(&section.into()),
+            key: key.into(),
+        }
+    }
+
+    pub fn remove_table(section: impl Into<String>) -> Self {
+        Self::RemoveTable {
+            path: split(&section.into()),
         }
     }
 }
@@ -68,6 +102,36 @@ fn put(table: &mut Table, key: &str, value: Value) {
         }
     }
     table.insert(key, Item::Value(value));
+}
+
+/// Таблица по пути, если она есть. Для удаления — без создания: `remove` не
+/// должен оставлять после себя свежесозданную пустую секцию.
+fn table_if<'a>(doc: &'a mut DocumentMut, path: &[String]) -> Option<&'a mut Table> {
+    let mut table = doc.as_table_mut();
+    for part in path {
+        table = table.get_mut(part.as_str())?.as_table_mut()?;
+    }
+    Some(table)
+}
+
+/// Таблица по пути, создаваемая на ходу: `[providers.<имя>]` может ещё не быть.
+/// Промежуточные уровни создаются `Table::new()` (в тексте это `[providers.nous]`,
+/// как и написал бы человек).
+fn table_at<'a>(doc: &'a mut DocumentMut, path: &[String]) -> R<&'a mut Table> {
+    if path.is_empty() {
+        return Ok(doc.as_table_mut());
+    }
+    let mut table = doc.as_table_mut();
+    for part in path {
+        if !table.contains_key(part) {
+            table.insert(part, Item::Table(Table::new()));
+        }
+        table = table
+            .get_mut(part)
+            .and_then(Item::as_table_mut)
+            .ok_or_else(|| format!("[{part}] — не таблица, правка отменена"))?;
+    }
+    Ok(table)
 }
 
 /// Применить пачку правок одним заходом: либо все, либо ни одна.
@@ -89,27 +153,16 @@ pub fn write(path: &Path, edits: &[Edit]) -> R<PathBuf> {
         .parse()
         .map_err(|e| format!("{}: конфиг не разбирается, правка отменена: {e}", path.display()))?;
     for edit in edits {
-        let key = edit.key.as_str();
-        match (&edit.section, &edit.value) {
+        match edit {
             // Удаление: ключа нет — уже то, чего хотели, ошибкой не считаем.
-            (None, None) => {
-                doc.remove(key);
-            }
-            (Some(section), None) => {
-                if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
-                    table.remove(key);
+            Edit::Remove { path, key } => {
+                if let Some(table) = table_if(&mut doc, path) {
+                    table.remove(key.as_str());
                 }
             }
-            (None, Some(value)) => put(&mut doc.as_table_mut(), key, value.clone()),
-            (Some(section), Some(value)) => {
-                if !doc.contains_key(section) {
-                    doc.insert(section, Item::Table(Table::new()));
-                }
-                let table = doc
-                    .get_mut(section)
-                    .and_then(Item::as_table_mut)
-                    .ok_or_else(|| format!("[{section}] — не таблица, правка отменена"))?;
-                put(table, key, value.clone());
+            Edit::RemoveTable { path } => remove_table(&mut doc, path)?,
+            Edit::Set { path, key, value } => {
+                put(table_at(&mut doc, path)?, key, value.clone());
             }
         }
     }
@@ -130,6 +183,17 @@ pub fn write(path: &Path, edits: &[Edit]) -> R<PathBuf> {
         return Err(format!("{}: {e}", path.display()).into());
     }
     Ok(path.to_path_buf())
+}
+
+/// Удалить таблицу по пути. Нет её — не ошибка: результат тот, который просили.
+fn remove_table(doc: &mut DocumentMut, path: &[String]) -> R<()> {
+    let Some((last, parents)) = path.split_last() else {
+        return Err("удаление всего документа — не правка".into());
+    };
+    if let Some(parent) = table_if(doc, parents) {
+        parent.remove(last);
+    }
+    Ok(())
 }
 
 /// Строка для TOML: экранирование делает `toml_edit`, поэтому переводы строк,
@@ -153,9 +217,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("snens-edit-{}-{name}.toml", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        p
+        std::env::temp_dir().join(format!("snens-edit-{}-{name}.toml", std::process::id()))
     }
 
     #[test]
@@ -190,11 +252,7 @@ mod tests {
             "# шапка\nmodel = \"a\"\n# про лимит\nmax_turns = 5\n\n[memory]\ncmd = \"memory\"\n",
         )
         .unwrap();
-        write(
-            &path,
-            &[Edit::top("max_turns", int(9).unwrap())],
-        )
-        .unwrap();
+        write(&path, &[Edit::top("max_turns", int(9).unwrap())]).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# шапка"), "{text}");
         assert!(text.contains("# про лимит"), "{text}");
@@ -208,11 +266,7 @@ mod tests {
         std::fs::write(&path, "model = \"a\"\n").unwrap();
         // Значение с переводом строки и кавычкой: раньше это оставляло на диске
         // конфиг, который не разбирался, и сервис не стартовал.
-        write(
-            &path,
-            &[Edit::top("subagent_model", string("a\nb\"c"))],
-        )
-        .unwrap();
+        write(&path, &[Edit::top("subagent_model", string("a\nb\"c"))]).unwrap();
         let cfg = crate::cfg::Config::load(Some(&path.display().to_string())).unwrap();
         assert_eq!(cfg.subagent_model.as_deref(), Some("a\nb\"c"));
         std::fs::remove_file(&path).ok();
@@ -246,6 +300,38 @@ mod tests {
         assert!(write(&path, &[Edit::top("max_turns", int(1).unwrap())]).is_err());
         // Прежнее содержимое на месте: правка не имеет права добивать файл.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = [не toml\n");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Вложенная таблица: профиль провайдера — это `[providers.<имя>]`, и он
+    /// должен появляться и исчезать целиком, не трогая соседей.
+    #[test]
+    fn nested_table_is_created_and_removed_whole() {
+        let path = tmp("nested");
+        std::fs::write(
+            &path,
+            "# шапка\nmodel = \"a\"\n\n[providers.old]\nbase_url = \"http://old\"\n",
+        )
+        .unwrap();
+        let brief = Edit::section("providers.new", "base_url", string("http://new"));
+        let silent = Edit::section("providers.new", "model", string("m"));
+        // Промежуточной таблицы `[providers]` ещё нет — создаётся сама.
+        write(&path, &[brief, silent]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# шапка"), "{text}");
+        assert!(
+            text.contains("[providers.new]") && text.contains("[providers.old]"),
+            "{text}"
+        );
+        // Удаление — таблицей, а не по ключам: пустой профиль занимал бы имя.
+        write(&path, &[Edit::remove_table("providers.new")]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("providers.new"), "{text}");
+        assert!(text.contains("[providers.old]"), "{text}");
+        let cfg = crate::cfg::Config::load(Some(&path.display().to_string())).unwrap();
+        assert!(cfg.providers.contains_key("old"));
+        // Второй раз — не ошибка: результат тот, который просили.
+        write(&path, &[Edit::remove_table("providers.new")]).unwrap();
         std::fs::remove_file(&path).ok();
     }
 }

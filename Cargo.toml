@@ -16,6 +16,10 @@ toml = "0.8"
 # строки человека остаются на месте (см. src/cfg_edit.rs).
 toml_edit = "0.22"
 axum = "0.8"
+# CORS для парного клиента: браузер с другого origin (веб-клиент на другом
+# устройстве) иначе не достучится до API. Тянем только эту часть tower-http —
+# она уже есть в дереве через reqwest, новых зависимостей не добавляется.
+tower-http = { version = "0.6", features = ["cors"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 fs2 = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }

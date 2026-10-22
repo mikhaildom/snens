@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, path::Path, path::PathBuf};
 
 use serde::Deserialize;
 
-use crate::R;
+use crate::{env_file, R};
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
@@ -26,6 +26,15 @@ pub struct Config {
     pub subagent_model: Option<String>,
     #[serde(default = "d_key_env")]
     pub key_env: String,
+    /// Именованные профили провайдеров: `[providers.<имя>]`. Секции нет — работают
+    /// top-level `base_url`/`model`/`key_env` (обратная совместимость). Есть
+    /// активный профиль — он и перебивает top-level (см. `resolve_providers`).
+    #[serde(default)]
+    pub providers: BTreeMap<String, Provider>,
+    /// Имя активного профиля. Пусто — профилей нет или ни один не выбран, и живём
+    /// на top-level ключах.
+    #[serde(default)]
+    pub active_provider: String,
     /// Произвольные поля в тело запроса (quirks конкретного провайдера).
     #[serde(default)]
     pub body_patch: BTreeMap<String, serde_json::Value>,
@@ -134,6 +143,32 @@ pub struct Config {
     /// ядро об этом знает только по argv-контракту.
     #[serde(default)]
     pub memory: Memory,
+}
+
+/// Профиль провайдера: куда стучаться и чем подписываться.
+///
+/// Ключа здесь нет — только имя переменной: config.toml уезжает в бэкап и git, а
+/// значение лежит в `.env` рядом с конфигом (см. `env_file`). Модель — часть
+/// профиля, потому что у провайдеров разный нейминг одних и тех же моделей:
+/// переключение провайдера без модели отправило бы чужой slug.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct Provider {
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    /// Имя переменной окружения с ключом. Пусто — наследуется общий `key_env`:
+    /// профиль, заведённый руками, не должен требовать своей переменной.
+    #[serde(default)]
+    pub key_env: String,
+}
+
+impl Provider {
+    /// Профиль пригоден для работы: без base_url и модели запрос всё равно не
+    /// соберётся, и «активный» он был бы только на бумаге.
+    pub fn is_complete(&self) -> bool {
+        !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+    }
 }
 
 /// Пороги уборки для конкретной модели. Пустое поле = взять общий дефолт.
@@ -406,6 +441,46 @@ impl Config {
         target.min(budget)
     }
 
+    /// Активный профиль, если он есть и пригоден к работе. Непригодный профиль
+    /// (человек стёр модель в редакторе) не подменяет top-level: иначе ядро
+    /// падало бы на пустом slug вместо того, чтобы работать как раньше.
+    pub fn active_profile(&self) -> Option<&Provider> {
+        let name = self.active_provider.trim();
+        if name.is_empty() {
+            return None;
+        }
+        self.providers.get(name).filter(|p| p.is_complete())
+    }
+
+    /// Модель, с которой реально пойдёт запрос: у активного профиля своя.
+    pub fn effective_model(&self) -> String {
+        match self.active_profile() {
+            Some(p) => p.model.trim().to_string(),
+            None => self.model.clone(),
+        }
+    }
+
+    /// Подставить поля активного профиля поверх top-level. Делается при каждом
+    /// перечитывании файла (`fresh`), а не один раз в `load`: меню настроек
+    /// переключает провайдера на живом сервисе, и со следующего хода должен
+    /// действовать новый base_url, а не снимок старта.
+    ///
+    /// Модель, закреплённая кодом (`model_pinned` — подагент на
+    /// `subagent_model`), профилем не перебивается: модель этого процесса, а не
+    /// настройка инстанса.
+    fn resolve_providers(&mut self) {
+        let Some(profile) = self.active_profile().cloned() else {
+            return;
+        };
+        self.base_url = profile.base_url.trim().to_string();
+        if !self.model_pinned {
+            self.model = profile.model.trim().to_string();
+        }
+        if !profile.key_env.trim().is_empty() {
+            self.key_env = profile.key_env.trim().to_string();
+        }
+    }
+
     pub fn load(override_path: Option<&str>) -> R<Config> {
         let path = match override_path {
             Some(p) => PathBuf::from(p),
@@ -425,6 +500,7 @@ impl Config {
         cfg.tickets_dir = cfg.tickets_dir.replace('~', &home());
         cfg.skills_dir = cfg.skills_dir.replace('~', &home());
         cfg.mail_dir = cfg.mail_dir.replace('~', &home());
+        cfg.resolve_providers();
         Ok(cfg)
     }
 
@@ -638,6 +714,10 @@ impl Config {
         fresh.skills_dir = self.skills_dir.clone();
         fresh.mail_dir = self.mail_dir.clone();
         fresh.source_path = self.source_path.clone();
+        if self.model_pinned {
+            fresh.model_pinned = true;
+        }
+        fresh.resolve_providers();
         Some(fresh)
     }
 
@@ -668,42 +748,53 @@ impl Config {
     /// Ключ: сначала переменная окружения, потом `.env` рядом с конфигом —
     /// чтобы snens мог стоять сам, без оболочки с экспортами.
     pub fn api_key(&self) -> R<String> {
-        if let Ok(k) = std::env::var(&self.key_env) {
-            if !k.trim().is_empty() {
-                return Ok(k);
-            }
-        }
-        // Рядом с *фактическим* конфигом: при `--config /tmp/x/config.toml`
-        // секрет должен браться из /tmp/x/.env, а не из глобального каталога
-        // пользователя (иначе инстансы обмениваются чужими ключами).
-        let path = self
-            .source_path
-            .clone()
-            .unwrap_or_else(config_path)
-            .with_file_name(".env");
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once('=') {
-                    if k.trim() == self.key_env {
-                        let v = v.trim().trim_matches('"').trim_matches('\'');
-                        if !v.is_empty() {
-                            return Ok(v.to_string());
-                        }
-                    }
-                }
-            }
+        if let Some(key) = self.key_value(&self.key_env) {
+            return Ok(key);
         }
         Err(format!(
             "ключ не найден: ни ${}, ни {} в {}",
             self.key_env,
             self.key_env,
-            path.display()
+            self.env_path().display()
         )
         .into())
+    }
+
+    /// Значение ключа по имени переменной: окружение, потом `.env` рядом с
+    /// конфигом. `None` — не задан нигде.
+    ///
+    /// Отдельно от `api_key`, потому что имя переменной у профиля может быть
+    /// пустым (наследуется общий `key_env`) — и тогда вопрос «задан ли ключ» надо
+    /// задавать с подставленным именем, а не с пустой строкой.
+    pub fn key_value(&self, var: &str) -> Option<String> {
+        let var = var.trim();
+        if var.is_empty() {
+            return None;
+        }
+        if let Ok(k) = std::env::var(var) {
+            if !k.trim().is_empty() {
+                return Some(k);
+            }
+        }
+        crate::env_file::read(var, &self.env_path())
+    }
+
+    /// Ключ задан (в окружении или `.env`) — для списка профилей: значение
+    /// клиенту не отдаётся никогда, только признак.
+    pub fn key_is_set(&self, var: &str) -> bool {
+        self.key_value(var).is_some()
+    }
+
+    /// Файл секретов рядом с *фактическим* конфигом: при `--config /tmp/x/config.toml`
+    /// секрет берётся из /tmp/x/.env, а не из глобального каталога
+    /// пользователя (иначе инстансы обмениваются чужими ключами).
+    pub fn env_path(&self) -> PathBuf {
+        env_file::path_near(
+            &self
+                .source_path
+                .clone()
+                .unwrap_or_else(config_path),
+        )
     }
 }
 

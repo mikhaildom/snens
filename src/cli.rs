@@ -9,6 +9,7 @@ mod context_document;
 #[cfg(test)]
 mod context_loop_tests;
 mod dispatch;
+mod env_file;
 mod exec;
 mod improve;
 mod input;
@@ -20,6 +21,7 @@ mod production;
 mod project;
 mod prompt;
 mod reasoning;
+mod remote;
 mod reduce;
 mod registry;
 mod render;

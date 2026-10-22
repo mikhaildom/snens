@@ -6,6 +6,7 @@ use std::{
 
 const HELP: &str = "snens — production entry\n\
   serve [--config PATH] [--listen 127.0.0.1:7420] [--token-file PATH] [--data-dir DIR]\n\
+        [--allow-remote] [--insecure-public] — слушать не только loopback (см. docs/pairing.md)\n\
   tui [--config PATH] [--endpoint URL] [--token-file PATH] [--session ID]\n\
   tui-local [--session ID] [--config PATH] — прежний локальный TUI\n\
   run, run-child, review, tools, build, config/model и остальные команды — legacy CLI\n\nDefault config: ~/.config/snens/config.toml; API token: <cfg.data_path()>/api.token.\n\
@@ -24,7 +25,19 @@ pub async fn entry() -> R<()> {
     match cmd {
         "serve" => {
             let parsed = flags(&argv[1..])?;
-            validate_options(&parsed, &["config", "listen", "token-file", "data-dir"])?;
+            validate_options(
+                &parsed,
+                &[
+                    "config",
+                    "listen",
+                    "token-file",
+                    "data-dir",
+                    "allow-remote",
+                    "insecure-public",
+                    "tls-cert",
+                    "tls-key",
+                ],
+            )?;
             serve(&parsed).await
         }
         "tui" => {
@@ -81,8 +94,28 @@ async fn serve(flags: &BTreeMap<String, String>) -> R<()> {
         .map(String::as_str)
         .unwrap_or("127.0.0.1:7420")
         .parse::<std::net::SocketAddr>()?;
-    if !addr.ip().is_loopback() {
-        return Err("production surface server must bind to loopback".into());
+    // Не-loopback разрешён только явно и только в приватной сети: API защищён
+    // одним bearer-токеном и без TLS, поэтому «открыть наружу» — решение
+    // человека, а не следствие опечатки в адресе (docs/pairing.md).
+    let remote = !addr.ip().is_loopback();
+    if remote {
+        if !flags.contains_key("allow-remote") {
+            // Про причину «не приватный» здесь молчим: это отдельная проверка
+            // ниже, а склеенное сообщение путало («100.x не приватный»).
+            return Err(format!(
+                "ядро слушает только loopback (сейчас --listen {addr}). Для доступа \
+                 с другого устройства добавь --allow-remote (в приватной сети: \
+                 tailnet/WireGuard/LAN) — см. docs/pairing.md"
+            )
+            .into());
+        }
+        if !crate::remote::allowed_without_override(addr.ip()) && !flags.contains_key("insecure-public") {
+            return Err(crate::remote::refusal(addr.ip()).into());
+        }
+        eprintln!(
+            "[snens] ВНИМАНИЕ: слушаю {addr} — API доступен по сети с одним bearer-токеном. \
+             Снаружи пускай только приватную сеть (tailnet/WireGuard) или TLS."
+        );
     }
     // Адрес поверхности — в окружение процесса: дочерние подагенты (`snens
     // run --detach`) наследуют его и стримят свою работу сюда, в эту же шину.
@@ -192,15 +225,32 @@ fn flags(args: &[String]) -> R<BTreeMap<String, String>> {
     while let Some(key) = args.next() {
         if !matches!(
             key.as_str(),
-            "--config" | "--listen" | "--token-file" | "--endpoint" | "--session" | "--data-dir"
+            "--config"
+                | "--listen"
+                | "--token-file"
+                | "--endpoint"
+                | "--session"
+                | "--data-dir"
+                | "--allow-remote"
+                | "--insecure-public"
+                | "--tls-cert"
+                | "--tls-key"
         ) {
             return Err(format!("unknown option {key}").into());
         }
-        let value = args
-            .next()
-            .ok_or_else(|| format!("missing value for {key}"))?;
+        // Флаги-переключатели значения не носят: `--allow-remote` без аргумента
+        // — это включено, а не ошибка разбора (прежний парсер требовал значение
+        // у каждого флага и падал на первом же переключателе).
+        let is_switch = matches!(key.as_str(), "--allow-remote" | "--insecure-public");
+        let value = if is_switch {
+            "1".to_string()
+        } else {
+            args.next()
+                .ok_or_else(|| format!("missing value for {key}"))?
+                .clone()
+        };
         if out
-            .insert(key.trim_start_matches("--").to_owned(), value.clone())
+            .insert(key.trim_start_matches("--").to_owned(), value)
             .is_some()
         {
             return Err(format!("duplicate option {key}").into());
