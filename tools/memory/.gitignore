@@ -1,0 +1,6 @@
+/target
+/memory
+*.db
+*.db-journal
+/.cargo
+/.env
