@@ -33,10 +33,7 @@ fn in_cgnat(v4: std::net::Ipv4Addr) -> bool {
 }
 
 fn mapped_v4(v6: std::net::Ipv6Addr) -> Option<IpAddr> {
-    match v6.to_ipv4_mapped() {
-        Some(v4) => Some(IpAddr::V4(v4)),
-        None => None,
-    }
+    v6.to_ipv4_mapped().map(IpAddr::V4)
 }
 
 /// Можно ли слушать этот адрес без `--insecure-public`.

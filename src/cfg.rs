@@ -599,6 +599,19 @@ impl Config {
             Some(p) => PathBuf::from(p),
             None => self.source_path.clone().unwrap_or_else(config_path),
         };
+        // Активный профиль перекрывает top-level `model`. Отказываем ДО записи:
+        // иначе на диске осталась бы правка, которая не действует, и человек
+        // искал бы причину в модели, а не в профиле.
+        let before = Config::load(Some(&path.display().to_string()))?;
+        if before.active_profile().is_some() {
+            return Err(format!(
+                "модель задаёт активный профиль «{}»: меняй её в профиле (snens providers, \
+                 раздел «провайдеры» в вебе) или переключись на другой",
+                before.active_provider.trim()
+            )
+            .replace("  ", " ")
+            .into());
+        }
         crate::cfg_edit::write(
             &path,
             &[crate::cfg_edit::Edit::top(
@@ -610,7 +623,22 @@ impl Config {
         // тем, что прочитает ядро (например, ключ перекрыт секцией).
         let check = Config::load(Some(&path.display().to_string()))?;
         if check.model != slug {
-            return Err(format!("модель не применилась: в конфиге {}", check.model).into());
+            // Активный профиль перекрывает top-level `model`: молчаливое «не
+            // применилось» отправляло бы человека искать причину в файле, где
+            // всё написано верно.
+            let hint = if check.active_provider.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (её задаёт активный профиль «{}» — меняй модель в профиле)",
+                    check.active_provider.trim()
+                )
+            };
+            return Err(format!(
+                "модель не применилась: в конфиге {}{hint}",
+                check.model
+            )
+            .into());
         }
         Ok(path)
     }
@@ -1034,6 +1062,48 @@ mod tests {
         // Сломанный файл не должен ронять ход: остаёмся на снимке.
         std::fs::write(&p, "model = [не toml").unwrap();
         assert_eq!(cfg.model_now(), "старая");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `snens model` при активном профиле: отказ до записи, файл не тронут.
+    /// Иначе правка легла бы на диск, не подействовала, и причину искали бы в
+    /// модели, а не в профиле.
+    #[test]
+    fn set_model_refuses_while_profile_is_active() {
+        let p = tmp("active-profile");
+        std::fs::write(
+            &p,
+            "model = \"top\"\nactive_provider = \"nous\"\n\n[providers.nous]\nbase_url = \"https://x/v1\"\nmodel = \"n/m\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&p.display().to_string())).unwrap();
+        let err = cfg.set_model("other/model", None).unwrap_err().to_string();
+        assert!(err.contains("nous"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap().matches("model = \"top\"").count(),
+            1,
+            "файл всё-таки поправлен"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Закреплённая кодом модель (подагент) профилем не перебивается: это модель
+    /// процесса, а не настройка инстанса.
+    #[test]
+    fn pinned_model_survives_active_profile() {
+        let p = tmp("pinned-profile");
+        std::fs::write(
+            &p,
+            "active_provider = \"nous\"\n\n[providers.nous]\nbase_url = \"https://x/v1\"\nmodel = \"n/m\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config::load(Some(&p.display().to_string())).unwrap();
+        assert_eq!(cfg.model_now(), "n/m");
+        cfg.model = "подагентская".into();
+        cfg.model_pinned = true;
+        // Адрес всё равно профильный: подагенту нужен тот же провайдер.
+        assert_eq!(cfg.model_now(), "подагентская");
+        assert_eq!(cfg.live().base_url, "https://x/v1");
         let _ = std::fs::remove_file(&p);
     }
 

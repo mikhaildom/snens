@@ -10,6 +10,10 @@
 // просили (`system_prompt = """… max_turns = 4 …"""` больше не перехватывается
 // правкой `max_turns`). Запись атомарная: сначала временный файл рядом, проверка
 // разбора, потом `rename` — при любой ошибке на диске остаётся прежний конфиг.
+//
+// Путь правки — цепочка таблиц (`["providers", "nous"]`), пустая — верхний
+// уровень: профили провайдеров живут в `[providers.<имя>]`, и без вложенных путей
+// профиль нельзя ни завести, ни удалить целиком.
 
 use std::path::{Path, PathBuf};
 
@@ -17,9 +21,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::R;
 
-/// Одна правка документа. Путь — цепочка таблиц (`["providers", "nous"]`);
-/// пустой путь — верхний уровень. Профили провайдеров живут в `[providers.<имя>]`,
-/// и без вложенных путей профиль нельзя ни завести, ни удалить целиком.
+/// Одна правка документа.
 pub enum Edit {
     Set {
         path: Vec<String>,
@@ -91,15 +93,13 @@ impl Edit {
 /// Вписать значение, сохранив оформление прежнего: комментарий над строкой и
 /// отступ — часть конфига человека, а вставка нового `Item` их сносила.
 fn put(table: &mut Table, key: &str, value: Value) {
-    if let Some((_k, item)) = table.get_key_value_mut(key) {
-        if let Item::Value(old) = item {
-            let mut fresh = value;
-            // Комментарий перед ключом живёт в decor ключа, хвостовой — в decor
-            // значения; второе переносим, первое не трогаем вовсе.
-            *fresh.decor_mut() = old.decor().clone();
-            *old = fresh;
-            return;
-        }
+    if let Some((_k, Item::Value(old))) = table.get_key_value_mut(key) {
+        let mut fresh = value;
+        // Комментарий перед ключом живёт в decor ключа, хвостовой — в decor
+        // значения; второе переносим, первое не трогаем вовсе.
+        *fresh.decor_mut() = old.decor().clone();
+        *old = fresh;
+        return;
     }
     table.insert(key, Item::Value(value));
 }
@@ -122,9 +122,16 @@ fn table_at<'a>(doc: &'a mut DocumentMut, path: &[String]) -> R<&'a mut Table> {
         return Ok(doc.as_table_mut());
     }
     let mut table = doc.as_table_mut();
-    for part in path {
+    for (i, part) in path.iter().enumerate() {
         if !table.contains_key(part) {
-            table.insert(part, Item::Table(Table::new()));
+            let mut fresh = Table::new();
+            // Промежуточный уровень (`[providers]`) — невидимый заголовок: человеку
+            // нужен `[providers.nous]`, а пустая `[providers]` над ним осталась бы
+            // мусором после удаления последнего профиля.
+            if i + 1 < path.len() {
+                fresh.set_implicit(true);
+            }
+            table.insert(part, Item::Table(fresh));
         }
         table = table
             .get_mut(part)
@@ -132,6 +139,17 @@ fn table_at<'a>(doc: &'a mut DocumentMut, path: &[String]) -> R<&'a mut Table> {
             .ok_or_else(|| format!("[{part}] — не таблица, правка отменена"))?;
     }
     Ok(table)
+}
+
+/// Удалить таблицу по пути. Нет её — не ошибка: результат тот, который просили.
+fn remove_table(doc: &mut DocumentMut, path: &[String]) -> R<()> {
+    let Some((last, parents)) = path.split_last() else {
+        return Err("удаление всего документа — не правка".into());
+    };
+    if let Some(parent) = table_if(doc, parents) {
+        parent.remove(last);
+    }
+    Ok(())
 }
 
 /// Применить пачку правок одним заходом: либо все, либо ни одна.
@@ -183,17 +201,6 @@ pub fn write(path: &Path, edits: &[Edit]) -> R<PathBuf> {
         return Err(format!("{}: {e}", path.display()).into());
     }
     Ok(path.to_path_buf())
-}
-
-/// Удалить таблицу по пути. Нет её — не ошибка: результат тот, который просили.
-fn remove_table(doc: &mut DocumentMut, path: &[String]) -> R<()> {
-    let Some((last, parents)) = path.split_last() else {
-        return Err("удаление всего документа — не правка".into());
-    };
-    if let Some(parent) = table_if(doc, parents) {
-        parent.remove(last);
-    }
-    Ok(())
 }
 
 /// Строка для TOML: экранирование делает `toml_edit`, поэтому переводы строк,
@@ -323,6 +330,9 @@ mod tests {
             text.contains("[providers.new]") && text.contains("[providers.old]"),
             "{text}"
         );
+        // Промежуточная `[providers]` не выводится заголовком: она — только
+        // контейнер, и пустой строкой в файле была бы мусором.
+        assert!(!text.contains("\n[providers]\n"), "пустой заголовок: {text}");
         // Удаление — таблицей, а не по ключам: пустой профиль занимал бы имя.
         write(&path, &[Edit::remove_table("providers.new")]).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

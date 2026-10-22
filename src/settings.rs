@@ -41,6 +41,16 @@ pub fn values(cfg: &Config) -> Value {
     let mem = &live.memory;
     json!({
         "model": live.model,
+        // Адрес и имя переменной с ключом: раньше они правились только руками в
+        // файле, а поверхность показывала одно поле модели без провайдера.
+        // У активного профиля это его значения (их и видит человек).
+        "base_url": live.base_url,
+        "key_env": live.key_env,
+        // Имя активного профиля, если он есть: `model`/`base_url` выше — уже его
+        // значения. Клиенту это нужно, чтобы не предлагать правку, которую
+        // профиль молча перекроет (поле модели в меню настроек).
+        "active_provider": live.active_provider,
+        "providers_count": live.providers.len(),
         "subagent_model": live.subagent_model.clone().unwrap_or_default(),
         "max_turns": live.max_turns,
         "review_min_turns": live.review_min_turns,
@@ -125,6 +135,16 @@ pub fn prepare(cfg: &Config, patch: &Value) -> R<Vec<crate::cfg_edit::Edit>> {
                 let s = text(value, k)?.trim().to_string();
                 if s.is_empty() {
                     return Err("model: пустой slug".into());
+                }
+                // Активный профиль перекрывает top-level `model`: правка легла бы
+                // в файл и не подействовала, а человек искал бы причину в модели.
+                let live = cfg.fresh().unwrap_or_else(|| cfg.clone());
+                if !live.active_provider.trim().is_empty() {
+                    return Err(format!(
+                        "model: модель задаёт активный профиль «{}» — меняй её в профиле                          (раздел «провайдеры»), либо переключись на другой",
+                        live.active_provider.trim()
+                    )
+                    .into());
                 }
                 edits.push(Edit::top("model", crate::cfg_edit::string(&s)));
             }
@@ -353,6 +373,21 @@ mod tests {
         assert_eq!(reloaded.subagent_model, None);
         // Соседняя секция цела: правка верхнего уровня не задела `[memory]`.
         assert_eq!(reloaded.memory.cmd, "memory");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Модель активного профиля живёт в профиле: правка top-level `model` легла
+    /// бы в файл и не подействовала — говорим это отказом, а не молчанием.
+    #[test]
+    fn model_edit_is_refused_while_a_profile_is_active() {
+        let (cfg, path) = cfg_with(
+            "model = \"top\"\nactive_provider = \"nous\"\n\n[providers.nous]\nbase_url = \"https://x/v1\"\nmodel = \"n/m\"\n",
+            "active-model",
+        );
+        let err = apply(&cfg, &json!({"model": "other/model"})).unwrap_err().to_string();
+        assert!(err.contains("nous"), "{err}");
+        // Файл не тронут: отказ до записи.
+        assert!(std::fs::read_to_string(&path).unwrap().contains("model = \"top\""));
         std::fs::remove_file(&path).ok();
     }
 

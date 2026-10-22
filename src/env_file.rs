@@ -120,20 +120,27 @@ fn restrict(_path: &Path) -> R<()> {
     Ok(())
 }
 
-/// Свободное имя переменной для нового профиля: `SNENS_<ИМЯ>_KEY`, где имя
-/// приведено к верхнему регистру с `_` вместо всего не-буквенного. Так человеку
-/// ключ легко найти в `.env` глазами, а ядру — собрать без словаря.
+/// Имя переменной для нового профиля: `SNENS_<ИМЯ>_KEY`, имя — в верхнем
+/// регистре, всё не-ASCII-буквенное схлопывается в `_`. Так человеку ключ легко
+/// найти в `.env` глазами, а ядру — собрать без словаря.
+///
+/// Только ASCII: имя переменной уезжает в шелл и в чужие `.env`, а кириллическое
+/// имя там не переживает копирования. Профиль с именем «наш» получит общее
+/// `SNENS_KEY`; столкновение имён разрешает `unique_var`.
 pub fn var_for(profile: &str) -> String {
-    let mut out = String::from("SNENS_");
+    let mut body = String::new();
     for c in profile.chars() {
         if c.is_ascii_alphanumeric() {
-            out.extend(c.to_uppercase());
-        } else if !out.ends_with('_') {
-            out.push('_');
+            body.extend(c.to_uppercase());
+        } else if !body.ends_with('_') {
+            body.push('_');
         }
     }
-    out.push_str("_KEY");
-    out
+    let body = body.trim_matches('_');
+    if body.is_empty() {
+        return "SNENS_KEY".into();
+    }
+    format!("SNENS_{body}_KEY")
 }
 
 #[cfg(test)]
@@ -184,7 +191,8 @@ mod tests {
     fn new_profile_var_is_readable() {
         assert_eq!(var_for("nous"), "SNENS_NOUS_KEY");
         assert_eq!(var_for("open-router"), "SNENS_OPEN_ROUTER_KEY");
-        assert_eq!(var_for("мой"), "SNENS_МОЙ_KEY");
+        // Кириллица в имени переменной не пережила бы шелл — остаётся общее имя.
+        assert_eq!(var_for("мой"), "SNENS_KEY");
     }
 
     #[cfg(unix)]

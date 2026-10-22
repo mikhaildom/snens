@@ -124,6 +124,16 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
         .route("/v1/model", get(get_model).put(put_model))
         .route("/v1/memory", get(get_memory).put(put_memory))
         .route("/v1/config", get(get_config).put(put_config))
+        // Профили провайдеров: список без ключей (только «ключ задан»), CRUD и
+        // отдельный маршрут переключения. Активация отдельным POST, а не флагом
+        // в PUT: у неё свои требования (профиль полный) и своя цена ошибки
+        // (ядро осталось бы без рабочего адреса).
+        .route("/v1/providers", get(get_providers).post(post_provider))
+        .route(
+            "/v1/providers/{name}",
+            axum::routing::put(put_provider).delete(delete_provider),
+        )
+        .route("/v1/providers/{name}/activate", post(activate_provider))
         // Список сессий без опроса: подагент растёт, пока его карточка на экране,
         // и клиент должен видеть ходы и конец работы, а не снимок на загрузке.
         .route("/v1/events", get(session_updates))
@@ -234,6 +244,149 @@ async fn get_config(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
         .clone()
         .unwrap_or_else(crate::cfg::config_path);
     Json(crate::settings::state(&s.cfg, &path)).into_response()
+}
+
+/// Список профилей провайдеров: ключей в ответе нет — только `key_set`.
+/// Читаем из файла (как и настройки): меню показывает диск, а не снимок старта.
+async fn get_providers(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
+    Json(crate::providers::list(&s.cfg)).into_response()
+}
+
+/// Разбор тела профиля — общий для POST/PUT. Ошибка здесь всегда вина клиента,
+/// поэтому возвращается текстом: ответ собирает вызывающий (у него статус).
+fn provider_draft(
+    body: &serde_json::Value,
+    name: &str,
+) -> Result<crate::providers::Draft, String> {
+    crate::providers::Draft::parse(body, name).map_err(|e| e.to_string())
+}
+
+/// Имя из пути: пустое или невалидное — 400 до всякой записи.
+fn provider_name(path_param: &str) -> Result<String, String> {
+    let name = crate::providers::normalize_name(path_param);
+    crate::providers::validate_name(&name).map_err(|e| e.to_string())?;
+    Ok(name)
+}
+
+/// Создать провайдера: `{"name", "base_url", "model", "key"}` или
+/// `{"name", "preset": "nous"}`. Пресет ключа не несёт — подставить чужой
+/// секрет нечем и незачем.
+///
+/// Первый созданный профиль сразу становится активным: иначе человек завёл
+/// провайдера и не понимает, почему ядро ходит старым адресом.
+async fn post_provider(
+    State(s): State<Arc<Runtime>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let raw = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let name = match provider_name(&raw) {
+        Ok(name) => name,
+        Err(e) => return err("invalid", &e, StatusCode::BAD_REQUEST).into_response(),
+    };
+    let live = s.cfg.fresh().unwrap_or_else(|| s.cfg.clone());
+    if live.providers.contains_key(&name) {
+        return err(
+            "exists",
+            &format!("профиль «{name}» уже есть: правь его, а не создавай второй"),
+            StatusCode::CONFLICT,
+        )
+        .into_response();
+    }
+    let draft = match provider_draft(&body, &name) {
+        Ok(draft) => draft,
+        Err(e) => return err("invalid", &e, StatusCode::BAD_REQUEST).into_response(),
+    };
+    let activate = live.providers.is_empty()
+        || body.get("activate").and_then(|v| v.as_bool()) == Some(true);
+    if let Err(e) = crate::providers::write_profile(&s.cfg, &name, &draft, None, activate) {
+        return err("invalid", &e.to_string(), StatusCode::BAD_REQUEST).into_response();
+    }
+    Json(crate::providers::list(&s.cfg)).into_response()
+}
+
+/// Изменить провайдера: любое подмножество полей. Отсутствующий ключ не стирается
+/// (иначе правка модели без ключа отключала бы провайдера).
+async fn put_provider(
+    State(s): State<Arc<Runtime>>,
+    Path(raw): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let name = match provider_name(&raw) {
+        Ok(name) => name,
+        Err(e) => return err("invalid", &e, StatusCode::BAD_REQUEST).into_response(),
+    };
+    let live = s.cfg.fresh().unwrap_or_else(|| s.cfg.clone());
+    let Some(existing) = live.providers.get(&name).cloned() else {
+        return err(
+            "not_found",
+            &format!("профиль «{name}» не найден"),
+            StatusCode::NOT_FOUND,
+        )
+        .into_response();
+    };
+    let draft = match provider_draft(&body, &name) {
+        Ok(draft) => draft,
+        Err(e) => return err("invalid", &e, StatusCode::BAD_REQUEST).into_response(),
+    };
+    // Пустое тело — не ошибка: PUT без полей значит «оставь как было».
+    if let Err(e) = crate::providers::write_profile(&s.cfg, &name, &draft, Some(&existing), false) {
+        return err("invalid", &e.to_string(), StatusCode::BAD_REQUEST).into_response();
+    }
+    Json(crate::providers::list(&s.cfg)).into_response()
+}
+
+async fn delete_provider(
+    State(s): State<Arc<Runtime>>,
+    Path(raw): Path<String>,
+) -> impl IntoResponse {
+    let name = match provider_name(&raw) {
+        Ok(name) => name,
+        Err(e) => return err("invalid", &e, StatusCode::BAD_REQUEST).into_response(),
+    };
+    let live = s.cfg.fresh().unwrap_or_else(|| s.cfg.clone());
+    if !live.providers.contains_key(&name) {
+        return err(
+            "not_found",
+            &format!("профиль «{name}» не найден"),
+            StatusCode::NOT_FOUND,
+        )
+        .into_response();
+    }
+    // Активный не удаляем: `active_provider` указывал бы в пустоту. Это правило
+    // предметной области — 409, а не 400.
+    match crate::providers::remove_profile(&s.cfg, &name) {
+        Ok(()) => Json(crate::providers::list(&s.cfg)).into_response(),
+        Err(e) => err("conflict", &e.to_string(), StatusCode::CONFLICT).into_response(),
+    }
+}
+
+/// Сделать профиль активным. Адрес и модель действуют со следующего хода:
+/// активный профиль подставляется в `Config::fresh`.
+async fn activate_provider(
+    State(s): State<Arc<Runtime>>,
+    Path(raw): Path<String>,
+) -> impl IntoResponse {
+    let name = match provider_name(&raw) {
+        Ok(name) => name,
+        Err(e) => return err("invalid", &e, StatusCode::BAD_REQUEST).into_response(),
+    };
+    let live = s.cfg.fresh().unwrap_or_else(|| s.cfg.clone());
+    if !live.providers.contains_key(&name) {
+        return err(
+            "not_found",
+            &format!("профиль «{name}» не найден"),
+            StatusCode::NOT_FOUND,
+        )
+        .into_response();
+    }
+    match crate::providers::activate(&s.cfg, &name) {
+        Ok(()) => Json(crate::providers::list(&s.cfg)).into_response(),
+        Err(e) => err("invalid", &e.to_string(), StatusCode::BAD_REQUEST).into_response(),
+    }
 }
 
 /// Правка настроек пачкой: `{"max_turns": 0}`. Одно битое поле — ни одна правка
@@ -493,7 +646,7 @@ fn search_sessions(
         files.push((updated, path, id));
     }
     // Свежие сверху: чаще ищут недавнее, а лимит должен резать старое.
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|(updated, _, _)| std::cmp::Reverse(*updated));
     let mut hits = Vec::new();
     for (updated, path, id) in files {
         if hits.len() >= limit {
@@ -2274,6 +2427,10 @@ async fn session_updates(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
 }
+
+#[cfg(test)]
+#[path = "surface_providers_tests.rs"]
+mod provider_tests;
 
 #[cfg(test)]
 mod tests {

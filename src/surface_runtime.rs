@@ -173,10 +173,10 @@ pub struct Runtime {
     pub tx_updates: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 impl Runtime {
-    /// Полная перезапись store. Нужна только там, где меняется всё сразу:
-    /// старт (миграция legacy `store.json`), shutdown, пересборка после
-    /// `interrupt_running`. В горячем пути (событие хода) — никогда: она
-    /// переписывает все таблицы, и её цена растёт вместе с объёмом истории.
+    // Полная перезапись store (`persist_store`) нужна только там, где меняется
+    // всё сразу: старт (миграция legacy `store.json`), shutdown, пересборка
+    // после `interrupt_running`. В горячем пути — никогда: она переписывает все
+    // таблицы, и цена растёт вместе с объёмом истории.
 
     /// Записать одну сессию (upsert).
     pub fn save_session(&self, s: &Session) -> crate::R<()> {

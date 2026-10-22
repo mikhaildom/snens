@@ -40,8 +40,11 @@ pub struct Facts {
     pub progress: Option<crate::surface_server::discovery::Progress>,
 }
 
-fn cache() -> &'static Mutex<HashMap<(PathBuf, u64, u64), Facts>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<(PathBuf, u64, u64), Facts>>> =
+/// Ключ кэша: путь, mtime (сек) и размер файла.
+type FactsKey = (PathBuf, u64, u64);
+
+fn cache() -> &'static Mutex<HashMap<FactsKey, Facts>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<FactsKey, Facts>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -97,10 +100,10 @@ fn read_facts(path: &Path, want_progress: bool) -> Facts {
                 if let Some(s) = surface.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     out.surface.get_or_insert_with(|| s.to_string());
                 }
-                if let Some(p) = Some(parent.as_str()).map(str::trim).filter(|p| !p.is_empty()) {
+                if let Some(p) = Some(parent.trim()).filter(|p| !p.is_empty()) {
                     out.parent.get_or_insert_with(|| p.to_string());
                 }
-                if let Some(m) = Some(model.as_str()).map(str::trim).filter(|m| !m.is_empty()) {
+                if let Some(m) = Some(model.trim()).filter(|m| !m.is_empty()) {
                     out.model.get_or_insert_with(|| m.to_string());
                 }
             }

@@ -20,6 +20,7 @@ mod memory;
 mod production;
 mod project;
 mod prompt;
+mod providers;
 mod reasoning;
 mod remote;
 mod reduce;
@@ -62,6 +63,8 @@ snens — узкое ядро агента
   snens model [slug]             # без аргумента — какая сейчас; со slug — сменить в конфиге
   snens config [ключ=значение …]  # без аргументов — текущие значения; с ними — правка на ходу
                                  # ключи: model, max_turns (0 — без лимита), memory_recall, …
+  snens providers [list|activate <имя>|key <имя> <ключ>]
+                                 # профили провайдеров: без аргументов — список и активный
   snens memory [on|off] [recall always|session|off] [retain on|off]
                                  # тумблер долгой памяти: справка на ход и запись хода
   snens build [<tool>…]          # без аргументов весь workspace, с аргументами — только названные тулы
@@ -119,6 +122,7 @@ async fn legacy_main() -> R<()> {
         Some("tools") => cmd_tools(&flags).await,
         Some("model") => cmd_model(&flags, positional),
         Some("config") => settings::cmd(&flags, positional),
+        Some("providers") => providers::cmd(&flags, positional),
         Some("memory") => cmd_memory(&flags, positional),
         Some("build") => cmd_build(&flags, positional),
         Some("review") => review::cmd(&flags).await,

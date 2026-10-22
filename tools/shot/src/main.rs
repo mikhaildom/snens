@@ -941,10 +941,13 @@ fn open(cdp: &mut Cdp, session: &str, a: &Args) -> Result<(), String> {
 /// видит ту же страницу, что и снимок, — иначе поведение проверялось бы на другой.
 fn shots_and_probe(cdp: &mut Cdp, session: &str, a: &Args, out_dir: &Path) -> Result<(), String> {
     let sizes: &[Size] = if a.no_shot { &[] } else { &a.sizes };
-    // Кадров не просили — страницу всё равно надо открыть: проба работает на
-    // том документе, который открыт, а не на about:blank.
-    if sizes.is_empty() {
-        open(cdp, session, a)?;
+    // Порядок шагов — часть контракта: страница открывается один раз, `--script`
+    // выполняется сразу после готовности, и только потом снимается кадр. Иначе
+    // сценарий «нажать и показать результат» снимал бы исходный вид: снимок
+    // делался до пробы, а повторный `navigate` на второй размер стирал состояние.
+    open(cdp, session, a)?;
+    if a.script.is_some() {
+        probe(cdp, session, a)?;
     }
     for size in sizes {
         cdp.call(
@@ -957,7 +960,6 @@ fn shots_and_probe(cdp: &mut Cdp, session: &str, a: &Args, out_dir: &Path) -> Re
                 "mobile": false,
             }),
         )?;
-        open(cdp, session, a)?;
         let (clip, tag) = if let Some(sel) = &a.selector {
             let r = shift_to_view(cdp, session, sel)?;
             println!(
@@ -985,15 +987,20 @@ fn shots_and_probe(cdp: &mut Cdp, session: &str, a: &Args, out_dir: &Path) -> Re
         fs::write(&path, &png).map_err(|e| format!("{}: {e}", path.display()))?;
         deliver(&path, &png)?;
     }
+    Ok(())
+}
 
-    if let Some(script) = &a.script {
-        let src = fs::read_to_string(script)
-            .map_err(|e| format!("--script {}: {e}", script.display()))?;
-        // Тело async-функции: `return` определяет результат, await разрешён.
-        let expr = format!("(async () => {{\n{src}\n}})()");
-        let v = cdp.eval(session, &expr)?;
-        println!("{}", serde_json::to_string(&v).unwrap_or_else(|_| "null".into()));
-    }
+/// Выполнить `--script` как тело async-функции страницы и напечатать JSON.
+fn probe(cdp: &mut Cdp, session: &str, a: &Args) -> Result<(), String> {
+    let Some(script) = &a.script else {
+        return Ok(());
+    };
+    let src = fs::read_to_string(script)
+        .map_err(|e| format!("--script {}: {e}", script.display()))?;
+    // Тело async-функции: `return` определяет результат, await разрешён.
+    let expr = format!("(async () => {{\n{src}\n}})()");
+    let v = cdp.eval(session, &expr)?;
+    println!("{}", serde_json::to_string(&v).unwrap_or_else(|_| "null".into()));
     Ok(())
 }
 

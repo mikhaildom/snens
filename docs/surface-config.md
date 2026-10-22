@@ -14,6 +14,10 @@
   "path": "/home/user/.config/snens/config.toml",
   "values": {
     "model": "vendor/model-name",
+    "base_url": "https://openrouter.ai/api/v1",
+    "key_env": "SNENS_OPENROUTER_KEY",
+    "active_provider": "openrouter",
+    "providers_count": 1,
     "subagent_model": "",
     "max_turns": 200,
     "review_min_turns": 20,
@@ -41,6 +45,10 @@
   ядро, и обещать число, которое молча обрежется, нельзя.
 - `subagent_model: ""` — «как основная»: ключ из файла **удаляется**, а не
   пишется пустой строкой (с ней подагент уходил моделью с пустым именем).
+- `base_url`/`key_env`/`active_provider` — то, чем ядро пойдёт сейчас: у
+  активного профиля это его значения. **Только чтение здесь**: правятся через
+  `/v1/providers` (см. ниже), иначе клиент писал бы в top-level ключ, который
+  профиль молча перекрывает.
 - `memory_recall` — `always` | `session` | `off`.
 - `memory_cmd` — имя штатного плагина (`memory`, он в поставке) или путь к
   своему бинарю со слэшем. Имени нет в каталоге тулов — канала нет, и это не
@@ -63,6 +71,68 @@
 
 Действие: **со следующего хода** той сессии, где он начнётся. Активный ход не
 перезапускается.
+
+## Провайдеры: `GET/POST /v1/providers`, `PUT/DELETE /v1/providers/{name}`,
+## `POST /v1/providers/{name}/activate`
+
+Несколько именованных профилей провайдеров и один активный. Профиль — это
+`[providers.<имя>]` в config.toml:
+
+```toml
+active_provider = "nous"
+
+[providers.nous]
+base_url = "https://inference-api.nousresearch.com/v1"
+model = "vendor/model"
+key_env = "SNENS_NOUS_KEY"
+```
+
+**Ключа в TOML нет и не бывает.** В конфиге только имя переменной (`key_env`),
+значение — строкой `KEY=VALUE` в `.env` рядом с конфигом (0600; при
+`--config /tmp/x/config.toml` это `/tmp/x/.env`). Config.toml человек копирует в
+git и бэкап, `.env` — нет, и разъехаться эти два факта не могут.
+
+Приоритет: активный профиль перекрывает top-level `base_url`/`model`/`key_env`
+(подстановка — в `Config::fresh`, то есть со следующего хода). Секции
+`[providers]` нет — работает top-level, как до профилей; правка `model` при
+активном профиле отвергается (`400`/ошибка `snens model`) с подсказкой, а не
+пишется в файл без эффекта. Неполный профиль (нет адреса или модели) активным
+не становится: ядро осталось бы без рабочего адреса.
+
+`GET /v1/providers` — ключей нет, только `key_set`:
+
+```json
+{
+  "providers": [
+    {"name": "nous", "base_url": "https://…/v1", "model": "vendor/model",
+     "key_env": "SNENS_NOUS_KEY", "key_set": true, "active": true, "complete": true}
+  ],
+  "active": "nous",
+  "effective": {"base_url": "https://…/v1", "model": "vendor/model",
+                "key_env": "SNENS_NOUS_KEY", "key_set": true},
+  "config": "/home/user/.config/snens/config.toml",
+  "presets": [{"name": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+               "model": "vendor/model"}, {"name": "nous", "…": "…"}]
+}
+```
+
+- Секции нет — список из одного виртуального профиля `(конфиг)` с `implicit: true`
+  (`active: true`): клиенту нужен видимый работающий провайдер, а не пустота при
+  рабочем ядре.
+- `POST /v1/providers` — `{"name", "base_url", "model", "key"}` или
+  `{"name", "preset": "openrouter"|"nous"}` (пресет ключа не несёт). Первый
+  профиль сразу становится активным. `409 exists` — имя занято.
+- `PUT /v1/providers/{name}` — любое подмножество полей; **отсутствующий `key`
+  ключ не стирает** (иначе правка модели отключала бы провайдера).
+- `DELETE /v1/providers/{name}` — `409 conflict`, если профиль активный: сначала
+  переключение. Секция удаляется целиком, строка переменной из `.env` — только
+  если на неё больше никто не ссылается.
+- `POST /v1/providers/{name}/activate` — `400 invalid` для неполного профиля.
+- Ошибки правки: `400 invalid` (имя, адрес без `http(s)`, пустая модель,
+  неизвестное поле), `404 not_found`, `409` (занятое имя, активный при удалении).
+
+CLI — тот же слой: `snens providers [list|activate <имя>|key <имя> <ключ|->]`
+(`-` читает ключ со stdin: значение в argv видно в `ps`).
 
 ## `GET /v1/events`
 
