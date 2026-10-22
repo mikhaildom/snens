@@ -4,17 +4,13 @@ use crate::{
 };
 use std::{fs, path::Path};
 
-/// Сколько байт головы лога читать для заголовка. Первое сообщение пользователя
-/// лежит в начале, а логи бывают по несколько сотен килобайт — целиком их
-/// разбирать на каждый `GET /v1/sessions` слишком дорого.
-const HEAD_BYTES: u64 = 64 * 1024;
-
 /// Заголовок, собранный из первых слов первого сообщения пользователя.
-/// Используется, когда ядро/поверхность заголовок не сгенерировали.
-pub fn title_from_transcript(path: &Path) -> Option<String> {
+/// Используется, когда ядро/поверхность заголовок не сгенерировали. Читается по
+/// уже прочитанной голове журнала: `surface_facts` берёт её один раз на все
+/// нужды списка, второй `read_head_bytes` за тем же был бы лишним I/O.
+pub fn title_from_head(head: &[crate::log::Rec]) -> Option<String> {
     const MAX_WORDS: usize = 8;
     const MAX_CHARS: usize = 64;
-    let head = crate::log::read_head_bytes(path, HEAD_BYTES).ok()?;
     for rec in head {
         let text = match rec {
             crate::log::Rec::User { text, .. } => text,
@@ -50,16 +46,7 @@ pub fn title_from_transcript(path: &Path) -> Option<String> {
 /// Заголовок сессии: `Meta.title`, иначе первые слова пользователя. Пустая
 /// строка не возвращается — `None` значит «заголовка нет».
 pub fn title(path: &Path) -> Option<String> {
-    let explicit = crate::log::read_head_bytes(path, HEAD_BYTES)
-        .ok()?
-        .into_iter()
-        .find_map(|rec| match rec {
-            crate::log::Rec::Meta { title, .. } => title,
-            _ => None,
-        })
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty());
-    explicit.or_else(|| title_from_transcript(path))
+    crate::surface_facts::facts(path, false).title
 }
 
 /// Поверхность сессии: метка `Meta.surface`, иначе `local`.
@@ -67,13 +54,15 @@ pub fn title(path: &Path) -> Option<String> {
 /// Локальные сессии (`tui`, `tui-local`, `run-child`) — не «legacy»: метку они
 /// не пишут, и это шум, а не признак устаревания.
 pub fn surface(path: &Path) -> String {
-    load_meta_surface(path).unwrap_or_else(|| "local".into())
+    crate::surface_facts::facts(path, false)
+        .surface
+        .unwrap_or_else(|| "local".into())
 }
 
 /// Merge durable delivery sessions with JSONL transcripts. JSONL-only sessions
 /// never get rewritten as a side effect of discovery.
 pub fn sessions(cfg: &Config, store: &rt::Store) -> crate::R<Vec<Session>> {
-    let data_dir = &cfg.data_path();
+    let data_dir = cfg.data_path();
     let mut sessions = store.sessions.clone();
     let dir = data_dir.join("sessions");
     if dir.is_dir() {
@@ -86,77 +75,54 @@ pub fn sessions(cfg: &Config, store: &rt::Store) -> crate::R<Vec<Session>> {
             let Some(id) = path.file_stem().and_then(|x| x.to_str()) else {
                 continue;
             };
-            if !rt::valid_id(id) {
+            if !rt::valid_id(id) || sessions.contains_key(id) {
                 continue;
             }
-            if sessions.contains_key(id) {
+            // Родитель нужен до фактов: он решает, считать ли ходы.
+            let facts_light = crate::surface_facts::facts(&path, false);
+            if !facts_light.has_dialogue {
                 continue;
             }
-            if !has_dialogue(&path) {
-                continue;
-            }
-            let surface = surface(&path);
-            let mut session = Session::new(id.to_string(), surface);
-            session.title = title(&path);
-            session.updated_at = mtime(&path);
-            session.parent = parent(&path);
-            session.model = model(&path);
-            // Прогресс нужен только карточкам подагентов: у пользовательских
-            // сессий ходы не показываются, а полный разбор их логов (бывают по
-            // несколько мегабайт) удорожает каждый список.
-            if let Some(parent) = session.parent.as_deref() {
-                let p = progress(&path);
-                session.turns = Some(p.turns);
-                session.started_at = p.started_at;
-                session.done_at = p.done_at;
-                session.state =
-                    child_state(&crate::subagent::state_of(cfg, parent, id)).into();
-                session.done = p.done;
-            }
+            let is_child = facts_light.parent.is_some();
+            let facts = if is_child {
+                crate::surface_facts::facts(&path, true)
+            } else {
+                facts_light
+            };
+            let mut session = build_session(cfg, id, &path, &facts);
+            session.state = child_state_or_idle(cfg, &session, &path);
             sessions.insert(id.to_string(), session);
         }
     }
     // Сессии из store тоже фильтруются: там могли остаться огрызки, созданные
     // до того, как discovery научился их отбрасывать.
-    sessions.retain(|id, _| path_from(data_dir, id).is_some_and(|p| has_dialogue(&p)));
-    // Заголовок и поверхность нужны и сессиям, которые уже в store: старые
-    // записи хранят "legacy" (устаревшее имя локальной сессии) и не знают
-    // заголовка. Метка из `Meta` точнее store — она пишется при создании лога
-    // и не переписывается; store достаётся, только если метки в логе нет.
+    sessions.retain(|id, _| path_from(&data_dir, id).is_some_and(|p| has_dialogue(&p)));
     for session in sessions.values_mut() {
-        let file = path_from(data_dir, &session.id);
-        if let Some(path) = &file {
-            if let Some(marked) = load_meta_surface(path) {
-                session.surface = marked;
-            }
-        }
-        if session.surface == "legacy" {
-            session.surface = "local".into();
-        }
-        if session.title.is_none() {
-            if let Some(path) = &file {
-                session.title = title(path);
-            }
-        }
-        session.updated_at = file.as_ref().and_then(|p| mtime(p));
-        if session.parent.is_none() {
-            session.parent = file.as_ref().and_then(|p| parent(p));
-        }
-        if session.model.is_none() {
-            session.model = file.as_ref().and_then(|p| model(p));
-        }
+        let Some(path) = path_from(&data_dir, &session.id) else {
+            continue;
+        };
+        // Один проход по журналу на сессию: метка, заголовок, родитель, модель
+        // и (для подагента) ходы приходят из одного кэшированного набора фактов.
+        let need_progress = session.parent.is_some() || facts_parent(&path).is_some();
+        let facts = crate::surface_facts::facts(&path, need_progress);
+        let fresh = build_session(cfg, &session.id, &path, &facts);
+        session.surface = fresh.surface;
+        session.title = session.title.take().or(fresh.title);
+        session.parent = fresh.parent.or(session.parent.take());
+        session.model = fresh.model.or(session.model.take());
+        session.updated_at = fresh.updated_at;
         // Ходы и закрытие пересчитываем всегда, а не только когда пусто:
         // подагент растёт, пока его карточка висит на экране, и «3 хода» без
         // обновления превращалось бы во враньё.
-        if let (Some(path), Some(parent)) = (&file, session.parent.clone()) {
-            let p = progress(path);
-            session.turns = Some(p.turns);
-            session.started_at = p.started_at;
-            session.done_at = p.done_at;
-            session.state =
-                child_state(&crate::subagent::state_of(cfg, &parent, &session.id)).into();
-            session.done = p.done;
-        }
+        session.turns = fresh.turns;
+        session.started_at = fresh.started_at;
+        session.done_at = fresh.done_at;
+        session.done = fresh.done;
+        session.state = if session.parent.is_some() {
+            child_state_or_idle(cfg, session, &path)
+        } else {
+            session.state.clone()
+        };
     }
     // Свежие сверху. Порядок не зависит от поверхности и от формы id
     // (`1234-567` и uuid иначе перемешивались лексикографически).
@@ -170,54 +136,55 @@ pub fn sessions(cfg: &Config, store: &rt::Store) -> crate::R<Vec<Session>> {
     Ok(out)
 }
 
+/// Родитель по журналу — без полного разбора: нужен, чтобы решить, звать ли
+/// дорогой проход ради счётчика ходов.
+fn facts_parent(path: &Path) -> Option<String> {
+    crate::surface_facts::facts(path, false).parent
+}
+
+fn build_session(
+    cfg: &Config,
+    id: &str,
+    path: &Path,
+    facts: &crate::surface_facts::Facts,
+) -> Session {
+    let mut session = Session::new(id.to_string(), "local".to_string());
+    session.surface = facts.surface.clone().unwrap_or_else(|| "local".into());
+    if session.surface == "legacy" {
+        session.surface = "local".into();
+    }
+    session.title = facts.title.clone();
+    session.parent = facts.parent.clone();
+    session.model = facts.model.clone();
+    session.updated_at = mtime(path);
+    if let Some(p) = &facts.progress {
+        session.turns = Some(p.turns);
+        session.started_at = p.started_at;
+        session.done_at = p.done_at;
+        session.done = p.done.clone();
+    }
+    let _ = cfg;
+    session
+}
+
+/// Состояние подагента по журналу и pid; у обычной сессии — как было в store.
+fn child_state_or_idle(cfg: &Config, session: &Session, _path: &Path) -> String {
+    match session.parent.as_deref() {
+        Some(parent) => child_state(&crate::subagent::state_of(cfg, parent, &session.id)).into(),
+        None => session.state.clone(),
+    }
+}
+
 /// Модель сессии: `Meta.model`, иначе последняя запись `usage` с непустым
 /// полем (появилось позже `Meta`), иначе `None` — у старых логов её нет.
 pub fn model(path: &Path) -> Option<String> {
-    let head = crate::log::read_head(path, 4).ok()?;
-    if let Some(m) = head.into_iter().find_map(|rec| match rec {
-        crate::log::Rec::Meta { model, .. } => Some(model),
-        _ => None,
-    }) {
-        let m = m.trim();
-        if !m.is_empty() {
-            return Some(m.to_string());
-        }
-    }
-    // Хвост лога: последний `usage` с моделью. Читаем с конца, но простым
-    // способом — файл открывается один раз и парсится построчно.
-    let text = fs::read_to_string(path).ok()?;
-    for line in text.lines().rev() {
-        if !line.contains("\"model\"") {
-            continue;
-        }
-        if let Ok(crate::log::Rec::Usage { model, .. }) = serde_json::from_str(line) {
-            let model = model.trim();
-            if !model.is_empty() {
-                return Some(model.to_string());
-            }
-        }
-    }
-    None
+    crate::surface_facts::facts(path, false).model
 }
 
 /// Родитель сессии из `Meta` (пусто у пользовательских сессий).
 pub fn parent(path: &Path) -> Option<String> {
-    crate::log::read_head(path, 4)
-        .ok()?
-        .into_iter()
-        .find_map(|rec| match rec {
-            crate::log::Rec::Meta { parent, .. } => Some(parent),
-            _ => None,
-        })
-        .filter(|p| !p.trim().is_empty())
+    crate::surface_facts::facts(path, false).parent
 }
-
-/// Кэш `progress`: список сессий дёргается на каждое событие SSE и на каждую
-/// смену сессии, а полный разбор сотни логов на каждый запрос — это секунды.
-/// Ключ — путь + mtime + размер: пока файл не менялся, пересчитывать нечего.
-static PROGRESS: std::sync::Mutex<
-    Option<std::collections::HashMap<(std::path::PathBuf, u64, u64), Progress>>,
-> = std::sync::Mutex::new(None);
 
 /// Что видно про подагента по его журналу: сколько ходов, когда начал, когда
 /// закончил и чем. Границы нужны для длительности — по ним клиент рисует «работает
@@ -234,36 +201,16 @@ pub struct Progress {
 
 /// Ходы, признаки закрытия и границы работы из журнала — для карточки
 /// подагента: сколько шагов прошло, чем кончилось и сколько это заняло.
-/// Читаем лог целиком: `Done` пишется только в конце.
+/// Считается тем же проходом, что и остальные факты, и кэшируется с ними.
 pub fn progress(path: &Path) -> Progress {
-    let meta = fs::metadata(path).ok();
-    let key_extra = meta
-        .as_ref()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let key = (path.to_path_buf(), key_extra, meta.map(|m| m.len()).unwrap_or(0));
-    if let Ok(guard) = PROGRESS.lock() {
-        if let Some(cache) = guard.as_ref() {
-            if let Some(hit) = cache.get(&key) {
-                return hit.clone();
-            }
-        }
-    }
-    let value = progress_uncached(path);
-    if let Ok(mut guard) = PROGRESS.lock() {
-        let cache = guard.get_or_insert_with(Default::default);
-        // Размер кэша ограничен числом сессий с их mtime: старые ключи живут,
-        // пока жив процесс. Это микроскопические значения, но подчистим, чтобы
-        // не копить их при активной работе: одна запись на путь.
-        cache.retain(|(p, _, _), _| p != path);
-        cache.insert(key, value.clone());
-    }
-    value
+    crate::surface_facts::facts(path, true)
+        .progress
+        .unwrap_or_default()
 }
 
-fn progress_uncached(path: &Path) -> Progress {
+/// Полный разбор журнала ради счётчика ходов. Дорого (весь файл), поэтому
+/// вызывается только для подагентов и только из `surface_facts`.
+pub fn progress_uncached(path: &Path) -> Progress {
     let Ok(records) = crate::log::read_file(path) else {
         return Progress::default();
     };
@@ -311,12 +258,7 @@ fn progress_uncached(path: &Path) -> Progress {
 /// Была ли в сессии хоть одна реплика человека или вставка в ход. Сессии без
 /// них — огрызки (создали и бросили, упал запуск): в списке им делать нечего.
 pub fn has_dialogue(path: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
-    text.lines().any(|line| {
-        line.starts_with("{\"kind\":\"user\"") || line.starts_with("{\"kind\":\"steer\"")
-    })
+    crate::surface_facts::facts(path, false).has_dialogue
 }
 
 /// Состояние подагента так, как его ждёт поверхность: `running` — ещё работает,
@@ -359,13 +301,7 @@ pub fn path(cfg: &Config, id: &str) -> Option<std::path::PathBuf> {
 }
 
 pub fn load_meta_surface(path: &Path) -> Option<String> {
-    crate::log::read_head_bytes(path, HEAD_BYTES)
-        .ok()?
-        .into_iter()
-        .find_map(|record| match record {
-            crate::log::Rec::Meta { surface, .. } => surface,
-            _ => None,
-        })
+    crate::surface_facts::facts(path, false).surface
 }
 
 #[cfg(test)]

@@ -31,8 +31,15 @@ libc = "0.2"
 # а ядро не тащит зависимости тулов. Бинарники на место кладёт `snens build
 # [<тул>…]` (он же зовёт cargo) — установка не зависит от отдельного скрипта.
 [workspace]
-members = ["tools/agent", "tools/audit", "tools/desk", "tools/edit", "tools/fetch", "tools/grep", "tools/read", "tools/search", "tools/shot", "tools/view", "tools/web", "tools/write"]
-# tools/memory не член workspace: плагин памяти — отдельный бинарь, который
-# кладут в tools/memory/ (симлинк или копия). Иначе сборка workspace
-# перезаписывала бы его своей версией.
+# Плагин долгой памяти — тоже член workspace: память входит в поставку, и
+# установщик должен получить её бинарь той же командой, что и остальные тулы.
+members = ["tools/agent", "tools/audit", "tools/desk", "tools/edit", "tools/fetch", "tools/grep", "tools/memory", "tools/read", "tools/search", "tools/shot", "tools/view", "tools/web", "tools/write"]
 resolver = "2"
+
+# Релизные сборки тулов: размер и старт важнее скорости компиляции — бинарь
+# уезжает в установщик. Профиль один на весь workspace (в крейтах тулов он не
+# задаётся, иначе cargo его игнорирует).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

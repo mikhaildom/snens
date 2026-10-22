@@ -173,9 +173,176 @@ pub struct Runtime {
     pub tx_updates: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 impl Runtime {
-    pub fn persist(&self, data: &Store) -> crate::R<()> {
-        persist(&self.db.lock().unwrap(), data)
+    /// Полная перезапись store. Нужна только там, где меняется всё сразу:
+    /// старт (миграция legacy `store.json`), shutdown, пересборка после
+    /// `interrupt_running`. В горячем пути (событие хода) — никогда: она
+    /// переписывает все таблицы, и её цена растёт вместе с объёмом истории.
+
+    /// Записать одну сессию (upsert).
+    pub fn save_session(&self, s: &Session) -> crate::R<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO sessions(id,surface,state,run_id,context_budget,context_target,parent)\n             VALUES(?1,?2,?3,?4,?5,?6,?7)\n             ON CONFLICT(id) DO UPDATE SET surface=excluded.surface,state=excluded.state,\n               run_id=excluded.run_id,context_budget=excluded.context_budget,\n               context_target=excluded.context_target,parent=excluded.parent",
+            params![
+                s.id,
+                s.surface,
+                s.state,
+                s.run_id,
+                s.context_budget,
+                s.context_target,
+                s.parent
+            ],
+        )?;
+        Ok(())
     }
+
+    /// Записать одно событие и сдвинуть курсор сессии — одной транзакцией.
+    pub fn save_event(&self, e: &Event) -> crate::R<()> {
+        let db = self.db.lock().unwrap();
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO events(session_id,seq,run_id,kind,fields) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                e.session_id,
+                e.seq as i64,
+                e.run_id,
+                e.kind,
+                serde_json::to_string(&e.fields)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO event_sequences(session_id,seq) VALUES(?1,?2)\n             ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq",
+            params![e.session_id, e.seq as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Удалить все строки сессии.
+    pub fn drop_session(&self, id: &str) -> crate::R<()> {
+        let db = self.db.lock().unwrap();
+        let tx = db.unchecked_transaction()?;
+        for table in [
+            "message_attachments",
+            "attachments",
+            "messages",
+            "events",
+            "surface_tools",
+            "reviews",
+        ] {
+            tx.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), params![id])?;
+        }
+        tx.execute("DELETE FROM event_sequences WHERE session_id=?1", params![id])?;
+        tx.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Записать сессию и все её сообщения с вложениями (грубый, но безопасный
+    /// способ для путей, которые меняют состав очереди целиком).
+    pub fn save_session_messages(&self, id: &str, data: &Store) -> crate::R<()> {
+        let db = self.db.lock().unwrap();
+        let tx = db.unchecked_transaction()?;
+        if let Some(s) = data.sessions.get(id) {
+            tx.execute(
+                "INSERT INTO sessions(id,surface,state,run_id,context_budget,context_target,parent)\n                 VALUES(?1,?2,?3,?4,?5,?6,?7)\n                 ON CONFLICT(id) DO UPDATE SET surface=excluded.surface,state=excluded.state,\n                   run_id=excluded.run_id,context_budget=excluded.context_budget,\n                   context_target=excluded.context_target,parent=excluded.parent",
+                params![
+                    s.id,
+                    s.surface,
+                    s.state,
+                    s.run_id,
+                    s.context_budget,
+                    s.context_target,
+                    s.parent
+                ],
+            )?;
+        }
+        tx.execute("DELETE FROM message_attachments WHERE session_id=?1", params![id])?;
+        tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
+        if let Some(ms) = data.messages.get(id) {
+            for (seq, m) in ms.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO messages(session_id,id,command_id,seq,text,state,run_id)\n                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        id,
+                        m.id,
+                        m.command_id,
+                        seq as i64,
+                        m.text,
+                        m.state,
+                        m.run_id
+                    ],
+                )?;
+                for (aseq, aid) in m.attachment_ids.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO message_attachments VALUES(?1,?2,?3,?4)",
+                        params![id, m.id, aid, aseq as i64],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Мелкие справочники: одна строка — одна запись.
+    pub fn save_command(&self, command_id: &str, payload: &serde_json::Value) -> crate::R<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO commands VALUES(?1,?2)",
+            params![command_id, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_surface_tools(&self, id: &str, defs: &[serde_json::Value]) -> crate::R<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO surface_tools VALUES(?1,?2)",
+            params![id, serde_json::to_string(defs)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_tool_result(&self, key: &str, payload: &serde_json::Value) -> crate::R<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO tool_results VALUES(?1,?2)",
+            params![key, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_tool_request(&self, key: &str, payload: &serde_json::Value) -> crate::R<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO tool_requests VALUES(?1,?2)",
+            params![key, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_review(&self, id: &str, turns: u64) -> crate::R<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO reviews VALUES(?1,?2)",
+            params![id, turns as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_attachment(&self, id: &str, a: &Attachment) -> crate::R<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO attachments VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id,
+                a.attachment_id,
+                a.command_id,
+                a.filename,
+                a.name,
+                serde_json::to_string(&a.part)?,
+                a.sha256
+            ],
+        )?;
+        Ok(())
+    }
+
+
     pub async fn emit(
         &self,
         id: &str,
@@ -193,8 +360,6 @@ impl Runtime {
                     .unwrap_or(0)
             }) + 1;
             sequences.insert(id.to_string(), next);
-            let db = self.db.lock().unwrap();
-            db.execute("INSERT INTO event_sequences(session_id,seq) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq", params![id, next as i64])?;
             next
         };
         let e = Event {
@@ -206,7 +371,10 @@ impl Runtime {
         };
         if kind != "assistant.delta" {
             d.events.entry(id.into()).or_default().push(e.clone());
-            self.persist(&d)?;
+            // Точечная запись одного события вместе с курсором: полная перезапись
+            // store на каждое событие — O(n²) по объёму истории (замер: ~140 мс
+            // при 15 тыс. событий) и она же держала оба мьютекса всё это время.
+            self.save_event(&e)?;
         }
         drop(d);
         // Карточка подагента живёт потоком (`GET /v1/sessions` без запроса), но
@@ -251,7 +419,7 @@ impl Runtime {
             }
             let after = (fresh.turns, fresh.done.clone(), fresh.state.clone());
             d.sessions.insert(id.to_string(), fresh.clone());
-            let _ = self.persist(&d);
+            let _ = self.save_session(&fresh);
             before != after
         };
         if changed {
@@ -278,6 +446,9 @@ impl Runtime {
 }
 
 fn schema(c: &Connection) -> crate::R<()> {
+    // WAL: запись события не блокирует читателей (SSE, список сессий), а
+    // `DELETE`-журнал на каждый коммит переписывал страницы целиком.
+    let _: String = c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     c.execute_batch("PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,surface TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,context_budget INTEGER,context_target INTEGER);
       CREATE TABLE IF NOT EXISTS messages(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL UNIQUE,seq INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));

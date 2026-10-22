@@ -311,26 +311,58 @@ async fn put_memory(State(s): State<Arc<Runtime>>, Json(body): Json<MemoryBody>)
 }
 
 async fn list(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
-    let d = s.data.lock().await;
-    match discovery::sessions(&s.cfg, &d) {
-        Ok(sessions) => {
-            let sessions = sessions
-                .into_iter()
-                .filter(|session| discovery::path(&s.cfg, &session.id).is_some_and(|p| p.is_file()))
-                .collect::<Vec<_>>();
-            drop(d);
-            let mut state = s.data.lock().await;
-            for session in &sessions {
-                state
-                    .sessions
-                    .entry(session.id.clone())
-                    .or_insert_with(|| session.clone());
-                state.events.entry(session.id.clone()).or_default();
-            }
-            Json(serde_json::json!({"sessions":sessions})).into_response()
+    // Разбор журналов — блокирующая работа (read_dir + чтение файлов), и на
+    // 500 сессиях она занимает секунды. В async-обработчике она останавливала
+    // воркер tokio целиком: на двух ядрах это половина рантайма. Плюс мьютекс
+    // store не держится во время чтения — иначе `emit` любой другой сессии
+    // стоял бы в очереди за списком.
+    let cfg = s.cfg.clone();
+    let snapshot = s.data.lock().await.sessions.clone();
+    let discovered = tokio::task::spawn_blocking(move || {
+        let store = rt::Store {
+            sessions: snapshot,
+            ..Default::default()
+        };
+        discovery::sessions(&cfg, &store)
+    })
+    .await;
+    let sessions = match discovered {
+        Ok(Ok(sessions)) => sessions,
+        Ok(Err(e)) => {
+            return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response()
         }
-        Err(e) => err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+        Err(e) => {
+            return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response()
+        }
+    };
+    // Записи, которые список принёс впервые, дописываем в store точечно.
+    {
+        let mut state = s.data.lock().await;
+        for session in &sessions {
+            match state.sessions.get_mut(&session.id) {
+                Some(slot) => {
+                    // Состояние процесса — правда store (его ставит launch/stop),
+                    // остальное точнее в журнале.
+                    slot.title = session.title.clone().or(slot.title.take());
+                    slot.surface = session.surface.clone();
+                    slot.parent = session.parent.clone();
+                    slot.model = session.model.clone();
+                    slot.updated_at = session.updated_at;
+                    slot.turns = session.turns;
+                    slot.done = session.done.clone();
+                    slot.started_at = session.started_at;
+                    slot.done_at = session.done_at;
+                }
+                None => {
+                    state.sessions.insert(session.id.clone(), session.clone());
+                    state.events.entry(session.id.clone()).or_default();
+                }
+            }
+        }
     }
+    Json(serde_json::json!({"sessions":sessions})).into_response()
 }
 
 /// Расклад рабочего окна сессии: из чего состоит проекция промпта.
@@ -348,8 +380,15 @@ async fn context_breakdown(
     let Some(path) = discovery::path(&s.cfg, &id).filter(|p| p.is_file()) else {
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     };
-    let log = match crate::log::read_file(&path) {
-        Ok(log) => log,
+    // Чтение и разбор журнала — блокирующая работа на весь файл: в async-хендлере
+    // она держала воркер (панель контекста занимала 0.5–0.65 с на 4 МБ логе).
+    let read_path = path.clone();
+    let log = match tokio::task::spawn_blocking(move || crate::log::read_file(&read_path)).await {
+        Ok(Ok(log)) => log,
+        Ok(Err(e)) => {
+            return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response()
+        }
         Err(e) => {
             return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
                 .into_response()
@@ -403,26 +442,56 @@ async fn search(
     }
     let limit = q.limit.unwrap_or(50).min(200);
     let dir = s.cfg.sessions_path();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return err("storage", "sessions directory is missing", StatusCode::INTERNAL_SERVER_ERROR)
-            .into_response();
-    };
-    let mut hits = Vec::new();
+    let cfg = s.cfg.clone();
+    let found = tokio::task::spawn_blocking(move || search_sessions(&dir, &cfg, &needle, limit))
+        .await;
+    match found {
+        Ok(Ok(hits)) => Json(serde_json::json!({"hits": hits})).into_response(),
+        Ok(Err(e)) => err("storage", &e, StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+        Err(e) => err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+    }
+}
+
+/// Синхронный поиск (зовётся из `spawn_blocking`).
+///
+/// Сначала дешёвая проверка по байтам: если подстроки в файле нет вовсе,
+/// разбирать JSON незачем. На инстансе с 400 МБ журналов это превращает
+/// промах из 1.6 с в единицы миллисекунд.
+fn search_sessions(
+    dir: &std::path::Path,
+    cfg: &Config,
+    needle: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|_| "sessions directory is missing".to_string())?;
+    let mut files: Vec<(u64, std::path::PathBuf, String)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
             continue;
         };
-        if !rt::valid_id(id) {
+        if !rt::valid_id(&id) {
             continue;
         }
-        let Ok(rows) = history::read_with(&path, &s.cfg, false) else {
+        let updated = discovery::mtime(&path).unwrap_or(0);
+        files.push((updated, path, id));
+    }
+    // Свежие сверху: чаще ищут недавнее, а лимит должен резать старое.
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut hits = Vec::new();
+    for (updated, path, id) in files {
+        if hits.len() >= limit {
+            break;
+        }
+        if !file_contains(&path, needle) {
+            continue;
+        }
+        let Ok(rows) = history::read_with(&path, cfg, false) else {
             continue;
         };
-        let title = discovery::title(&path);
         let mut matched = Vec::new();
         for row in &rows {
             if row.role != "user" && row.role != "assistant" {
@@ -432,7 +501,7 @@ async fn search(
                 continue;
             };
             let lower = text.to_lowercase();
-            let Some(pos) = lower.find(&needle) else {
+            let Some(pos) = lower.find(needle) else {
                 continue;
             };
             // Окно вокруг совпадения: символы, а не байты — иначе кириллицу
@@ -452,9 +521,10 @@ async fn search(
                 break;
             }
         }
+        let title = discovery::title(&path);
         let title_hit = title
             .as_deref()
-            .is_some_and(|t| t.to_lowercase().contains(&needle));
+            .is_some_and(|t| t.to_lowercase().contains(needle));
         if matched.is_empty() && !title_hit {
             continue;
         }
@@ -462,14 +532,46 @@ async fn search(
             "id": id,
             "title": title,
             "surface": discovery::surface(&path),
-            "updated_at": discovery::mtime(&path),
+            "updated_at": updated,
             "matches": matched,
         }));
-        if hits.len() >= limit {
-            break;
-        }
     }
-    Json(serde_json::json!({"hits": hits})).into_response()
+    Ok(hits)
+}
+
+/// Есть ли подстрока в файле (без учёта регистра, потоками по 256 КБ).
+/// Регистр складываем в нижний на лету: ASCII-поиск дешевле полного разбора.
+fn file_contains(path: &std::path::Path, needle: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // Кириллица в UTF-8 при смене регистра меняет длину байтов, поэтому для
+    // не-ASCII ищем как есть и в нижнем регистре по декодированному куску.
+    let ascii = needle.is_ascii();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut carry = String::new();
+    loop {
+        let Ok(n) = file.read(&mut buf) else {
+            return false;
+        };
+        if n == 0 {
+            return false;
+        }
+        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+        let combined = format!("{carry}{chunk}");
+        let found = if ascii {
+            combined.to_ascii_lowercase().contains(needle)
+        } else {
+            combined.to_lowercase().contains(needle)
+        };
+        if found {
+            return true;
+        }
+        // Хвост может разрезать многобайтный символ: переносим последние байты.
+        let keep = combined.len().saturating_sub(8);
+        carry = combined[keep..].to_string();
+    }
 }
 
 /// Удаление сессии: журнал, каталоги вложений и запись в store. Только когда
@@ -519,14 +621,20 @@ async fn delete_session(
     if !removed {
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     }
-    let mut d = s.data.lock().await;
-    d.sessions.remove(&id);
-    d.events.remove(&id);
-    d.messages.remove(&id);
-    d.attachments.remove(&id);
-    drop(d);
-    let d = s.data.lock().await;
-    let _ = s.persist(&d);
+    // Блокировка сессии на время удаления: без неё `message` мог увидеть её в
+    // проверке «known» и упасть на `unwrap()` после того, как её уже стёрли.
+    let guard = s.session_lock(&id).await;
+    let _guard = guard.lock().await;
+    {
+        let mut d = s.data.lock().await;
+        d.sessions.remove(&id);
+        d.events.remove(&id);
+        d.messages.remove(&id);
+        d.attachments.remove(&id);
+    }
+    if let Err(e) = s.drop_session(&id) {
+        return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
     Json(serde_json::json!({"deleted": id})).into_response()
 }
 
@@ -563,7 +671,7 @@ async fn register_tools(
         .into_response();
     }
     d.surface_tools.insert(id.clone(), defs.clone());
-    if let Err(e) = s.persist(&d) {
+    if let Err(e) = s.save_surface_tools(&id, &defs) {
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
     }
     (StatusCode::OK, Json(serde_json::json!({"tools":defs}))).into_response()
@@ -696,13 +804,14 @@ async fn tool_result(
             err("not_found", "tool call not found", StatusCode::NOT_FOUND).into_response()
         };
     }
-    d.tool_results.insert(
-        key.clone(),
-        serde_json::json!({"text":body.text,"exit":body.exit}),
-    );
-    d.tool_requests
-        .insert(key.clone(), serde_json::json!({"status":"completed"}));
-    if let Err(e) = s.persist(&d) {
+    let result_payload = serde_json::json!({"text":body.text,"exit":body.exit});
+    let request_payload = serde_json::json!({"status":"completed"});
+    d.tool_results.insert(key.clone(), result_payload.clone());
+    d.tool_requests.insert(key.clone(), request_payload.clone());
+    if let Err(e) = s
+        .save_tool_result(&key, &result_payload)
+        .and_then(|_| s.save_tool_request(&key, &request_payload))
+    {
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
     }
     let tx = s
@@ -712,10 +821,10 @@ async fn tool_result(
         .remove(&key)
         .expect("pending tool checked under serialized result handler");
     if tx.send(result).is_err() {
+        let expired = serde_json::json!({"status":"expired"});
         d.tool_results.remove(&key);
-        d.tool_requests
-            .insert(key.clone(), serde_json::json!({"status":"expired"}));
-        if let Err(e) = s.persist(&d) {
+        d.tool_requests.insert(key.clone(), expired.clone());
+        if let Err(e) = s.save_tool_request(&key, &expired) {
             return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
                 .into_response();
         }
@@ -787,9 +896,14 @@ async fn create(State(s): State<Arc<Runtime>>, Json(b): Json<Create>) -> impl In
     d.messages.insert(id.clone(), vec![]);
     let mut record = serde_json::to_value(&session).unwrap();
     record["_surface_request"] = serde_json::Value::String(b.surface.clone());
+    let command_payload = record.clone();
+    let command_id = b.command_id.clone();
     d.commands.insert(b.command_id, record);
     s.writers.lock().await.insert(id.clone(), writer);
-    if let Err(e) = s.persist(&d) {
+    if let Err(e) = s
+        .save_session(&session)
+        .and_then(|_| s.save_command(&command_id, &command_payload))
+    {
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
     }
     s.event_seq.lock().await.insert(id, 0);
@@ -983,8 +1097,8 @@ async fn upload_attachment(
     d.attachments
         .entry(id.clone())
         .or_default()
-        .insert(aid.clone(), attachment);
-    if let Err(e) = s.persist(&d) {
+        .insert(aid.clone(), attachment.clone());
+    if let Err(e) = s.save_attachment(&id, &attachment) {
         d.attachments.get_mut(&id).and_then(|m| m.remove(&aid));
         let _ = tokio::fs::remove_file(&path).await;
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
@@ -1140,9 +1254,9 @@ async fn message(
             discovery::surface(&path),
         );
         let mut data = s.data.lock().await;
-        data.sessions.entry(id.clone()).or_insert(session);
+        let inserted = data.sessions.entry(id.clone()).or_insert(session).clone();
         data.events.entry(id.clone()).or_default();
-        if let Err(error) = s.persist(&data) {
+        if let Err(error) = s.save_session(&inserted) {
             return err(
                 "storage",
                 &error.to_string(),
@@ -1200,13 +1314,17 @@ async fn message(
     });
     let result = serde_json::json!({"message_id":mid,"run_id":run_id,"state":state});
     let surface = d.sessions.get(&id).unwrap().surface.clone();
-    d.commands.insert(b.command_id, result.clone());
+    let command_id = b.command_id.clone();
+    d.commands.insert(b.command_id.clone(), result.clone());
     if !busy {
         let x = d.sessions.get_mut(&id).unwrap();
         x.state = "running".into();
         x.run_id = run_id.clone()
     }
-    if let Err(e) = s.persist(&d) {
+    if let Err(e) = s
+        .save_session_messages(&id, &d)
+        .and_then(|_| s.save_command(&command_id, &result))
+    {
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
     }
     if let Some(live) = d.sessions.get(&id).cloned() {
@@ -1271,7 +1389,7 @@ async fn finalize_launch_error(s: &Arc<Runtime>, id: &str, run: &str, message: &
         {
             queued.state = "cancelled".into();
         }
-        let _ = s.persist(&data);
+        let _ = s.save_session_messages(id, &data);
     }
     s.controls.lock().await.remove(id);
     let _ = s
@@ -1491,7 +1609,7 @@ fn schedule_review(s: Arc<Runtime>, id: String) {
         {
             let mut d = s.data.lock().await;
             d.reviews.insert(id.clone(), turns as u64);
-            let _ = s.persist(&d);
+            let _ = s.save_review(&id, turns as u64);
         }
         // Маркер в журнал сессии — до запуска процесса: `review::run` при своём
         // старте видит уже готовую границу, а если процесс не поднимется, в
@@ -1599,11 +1717,9 @@ async fn launch(
             let key = format!("{broker_id}/{broker_run}/{}", req.call_id);
             {
                 let mut d = broker_s.data.lock().await;
-                d.tool_requests.insert(
-                    key.clone(),
-                    serde_json::json!({"status":"pending","name":req.name,"args":req.args}),
-                );
-                if broker_s.persist(&d).is_err() {
+                let payload = serde_json::json!({"status":"pending","name":req.name,"args":req.args});
+                d.tool_requests.insert(key.clone(), payload.clone());
+                if broker_s.save_tool_request(&key, &payload).is_err() {
                     d.tool_requests.remove(&key);
                     return;
                 }
@@ -1638,9 +1754,9 @@ async fn launch(
                 .and_then(|v| v.as_str())
                 == Some("pending")
             {
-                d.tool_requests
-                    .insert(key.clone(), serde_json::json!({"status":"expired"}));
-                let _ = broker_s.persist(&d);
+                let expired = serde_json::json!({"status":"expired"});
+                d.tool_requests.insert(key.clone(), expired.clone());
+                let _ = broker_s.save_tool_request(&key, &expired);
             }
         }
     });
@@ -1810,7 +1926,9 @@ async fn launch(
             x.state = "idle".into();
             x.run_id = None
         }
-        let _ = s.persist(&d);
+        if let Some(live) = d.sessions.get(&id) {
+            let _ = s.save_session(live);
+        }
         if let Some(live) = d.sessions.get(&id).cloned() {
             s.publish_session(live).await;
         }
@@ -1852,7 +1970,7 @@ async fn stop(
             m.state = "cancelled".into()
         }
     }
-    let _ = s.persist(&d);
+    let _ = s.save_session_messages(&id, &d);
     drop(d);
     s.publish_session(out.clone()).await;
     if let Some(c) = s.controls.lock().await.get(&id) {
@@ -1933,9 +2051,10 @@ async fn ingest(
             match found {
                 Some(session) => {
                     let mut d = s.data.lock().await;
+                    let saved = session.clone();
                     d.sessions.insert(id.clone(), session);
                     d.events.entry(id.clone()).or_default();
-                    let _ = s.persist(&d);
+                    let _ = s.save_session(&saved);
                 }
                 None => {
                     return err("not_found", "unknown session", StatusCode::NOT_FOUND)
@@ -1973,17 +2092,32 @@ async fn history(
     if !rt::valid_id(&id) {
         return err("invalid", "invalid session id", StatusCode::BAD_REQUEST).into_response();
     }
-    let d = s.data.lock().await;
-    let session = d.sessions.get(&id);
     let Some(path) = discovery::path(&s.cfg, &id) else {
         unreachable!()
     };
-    if session.is_none() && !path.is_file() {
+    // Из store под мьютексом берём ровно копию нужного и сразу отпускаем: раньше
+    // блокировка держалась всё время разбора журнала (0.3–0.6 с на мегабайтном
+    // логе), и `emit` любой другой сессии стоял в очереди.
+    let (known, events) = {
+        let d = s.data.lock().await;
+        (
+            d.sessions.contains_key(&id),
+            d.events.get(&id).cloned().unwrap_or_default(),
+        )
+    };
+    if !known && !path.is_file() {
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     }
-    let messages = match history::read_with(&path, &s.cfg, q.with_recall()) {
-        Ok(messages) => messages,
-        Err(e) => {
+    let with_recall = q.with_recall();
+    let cfg = s.cfg.clone();
+    let read_path = path.clone();
+    let messages = match tokio::task::spawn_blocking(move || {
+        history::read_with(&read_path, &cfg, with_recall)
+    })
+    .await
+    {
+        Ok(Ok(messages)) => messages,
+        Ok(Err(e)) => {
             return err(
                 "history_read",
                 &e.to_string(),
@@ -1991,8 +2125,11 @@ async fn history(
             )
             .into_response();
         }
+        Err(e) => {
+            return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response();
+        }
     };
-    let events = d.events.get(&id).cloned().unwrap_or_default();
     let cursor = s
         .event_seq
         .lock()
@@ -2314,7 +2451,7 @@ mod tests {
         let event = event(id, seq);
         let mut data = runtime.data.lock().await;
         data.events.get_mut(id).unwrap().push(event.clone());
-        runtime.persist(&data).unwrap();
+        runtime.save_event(&event).unwrap();
         let _ = runtime.tx.send(event);
     }
 
@@ -2326,9 +2463,9 @@ mod tests {
                 .unwrap()
                 .push(event.clone());
         }
-        // Match emit's persist-before-publish ordering, but pay for one durable
-        // transaction rather than rewriting the whole store for every test event.
-        runtime.persist(&data).unwrap();
+        for event in &events {
+            runtime.save_event(event).unwrap();
+        }
         for event in events {
             let _ = runtime.tx.send(event);
         }
@@ -2367,7 +2504,7 @@ mod tests {
                 kind: "tool.requested".into(),
                 fields: serde_json::json!({"call_id":"c"}),
             });
-            runtime.persist(&d).unwrap();
+            runtime.save_session(d.sessions.get("a").unwrap()).unwrap();
         }
         let (tx, rx) = oneshot::channel();
         drop(rx);

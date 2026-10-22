@@ -59,11 +59,6 @@ pub struct Usage {
     pub cost_micro: u64,
 }
 
-/// Транскрипт без служебной справки памяти — обычное чтение журнала.
-pub fn read(path: &Path, cfg: &Config) -> crate::R<Vec<HistoryMessage>> {
-    read_with(path, cfg, false)
-}
-
 /// Project transcript records directly from the append-only journal. `seq` is
 /// the 1-based physical JSONL line number, independent of delivery event seq.
 ///
@@ -325,7 +320,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = read(&path, &Config::default()).unwrap();
+        let rows = read_with(&path, &Config::default(), false).unwrap();
         let json = serde_json::to_string(&rows).unwrap();
         assert!(rows.is_empty());
         assert!(!json.contains("PRIVATE_RECALL_MARKER"));
@@ -361,7 +356,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = read(&path, &Config::default()).unwrap();
+        let rows = read_with(&path, &Config::default(), false).unwrap();
         let roles: Vec<&str> = rows.iter().map(|r| r.role).collect();
         assert_eq!(roles, ["user", "review", "assistant", "review"], "маркер не отличим от реплики");
         assert_eq!(rows[1].content.as_deref(), Some("саморевью · 12 ходов"));
@@ -390,7 +385,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = read(&path, &Config::default()).unwrap();
+        let rows = read_with(&path, &Config::default(), false).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content.as_deref(), Some("послушай голосовое"));
         let parts = rows[0].parts.as_ref().expect("вложения сохраняются");
@@ -413,7 +408,7 @@ mod tests {
         );
         fs::write(&path, raw).unwrap();
         let before = fs::read(&path).unwrap();
-        let rows = read(&path, &Config::default()).unwrap();
+        let rows = read_with(&path, &Config::default(), false).unwrap();
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [2, 3, 4]);
         assert_eq!(rows[0].role, "user");
         assert_eq!(rows[0].content.as_deref(), Some("hi"));
@@ -426,7 +421,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            read(&path, &Config::default())
+            read_with(&path, &Config::default(), false)
                 .unwrap_err()
                 .to_string()
                 .contains("physical line 2")
@@ -436,7 +431,7 @@ mod tests {
             "{\"kind\":\"user\",\"ts\":1,\"text\":\"ok\",\"source\":\"tui\"}\n{incomplete",
         )
         .unwrap();
-        assert_eq!(read(&path, &Config::default()).unwrap().len(), 1);
+        assert_eq!(read_with(&path, &Config::default(), false).unwrap().len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -31,6 +31,7 @@ mod subagent;
 mod sweep;
 mod surface_client;
 mod surface_ingest;
+mod surface_facts;
 mod surface_runtime;
 mod surface_server;
 mod surface_tui;

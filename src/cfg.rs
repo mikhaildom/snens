@@ -129,8 +129,9 @@ pub struct Config {
     #[serde(default = "d_mail")]
     pub mail_dir: String,
     /// Долгая память: программа-провайдер, вызываемая как `<cmd> recall <текст>`
-    /// и `<cmd> retain` (JSON хода на stdin). Пусто — канала нет: чистая
-    /// установка за модуль не платит, а ядро о нём ничего не знает.
+    /// и `<cmd> retain` (JSON хода на stdin). По умолчанию — штатный плагин
+    /// `memory` из поставки; нет бинаря или `enabled = false` — канала нет, и
+    /// ядро об этом знает только по argv-контракту.
     #[serde(default)]
     pub memory: Memory,
 }
@@ -186,20 +187,26 @@ pub struct Memory {
     pub tag: Vec<String>,
 }
 
-/// Дефолты секции для `#[serde(default)]` на поле: `enabled = true`, режим
-/// справки — на каждый ход, запись включена. Явный `Memory::default()`
-/// (например, у экспериментального инстанса) намеренно даёт выключенный канал.
+/// Дефолт секции: память включена и указывает на штатный плагин `memory`.
+/// Плагин — часть поставки (`tools/memory`), поэтому «чистая установка» его уже
+/// имеет; выключают осознанно (`enabled = false`), а не по умолчанию.
+/// Отсутствие бинаря — не ошибка: канала просто нет (`memory_bin` вернёт `None`).
 impl Default for Memory {
     fn default() -> Self {
         Self {
-            cmd: String::new(),
-            enabled: false,
-            recall: RecallMode::Off,
-            retain: false,
+            cmd: d_memory_cmd(),
+            enabled: true,
+            recall: RecallMode::Always,
+            retain: true,
             timeout_seconds: d_mem_timeout(),
             tag: Vec::new(),
         }
     }
+}
+
+/// Имя штатного плагина памяти в каталоге тулов.
+fn d_memory_cmd() -> String {
+    "memory".into()
 }
 
 /// Провайдер не выбирается за человека: ключ у всех свой, а подставить
@@ -491,14 +498,17 @@ impl Config {
             return None;
         }
         let named = Path::new(cmd);
-        let exe = self
-            .bin_path()
-            .join(format!("{cmd}{}", std::env::consts::EXE_SUFFIX));
-        if named.components().count() == 1 && exe.is_file() {
-            Some(exe)
-        } else {
-            Some(PathBuf::from(cmd))
+        // Имя без слэша — программа из `bin/` рядом с тулами; её отсутствие
+        // значит «канала нет», а не «попробуем несуществующий путь»: иначе ход
+        // падал бы на spawn вместо тихой работы без памяти.
+        if named.components().count() == 1 {
+            let exe = self
+                .bin_path()
+                .join(format!("{cmd}{}", std::env::consts::EXE_SUFFIX));
+            return exe.is_file().then_some(exe);
         }
+        let path = PathBuf::from(cmd);
+        path.is_file().then_some(path)
     }
 
     /// Сменить основную модель: правит `model` в конфиге как документ (см.
@@ -703,11 +713,13 @@ mod tests {
 
     #[test]
     fn memory_section_defaults_and_switches() {
-        // Секции нет — канал выключен: чистая установка не платит за модуль.
+        // Секции нет — память включена на штатном плагине: он часть поставки.
         let cfg = Config::default();
-        assert!(!cfg.memory.enabled);
-        assert_eq!(cfg.memory.recall, RecallMode::Off);
-        assert!(!cfg.memory.retain);
+        assert!(cfg.memory.enabled);
+        assert_eq!(cfg.memory.cmd, "memory");
+        assert_eq!(cfg.memory.recall, RecallMode::Always);
+        assert!(cfg.memory.retain);
+        // Но бинаря в тестовом окружении нет — канала нет, и это не ошибка.
         assert!(cfg.memory_bin().is_none());
 
         // Дефолты полей секции: enabled=true, recall=always, retain=true.
