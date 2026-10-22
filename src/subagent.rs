@@ -48,27 +48,27 @@ pub struct Child {
     pub state: State,
 }
 
-fn done_of(cfg: &Config, id: &str) -> Option<String> {
-    log::read_file(&cfg.sessions_path().join(format!("{id}.jsonl")))
-        .ok()?
-        .into_iter()
-        .rev()
-        .find_map(|r| match r {
-            log::Rec::Done { status, .. } => Some(status),
-            _ => None,
-        })
-}
-
-/// Что журнал ребёнка говорит о его жизни: pid из записи `Started` и время
-/// старта. `None` — запись не писалась (лог старый или процесс умер, не начав).
-fn started_of(cfg: &Config, id: &str) -> Option<u32> {
-    log::read_file(&cfg.sessions_path().join(format!("{id}.jsonl")))
-        .ok()?
-        .into_iter()
-        .find_map(|r| match r {
-            log::Rec::Started { pid, .. } => Some(pid),
-            _ => None,
-        })
+/// Прочитать журнал ребёнка **один раз** и достать оба признака.
+///
+/// Раньше `done_of` и `started_of` открывали и разбирали один и тот же файл
+/// каждый сам: на карточку подагента это два полных прохода, а третий рядом
+/// делал `progress` ради счётчика ходов.
+pub fn journal_signs(path: &Path) -> (Option<String>, Option<u32>) {
+    let Ok(records) = log::read_file(path) else {
+        return (None, None);
+    };
+    let mut done = None;
+    let mut pid = None;
+    for rec in &records {
+        match rec {
+            log::Rec::Done { status, .. } => done = Some(status.clone()),
+            log::Rec::Started { pid: p, .. } => {
+                pid.get_or_insert(*p);
+            }
+            _ => {}
+        }
+    }
+    (done, pid)
 }
 
 /// Индекс детей в ящике: pid из регистрации при спавне. Нужен только когда в
@@ -165,9 +165,23 @@ pub fn describe(state: &State) -> &'static str {
 /// третьей стороной. Теперь состояние подагента — факт его журнала, а ящик лишь
 /// индекс.
 pub fn state_of(cfg: &Config, parent: &str, id: &str) -> State {
-    let pid = started_of(cfg, id).or_else(|| pid_of(&cfg.mail_path(), parent, id));
+    let path = cfg.sessions_path().join(format!("{id}.jsonl"));
+    let (done, started) = journal_signs(&path);
+    state_from_signs(cfg, parent, id, done, started)
+}
+
+/// То же по уже прочитанным признакам журнала: список сессий читает файл один
+/// раз на все нужды (факты, ходы, состояние) и не должен повторять проход.
+pub fn state_from_signs(
+    cfg: &Config,
+    parent: &str,
+    id: &str,
+    done: Option<String>,
+    started: Option<u32>,
+) -> State {
+    let pid = started.or_else(|| pid_of(&cfg.mail_path(), parent, id));
     let live = pid.map(alive).unwrap_or(false);
-    match done_of(cfg, id) {
+    match done {
         Some(s) if s == "ok" => State::Done,
         // `Done` есть — процесс закрылся сам, даже если pid ещё не вышел.
         Some(s) => State::Failed(s),

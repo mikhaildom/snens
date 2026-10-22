@@ -168,11 +168,22 @@ fn build_session(
 }
 
 /// Состояние подагента по журналу и pid; у обычной сессии — как было в store.
-fn child_state_or_idle(cfg: &Config, session: &Session, _path: &Path) -> String {
-    match session.parent.as_deref() {
-        Some(parent) => child_state(&crate::subagent::state_of(cfg, parent, &session.id)).into(),
-        None => session.state.clone(),
-    }
+///
+/// Признаки (`Done`, `Started`) берём из тех же фактов, что уже прочитаны для
+/// списка: третий полный разбор журнала ради них был лишним.
+fn child_state_or_idle(cfg: &Config, session: &Session, path: &Path) -> String {
+    let Some(parent) = session.parent.as_deref() else {
+        return session.state.clone();
+    };
+    let (done, started) = crate::subagent::journal_signs(path);
+    child_state(&crate::subagent::state_from_signs(
+        cfg,
+        parent,
+        &session.id,
+        done,
+        started,
+    ))
+    .into()
 }
 
 /// Модель сессии: `Meta.model`, иначе последняя запись `usage` с непустым
