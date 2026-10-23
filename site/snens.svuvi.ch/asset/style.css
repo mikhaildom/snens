@@ -143,20 +143,36 @@ main.landing {
 }
 
 /* Проза на широком экране остаётся прозой: строка длиннее ~80 символов
-   читается плохо и глаз теряет начало следующей. Ограничиваем только
-   текстовые блоки, а сетки и таблицы остаются во всю ширину. */
+   читается плохо. Блоки уже контейнера центрируются, а не липнут к левому
+   краю: иначе справа зияет пустота, и страница выглядит сломанной. */
 main.landing > p,
 main.landing > ul,
 main.landing > blockquote,
 main.landing > h2 {
   max-width: 74ch;
+  margin-inline: auto;
 }
 
-/* Первый абзац и кнопки — во всю ширину контейнера: это вход, а не текст для
-   чтения подряд. */
+/* Шапка лендинга — по центру: марка, вступление и кнопки — это вход в
+   страницу, и он должен стоять на оси, а не у края. h1 — inline-block (так
+   задан фон марки), поэтому margin-inline:auto его не центрирует: ему нужна
+   width:fit-content, иначе он займёт всю строку. */
+main.landing > h1,
+main.landing > p:first-of-type {
+  text-align: center;
+  margin-inline: auto;
+}
+
 main.landing > p:first-of-type {
   max-width: 90ch;
   font-size: var(--fs-lg);
+}
+
+/* Строка с кнопками — тоже вход: центрируем, иначе она свисает влево под
+   центрированным вступлением. */
+main.landing > p:has(a.cta) {
+  text-align: center;
+  margin-inline: auto;
 }
 
 /* Преимущества — сеткой: на широком экране в две колонки, на узком в одну.
@@ -184,9 +200,12 @@ main.landing h1 {
   letter-spacing: 0.18em;
   background: var(--ink);
   color: var(--paper);
-  display: inline-block;
+  /* block + fit-content, а не inline-block: у inline-block auto-поля не
+     центрируют, и марка липла к левому краю контейнера. */
+  display: block;
+  width: fit-content;
+  margin: 0 auto calc(var(--step) * 3);
   padding: 6px 10px;
-  margin-bottom: calc(var(--step) * 3);
 }
 
 h2 {
