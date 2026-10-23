@@ -38,14 +38,21 @@
         "type": "downloadBootstrapper"
       }
     },
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/tools/": "tools/",
+      "resources/web/": "web/"
+    }
   },
   "plugins": {
     "updater": {
       "endpoints": [
         "https://releases.svuvi.ch/snens/latest.json"
       ],
-      "pubkey": ""
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFEM0IzQUNCREJERjQ2NzQKUldSMFJ0L2J5em83cmF0dFE5dDV1Uk0zU0VJZDBVNnp3VEhGSkFUbTVLeUxjOEdxN3U1NjBud08K",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

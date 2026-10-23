@@ -327,8 +327,7 @@ impl Session {
         file.try_lock_exclusive().map_err(|e| {
             format!("session {id} is already open for writing (possibly by surface API); stop that writer before resuming: {e}")
         })?;
-        recover_tail(&mut file, &path)?;
-        let lines = AtomicU64::new(count_lines(&path)?.max(1));
+        let lines = AtomicU64::new(recover_tail(&mut file, &path)?.max(1));
         let dir = dir.to_path_buf();
         // Родитель неизменяем и живёт в `Meta`: при открытии существующего лога
         // берём его оттуда, а не из аргумента (resume подагента не должен терять связь).
@@ -482,12 +481,21 @@ impl Session {
 
 /// With the writer lock held, validate complete records and repair only an
 /// incomplete final line. A valid unterminated JSON record is preserved.
-fn recover_tail(file: &mut File, path: &Path) -> R<()> {
+/// Проверить и при необходимости починить хвост журнала. Возвращает число
+/// непустых целых записей — оно же «следующий номер строки».
+///
+/// Считает именно здесь, потому что файл уже прочитан целиком: раньше рядом
+/// стоял `count_lines`, который открывал файл ВТОРОЙ раз, и на Windows этот
+/// второй хендл не мог читать область, залоченную первым (`recover_tail`
+/// работает под эксклюзивной блокировкой). Создание сессии вставало насмерть:
+/// CPU в цикле, запрос висит, ядро не отвечает ни на что.
+fn recover_tail(file: &mut File, path: &Path) -> R<u64> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let complete_end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
 
+    let mut lines = 0u64;
     for (i, line) in bytes[..complete_end].split(|b| *b == b'\n').enumerate() {
         if line.is_empty() {
             continue;
@@ -499,6 +507,7 @@ fn recover_tail(file: &mut File, path: &Path) -> R<()> {
                 i + 1
             )
         })?;
+        lines += 1;
     }
 
     if complete_end < bytes.len() {
@@ -511,7 +520,7 @@ fn recover_tail(file: &mut File, path: &Path) -> R<()> {
         }
         file.sync_data()?;
     }
-    Ok(())
+    Ok(lines)
 }
 
 /// Первые `n` записей файла без чтения остального. Нужно там, где всё решается
@@ -722,6 +731,40 @@ mod writer_safety_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Открытие сессии не должно открывать файл второй раз: под эксклюзивной
+    /// блокировкой это на Windows не читается вовсе (создание сессии вставало
+    /// насмерть — CPU в цикле, ядро не отвечает). Проверяем, что счётчик строк
+    /// приходит из того же прохода, что и проверка хвоста.
+    #[test]
+    fn opening_session_counts_lines_without_reopening_file() {
+        let dir = TempDir::new();
+        // Первое открытие создаёт журнал, второе обязано пройти по тому же пути
+        // и вернуть верный номер следующей строки.
+        for round in 0..3 {
+            let sess = Session::open(&dir.0, "s").unwrap();
+            if round == 0 {
+                sess.append(user("привет")).unwrap();
+            }
+            // Номер следующей записи: он и есть результат подсчёта строк при
+            // открытии. Ноль означал бы, что счётчик потерян.
+            let next = sess.lines.load(Ordering::Relaxed);
+            drop(sess);
+            assert!(
+                next >= 1,
+                "раунд {round}: следующая строка не посчитана ({next})"
+            );
+        }
+        // Файл читается целиком один раз при открытии: содержимое цело.
+        // Две записи — это `Meta` (пишется при создании журнала) и наша реплика;
+        // повторные открытия не должны добавлять ничего лишнего.
+        let recs = read_file(&dir.0.join("s.jsonl")).unwrap();
+        assert_eq!(recs.len(), 2, "журнал повреждён повторными открытиями");
+        assert!(
+            matches!(recs[0], Rec::Meta { .. }),
+            "первая запись должна быть Meta"
+        );
     }
 
     fn user(text: &str) -> Rec {

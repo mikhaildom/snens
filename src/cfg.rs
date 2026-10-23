@@ -280,8 +280,25 @@ fn d_max_proc() -> usize {
 fn d_sessions() -> String {
     format!("{}/sessions", data_dir())
 }
+/// Тулы: если рядом с бинарником ядра лежит `tools/` (так их кладёт установщик
+/// десктоп-приложения), берём оттуда — иначе из каталога данных (сборка из
+/// исходников кладёт их в репозиторий, а `SNENS_DATA_DIR` указывает на него).
 fn d_tools() -> String {
+    if let Some(dir) = beside_exe("tools") {
+        return dir;
+    }
     format!("{}/tools", data_dir())
+}
+
+/// Каталог `name` рядом с исполняемым файлом ядра, если он там есть.
+///
+/// Нужно ровно для поставки: установленное приложение — read-only, писать тулы
+/// в `%LOCALAPPDATA%` значило бы копировать бандл при каждом обновлении и
+/// ловить рассинхрон «ядро новое, тулы старые».
+pub fn beside_exe(name: &str) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join(name);
+    dir.is_dir().then(|| dir.to_string_lossy().into_owned())
 }
 fn d_max_attach() -> usize {
     32 * 1024 * 1024
@@ -578,9 +595,19 @@ impl Config {
         // значит «канала нет», а не «попробуем несуществующий путь»: иначе ход
         // падал бы на spawn вместо тихой работы без памяти.
         if named.components().count() == 1 {
-            let exe = self
-                .bin_path()
-                .join(format!("{cmd}{}", std::env::consts::EXE_SUFFIX));
+            let file = format!("{cmd}{}", std::env::consts::EXE_SUFFIX);
+            // Сначала рядом с ядром (поставка: `memory.exe` лежит в бандле, не
+            // в каталоге данных), потом в `bin/` (сборка из исходников, где
+            // `sync_bin_dir` раскладывает симлинки на тулы).
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    let candidate = dir.join(&file);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+            let exe = self.bin_path().join(&file);
             return exe.is_file().then_some(exe);
         }
         let path = PathBuf::from(cmd);
