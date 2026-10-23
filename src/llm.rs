@@ -117,8 +117,12 @@ impl SseFrames {
 /// `HTTP-Referer` — обязательный идентификатор (без него приложение не заводится),
 /// `X-OpenRouter-Title` — отображаемое имя. Заголовки ставим только для роутера:
 /// у строгих апстримов (Nous) лишний `Origin`/`Referer` — повод для 403.
+///
+/// `X-OpenRouter-Categories` — место в маркетплейсе: `personal-agent` (личный
+/// агент). Список слияется с прежними категориями приложения, а не перезаписывает их.
 const APP_REFERER: (&str, &str) = ("HTTP-Referer", "https://docs.svuvi.ch");
 const APP_TITLE: (&str, &str) = ("X-OpenRouter-Title", "snens agent");
+const APP_CATEGORIES: (&str, &str) = ("X-OpenRouter-Categories", "personal-agent");
 
 /// Заголовки атрибуции для адреса провайдера. Пусто — не роутер: подписываться
 /// нечем и незачем.
@@ -130,6 +134,7 @@ pub fn attribution_headers(base_url: &str) -> Vec<(String, String)> {
     vec![
         (APP_REFERER.0.to_string(), APP_REFERER.1.to_string()),
         (APP_TITLE.0.to_string(), APP_TITLE.1.to_string()),
+        (APP_CATEGORIES.0.to_string(), APP_CATEGORIES.1.to_string()),
     ]
 }
 
@@ -567,6 +572,10 @@ mod tests {
             vec![
                 ("HTTP-Referer".to_string(), "https://docs.svuvi.ch".to_string()),
                 ("X-OpenRouter-Title".to_string(), "snens agent".to_string()),
+                (
+                    "X-OpenRouter-Categories".to_string(),
+                    "personal-agent".to_string()
+                ),
             ]
         );
         assert!(attribution_headers("https://inference-api.nousresearch.com/v1").is_empty());
@@ -612,6 +621,10 @@ mod tests {
         llm.reply(&cfg, vec![], vec![], &mut noop).await.unwrap();
         let head = server.join().unwrap();
 
+        assert!(
+            head.contains("x-openrouter-categories: personal-agent"),
+            "{head}"
+        );
         assert!(head.contains("http-referer: https://docs.svuvi.ch"), "{head}");
         let titles = head.matches("x-openrouter-title:").count();
         assert_eq!(titles, 2, "подпись + правка человека: {head}");
