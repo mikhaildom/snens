@@ -1,0 +1,28 @@
+[package]
+name = "snens-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Окно snens: веб-клиент и своё ядро (или подключение к удалённому)"
+license = "MIT"
+
+# Отдельный workspace, а не член корневого: оболочка тянет tauri, а ядру и тулам
+# он не нужен. Иначе любая правка окна пересобирала бы весь харнесс.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Только для проверки готовности ядра до открытия окна: блокирующий клиент в
+# отдельном потоке setup — так проще, чем делать setup асинхронным.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

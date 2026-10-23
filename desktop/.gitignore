@@ -1,0 +1,5 @@
+# Сборка Tauri: бинарники раскладывает scripts/desktop-stage.sh, они не в git.
+/binaries/
+/resources/
+/target/
+/node_modules/

@@ -100,7 +100,24 @@ pub(super) fn app(state: Arc<Runtime>, token: String) -> Router {
         .route("/v1/pair/claim", post(pairing::claim))
         .with_state(state);
 
-    protected.merge(claim)
+    // Собранный веб-клиент, если он лежит рядом с ядром: в десктопной поставке
+    // это `resources/web` (или `SNENS_WEB_DIR`), в dev — пусто, и тогда клиент
+    // живёт на vite, который сам проксирует /api. Отдача статики идёт ДО auth:
+    // index.html и ассеты — не секрет, а токен клиент получит сам.
+    let app = match web_root() {
+        Some(dir) => {
+            let index = dir.join("index.html");
+            // SPA: клиент — одностраничник, и `/some/route` рисует тот же
+            // index.html. Поэтому «не найдено в каталоге» отдаёт index, а не 404.
+            protected.merge(claim).fallback_service(
+                tower_http::services::ServeDir::new(&dir).fallback(
+                    tower_http::services::ServeFile::new(index),
+                ),
+            )
+        }
+        None => protected.merge(claim),
+    };
+    app
         // Порядок слоёв важен: в axum последний `.layer` оказывается СНАРУЖИ.
         // CORS снаружи auth, иначе preflight `OPTIONS` (он не несёт Authorization)
         // получал бы 401, и браузер не отправил бы сам запрос.
@@ -110,4 +127,14 @@ pub(super) fn app(state: Arc<Runtime>, token: String) -> Router {
                 .allow_methods(tower_http::cors::Any)
                 .allow_headers(tower_http::cors::Any),
         )
+}
+
+/// Каталог собранного веб-клиента: `SNENS_WEB_DIR`, иначе `web/` рядом с
+/// бинарником (так его кладёт установщик). Нет `index.html` — клиента нет.
+fn web_root() -> Option<std::path::PathBuf> {
+    let candidate = match std::env::var("SNENS_WEB_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => std::path::PathBuf::from(dir),
+        _ => std::env::current_exe().ok()?.parent()?.join("web"),
+    };
+    candidate.join("index.html").is_file().then_some(candidate)
 }
