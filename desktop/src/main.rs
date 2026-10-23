@@ -7,7 +7,6 @@
 // вместе с ним (job object с KILL_ON_JOB_CLOSE).
 
 use std::{
-    net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -27,15 +26,6 @@ pub struct Connection {
 struct Daemon {
     child: Mutex<Option<Child>>,
     connection: Mutex<Option<Connection>>,
-}
-
-/// Свободный порт на loopback: два экземпляра приложения не должны драться за
-/// один адрес. `bind(0)` отдаёт выбранный порт, и мы тут же отпускаем его —
-/// гонка теоретически возможна, но на loopback в пределах одного пользователя
-/// это цена, которую проще принять, чем держать порт занятым до старта ядра.
-fn free_port() -> std::io::Result<u16> {
-    let l = TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
 }
 
 /// Где лежат бинарники: рядом с exe (так их кладёт установщик).
@@ -118,16 +108,23 @@ fn main() {
         .invoke_handler(tauri::generate_handler![connection, set_remote])
         .setup(|app| {
             let state = app.state::<Daemon>();
-            // Порт выбираем сами и передаём ядру явно: окну нужно знать адрес до
-            // того, как ядро напечатает свой.
-            let port = free_port().map_err(|e| format!("свободный порт: {e}"))?;
-            let base = format!("http://127.0.0.1:{port}");
             let bin = side("snens");
+
+            // Порт и путь к токену не угадываем: ядро само выберет свободный
+            // (`--listen 127.0.0.1:0`) и запишет ФАКТИЧЕСКИЕ значения в ready-файл.
+            // Иначе оболочка держала бы вторую копию правил «где данные, какой
+            // порт» — и расходилась бы с ядром (проверено: расходилась).
+            let ready_path = std::env::temp_dir().join(format!(
+                "snens-desktop-ready-{}.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&ready_path);
 
             let mut cmd = Command::new(&bin);
             cmd.arg("serve")
                 .arg("--listen")
-                .arg(format!("127.0.0.1:{port}"))
+                .arg("127.0.0.1:0")
+                .env("SNENS_READY_FILE", &ready_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -143,33 +140,53 @@ fn main() {
                 .map_err(|e| format!("не удалось запустить {}: {e}", bin.display()))?;
             *state.child.lock().unwrap() = Some(child);
 
-            // Токен ядро создаёт при первом старте; читаем после запуска.
-            let data = snens_data_dir();
-            let token_path = data.join("api.token");
-            let mut token = None;
-            for _ in 0..50 {
-                token = read_token(&token_path);
-                if token.is_some() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            let token = token.ok_or("ядро не создало api.token")?;
+            let ready = wait_ready_file(&ready_path, Duration::from_secs(30))
+                .ok_or("ядро не сообщило адрес за 30 с")?;
+            let _ = std::fs::remove_file(&ready_path);
+            let base = ready
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or("ядро не сообщило url")?
+                .to_string();
+            let token_file = ready
+                .get("token_file")
+                .and_then(|v| v.as_str())
+                .ok_or("ядро не сообщило token_file")?;
+            let token = read_token(Path::new(token_file)).ok_or("нет api.token")?;
 
             if !wait_ready(&base, &token, Duration::from_secs(20)) {
                 return Err("ядро не ответило на /v1/model за 20 с".into());
             }
             *state.connection.lock().unwrap() = Some(Connection {
                 base_url: base.clone(),
-                token: token.clone(),
+                token,
             });
 
-            // Клиент живёт на том же адресе: ядро отдаёт `web/` само.
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.eval(&format!(
-                    "window.location.replace({base:?})"
-                ));
-            }
+            // Клиенту нужно знать адрес ядра и токен: в упакованном приложении
+            // vite-прокси нет, и относительный `/api` ведёт в никуда (проверено:
+            // окно рисовалось, модель в шапке стояла «—», запросы падали 404).
+            //
+            // Окно создаётся ЗДЕСЬ, а не из конфига: `initialization_script`
+            // выполняется до кода страницы, а клиент читает `window.__SNENS__`
+            // при инициализации модуля. `eval` после загрузки окна опаздывал бы.
+            let token = state
+                .connection
+                .lock()
+                .map(|g| g.as_ref().map(|c| c.token.clone()).unwrap_or_default())
+                .unwrap_or_default();
+            let init = format!(
+                "window.__SNENS__ = {{ baseUrl: {base_json}, token: {token_json} }};",
+                base_json = serde_json::to_string(&base)?,
+                token_json = serde_json::to_string(&token)?,
+            );
+            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(
+                base.parse().map_err(|e| format!("адрес ядра: {e}"))?,
+            ))
+            .title("snens")
+            .inner_size(1280.0, 860.0)
+            .min_inner_size(900.0, 600.0)
+            .initialization_script(&init)
+            .build()?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -180,29 +197,32 @@ fn main() {
             // Гасим ядро до выхода приложения: иначе оно переживёт окно и
             // следующая установка не сможет перезаписать его файлы.
             let state = handle.state::<Daemon>();
-            if let Ok(mut guard) = state.child.lock() {
-                if let Some(mut child) = guard.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
+            // Отдельная переменная, а не `if let Ok(...)`: временный `Result` от
+            // `lock()` живёт до конца выражения и держит заимствование `state`,
+            // а `state` умирает раньше (E0597 — ловится только на Windows-сборке).
+            let stopped = state
+                .child
+                .lock()
+                .map(|mut guard| guard.take())
+                .unwrap_or(None);
+            if let Some(mut child) = stopped {
+                let _ = child.kill();
+                let _ = child.wait();
             }
         }
     });
 }
 
-/// Каталог данных snens: та же раскладка, что у ядра (`cfg::data_dir`), но
-/// без его кода — оболочка не линкуется со ядром.
-fn snens_data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SNENS_DATA_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
+/// Дождаться ready-файла от ядра и разобрать его.
+fn wait_ready_file(path: &Path, budget: Duration) -> Option<serde_json::Value> {
+    let until = Instant::now() + budget;
+    while Instant::now() < until {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                return Some(v);
+            }
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    if cfg!(windows) {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("snens");
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".local/share/snens")
+    None
 }

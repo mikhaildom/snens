@@ -4,35 +4,35 @@
   "version": "0.1.0",
   "identifier": "ch.svuvi.snens",
   "build": {
-    "frontendDist": "../snens-web/dist"
+    "frontendDist": "resources/web"
   },
   "app": {
-    "windows": [
-      {
-        "title": "snens",
-        "width": 1280,
-        "height": 860,
-        "minWidth": 900,
-        "minHeight": 600,
-        "resizable": true
-      }
-    ],
     "security": {
       "csp": null
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "appimage", "deb"],
-    "icon": ["icons/icon.png"],
-    "resources": {
-      "../snens-web/dist/": "web/"
-    },
-    "externalBin": ["binaries/snens", "binaries/memory"],
+    "targets": [
+      "nsis",
+      "appimage",
+      "deb"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "externalBin": [
+      "binaries/snens",
+      "binaries/memory"
+    ],
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["English", "Russian"]
+        "languages": [
+          "English",
+          "Russian"
+        ]
       },
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
@@ -42,7 +42,9 @@
   },
   "plugins": {
     "updater": {
-      "endpoints": ["https://releases.svuvi.ch/snens/latest.json"],
+      "endpoints": [
+        "https://releases.svuvi.ch/snens/latest.json"
+      ],
       "pubkey": ""
     }
   }

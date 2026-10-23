@@ -116,7 +116,7 @@ async fn serve(flags: &BTreeMap<String, String>) -> R<()> {
         data.display(),
         token_path.display()
     );
-    crate::surface_server::serve(cfg, addr, token).await
+    crate::surface_server::serve_with_ready(cfg, addr, token, &token_path).await
 }
 
 async fn tui(flags: &BTreeMap<String, String>) -> R<()> {

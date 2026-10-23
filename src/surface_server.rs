@@ -43,11 +43,34 @@ pub(crate) mod history;
 #[path = "surface_discovery.rs"]
 pub mod discovery;
 
-pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()> {
+/// Запуск с машинным каналом для оболочки: после того как сокет занят, пишем
+/// `SNENS_READY_FILE` с ФАКТИЧЕСКИМ адресом (порт мог быть выбран ядром при
+/// `--listen 127.0.0.1:0`) и путём к токену. Иначе оболочка держала бы вторую
+/// копию правил «где данные и какой порт» — и расходилась бы с ядром.
+pub async fn serve_with_ready(
+    cfg: Config,
+    addr: SocketAddr,
+    token: String,
+    token_path: &std::path::Path,
+) -> crate::R<()> {
+    serve_inner(cfg, addr, token, Some(token_path.to_path_buf())).await
+}
+
+async fn serve_inner(
+    cfg: Config,
+    addr: SocketAddr,
+    token: String,
+    token_path: Option<std::path::PathBuf>,
+) -> crate::R<()> {
     // Адрес проверил вызывающий (`production::serve`): здесь политики нет, иначе
     // правило разъехалось бы по двум местам (см. src/remote.rs, docs/pairing.md).
-    let key = cfg.api_key()?;
-    let llm = Arc::new(crate::llm::OpenAi::new(key)?);
+    // Ключ не обязателен для старта: поверхность должна подняться и дать
+    // человеку ввести провайдера (онбординг, `PUT /v1/providers`). Без ключа
+    // первый ход ответит понятной ошибкой, а не «сервер не запустился».
+    let llm = Arc::new(match cfg.api_key() {
+        Ok(key) => crate::llm::OpenAi::new(key)?,
+        Err(_) => crate::llm::OpenAi::without_key()?,
+    });
     let dir = cfg.data_path().join("surface-api");
     std::fs::create_dir_all(&dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -103,6 +126,7 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
     // на каждом запросе идёт по памяти, а `DELETE /v1/clients/{id}` правит и
     // память, и файл.
     let registry = crate::clients::Registry::load(&cfg.data_path());
+    let data_dir_display = cfg.data_path().display().to_string();
     let state = Arc::new(Runtime {
         data: tokio::sync::Mutex::new(store),
         db: std::sync::Mutex::new(db),
@@ -125,6 +149,23 @@ pub async fn serve(cfg: Config, addr: SocketAddr, token: String) -> crate::R<()>
     approvals::spawn_approval_server(state.clone());
     let app = router::app(state.clone(), token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Сокет занят — теперь адрес настоящий. Пишем ready-файл ДО того, как
+    // начнём принимать запросы: оболочка читает его и идёт по этому адресу.
+    let actual = listener.local_addr()?;
+    if let (Some(path), Ok(ready_path)) = (
+        token_path,
+        std::env::var("SNENS_READY_FILE").map_err(|_| "нет SNENS_READY_FILE"),
+    ) {
+        if !ready_path.trim().is_empty() {
+            let ready = serde_json::json!({
+                "url": format!("http://{actual}"),
+                "token_file": path.display().to_string(),
+                "data_dir": data_dir_display,
+                "pid": std::process::id(),
+            });
+            std::fs::write(&ready_path, ready.to_string())?;
+        }
+    }
     tokio::select! {
         r=axum::serve(listener,app)=>{r?;},
         _=async {
