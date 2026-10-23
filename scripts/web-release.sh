@@ -89,11 +89,22 @@ enable --now snens-web.service (пути в юните — %h, поправь, �
 EOF
 
 ARCHIVE="snens-web_${VERSION}_linux-x86_64.tar.gz"
-( cd "$STAGE" && tar czf "../../$ARCHIVE" . ) || die "tar провалился"
+# tar пишет в `OUT`, а не в `STAGE`: `-C` меняет каталог, и относительный
+# `../../` оттуда уводил архив на два уровня выше, а sha256sum потом искал его
+# в `OUT` и не находил. Скрипт теперь ещё и проверяет, что архив появился.
+( cd "$STAGE" && tar czf "$OUT/$ARCHIVE" . ) || die "tar провалился"
+[ -f "$OUT/$ARCHIVE" ] || die "архив не создан: $OUT/$ARCHIVE"
 SHA="$(sha256sum "$OUT/$ARCHIVE" | cut -d' ' -f1)"
+[ -n "$SHA" ] || die "sha256 не посчитался: $OUT/$ARCHIVE"
 printf '%s  %s\n' "$SHA" "$ARCHIVE" > "$OUT/$ARCHIVE.sha256"
-say "архив: $OUT/$ARCHIVE ($(wc -c <"$OUT/$ARCHIVE") байт)"
+SIZE="$(wc -c <"$OUT/$ARCHIVE")"
+say "архив: $OUT/$ARCHIVE ($SIZE байт)"
 say "sha256: $SHA"
+# Архив без бинаря или без клиента — это не релиз, а пустышка; проверяем, что
+# внутри то, что обещали, а не только что файл есть.
+for want in ./snens-web ./web/index.html ./snens-web.service ./README.txt; do
+    tar tzf "$OUT/$ARCHIVE" | grep -qx "$want" || die "в архиве нет $want"
+done
 
 say "4/5 выкладка"
 if [ "$PUBLISH" = 0 ]; then
