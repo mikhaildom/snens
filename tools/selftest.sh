@@ -101,7 +101,7 @@ if [ -n "$CORE" ]; then
     esac
   done
   case "$tools_out" in
-    *"[generic args]"*) ok "schema: snens tools оставляет generic-пометку для тулов без схемы" ;;
+    *"аргументы:"*) ok "schema: snens tools оставляет пометку аргументов для тулов без схемы" ;;
     *) bad "schema: snens tools потерял пометку generic" ;;
   esac
 fi

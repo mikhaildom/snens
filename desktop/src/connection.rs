@@ -77,7 +77,7 @@ pub fn reopen(app: tauri::AppHandle, state: tauri::State<'_, crate::Daemon>) -> 
     let conn = state
         .connection
         .lock()
-        .map_err(|_| "состояние отравлено")?
+        .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")?
         .clone()
         .ok_or("нет соединения")?;
     let remote = state.remote.lock().map(|g| *g).unwrap_or(false);
@@ -118,8 +118,8 @@ pub fn set_remote(
     *state
         .connection
         .lock()
-        .map_err(|_| "состояние отравлено")? = Some(conn);
-    *state.remote.lock().map_err(|_| "состояние отравлено")? = true;
+        .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = Some(conn);
+    *state.remote.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = true;
     Ok(())
 }
 
@@ -129,7 +129,7 @@ pub fn set_remote(
 #[tauri::command]
 pub fn clear_remote(app: tauri::AppHandle, state: tauri::State<'_, crate::Daemon>) -> Result<(), String> {
     forget_stored(&app);
-    *state.connection.lock().map_err(|_| "состояние отравлено")? = None;
-    *state.remote.lock().map_err(|_| "состояние отравлено")? = false;
+    *state.connection.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = None;
+    *state.remote.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = false;
     Ok(())
 }

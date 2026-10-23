@@ -289,7 +289,7 @@ async fn run_loop<L: Llm>(
                 cleared: cleared.clone(),
             })?;
             project::apply_cleared(&mut msgs, &cleared);
-            ui.notice(&format!("автоэлизия: схлопнуто результатов тулов: {elided}"));
+            ui.notice(&format!("контекст: сжал {elided} результатов тулов"));
         } else {
             project::apply_cleared(&mut msgs, &project::cleared_map(&raw));
         }
@@ -334,9 +334,8 @@ async fn run_loop<L: Llm>(
             msgs = mirror.prepare(&sess.read()?, cfg)?;
             project::apply_cleared(&mut msgs, &project::cleared_map(&sess.read()?));
             ui.notice(&format!(
-                "контекст ~{approx}: запрос уборки (бюджет {}, ctx {})",
-                cfg.context_budget(),
-                if ctx_tool { "есть" } else { "нет" }
+                "контекст ~{approx} из {} — прошу агента убрать лишнее",
+                cfg.context_budget()
             ));
         }
         // Protocol is constant across requests; outside the editable mirror.
@@ -390,7 +389,7 @@ async fn run_loop<L: Llm>(
                 String::new()
             };
             ui.notice(&format!(
-                "ход {turn}: ↑{} (кеш {}) ↓{}{reasoning}{cost}",
+                "ход {turn}: вход {} · кеш {} · выход {}{reasoning}{cost}",
                 reply.usage.in_tok, reply.usage.cached_tok, reply.usage.out_tok
             ));
         }
@@ -704,7 +703,7 @@ async fn final_answer<L: Llm>(
         },
     })?;
     sess.append(usage_rec(&reply, est_raw, &cfg.model_now()))?;
-    ui.notice(&format!("лимит {turn} ходов: запрошен промежуточный итог"));
+    ui.notice(&format!("лимит {turn} ходов — прошу подвести итог"));
     memory::retain_turn(sess, cfg, path, &reply.text).await;
     Ok(())
 }

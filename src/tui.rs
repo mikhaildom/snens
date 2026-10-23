@@ -12,10 +12,9 @@ use std::{collections::BTreeMap, io::IsTerminal, path::PathBuf, sync::Arc};
 
 use crate::{agent, cfg::Config, input, input::In, llm, log, mail, render::Ui, R};
 
-const HELP: &str = "/new — новая сессия · /reasoning — скрыть/показать рассуждение · \
-/memory [on|off] — долгая память · \
-/compact [инструкция] — уборка контекста · /help · /quit (или Ctrl+D) · Ctrl+C — отменить ход · во время хода строка уходит агенту \
-как steer (после текущего шага)";
+const HELP: &str = "команды: /new — новая сессия · /reasoning — рассуждение · \
+/memory [on|off] — долгая память · /compact [указание] — сжать контекст · \
+/help · /quit (Ctrl+D) · во время хода: Ctrl+C — отменить ход, строка уйдёт агенту после шага";
 
 pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
     let cfg = Config::load(flags.get("config").map(|s| s.as_str()))?;
@@ -52,7 +51,6 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
 
     let cwd = std::env::current_dir().unwrap_or_default();
     ui.line(&format!("сессия {id} · {} · {}", cfg.model, cwd.display()));
-    ui.line(&format!("продолжить: snens tui --session {id}"));
     ui.line(HELP);
 
     loop {
@@ -60,7 +58,7 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
         let line = match msg {
             In::Eof => break,
             In::Interrupt => {
-                ui.line(&format!("({HELP})"));
+                ui.line("Ctrl+D — выход, /help — команды");
                 continue;
             }
             In::Line(l) => l,
@@ -101,7 +99,7 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
                     },
                     if mem.retain { "да" } else { "нет" },
                 ));
-                ui.line("сменить: /memory on|off (конфиг, действует со следующего хода)");
+                ui.line("переключить: /memory on или /memory off");
                 continue;
             }
             "/memory on" | "/memory off" => {
@@ -127,6 +125,10 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
             Flow::Quit => break,
         }
     }
+
+    // Инструкция «как вернуться» — при выходе, а не на входе: до первого хода
+    // она отвечает на вопрос, которого человек ещё не задал.
+    ui.line(&format!("продолжить: snens tui --session {id}"));
 
     // Ревью уезжает фоновым процессом (см. main::spawn_review): окно можно
     // закрывать, ревью доработает само.
@@ -176,7 +178,7 @@ async fn run_turn(
                         continue;
                     }
                     mail::send(&cfg.mail_path(), id, "human", "steer", &l)?;
-                    ui.notice(&format!("steer принят: {l}"));
+                    ui.notice(&format!("принято, уйдёт агенту после шага: {l}"));
                 }
             },
         }

@@ -4,13 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const HELP: &str = "snens — production entry\n\
+const HELP: &str = "snens — агент с инструментами\n\
   serve [--config PATH] [--listen 127.0.0.1:7420] [--token-file PATH] [--data-dir DIR]\n\
         [--allow-remote] [--insecure-public] — слушать не только loopback (см. docs/pairing.md)\n\
-  tui [--config PATH] [--endpoint URL] [--token-file PATH] [--session ID]\n\
-  tui-local [--session ID] [--config PATH] — прежний локальный TUI\n\
-  run, run-child, review, tools, build, config/model и остальные команды — legacy CLI\n\nDefault config: ~/.config/snens/config.toml; API token: <cfg.data_path()>/api.token.\n\
-The HTTP/SSE server binds loopback only. API TUI does not accept remote sudo secrets.\n";
+  tui [--config PATH] [--endpoint URL] [--token-file PATH] [--session ID] — диалог с ядром\n\
+  tui-local [--session ID] — прежний локальный TUI, без ядра (совместимость)\n\
+  run, review, tools, build, config, model и остальные — ядро в терминале (snens help)\n\n\
+Конфиг: ~/.config/snens/config.toml; токен API: <каталог данных>/api.token.\n\
+Сервер слушает только loopback. sudo в этом TUI не спрашивается: секреты живут локально.\n";
 
 pub async fn entry() -> R<()> {
     // Preserve executable aliases used by sudo/askpass shims.

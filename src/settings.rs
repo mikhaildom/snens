@@ -120,7 +120,7 @@ pub fn prepare(cfg: &Config, patch: &Value) -> R<Vec<crate::cfg_edit::Edit>> {
         .as_object()
         .ok_or("правка должна быть объектом {ключ: значение}")?;
     if obj.is_empty() {
-        return Err("пустая правка".into());
+        return Err("нечего менять: укажи ключ=значение".into());
     }
     let mut edits: Vec<Edit> = Vec::new();
     let mut nums: Vec<(&'static str, u64)> = Vec::new();
@@ -129,7 +129,7 @@ pub fn prepare(cfg: &Config, patch: &Value) -> R<Vec<crate::cfg_edit::Edit>> {
             .iter()
             .find(|x| **x == key.as_str())
             .copied()
-            .ok_or_else(|| format!("неизвестный ключ настройки: {key}"))?;
+            .ok_or_else(|| format!("{key}: такого ключа нет — snens config покажет список"))?;
         match k {
             "model" => {
                 let s = text(value, k)?.trim().to_string();
@@ -201,7 +201,7 @@ pub fn prepare(cfg: &Config, patch: &Value) -> R<Vec<crate::cfg_edit::Edit>> {
             // (и на `snens config k=v`). Ошибка честнее — клиент увидит, что
             // ключ не принят, а сервис останется живым. Инвариант проверяется
             // тестом `every_key_has_a_handler` ниже.
-            other => return Err(format!("{other}: ключ не поддержан").into()),
+            other => return Err(format!("{other}: такого ключа нет — snens config покажет список").into()),
         }
     }
     // Цель уборки не может быть больше бюджета: иначе она недостижима и правка

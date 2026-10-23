@@ -74,7 +74,11 @@ fn side(name: &str) -> PathBuf {
 pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Error>> {
     let bin = side("snens");
     if !bin.is_file() {
-        return Err(format!("нет ядра рядом с окном: {}", bin.display()).into());
+        return Err(format!(
+            "ядро не найдено: {}. Переустанови приложение или укажи адрес в настройках",
+            bin.display()
+        )
+        .into());
     }
     // ready-файл уникален на процесс окна: два окна (или окно и TUI) не должны
     // читать адрес друг друга.
@@ -109,12 +113,12 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
     let job = crate::job::attach(&child);
     {
         let state = app.state::<Daemon>();
-        *state.child.lock().map_err(|_| "состояние отравлено")? = Some(child);
-        *state.job.lock().map_err(|_| "состояние отравлено")? = job;
+        *state.child.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = Some(child);
+        *state.job.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = job;
     }
 
     let ready = wait_ready_file(&ready_path, READY_BUDGET)
-        .ok_or("ядро не сообщило адрес за 30 с")?;
+        .ok_or("ядро не запустилось за 30 с — смотри лог, потом перезапусти окно")?;
     let _ = std::fs::remove_file(&ready_path);
     let base = ready
         .get("url")
@@ -130,7 +134,7 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
     // Адрес получен, но HTTP-сервер мог ещё не подняться: окно на пустоту
     // открывать незачем.
     if !wait_ready(&base, &token, PING_BUDGET) {
-        return Err("ядро не ответило на /v1/model за 20 с".into());
+        return Err("ядро не отвечает — перезапусти окно".into());
     }
     Ok(Connection {
         base_url: base,

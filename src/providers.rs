@@ -467,7 +467,7 @@ pub fn cmd(
             }
             if let Some(eff) = state.get("effective") {
                 println!(
-                    "работает: {} · {}",
+                    "сейчас: {} · {}",
                     eff["base_url"].as_str().unwrap_or(""),
                     eff["model"].as_str().unwrap_or("")
                 );

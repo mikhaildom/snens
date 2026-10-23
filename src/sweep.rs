@@ -83,7 +83,7 @@ fn run(cfg: &Config, older: Duration, dry: bool, attachments: bool) -> R<()> {
             } else if name == "LIVE_CONTEXT.json" {
                 // Зеркало закрытой сессии: resume соберёт его заново, а черновик
                 // правок в закрытой сессии некому применять.
-                (old && !is_open).then_some("зеркало ctx")
+                (old && !is_open).then_some("копия контекста")
             } else {
                 None
             };

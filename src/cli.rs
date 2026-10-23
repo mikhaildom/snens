@@ -48,38 +48,37 @@ use std::{collections::BTreeMap, error::Error};
 pub type R<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const USAGE: &str = "\
-snens — узкое ядро агента
+snens — агент с инструментами
 
-  snens run [--new] [--session ID] [--config PATH] \"запрос\"
-  snens serve [--config PATH] [--listen 127.0.0.1:7420] [--token-file PATH]
-  snens tui [--endpoint URL] [--token-file PATH] [--session ID]
-  snens tui-local [--session ID] [--config PATH]  # прежний локальный TUI
-  snens show [--session ID]
-  snens log  [--session ID]
-  snens sessions
-  snens sweep [--older-than DAYS] [--attachments] [--dry-run]
-                                 # убрать мёртвое в sessions/
-  snens tickets [--all] [--target T] [--kind K]
-  snens tickets show <имя> | grep <текст> | stats
-  snens tools [--json]        # список тулов; --json — определения для модели
-  snens model [slug]             # без аргумента — какая сейчас; со slug — сменить в конфиге
-  snens config [ключ=значение …]  # без аргументов — текущие значения; с ними — правка на ходу
-                                 # ключи: model, max_turns (0 — без лимита), memory_recall, …
-  snens providers [list|activate <имя>|key <имя> <ключ>]
-                                 # профили провайдеров: без аргументов — список и активный
-  snens memory [on|off] [recall always|session|off] [retain on|off]
-                                 # тумблер долгой памяти: справка на ход и запись хода
-  snens build [<tool>…]          # без аргументов весь workspace, с аргументами — только названные тулы
-  snens review [--session ID]
-  snens improve
-  snens selftest
-  snens verify                   # check + test --workspace + selftest тулов, один вердикт
+  snens run [--new] [--session ID] [--config PATH] \"запрос\" — ответить на запрос в терминале
+  snens serve [--config PATH] [--listen 127.0.0.1:7420] [--token-file PATH] — поднять ядро для клиентов
+  snens tui [--endpoint URL] [--token-file PATH] [--session ID] — диалог в терминале
+  snens show [--session ID] — чего стоили токены этой сессии
+  snens log [--session ID] — журнал сессии, строками JSON
+  snens sessions — список сессий
+  snens sweep [--older-than DAYS] [--attachments] [--dry-run] — удалить старые сессии и вложения
+  snens tickets [--all] [--target T] [--kind K] — заведённые проблемы
+  snens tickets show <имя> | grep <текст> | stats — посмотреть, найти, сводка
+  snens tools [--json] — список тулов; --json — определения для модели
+  snens model [slug] — какая модель сейчас; со slug — сменить
+  snens config [ключ=значение …] — показать значения; с аргументами — поправить на ходу
+       ключи: model, max_turns (0 — без лимита), memory_recall, …
+  snens providers [list|activate <имя>|key <имя> <ключ>] — профили провайдеров
+  snens memory [on|off] [recall always|session|off] [retain on|off] — долгая память
+  snens build [<tool>…] — собрать тулы; без аргументов — все
+  snens review [--session ID] — разобрать сессию вторым проходом
+  snens improve — поработать над самим ядром
+  snens selftest — интеграционная проверка цикла
+  snens verify — check, test и selftest одним вердиктом
 
 Подагенты:
-  snens run --detach --session ID [--parent PID] <задача>
-  snens steer <ID> <текст>       (текст берётся со stdin, если не задан)
-  snens agents [--session ID]    список и состояние детей
-  snens result <ID>              финальный текст сессии
+  snens run --detach --session ID [--parent PID] <задача> — запустить подагента фоном
+  snens steer <ID> <текст> — сказать подагенту; текст можно отдать со stdin
+  snens agents [--session ID] — какие подагенты запущены
+  snens result <ID> — что подагент ответил
+
+Совместимость:
+  snens tui-local [--session ID] [--config PATH] — прежний локальный TUI, без ядра
 ";
 
 async fn legacy_main() -> R<()> {
@@ -291,13 +290,13 @@ fn cmd_steer(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()>
     let id = flags
         .get("session")
         .cloned()
-        .ok_or("steer: нужен --session <ID>")?;
+        .ok_or("нужен --session <ID>: кого предупредить")?;
     let text = text_or_stdin(&positional);
     if text.trim().is_empty() {
-        return Err("steer: пустое сообщение".into());
+        return Err("пустое сообщение — нечего передавать".into());
     }
     mail::send(&cfg.mail_path(), &id, "human", "steer", &text)?;
-    eprintln!("[snens] steer → {id}");
+    eprintln!("[snens] {id}: уйдёт агенту после шага");
     Ok(())
 }
 
@@ -307,7 +306,7 @@ fn cmd_agents(flags: &BTreeMap<String, String>) -> R<()> {
     let kids = subagent::children(&cfg, &id);
     println!("сессия: {id}");
     if kids.is_empty() {
-        println!("(детей нет)");
+        println!("подагентов нет");
         return Ok(());
     }
     for c in &kids {
@@ -335,7 +334,7 @@ fn cmd_result(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()
     };
     match subagent::final_text(&cfg, &id) {
         Some(t) => println!("{t}"),
-        None => eprintln!("[snens] у сессии {id} нет финального текста"),
+        None => eprintln!("[snens] сессия {id} не ответила текстом — смотри snens log --session {id}"),
     }
     Ok(())
 }
@@ -518,7 +517,7 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
     let sess = log::Session::open(&cfg.sessions_path(), &id)?;
     let recs = sess.read()?;
 
-    let (mut calls, mut in_tok, mut cached, mut out_tok, mut cost) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut in_tok, mut cached, mut out_tok, mut cost) = (0u64, 0u64, 0u64, 0u64);
     let mut reason_tok = 0u64;
     let mut encrypted_turns = 0u64;
     let mut biggest: Option<(usize, &str)> = None;
@@ -526,10 +525,10 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
     // провайдера. Смена бэкенда объясняет промах, который иначе искать в проекции.
     let (mut uncached_turns, mut usages) = (0u64, 0u64);
     let mut upstreams: Vec<&str> = Vec::new();
+    let mut fingerprints: Vec<&str> = Vec::new();
     for r in &recs {
         match r {
             log::Rec::ToolResult { tool, bytes, .. } => {
-                calls += 1;
                 if biggest.is_none_or(|(b, _)| *bytes > b) {
                     biggest = Some((*bytes, tool.as_str()));
                 }
@@ -540,6 +539,7 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
                 out_tok: o,
                 cost_micro: m,
                 upstream_id,
+                fingerprint,
                 reason_tok: r,
                 encrypted_reasoning,
                 ..
@@ -559,14 +559,15 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
                 if !upstream_id.is_empty() {
                     upstreams.push(upstream_id.as_str());
                 }
+                if !fingerprint.is_empty() {
+                    fingerprints.push(fingerprint.as_str());
+                }
             }
             _ => {}
         }
     }
     println!("сессия:  {id}");
     println!("файл:    {}", sess.path().display());
-    println!("записей: {}", recs.len());
-    println!("тулов:   {calls}");
     if let Some((b, name)) = biggest {
         println!("макс. результат: {b} Б ({name})");
     }
@@ -584,12 +585,22 @@ fn cmd_show(flags: &BTreeMap<String, String>) -> R<()> {
     if usages > 0 {
         // Ходы без кеша — норма для первого хода и после смены апстрима. Если их
         // много подряд на одном апстриме — тогда промах наш, искать в проекции.
-        println!("кеш:     ходов без кеша {uncached_turns} из {usages}");
-        let distinct: std::collections::BTreeSet<&str> = upstreams.iter().copied().collect();
+        println!("кеш:     {uncached_turns} из {usages} ходов без попадания");
+        // Разные серверы опознаём по отпечатку бэкенда, когда он есть: id ответа
+        // (`gen-…`) у каждого хода свой и о смене сервера ничего не говорит.
+        let keys = if fingerprints.len() == usages as usize {
+            &fingerprints
+        } else {
+            &upstreams
+        };
+        let distinct: std::collections::BTreeSet<&str> = keys.iter().copied().collect();
         if distinct.len() > 1 {
-            println!("апстримы: {} (роутер мог увести запрос)", distinct.len());
-        } else if let Some(u) = upstreams.first() {
-            println!("апстрим: {u}");
+            println!(
+                "серверы:  {} — запросы уходили на разные, кеш на них не общий",
+                distinct.len()
+            );
+        } else if let Some(u) = keys.first() {
+            println!("сервер:  {u}");
         }
     }
     if cost > 0 {
@@ -632,8 +643,8 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
         return Ok(());
     }
     println!("каталог тулов: {}", cfg.tools_path().display());
-    println!("PATH (дети и человек): {}\n", bin.display());
-    println!("встроенные (ядро, всегда в схеме):");
+    println!("PATH для тулов и человека: {}\n", bin.display());
+    println!("встроенные:");
     for def in dispatch::builtin_defs(&cfg.shell_line()) {
         let name = def
             .pointer("/function/name")
@@ -674,7 +685,7 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
                 println!("    [схема] поля: {fields}");
                 println!("    {}", t.usage);
             }
-            None => println!("    [generic args] {}", t.usage),
+            None => println!("    аргументы: {}", t.usage),
         }
     }
     Ok(())
@@ -704,13 +715,13 @@ async fn cmd_pair(flags: &BTreeMap<String, String>) -> R<()> {
     let code = reply["code"].as_str().unwrap_or("?");
     let left = reply["seconds_left"].as_u64().unwrap_or(0);
     println!("Код пейринга: {code}");
-    println!("Действует {}:{:02}.", left / 60, left % 60);
+    println!("код действует {}:{:02}", left / 60, left % 60);
     for e in reply["endpoints"].as_array().cloned().unwrap_or_default() {
         if let Some(e) = e.as_str() {
             println!("Адрес: {e}");
         }
     }
-    println!("Введите адрес и код в приложении — токен оно получит само.");
+    println!("введи адрес и код в приложении — токен оно получит само");
     Ok(())
 }
 
@@ -792,20 +803,22 @@ fn cmd_memory(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()
             "on" => changes.push(("enabled", "true".into())),
             "off" => changes.push(("enabled", "false".into())),
             "recall" => {
-                let v = it.next().ok_or("memory recall: нужен режим")?;
+                let v = it
+                    .next()
+                    .ok_or("memory recall: нужен режим — always, session или off")?;
                 match v.as_str() {
                     "always" | "session" | "off" => {
                         changes.push(("recall", format!("\"{v}\"")))
                     }
-                    other => return Err(format!("memory recall: неизвестный режим {other}").into()),
+                    other => return Err(format!("memory recall: режим {other} не знаю — always, session или off").into()),
                 }
             }
             "retain" => {
-                let v = it.next().ok_or("memory retain: нужен on|off")?;
+                let v = it.next().ok_or("memory retain: нужен on или off")?;
                 match v.as_str() {
                     "on" => changes.push(("retain", "true".into())),
                     "off" => changes.push(("retain", "false".into())),
-                    other => return Err(format!("memory retain: неизвестно {other}").into()),
+                    other => return Err(format!("memory retain: {other} не знаю — on или off").into()),
                 }
             }
             other => return Err(format!("memory: непонятный аргумент {other}").into()),
@@ -997,7 +1010,7 @@ fn cmd_verify(flags: &BTreeMap<String, String>) -> R<()> {
             return Err(format!("{label}: красный (код {:?})", status.code()).into());
         }
     }
-    println!("verify ok");
+    println!("проверка прошла");
     Ok(())
 }
 

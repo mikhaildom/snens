@@ -15,7 +15,10 @@ use std::{
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-const HELP: &str = "/new · /sessions · /resume ID · /stop · /reasoning · /memory [on|off] · /compact [инструкция] · /model [slug] · /help · /quit (Ctrl+D); Ctrl+C — stop текущего run · sudo/секреты пока не поддерживаются";
+const HELP: &str = "команды: /new — новая сессия · /sessions — какие есть · /resume ID — открыть · \
+/stop — остановить ход · /model [slug] — модель · /reasoning — рассуждение · \
+/memory [on|off] — долгая память · /compact [указание] — сжать контекст · /help · /quit (Ctrl+D)\n\
+Ctrl+C — остановить текущий ход. Пароль sudo здесь не спрашивается.";
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 enum Notice {
@@ -409,7 +412,7 @@ async fn command(
         return Ok(false);
     }
     if line.starts_with('/') {
-        ui.line("неизвестная команда; /help · sudo и секреты API пока не поддержаны");
+        ui.line("такой команды нет — /help покажет список");
         return Ok(false);
     }
     send_message(client, session, selected_run, line, ui).await?;
