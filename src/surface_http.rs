@@ -28,12 +28,29 @@ pub(super) async fn auth(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
-    let given = req
+    let header_token = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|x| x.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    let Some(given) = given else {
+    // `EventSource` в браузере не умеет заголовков, и `fetch`-обёртка над SSE
+    // лишает нас авто-переподключения. Поэтому для SSE-маршрутов токен
+    // принимается ещё и в query (`?token=…`). Цена решения честная: query
+    // попадает в логи прокси и историю. Поэтому — только для GET-потоков, у
+    // которых нет тела и которые и так живут в браузере; для остальных API
+    // остаётся заголовок.
+    let query_token = if req.method() == axum::http::Method::GET && is_stream_path(req.uri().path())
+    {
+        req.uri().query().and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                (k == "token" && !v.is_empty()).then(|| v.to_string())
+            })
+        })
+    } else {
+        None
+    };
+    let Some(given) = header_token.map(str::to_string).or(query_token) else {
         return unauthorized();
     };
     // Два законных способа войти: токен инстанса (локальные клиенты: TUI, веб
@@ -42,10 +59,15 @@ pub(super) async fn auth(
     if given == ctx.token {
         return next.run(req).await;
     }
-    if ctx.runtime.registry.owner(given).is_some() {
+    if ctx.runtime.registry.owner(&given).is_some() {
         return next.run(req).await;
     }
     unauthorized()
+}
+
+/// Потоки, где токен в query допустим: `EventSource` не умеет заголовков.
+fn is_stream_path(path: &str) -> bool {
+    path.ends_with("/events") || path == "/v1/events"
 }
 
 fn unauthorized() -> axum::response::Response {
