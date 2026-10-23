@@ -164,11 +164,22 @@ def inline(text: str, depth: int = 0) -> str:
     return src
 
 
-def render(md: str) -> str:
+def render(md: str, land: bool = False) -> str:
+    """Markdown → HTML. `land` — лендинг: там серия пунктов-определений
+    собирается в один блок `.cards`, чтобы лечь сеткой в ширину экрана.
+    В доках тот же пункт — строка прозы, и сетка сломала бы чтение."""
     lines = md.splitlines()
     blocks: list[str] = []
     para: list[str] = []
     i = 0
+    # Пункты-определения, ещё не отданные в вывод: на лендинге жду, не начнётся
+    # ли следующий, чтобы собрать их в сетку одним блоком.
+    cards: list[str] = []
+
+    def flush_cards() -> None:
+        if cards:
+            blocks.append('<div class="cards">' + "".join(cards) + "</div>")
+            cards.clear()
 
     def flush() -> None:
         if para:
@@ -179,8 +190,14 @@ def render(md: str) -> str:
             # Жирное с двоеточием (`**ядро**: …`) — обычная проза в начале фразы.
             head = re.match(r"^<strong>(.*?)</strong>", text)
             if head and re.search(r"[.!?…]$", head.group(1)):
-                blocks.append(f'<p class="def">{text}</p>')
+                block = f'<p class="def">{text}</p>'
+                if land:
+                    cards.append(block)
+                    para.clear()
+                    return
+                blocks.append(block)
             else:
+                flush_cards()
                 blocks.append(f"<p>{text}</p>")
             para.clear()
 
@@ -196,6 +213,7 @@ def render(md: str) -> str:
         m = FENCE.match(stripped)
         if m:
             flush()
+            flush_cards()
             i += 1
             code: list[str] = []
             while i < len(lines) and not FENCE.match(lines[i].strip()):
@@ -210,6 +228,7 @@ def render(md: str) -> str:
         m = HEADING.match(stripped)
         if m:
             flush()
+            flush_cards()
             level = len(m.group(1))
             blocks.append(f"<h{level}>{inline(m.group(2))}</h{level}>")
             i += 1
@@ -218,6 +237,7 @@ def render(md: str) -> str:
         # Таблица: строка с |, затем разделитель. Без разделителя это просто текст.
         if stripped.startswith("|") and i + 1 < len(lines) and TABLE_SEP.match(lines[i + 1].strip()):
             flush()
+            flush_cards()
             head = [c.strip() for c in stripped.strip("|").split("|")]
             i += 2
             rows: list[list[str]] = []
@@ -235,6 +255,7 @@ def render(md: str) -> str:
 
         if ULIST.match(line) or OLIST.match(line):
             flush()
+            flush_cards()
             pattern = ULIST if ULIST.match(line) else OLIST
             items: list[str] = []
             while i < len(lines):
@@ -260,17 +281,20 @@ def render(md: str) -> str:
 
         if stripped.startswith(">"):
             flush()
+            flush_cards()
             quote: list[str] = []
             while i < len(lines) and lines[i].strip().startswith(">"):
                 quote.append(lines[i].strip().lstrip(">").strip())
                 i += 1
             blocks.append("<blockquote><p>" + inline(" ".join(quote)) + "</p></blockquote>")
+            flush_cards()
             continue
 
         para.append(stripped)
         i += 1
 
     flush()
+    flush_cards()
     return "\n".join(blocks)
 
 
@@ -352,7 +376,7 @@ def crumbs_html(current: str, label: str) -> str:
 
 
 def build_page(slug: str, label: str, md: str) -> str:
-    body = render(md)
+    body = render(md, land=slug == "index")
     title = "snens" if slug == "index" else f"{label} — snens"
     landing = slug == "index"
     return TEMPLATE.format(
