@@ -1,7 +1,7 @@
 {
   "name": "snens-desktop",
   "private": true,
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Окно snens: веб-клиент и ядро как sidecar",
   "scripts": {
     "tauri": "tauri",

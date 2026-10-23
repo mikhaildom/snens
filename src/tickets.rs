@@ -384,7 +384,15 @@ mod tests {
                         ## Симптом\nУже починено\n";
 
     fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("snens-tickets-{}", std::process::id()));
+        // Уникальный на КАЖДЫЙ тест, а не на процесс: тесты идут параллельно
+        // и каждый зовёт `remove_dir_all` в конце — общий каталог они сносили
+        // друг у друга, и `write` падал с NotFound (плавающий красный тест).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "snens-tickets-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("2026-09-22-read.md"), OPEN).unwrap();

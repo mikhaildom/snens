@@ -25,8 +25,8 @@ param(
 
 $log = Join-Path $Repo "tauri-signed.log"
 
+Write-Output "=== 1/3 сборка ядра и тулов"
 if (-not $NoBuild) {
-  Write-Output "=== 1/3 сборка ядра и тулов"
   Push-Location $Repo
   & cargo build --release --workspace *> (Join-Path $Repo "cargo-build.log")
   $code = $LASTEXITCODE
@@ -39,7 +39,8 @@ if (-not $NoBuild) {
 }
 
 Write-Output "=== 2/3 раскладка (ядро, тулы, клиент)"
-# sh из Git for Windows: desktop-stage.sh — обычный POSIX-скрипт.
+# Стейджа ОБЯЗАН идти до сборки окна: его build.rs проверяет, что
+# `binaries/snens-<triple>.exe` есть, и падает иначе.
 $sh = "C:\Program Files\Git\bin\sh.exe"
 if (-not (Test-Path $sh)) { $sh = "C:\Program Files\Git\usr\bin\sh.exe" }
 $env:SNENS_BIN_DIR = $BinDir

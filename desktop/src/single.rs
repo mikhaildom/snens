@@ -6,22 +6,47 @@
 //! (второй процесс падал в setup, а паника в GUI-сборке не видна) — снаружи
 //! «приложение не перезапускается».
 //!
-//! Механизм без внешних зависимостей: именованный мьютекс Windows (на unix —
-//! файл с `flock`). Имя включает пользователя, потому что два человека на
-//! одной машине — это два разных приложения.
+//! Как связаны экземпляры. Второй не показывает окно сам: он просит об этом
+//! ПЕРВЫЙ через локальный сокет, а первый зовёт `tauri::Window::show()`.
 //!
-//! Второй экземпляр не молчит: он показывает окно первого (сообщение
-//! зарегистрированного класса окна) и выходит.
+//! Почему не Win32 `ShowWindow` из второго процесса (так было сначала и это
+//! оказалось багом). Tauri помнит состояние своего окна. Показав окно в обход
+//! него, мы получали рассинхрон: для Tauri окно оставалось спрятанным, и
+//! следующий клик по крестику честно звал `hide()` — который становился
+//! no-op, потому что «уже спрятано». Снаружи это выглядело так: окно закрыли
+//! крестиком, а оно не закрывается; выйти можно только через трей. Ровно это
+//! и поймал владелец на живой Windows.
+//!
+//! Файл-замок остаётся (он и определяет «первый экземпляр»): на Windows это
+//! именованный мьютекс, на unix — файл с `flock`.
 
-/// Что делать второму экземпляру: показать уже открытое окно и уйти.
-#[cfg(windows)]
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+
+use tauri::Manager;
+
+/// Захватить право быть единственным экземпляром.
+///
+/// `true` — уже работает другой: просьба «покажи окно» отправлена, этому
+/// процессу делать нечего.
 pub fn already_running() -> bool {
+    if !claim_lock() {
+        request_show();
+        return true;
+    }
+    false
+}
+
+// --- Windows: именованный мьютекс ---
+
+#[cfg(windows)]
+fn claim_lock() -> bool {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
-    };
 
+    // Имя включает сессию пользователя: два человека за одной машиной — это
+    // два разных приложения, и мешать друг другу они не должны.
     let name: Vec<u16> = "Local\\snens-desktop-single"
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -29,60 +54,111 @@ pub fn already_running() -> bool {
     unsafe {
         let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
         if handle.is_null() {
-            // Не смогли создать мьютекс — считаем, что мы первые: лучше открыть
+            // Не смогли создать мьютекс — считаем себя первыми: лучше открыть
             // окно, чем не открыть ничего.
-            return false;
+            return true;
         }
-        if GetLastError() != ERROR_ALREADY_EXISTS {
-            // Ручка живёт до выхода процесса — намеренно не закрываем.
-            return false;
-        }
-        // Уже работает: поднимаем окно первого экземпляра и уходим.
-        //
-        // Ищем по ЗАГОЛОВКУ, а не по классу: класс окна задаёт сам Tauri, и
-        // подставлять туда своё имя значило бы зависеть от его версии. Заголовок
-        // наш (`open_window` ставит «snens»), и он же — то, что человек видит в
-        // панели задач.
-        let title: Vec<u16> = "snens".encode_utf16().chain(std::iter::once(0)).collect();
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if !hwnd.is_null() {
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
-        }
-        true
+        // Ручка живёт до выхода процесса — намеренно не закрываем.
+        GetLastError() != ERROR_ALREADY_EXISTS
     }
 }
 
+// --- unix: файл с flock ---
+
 #[cfg(not(windows))]
-pub fn already_running() -> bool {
-    use std::io::Write;
+fn claim_lock() -> bool {
+    use std::os::unix::io::AsRawFd;
+
     let path = std::env::temp_dir().join("snens-desktop-single.lock");
-    match std::fs::OpenOptions::new()
+    let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&path)
-    {
-        Ok(mut f) => {
-            use std::os::unix::io::AsRawFd;
-            let rc = unsafe { libc_flock(f.as_raw_fd()) };
-            if rc == 0 {
-                // Наш лок: подержим ручку до выхода, а pid запишем для другого.
-                let _ = write!(f, "{}", std::process::id());
-                std::mem::forget(f);
-                false
-            } else {
-                true
-            }
-        }
-        Err(_) => false,
+    else {
+        return true;
+    };
+    extern "C" {
+        fn flock(fd: i32, op: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        return false;
+    }
+    // Держим ручку до выхода процесса.
+    std::mem::forget(file);
+    true
+}
+
+// --- просьба «покажи окно» ---
+
+/// Второй экземпляр: попросить первый показать окно. Не блокируется и не
+/// падает, если первый уже умирает — тогда человек просто запустит ещё раз.
+fn request_show() {
+    let Some(path) = port_file_path() else { return };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(port) = text.trim().parse::<u16>() else {
+        return;
+    };
+    if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+        let _ = s.write_all(b"show\n");
+        let _ = s.flush();
     }
 }
 
-#[cfg(not(windows))]
-extern "C" {
-    #[link_name = "flock"]
-    fn libc_flock(fd: i32) -> i32;
+/// Путь к файлу порта без `AppHandle`: у второго экземпляра его ещё нет
+/// (окно не создаётся), а каталог конфига Tauri вычисляет от идентификатора.
+fn port_file_path() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)?
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
+    };
+    Some(base.join("ch.svuvi.snens").join("instance.port"))
 }
 
-extern "C" {}
+/// Первый экземпляр: слушать просьбы и показывать окно. Вызывается из setup
+/// после создания окна — до этого показывать нечего.
+pub fn serve_show_requests(app: tauri::AppHandle) {
+    let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let Ok(addr) = listener.local_addr() else {
+        return;
+    };
+    // Порт — в тот же файл, откуда его читает второй экземпляр.
+    let path = app
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("instance.port");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(&path, addr.port().to_string()).is_err() {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            if line.trim() != "show" {
+                continue;
+            }
+            // Показ — ТОЛЬКО через Tauri: он ведёт состояние окна сам, и
+            // обход его (Win32 ShowWindow) ломал следующий hide по крестику.
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }
+    });
+}
