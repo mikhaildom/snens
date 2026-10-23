@@ -623,7 +623,7 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
     // `--json` — ровно то, что уезжает модели: дамп определений для отладки
     // контракта (generic vs schema) без догадок по тексту.
     if flags.contains_key("json") {
-        let mut defs = dispatch::builtin_defs();
+        let mut defs = dispatch::builtin_defs(&cfg.shell_line());
         defs.extend(registry::definitions(&tools));
         println!(
             "{}",
@@ -634,7 +634,7 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
     println!("каталог тулов: {}", cfg.tools_path().display());
     println!("PATH (дети и человек): {}\n", bin.display());
     println!("встроенные (ядро, всегда в схеме):");
-    for def in dispatch::builtin_defs() {
+    for def in dispatch::builtin_defs(&cfg.shell_line()) {
         let name = def
             .pointer("/function/name")
             .and_then(|x| x.as_str())

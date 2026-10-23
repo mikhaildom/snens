@@ -125,7 +125,7 @@ pub(super) async fn validate_tools(
         return Err("tool definitions exceed 32 KiB".into());
     }
     let dynamic = crate::registry::discover(cfg).await;
-    let core: BTreeSet<String> = crate::dispatch::builtin_defs()
+    let core: BTreeSet<String> = crate::dispatch::builtin_defs(&cfg.shell_line())
         .iter()
         .filter_map(|d| {
             d.pointer("/function/name")

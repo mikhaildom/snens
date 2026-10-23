@@ -79,17 +79,28 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
 }
 
 /// Вшитый инструмент. Всё остальное — процессы из реестра.
-pub fn builtin_defs() -> Vec<Value> {
+///
+/// Оболочка берётся из конфига: на unix это обычно `sh -c`, но где-то `bash -c`,
+/// и описание не должно врать модели про разные диалекты.
+pub fn builtin_defs(shell: &str) -> Vec<Value> {
+    let shell_line = shell.to_string();
     vec![
         json!({
             "type": "function",
             "function": {
                 "name": "run",
-                "description": "Выполнить shell-команду (sh -c) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]\nОболочка — sh (dash), не bash: нет ${x:0:n}, [[ ]], массивов, $'\\t'; нужен bash — зови `bash -c '...'`. Код возврата при `;`-цепочке — от последней команды, поэтому хвостовой `which`/`grep` может покрасить успешную команду в ошибку (для bash-измов это частая причина).",
+                "description": format!(
+                    "Выполнить shell-команду ({shell_line}) и получить вывод: stdout, затем \
+                     stderr, и код возврата.\n\
+                     run <команда> [--cwd каталог]\n\
+                     Код возврата при `;`-цепочке — от последней команды: хвостовой \
+                     `{shell_line}` может покрасить успешную команду в ошибку.\n\
+                     Другой диалект — только когда он действительно нужен: `bash -c '...'`."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": {"type": "string", "description": "Команда для sh -c"},
+                        "command": {"type": "string", "description": "Команда для $shell_line"},
                         "cwd": {"type": "string", "description": "Рабочий каталог"},
                         "timeout_seconds": {"type": "integer", "description": "Таймаут в секундах"}
                     },
@@ -127,7 +138,7 @@ pub async fn prepare(cfg: &Config) -> R<(Vec<Value>, Vec<registry::Tool>, String
         parts.push(s.clone());
     }
     let path = registry::child_path_with(&parts, &bin, &tools);
-    let mut defs = builtin_defs();
+    let mut defs = builtin_defs(&cfg.shell_line());
     defs.extend(registry::definitions(&tools));
     Ok((defs, tools, path))
 }

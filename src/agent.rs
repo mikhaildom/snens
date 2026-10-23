@@ -863,7 +863,7 @@ mod tests {
                 _ => None,
             })
             .expect("system prompt must be logged");
-        assert!(prompt.contains("Текущая поверхность: Telegram, личный чат."));
+        assert!(prompt.contains("Поверхность: Telegram, личный чат."));
 
         run_agent_surface(
             &sess,

@@ -94,6 +94,8 @@ pub struct Config {
     /// на Windows это `cmd /C`.
     #[serde(default = "d_shell")]
     pub shell: Vec<String>,
+    #[serde(default = "d_docs_url")]
+    pub docs_url: String,
     /// Каталог тикетов инстанса: публикуется код, а не история улучшений.
     #[serde(default = "d_tickets")]
     pub tickets_dir: String,
@@ -128,9 +130,8 @@ pub struct Config {
     /// Свой файл промпта ревью вместо вкомпилированного (для опытов).
     #[serde(default)]
     pub review_prompt: Option<String>,
-    /// Каталог инстанса под git: промпт просит коммитить тикеты сразу.
-    /// Включено только там, где data-dir действительно репозиторий; продукту
-    /// это не нужно и чужого `user.name` в системе не подразумевает.
+    /// Каталог инстанса под git: промпт просит коммитить тикеты сразу — строку
+    /// с командой берёт из memory.md инстанса, а не из текста продукта.
     #[serde(default)]
     pub instance_git: bool,
     /// Ящик сессий: канал между подагентом и родителем. Дефолт — рядом с сессиями,
@@ -335,6 +336,11 @@ fn d_stream_idle() -> u64 {
 }
 fn d_mem_timeout() -> u64 {
     60
+}
+fn d_docs_url() -> String {
+    // Документация для агентов: плейнтекст, читается fetch'ем. Адрес в конфиге,
+    // а не в коде: у чужой установки может быть свой (или никакого).
+    "https://snens.svuvi.ch/llm/index.txt".into()
 }
 fn d_shell() -> Vec<String> {
     if cfg!(windows) {
@@ -552,6 +558,18 @@ impl Config {
             .into());
         }
         Ok(repo)
+    }
+
+    /// Оболочка одной строкой для текста, который видит модель (`bash -c`).
+    pub fn shell_line(&self) -> String {
+        self.shell.join(" ")
+    }
+
+    /// Адрес документации о самом харнессе. Пусто — в промпте нет строки
+    /// вовсе: мёртвый чужой домен в префиксе хуже молчания.
+    pub fn docs_url(&self) -> Option<&str> {
+        let u = self.docs_url.trim();
+        (!u.is_empty()).then_some(u)
     }
 
     pub fn tickets_path(&self) -> PathBuf {
