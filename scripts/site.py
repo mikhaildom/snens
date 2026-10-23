@@ -319,6 +319,7 @@ TEMPLATE = """<!doctype html>
 </main>
 </div>
 <footer class="foot">
+<p class="foot__ask">Не знаешь, умеет ли он то, что тебе надо? Спроси агента — он знает свои тулы и ограничения.</p>
 <p><a href="/llm/index.txt">документация для агентов (плейнтекст)</a> · <a href="/releases/latest.json">манифест обновлений</a></p>
 <p>snens — MIT. Источник: <a href="https://git.svuvi.ch/svuvich/snens">git.svuvi.ch/svuvich/snens</a></p>
 </footer>

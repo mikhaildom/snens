@@ -284,6 +284,18 @@ th { border-bottom: var(--bar) solid var(--line); }
 .foot p { margin: 0 0 4px; }
 .foot a { color: var(--ink-2); }
 
+/* Подсказка «спроси агента» — единственная строка в подвале, обращённая
+   к человеку, а не к поисковику: поэтому она крупнее и с акцентом. */
+.foot__ask {
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  margin-bottom: calc(var(--step) * 1.5) !important;
+  border-left: var(--bar) solid var(--accent);
+  display: inline-block;
+  padding-left: var(--step);
+  text-align: left;
+}
+
 @media (max-width: 640px) {
   main { padding: calc(var(--step) * 2) calc(var(--step) * 1.5) calc(var(--step) * 4); }
   main.landing h1 { font-size: 30px; }
