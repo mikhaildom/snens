@@ -52,6 +52,8 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
     ui.line(&format!("сессия {id} · {} · {}", cfg.model, cwd.display()));
     ui.line(HELP);
+    // Первый раз человек не знает ни команд, ни границ: дешевле спросить, чем искать.
+    ui.line("не знаешь, умеет ли он то, что надо, — спроси его самого");
 
     loop {
         let Some(msg) = rx.recv().await else { break };

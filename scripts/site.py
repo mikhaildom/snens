@@ -38,6 +38,13 @@ BASE_URL = "https://snens.svuvi.ch"
 # Первый элемент группы — её заголовок в боковом меню.
 GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     (
+        "с нуля",
+        [
+            ("start", "С чего начать"),
+            ("keys", "Где взять ключ"),
+        ],
+    ),
+    (
         "начало",
         [
             ("install", "Установка"),
@@ -142,6 +149,13 @@ def inline(text: str, depth: int = 0) -> str:
         return keep(f'<a{attr} href="{m.group(2)}">{label}</a>')
 
     src = html.escape(text, quote=False)
+    # Автоссылка `<https://…>` — как в markdown; после escape угловые скобки
+    # стали `&lt;`/`&gt;`, ловим их именно в этом виде.
+    src = re.sub(
+        r"&lt;(https?://[^\s&]+)&gt;",
+        lambda m: keep(f'<a href="{m.group(1)}">{m.group(1)}</a>'),
+        src,
+    )
     src = CODE.sub(code, src)
     src = LINK.sub(link, src)
     src = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", src)
@@ -158,7 +172,16 @@ def render(md: str) -> str:
 
     def flush() -> None:
         if para:
-            blocks.append("<p>" + inline(" ".join(para)) + "</p>")
+            text = inline(" ".join(para))
+            # Абзац-определение: начинается с жирного, которое кончается точкой
+            # (`**Тула нет: … код 1.**`). Так пишутся пункты FAQ и преимущества
+            # на лендинге — это единицы чтения, их надо отделять визуально.
+            # Жирное с двоеточием (`**ядро**: …`) — обычная проза в начале фразы.
+            head = re.match(r"^<strong>(.*?)</strong>", text)
+            if head and re.search(r"[.!?…]$", head.group(1)):
+                blocks.append(f'<p class="def">{text}</p>')
+            else:
+                blocks.append(f"<p>{text}</p>")
             para.clear()
 
     while i < len(lines):
@@ -210,22 +233,29 @@ def render(md: str) -> str:
             blocks.append("".join(out))
             continue
 
-        if ULIST.match(line):
+        if ULIST.match(line) or OLIST.match(line):
             flush()
+            pattern = ULIST if ULIST.match(line) else OLIST
             items: list[str] = []
-            while i < len(lines) and ULIST.match(lines[i]):
-                items.append(ULIST.match(lines[i]).group(1))
-                i += 1
-            blocks.append("<ul>" + "".join(f"<li>{inline(t)}</li>" for t in items) + "</ul>")
-            continue
-
-        if OLIST.match(line):
-            flush()
-            items = []
-            while i < len(lines) and OLIST.match(lines[i]):
-                items.append(OLIST.match(lines[i]).group(1))
-                i += 1
-            blocks.append("<ol>" + "".join(f"<li>{inline(t)}</li>" for t in items) + "</ol>")
+            while i < len(lines):
+                m = pattern.match(lines[i])
+                if m:
+                    items.append(m.group(1))
+                    i += 1
+                    # Продолжение пункта — последующие строки с отступом. Без
+                    # этого они выпадали из списка отдельным абзацем, и текст
+                    # вроде «цикл → запись» терял связь с пунктом, к которому
+                    # относится. Пустая строка закрывает пункт.
+                    while i < len(lines) and lines[i].startswith("  ") and lines[i].strip():
+                        nxt = lines[i].strip()
+                        if ULIST.match(lines[i]) or OLIST.match(lines[i]):
+                            break
+                        items[-1] += " " + nxt
+                        i += 1
+                    continue
+                break
+            tag = "ul" if pattern is ULIST else "ol"
+            blocks.append(f"<{tag}>" + "".join(f"<li>{inline(t)}</li>" for t in items) + f"</{tag}>")
             continue
 
         if stripped.startswith(">"):
