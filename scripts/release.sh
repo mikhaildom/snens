@@ -21,7 +21,7 @@ set -eu
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DESKTOP="$REPO/desktop"
 OUT="${SNENS_RELEASE_DIR:-$REPO/desktop/target/release/bundle}"
-BASE_URL="${SNENS_RELEASE_URL:-https://releases.svuvi.ch/snens}"
+BASE_URL="${SNENS_RELEASE_URL:-https://snens.svuvi.ch/releases}"
 VERSION="$(python3 -c "import json;print(json.load(open('$DESKTOP/tauri.conf.json'))['version'])")"
 
 say() { printf '>>> %s\n' "$*"; }
@@ -96,13 +96,11 @@ print(f"  манифест: {dest}")
 PY
 
 say "готово. Выложи на $BASE_URL: latest.json и каталог $VERSION/ с артефактами"
-# Путь назначения — не догадка, а тот же корень, что раздаёт Caddy
-# (deploy/caddy-sites.conf): `releases.svuvi.ch` → /var/www/releases.svuvi.ch,
-# а `BASE_URL` уже включает `/snens`. Раньше здесь стоял `/var/www/releases/snens`
-# — каталог, которого нет ни у кого, и команда из вывода просто не работала.
-WEBROOT="${SNENS_RELEASE_WEBROOT:-/var/www/releases.svuvi.ch}"
+# Путь назначения — тот же корень, что раздаёт Caddy (deploy/caddy-sites.conf):
+# сайт берёт `/releases/*` из каталога релизов, один домен на всё.
+WEBROOT="${SNENS_RELEASE_WEBROOT:-/var/www/snens.svuvi.ch}"
 SUBDIR="$(printf '%s' "$BASE_URL" | sed -n 's#^[a-z]*://[^/]*/*\(.*\)$#\1#p')"
-[ -n "$SUBDIR" ] || SUBDIR="snens"
+[ -n "$SUBDIR" ] || SUBDIR="releases"
 DEST="$WEBROOT/$SUBDIR"
 
 # Выкладка. Два пути, потому что релиз собирается на Windows, а раздаёт сервер:
@@ -130,6 +128,6 @@ if [ "${SNENS_RELEASE_PUBLISH:-0}" = 1 ] && [ -d "$WEBROOT" ] && [ -w "$WEBROOT"
 else
     say "выложить руками:"
     say "  rsync -av --mkpath $OUT/latest.json $OUT/$VERSION/ \${SNENS_RELEASE_HOST:-<host>}:$DEST/"
-    [ "$WEBROOT" = /var/www/releases.svuvi.ch ] && [ -d "$WEBROOT" ] && [ "${SNENS_RELEASE_PUBLISH:-0}" != 1 ] &&
+    [ "$WEBROOT" = /var/www/snens.svuvi.ch ] && [ -d "$WEBROOT" ] && [ "${SNENS_RELEASE_PUBLISH:-0}" != 1 ] &&
         say "  (каталог доступен локально: тот же скрипт с SNENS_RELEASE_PUBLISH=1 скопирует сам)"
 fi

@@ -25,7 +25,7 @@ HEADER = [
     "tools.txt — справочник по инструментам snens",
     "Источник: --help тулов (tools/*/src), tools/*/schema.json, встроенные run и ctx "
     "(src/dispatch.rs). Сгенерировано scripts/docs-tools.py — руками не править. "
-    "URL: https://docs.svuvi.ch/tools.txt",
+    "URL: https://snens.svuvi.ch/llm/tools.txt",
 ]
 
 GENERIC = (
@@ -240,6 +240,9 @@ def builtins():
             raise DocsError("%s: у %s нет description" % (where, name))
         desc_at = name_at + dm.end() + 1
         desc = decode_rust_string(body, desc_at, where)
+        # Ядро подставляет реальную оболочку из конфига из кода; в документации
+        # показываем дефолт unix — символ в тексте был бы неправдой.
+        desc = desc.replace("$shell", "sh -c")
         out.append((name, desc))
         pos = desc_at
     if not out:

@@ -109,7 +109,7 @@ cd desktop && npm ci && npx tauri build
 копируется в `resources/web`.
 
 Релиз целиком (сборка + `latest.json` для апдейтера) — `scripts/release.sh`;
-он же печатает команду выкладки на `releases.svuvi.ch`.
+он же печатает команду выкладки в `/var/www/snens.svuvi.ch/releases`.
 
 ## Что осталось проверить на живой Windows
 

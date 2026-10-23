@@ -287,11 +287,17 @@ fn text_or_stdin(positional: &[String]) -> String {
 /// Steer: сообщение сессии на границе ближайшего хода (человек — тоже сессия).
 fn cmd_steer(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
     let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
-    let id = flags
-        .get("session")
-        .cloned()
-        .ok_or("нужен --session <ID>: кого предупредить")?;
-    let text = text_or_stdin(&positional);
+    // Идентификатор берём либо флагом `--session`, либо первым позиционным
+    // аргументом: в справке он всегда стоял позиционным, и человек вводил именно
+    // так. Отказ в обоих случаях — с подсказкой.
+    let (id, rest) = match flags.get("session").cloned() {
+        Some(id) => (id, positional.as_slice()),
+        None => match positional.split_first() {
+            Some((id, rest)) => (id.clone(), rest),
+            None => return Err("нужен id сессии: snens steer <ID> <текст>".into()),
+        },
+    };
+    let text = text_or_stdin(rest);
     if text.trim().is_empty() {
         return Err("пустое сообщение — нечего передавать".into());
     }

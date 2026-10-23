@@ -1,0 +1,264 @@
+/* snens.svuvi.ch — тот же язык, что у клиента: mono, ноль радиусов, 2px правила,
+   акцент один. Токены скопированы из snens-web/src/styles/00-tokens.css, чтобы
+   сайт и приложение выглядели одним продуктом; правка здесь — правка там. */
+
+:root {
+  color-scheme: light dark;
+  --mono: "JetBrains Mono", ui-monospace, "DejaVu Sans Mono", "Noto Sans Mono",
+    "SF Mono", Menlo, Consolas, monospace;
+  --step: 8px;
+  --bar: 2px;
+  --paper: #eeeae1;
+  --paper-2: #e4dfd4;
+  --ink: #0b0b0b;
+  --ink-2: #575247;
+  --line: #0b0b0b;
+  --hair: #b8b1a1;
+  --accent: #ff3b00;
+  --accent-ink: #fff6f0;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13.5px;
+  --fs-lg: 16px;
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+  line-height: 1.6;
+  font-variant-ligatures: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --paper: #0d0d0d;
+    --paper-2: #141414;
+    --ink: #edeae2;
+    --ink-2: #8e8a80;
+    --line: #edeae2;
+    --hair: #3a3a37;
+    --accent: #ccff00;
+    --accent-ink: #0b0b0b;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+/* ── шапка ─────────────────────────────────────────────────── */
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: calc(var(--step) * 1.5);
+  padding: calc(var(--step) * 1.5) calc(var(--step) * 2);
+  border-bottom: var(--bar) solid var(--line);
+}
+
+.mark {
+  font-weight: 700;
+  font-size: var(--fs-lg);
+  letter-spacing: 0.16em;
+  text-decoration: none;
+  color: var(--paper);
+  background: var(--ink);
+  padding: 2px 8px;
+}
+
+.bar nav {
+  display: flex;
+  gap: var(--step);
+  font-size: var(--fs-sm);
+}
+
+.bar nav a { color: var(--ink-2); text-decoration: none; border-bottom: 1px solid transparent; }
+.bar nav a:hover { color: var(--ink); border-bottom-color: var(--hair); }
+.bar nav a.on { color: var(--ink); border-bottom-color: var(--accent); }
+.bar nav span { color: var(--ink); }
+
+/* ── сетка страницы с боковым меню ────────────────────────── */
+
+.page { display: block; }
+
+.page.with-side {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 78ch);
+  gap: calc(var(--step) * 4);
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: calc(var(--step) * 3) calc(var(--step) * 2) calc(var(--step) * 6);
+}
+
+.side {
+  font-size: var(--fs-sm);
+  position: sticky;
+  top: calc(var(--step) * 2);
+  align-self: start;
+}
+
+.side__head {
+  margin: calc(var(--step) * 2) 0 4px;
+  color: var(--ink-2);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.side ul { list-style: none; margin: 0; padding: 0; }
+.side li { margin: 0 0 2px; }
+.side a {
+  display: block;
+  padding: 2px 6px;
+  color: var(--ink-2);
+  text-decoration: none;
+  border-left: var(--bar) solid transparent;
+}
+.side a:hover { color: var(--ink); border-left-color: var(--hair); }
+.side a.on { color: var(--ink); border-left-color: var(--accent); background: var(--paper-2); }
+
+@media (max-width: 860px) {
+  .page.with-side { display: block; padding-top: calc(var(--step) * 2); }
+  .side { position: static; margin-bottom: calc(var(--step) * 3); }
+  .side ul { column-count: 2; }
+}
+
+/* ── содержимое ────────────────────────────────────────────── */
+
+main {
+  max-width: 78ch;
+  margin: 0 auto;
+  padding: calc(var(--step) * 4) calc(var(--step) * 2) calc(var(--step) * 6);
+}
+
+/* Внутри сетки отступы даёт она сама. */
+.page.with-side main { margin: 0; padding: 0; max-width: 78ch; }
+
+main.landing { max-width: 68ch; }
+
+h1 {
+  font-size: 28px;
+  line-height: 1.2;
+  margin: 0 0 calc(var(--step) * 3);
+  letter-spacing: -0.01em;
+}
+
+main.landing h1 {
+  font-size: 40px;
+  letter-spacing: 0.18em;
+  background: var(--ink);
+  color: var(--paper);
+  display: inline-block;
+  padding: 6px 10px;
+  margin-bottom: calc(var(--step) * 3);
+}
+
+h2 {
+  font-size: var(--fs-lg);
+  margin: calc(var(--step) * 5) 0 calc(var(--step) * 1.5);
+  padding-bottom: 4px;
+  border-bottom: var(--bar) solid var(--line);
+}
+
+h3 {
+  font-size: var(--fs-md);
+  margin: calc(var(--step) * 3) 0 var(--step);
+  color: var(--ink-2);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+p { margin: 0 0 calc(var(--step) * 1.5); }
+
+a { color: var(--ink); text-decoration-color: var(--accent); text-underline-offset: 2px; }
+
+ul, ol { margin: 0 0 calc(var(--step) * 1.5); padding-left: calc(var(--step) * 4); }
+li { margin-bottom: 4px; }
+
+code {
+  font-family: var(--mono);
+  font-size: 0.94em;
+  background: var(--paper-2);
+  border: 1px solid var(--hair);
+  padding: 0 4px;
+}
+
+pre {
+  background: var(--paper-2);
+  border: var(--bar) solid var(--line);
+  padding: calc(var(--step) * 1.5);
+  overflow-x: auto;
+  margin: 0 0 calc(var(--step) * 2);
+}
+
+pre code { background: none; border: 0; padding: 0; }
+
+blockquote {
+  margin: 0 0 calc(var(--step) * 2);
+  padding-left: calc(var(--step) * 2);
+  border-left: 4px solid var(--accent);
+  color: var(--ink-2);
+}
+
+/* Таблица шире экрана прокручивается сама, а не ломает страницу:
+   на телефоне колонки иначе сжимаются до одного слова в строке. */
+.tw { overflow-x: auto; margin: 0 0 calc(var(--step) * 2); }
+
+table {
+  width: 100%;
+  min-width: 420px;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+@media (max-width: 640px) {
+  table { min-width: 0; }
+  th, td { padding: 4px 6px; }
+}
+
+th, td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--hair);
+  vertical-align: top;
+}
+
+th { border-bottom: var(--bar) solid var(--line); }
+
+/* ── лендинг ───────────────────────────────────────────────── */
+
+.cta {
+  display: inline-block;
+  border: var(--bar) solid var(--line);
+  background: var(--accent);
+  color: var(--accent-ink);
+  padding: calc(var(--step) * 1.5) calc(var(--step) * 3);
+  font-weight: 700;
+  text-decoration: none;
+  margin: 0 calc(var(--step) * 2) calc(var(--step) * 2) 0;
+}
+
+.cta:hover { background: var(--line); color: var(--paper); }
+
+/* ── подвал ────────────────────────────────────────────────── */
+
+.foot {
+  border-top: var(--bar) solid var(--line);
+  padding: calc(var(--step) * 2);
+  font-size: var(--fs-xs);
+  color: var(--ink-2);
+  text-align: center;
+}
+
+.foot p { margin: 0 0 4px; }
+.foot a { color: var(--ink-2); }
+
+@media (max-width: 640px) {
+  main { padding: calc(var(--step) * 2) calc(var(--step) * 1.5) calc(var(--step) * 4); }
+  main.landing h1 { font-size: 30px; }
+  .bar { padding: var(--step) calc(var(--step) * 1.5); }
+}

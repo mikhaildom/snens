@@ -80,27 +80,21 @@ fn session_env(sess: &Session, cfg: &Config) -> Vec<(String, String)> {
 
 /// Вшитый инструмент. Всё остальное — процессы из реестра.
 ///
-/// Оболочка берётся из конфига: на unix это обычно `sh -c`, но где-то `bash -c`,
-/// и описание не должно врать модели про разные диалекты.
+/// Оболочка берётся из конфига (`shell`): на unix обычно `sh -c`, но бывает
+/// `bash -c`, и описание не должно врать модели про диалект. В литерале стоит
+/// токен `$shell` — его заменяет `builtin_defs`, а генератор документации
+/// (`scripts/docs-tools.py`) подставляет своё значение: текст один на всё.
 pub fn builtin_defs(shell: &str) -> Vec<Value> {
-    let shell_line = shell.to_string();
-    vec![
+    let defs = vec![
         json!({
             "type": "function",
             "function": {
                 "name": "run",
-                "description": format!(
-                    "Выполнить shell-команду ({shell_line}) и получить вывод: stdout, затем \
-                     stderr, и код возврата.\n\
-                     run <команда> [--cwd каталог]\n\
-                     Код возврата при `;`-цепочке — от последней команды: хвостовой \
-                     `{shell_line}` может покрасить успешную команду в ошибку.\n\
-                     Другой диалект — только когда он действительно нужен: `bash -c '...'`."
-                ),
+                "description": "Выполнить shell-команду ($shell) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]\nКод возврата при `;`-цепочке — от последней команды: хвостовой which/grep может покрасить успешную команду в ошибку.\nДругой диалект — только когда он действительно нужен: `bash -c '...'`.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": {"type": "string", "description": "Команда для $shell_line"},
+                        "command": {"type": "string", "description": "Команда для $shell"},
                         "cwd": {"type": "string", "description": "Рабочий каталог"},
                         "timeout_seconds": {"type": "integer", "description": "Таймаут в секундах"}
                     },
@@ -123,7 +117,15 @@ pub fn builtin_defs(shell: &str) -> Vec<Value> {
                 }}
             }
         }),
-    ]
+    ];
+    // Токен подставляется в готовом JSON: иначе литерал пришлось бы собирать
+    // через format!, и `docs-tools.py` (он читает именно литерал) потерял бы текст.
+    defs.into_iter()
+        .map(|d| {
+            let s = d.to_string().replace("$shell", shell);
+            serde_json::from_str(&s).unwrap_or(d)
+        })
+        .collect()
 }
 
 /// Определения тулов для модели + сами тулы + PATH дочерних процессов.
