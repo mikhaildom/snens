@@ -137,7 +137,9 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
     let by_vec = api::embed(cfg, &query)
         .map(|e| {
             let q = api::quantize(&e);
-            store.vector_search(&q, cfg.embed_dim, cand).unwrap_or_default()
+            store
+                .vector_search(&q, cfg.embed_dim, cand)
+                .unwrap_or_default()
         })
         .unwrap_or_default();
     let by_text = store.bm25_search(&query, cand).unwrap_or_default();
@@ -172,8 +174,8 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
     fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     fused.truncate(cand);
 
-    let mut hits: Vec<Hit> = store
-        .load(&fused.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>())?;
+    let mut hits: Vec<Hit> =
+        store.load(&fused.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>())?;
     // `load` отдаёт в порядке ids; uid — единственный общий ключ, поэтому
     // скоры кладём по позиции в `fused`.
     let uids = store.uids(&fused.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>())?;
@@ -185,14 +187,21 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
             h.bm25 = bm25;
         }
     }
-    hits.sort_by(|a, b| b.rrf.partial_cmp(&a.rrf).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.rrf
+            .partial_cmp(&a.rrf)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Реранк: только он умеет отсекать «похоже, но не отвечает». Нет реранкера —
     // решает RRF, и тогда бюджет урезается жёстче (без порога мы не уверены).
     let docs: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
     let reranked = api::rerank(cfg, &query, &docs);
     if std::env::var("MEMORY_DEBUG").is_ok() {
-        for (h, s) in hits.iter().zip(reranked.clone().unwrap_or_else(|| vec![-1.0; hits.len()])) {
+        for (h, s) in hits
+            .iter()
+            .zip(reranked.clone().unwrap_or_else(|| vec![-1.0; hits.len()]))
+        {
             eprintln!("rerank={s:.3} rrf={:.4} {}", h.rrf, api::cut(&h.text, 60));
         }
     }
@@ -216,7 +225,9 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
     };
     ranked.sort_by(|a, b| {
         let key = |h: &Hit| h.rerank.unwrap_or(h.rrf as f32);
-        key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal)
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Бюджет: не больше N фактов и M «токенов» (символы/4 — оценка без токенизатора).
@@ -435,7 +446,14 @@ fn forget(store: &Store, args: &[String]) -> Result<i32, String> {
     let Some(uid) = args.first() else {
         return Err("forget: нужен uid".into());
     };
-    println!("{}", if store.forget(uid)? { "закрыт" } else { "не найден" });
+    println!(
+        "{}",
+        if store.forget(uid)? {
+            "закрыт"
+        } else {
+            "не найден"
+        }
+    );
     Ok(0)
 }
 
@@ -487,8 +505,10 @@ fn same_fact(a: &str, b: &str) -> bool {
     if ka.is_empty() || kb.is_empty() {
         return a.trim().eq_ignore_ascii_case(b.trim());
     }
-    let (sa, sb): (std::collections::HashSet<&str>, std::collections::HashSet<&str>) =
-        (ka.split(' ').collect(), kb.split(' ').collect());
+    let (sa, sb): (
+        std::collections::HashSet<&str>,
+        std::collections::HashSet<&str>,
+    ) = (ka.split(' ').collect(), kb.split(' ').collect());
     let common = sa.intersection(&sb).count();
     let union = sa.union(&sb).count();
     common * 100 / union.max(1) >= 60

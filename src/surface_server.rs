@@ -24,6 +24,8 @@ mod commands;
 mod files;
 #[path = "surface_query.rs"]
 mod query;
+#[path = "surface_dashboard.rs"]
+mod dashboard;
 #[path = "surface_launch.rs"]
 mod launch;
 #[path = "surface_review.rs"]

@@ -44,7 +44,12 @@ pub fn http_get(port: u16, path: &str) -> Result<String, String> {
 /// мы стучимся в локальный порт, а Chrome на той стороне ждёт `Host: 127.0.0.1:<его
 /// порт>` — с чужим Host он отвечает 403 «Host header is specified and is not an
 /// IP address or localhost».
-pub fn http_get_host(host: &str, port: u16, host_header: &str, path: &str) -> Result<String, String> {
+pub fn http_get_host(
+    host: &str,
+    port: u16,
+    host_header: &str,
+    path: &str,
+) -> Result<String, String> {
     let addr = format!("{host}:{port}");
     let sa = addr
         .to_socket_addrs()
@@ -232,8 +237,10 @@ impl Cdp {
                 let mut req = url
                     .into_client_request()
                     .map_err(|e| format!("CDP: адрес {url}: {e}"))?;
-                req.headers_mut()
-                    .insert("Host", h.parse().map_err(|e| format!("CDP: Host {h}: {e}"))?);
+                req.headers_mut().insert(
+                    "Host",
+                    h.parse().map_err(|e| format!("CDP: Host {h}: {e}"))?,
+                );
                 tungstenite::connect(req).map_err(|e| format!("CDP: {e}"))?
             }
             None => tungstenite::connect(url).map_err(|e| format!("CDP: {e}"))?,
@@ -299,8 +306,8 @@ impl Cdp {
             }
             match self.ws.read() {
                 Ok(Message::Text(t)) => {
-                    let v: Value =
-                        serde_json::from_str(t.as_str()).map_err(|e| format!("CDP: не JSON: {e}"))?;
+                    let v: Value = serde_json::from_str(t.as_str())
+                        .map_err(|e| format!("CDP: не JSON: {e}"))?;
                     // События (Page.*, Network.*) не нужны: ждём ответ на свой id.
                     if v.get("id").and_then(Value::as_u64) != Some(id) {
                         continue;
@@ -315,8 +322,7 @@ impl Cdp {
                     return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                 }
                 Ok(Message::Binary(b)) => {
-                    let v: Value =
-                        serde_json::from_slice(&b).map_err(|e| format!("CDP: {e}"))?;
+                    let v: Value = serde_json::from_slice(&b).map_err(|e| format!("CDP: {e}"))?;
                     if v.get("id").and_then(Value::as_u64) != Some(id) {
                         continue;
                     }

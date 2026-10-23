@@ -16,7 +16,8 @@ pub fn dir() -> PathBuf {
     let base = std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".local/state")
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+                .join(".local/state")
         });
     base.join("snens/web")
 }
@@ -130,12 +131,8 @@ pub fn save_refs(tab: &str, refs: &[Ref]) -> Result<PathBuf, String> {
 
 pub fn load_refs(tab: &str) -> Result<Vec<Ref>, String> {
     let p = dir().join(tab).join("refs.json");
-    let text = fs::read_to_string(&p).map_err(|e| {
-        format!(
-            "нет адресов для вкладки {tab} ({}): сначала `web snap`",
-            e
-        )
-    })?;
+    let text = fs::read_to_string(&p)
+        .map_err(|e| format!("нет адресов для вкладки {tab} ({}): сначала `web snap`", e))?;
     serde_json::from_str(&text).map_err(|e| format!("refs: {e}"))
 }
 

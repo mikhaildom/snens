@@ -376,8 +376,15 @@ pub fn sync_bin_dir(cfg: &Config, tools: &[Tool]) -> R<PathBuf> {
         let to = bin.join(name);
         #[cfg(unix)]
         let _ = std::os::unix::fs::symlink(&t.bin, &to);
+        // Windows: симлинк требует прав администратора, поэтому раньше здесь
+        // была копия — и установка держала второй полный комплект тулов (17 МБ
+        // рядом с бандлом, при каждом обновлении заново). Жёсткая ссылка решает
+        // то же самое без прав и без второго экземпляра: тот же том NTFS, тот
+        // же inode. Не получилось (чужой том, ФС без ссылок) — копия, как было.
         #[cfg(not(unix))]
-        std::fs::copy(&t.bin, &to)?;
+        if std::fs::hard_link(&t.bin, &to).is_err() {
+            std::fs::copy(&t.bin, &to)?;
+        }
     }
     Ok(bin)
 }

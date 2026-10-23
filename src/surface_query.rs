@@ -32,21 +32,33 @@ pub(super) async fn context_breakdown(
     let Some(path) = discovery::path(&s.cfg, &id).filter(|p| p.is_file()) else {
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     };
-    // Чтение и разбор журнала — блокирующая работа на весь файл: в async-хендлере
-    // она держала воркер (панель контекста занимала 0.5–0.65 с на 4 МБ логе).
+    // Чтение, разбор журнала и расклад — блокирующая работа на весь файл: в
+    // async-хендлере она держала воркер (панель контекста занимала 0.5–0.65 с
+    // на 4 МБ логе). Расклад считается по проекции (`project::msgs`), а это
+    // ещё и сборка базы ревизии контекста — тем более не в async-воркере.
     let read_path = path.clone();
-    let log = match tokio::task::spawn_blocking(move || crate::log::read_file(&read_path)).await {
-        Ok(Ok(log)) => log,
-        Ok(Err(e)) => {
-            return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
-                .into_response()
-        }
-        Err(e) => {
-            return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
-                .into_response()
-        }
-    };
-    let breakdown = crate::project::window_breakdown(&log, &s.cfg);
+    let read_cfg = s.cfg.clone();
+    let (breakdown, scale) =
+        match tokio::task::spawn_blocking(move || {
+            let log = crate::log::read_file(&read_path)?;
+            let scale = crate::project::calibration(&log);
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                crate::project::window_breakdown(&log, &read_cfg),
+                scale,
+            ))
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                    .into_response()
+            }
+            Err(e) => {
+                return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                    .into_response()
+            }
+        };
     // Схемы инструментов тоже уезжают в запрос и занимают окно: считаем их
     // оценкой по JSON и приводим тем же коэффициентом, что и остальное.
     let tools = crate::registry::discover(&s.cfg).await;
@@ -54,20 +66,35 @@ pub(super) async fn context_breakdown(
         .iter()
         .map(|t| crate::project::estimate_message(t) + 8)
         .sum();
-    let breakdown = breakdown.with_tool_schema(schema, crate::project::calibration(&log));
-    let budget = s
-        .data
-        .lock()
-        .await
-        .sessions
-        .get(&id)
-        .and_then(|x| x.context_target.or(x.context_budget))
-        .unwrap_or_else(|| s.cfg.context_budget());
+    let breakdown = breakdown.with_tool_schema(schema, scale);
+    let budget = {
+        let d = s.data.lock().await;
+        window_limit(&s.cfg, d.sessions.get(&id))
+    };
     Json(serde_json::json!({
         "breakdown": breakdown,
         "limit": budget,
     }))
     .into_response()
+}
+
+/// Знаменатель шкалы окна: бюджет уборки, а не цель.
+///
+/// `context_target` — ориентир, до которого контекст опускают уборкой. Как
+/// знаменатель он врёт дважды: сразу после уборки `total ≈ target`, и шкала
+/// показывает «свободно 0», хотя до потолка ещё треть бюджета; а без уборки
+/// (бюджет задан, цель — его 70%) он рисует переполнение там, где порог ещё
+/// не перейдён. Поэтому берём тот же порог, по которому ядро решает «пора
+/// убирать» (`agent` сравнивает с `context_budget`), и тот же, что видит
+/// поверхность при запуске (`review::session_cleanup_limits`).
+///
+/// Своё значение сессии перебивает конфиг (групповой чат живёт на своём
+/// бюджете); ноль — «не задано», а не «окно нулевого размера».
+pub(super) fn window_limit(cfg: &Config, session: Option<&rt::Session>) -> u64 {
+    session
+        .and_then(|x| x.context_budget)
+        .filter(|b| *b > 0)
+        .unwrap_or_else(|| cfg.context_budget())
 }
 
 #[derive(Deserialize)]
@@ -223,5 +250,33 @@ pub(super) fn file_contains(path: &std::path::Path, needle: &str) -> bool {
         // Хвост может разрезать многобайтный символ: переносим последние байты.
         let keep = combined.len().saturating_sub(8);
         carry = combined[keep..].to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_limit;
+    use crate::{cfg::Config, surface_runtime::Session};
+
+    #[test]
+    fn window_limit_is_the_cleanup_budget_not_the_target() {
+        let cfg = Config {
+            context_budget: 500_000,
+            context_target: 350_000,
+            ..Default::default()
+        };
+        // Сессии нет — общий бюджет конфига; цель на шкалу не попадает.
+        assert_eq!(window_limit(&cfg, None), 500_000);
+        // Сессия без своего бюджета живёт на общем.
+        assert_eq!(window_limit(&cfg, Some(&Session::new("s", "web"))), 500_000);
+        // Свой бюджет перебивает конфиг.
+        let mut own = Session::new("s", "web");
+        own.context_budget = Some(100_000);
+        own.context_target = Some(70_000);
+        assert_eq!(window_limit(&cfg, Some(&own)), 100_000);
+        // Ноль — «не задано».
+        let mut zero = Session::new("s", "web");
+        zero.context_budget = Some(0);
+        assert_eq!(window_limit(&cfg, Some(&zero)), 500_000);
     }
 }

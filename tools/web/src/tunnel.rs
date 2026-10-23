@@ -145,7 +145,9 @@ fn is_open(port: u16) -> bool {
 /// `DevToolsActivePort` в каталоге профиля есть всегда — из него и берём путь.
 pub fn remote_browser_path(host: &str, local_port: u16) -> Option<String> {
     // Сначала обычный путь: /json/version (старые сборки и отдельные профили).
-    if let Ok(raw) = crate::cdp::http_get_host("127.0.0.1", local_port, "127.0.0.1", "/json/version") {
+    if let Ok(raw) =
+        crate::cdp::http_get_host("127.0.0.1", local_port, "127.0.0.1", "/json/version")
+    {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(u) = v.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
                 if let Some(i) = u.find("/devtools/") {

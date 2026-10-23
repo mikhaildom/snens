@@ -459,26 +459,32 @@ pub fn estimate_message(value: &Value) -> u64 {
 
 /// Из чего состоит рабочее окно сессии: расклад проекции по категориям.
 ///
-/// Категории — не догадка клиента, а роли сообщений проекции, которые ядро и так
-/// собирает перед каждым ходом:
-/// - `prefix` — системный промпт и пометки рамки (уезжают в префикс кеша);
-/// - `history` — реплики человека и ответы модели (текст диалога);
-/// - `tools` — описания инструментов и результаты их вызовов: самая тяжёлая и
-///   самая изменчивая часть окна, из-за неё промахивает кеш;
+/// Категории — не догадка клиента, а роли сообщений той самой проекции, которая
+/// уйдёт провайдеру в следующем ходу:
+/// - `system` — системный промпт и пометки рамки/уборки (уезжают в префикс кеша);
+/// - `messages` — реплики человека и ответы модели (текст диалога);
+/// - `tool_calls` — вызовы инструментов внутри assistant-сообщений (имена,
+///   аргументы) плюс описания инструментов из `with_tool_schema`;
+/// - `tool_results` — результаты вызовов: самая тяжёлая и самая изменчивая часть
+///   окна, именно она схлопывается уборкой;
 /// - `images` — картинки-вложения (считаются по фиксированной цене части).
 ///
-/// `total` — оценка всей проекции; `estimate` — та же эвристика, что у порога
-/// компакции, без калибровки: калибровка подгоняет под провайдера по usage
-/// прошлых ходов, и для расклада важнее сопоставимость частей, чем точное
-/// совпадение с счётом провайдера.
+/// Считается по [`msgs`], а не по сырому журналу: после `ctx commit` и элизии
+/// журнал помнит всё, а на провод уходит ужатая база. Расклад по журналу врал
+/// ровно на объём освобождённого контекста (484k там, где провайдер видел 398k).
+///
+/// `total` — сумма статей, а не отдельно округлённое целое: иначе округление
+/// каждой статьи по отдельности разъезжается с суммой на единицы.
 pub fn window_breakdown(log: &[Rec], cfg: &Config) -> WindowBreakdown {
-    let msgs = build(log, cfg);
+    let projected = msgs(log, cfg);
     // Сырые размеры по категориям, потом один общий коэффициент калибровки:
     // эвристика len/3 для кириллицы завышает почти вдвое, и без калибровки
     // расклад врёт ровно настолько, насколько врёт оценка порога компакции.
+    // `est_tok` в `Rec::Usage` писался по этой же проекции (`project::msgs`),
+    // поэтому коэффициент согласован именно с ней.
     let mut raw = WindowBreakdown::default();
     let mut calls = 0u64;
-    for m in &msgs {
+    for m in &projected {
         // Картинки — отдельная категория: у них фиксированная цена части, и в
         // текстовых категориях их вес иначе терялся бы среди символов.
         let images = match m["content"].as_array() {
@@ -487,7 +493,6 @@ pub fn window_breakdown(log: &[Rec], cfg: &Config) -> WindowBreakdown {
         };
         let size = estimate_message(m).saturating_sub(images);
         raw.images += images;
-        raw.total += size + images;
         match m["role"].as_str().unwrap_or("") {
             // Системный промпт — то, что уезжает в префикс кеша и не меняется.
             "system" => raw.system += size,
@@ -507,15 +512,15 @@ pub fn window_breakdown(log: &[Rec], cfg: &Config) -> WindowBreakdown {
             _ => raw.messages += size,
         }
     }
+    raw.messages_count = projected.len() as u64;
     raw.tool_calls_count = calls;
-    raw.messages_count = msgs.len() as u64;
 
     // Один коэффициент на всё: части остаются сопоставимыми между собой, а
     // сумма сходится с тем, что провайдер реально посчитал на последнем ходу.
     let k = calibration(log);
     let scale = |v: u64| (v as f64 * k).round() as u64;
-    WindowBreakdown {
-        total: scale(raw.total),
+    let mut out = WindowBreakdown {
+        total: 0,
         system: scale(raw.system),
         messages: scale(raw.messages),
         tool_calls: scale(raw.tool_calls),
@@ -523,7 +528,9 @@ pub fn window_breakdown(log: &[Rec], cfg: &Config) -> WindowBreakdown {
         images: scale(raw.images),
         messages_count: raw.messages_count,
         tool_calls_count: raw.tool_calls_count,
-    }
+    };
+    out.total = out.system + out.messages + out.tool_calls + out.tool_results + out.images;
+    out
 }
 
 impl WindowBreakdown {
@@ -1331,6 +1338,162 @@ mod tests {
             (b.total as f64 / raw as f64 - 0.5).abs() < 0.05,
             "total={} raw={raw} — калибровка не применена",
             b.total
+        );
+    }
+
+    /// Компакция через `Rec::ContextRevision`: журнал помнит весь мусор, а на
+    /// провод уходит ужатая база. Расклад обязан считаться по проекции, иначе
+    /// после уборки он остаётся на прежнем числе — та самая жалоба «показывает
+    /// 488k, а реально было 398k».
+    #[test]
+    fn window_breakdown_follows_context_revision() {
+        let cfg = Config::default();
+        let mut log = vec![
+            Rec::System {
+                ts: 0,
+                text: "s".repeat(2000),
+            },
+            user("цель задачи", "surface"),
+        ];
+        // Три крупных результата: их сумма и есть «переваренный» контекст.
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            log.push(Rec::Assistant {
+                ts: 0,
+                text: None,
+                tool_calls: vec![crate::log::Call {
+                    id: (*id).into(),
+                    name: "run".into(),
+                    args: "{}".into(),
+                }],
+                reasoning: None,
+            });
+            log.push(tool_rec(id, &format!("{i}{}", "x".repeat(60_000)), 60_000));
+        }
+        let before = window_breakdown(&log, &cfg);
+        assert!(before.tool_results > 20_000, "seed too small: {before:?}");
+
+        let compressed = vec![
+            json!({"role":"system","content":"s".repeat(2000)}),
+            json!({"role":"user","content":"цель задачи"}),
+            json!({"role":"assistant","content":"итог: сделано"}),
+        ];
+        crate::context_document::validate(&compressed, true).unwrap();
+        // anchor/digest считаются по префиксу журнала на момент уборки — ровно
+        // так их пишет `context::Mirror::apply`.
+        let anchor = log.len();
+        let digest = crate::context_document::hash(&serde_json::to_vec(&log).unwrap());
+        log.push(Rec::ContextRevision {
+            ts: 0,
+            anchor,
+            digest,
+            messages: compressed,
+        });
+        let after = window_breakdown(&log, &cfg);
+        assert!(
+            after.total * 4 < before.total,
+            "расклад не заметил компакцию: было {}, стало {}",
+            before.total,
+            after.total
+        );
+        assert!(after.tool_results < before.tool_results / 4);
+        // База ревизии на проводе — та самая: мусора в проекции нет.
+        let wire = serde_json::to_string(&msgs(&log, &cfg)).unwrap();
+        assert!(!wire.contains(&"x".repeat(100)), "вырезанное вернулось в проекцию");
+    }
+
+    /// Элизия (`Rec::Ctx`) — тоже правило проекции: журнал цел, а окно меньше.
+    #[test]
+    fn window_breakdown_follows_cleared_results() {
+        let cfg = Config::default();
+        let mut log = vec![
+            user("цель", "surface"),
+            Rec::Assistant {
+                ts: 0,
+                text: None,
+                tool_calls: vec![crate::log::Call {
+                    id: "big".into(),
+                    name: "run".into(),
+                    args: "{}".into(),
+                }],
+                reasoning: None,
+            },
+            tool_rec("big", &"y".repeat(90_000), 90_000),
+        ];
+        let before = window_breakdown(&log, &cfg);
+        log.push(Rec::Ctx {
+            ts: 0,
+            action: "clear".into(),
+            elided: 1,
+            freed_bytes: 90_000,
+            cleared: std::collections::BTreeMap::from([(
+                "big".to_string(),
+                "[результат вырезан уборкой контекста: run, 90000 Б, exit 0 — echo hi]"
+                    .to_string(),
+            )]),
+        });
+        let after = window_breakdown(&log, &cfg);
+        assert!(
+            after.total * 3 <= before.total,
+            "элизия не уменьшила расклад: было {}, стало {}",
+            before.total,
+            after.total
+        );
+        assert!(
+            after.tool_results < 100,
+            "заглушка не должна весить как результат: {}",
+            after.tool_results
+        );
+    }
+
+    /// Части складываются в total, который сходится с `in_tok` последнего хода,
+    /// если калибровка снята с той же проекции.
+    #[test]
+    fn window_breakdown_total_matches_parts_and_usage() {
+        let cfg = Config::default();
+        let mut log = vec![
+            Rec::System {
+                ts: 0,
+                text: "s".repeat(3000),
+            },
+            user(&"u".repeat(30_000), "surface"),
+            Rec::Assistant {
+                ts: 0,
+                text: Some("ответ модели".into()),
+                tool_calls: vec![crate::log::Call {
+                    id: "c1".into(),
+                    name: "run".into(),
+                    args: "{\"command\":\"ls\"}".into(),
+                }],
+                reasoning: None,
+            },
+            tool_rec("c1", &"z".repeat(30_000), 30_000),
+        ];
+        // Калибровка по проекции: est_tok — то, что уехало в тот ход.
+        let est = estimate_tokens(&msgs(&log, &cfg));
+        log.push(Rec::Usage {
+            ts: 0,
+            model: String::new(),
+            in_tok: est / 2,
+            cached_tok: 0,
+            out_tok: 1,
+            cost_micro: 0,
+            upstream_id: String::new(),
+            fingerprint: String::new(),
+            finish_reason: "stop".into(),
+            reason_tok: 0,
+            encrypted_reasoning: false,
+            est_tok: est,
+        });
+        let b = window_breakdown(&log, &cfg);
+        let parts = b.system + b.messages + b.tool_calls + b.tool_results + b.images;
+        assert_eq!(b.total, parts, "total не сходится с суммой статей");
+        let last_in = est / 2;
+        let delta = (b.total as f64 - last_in as f64).abs() / last_in as f64;
+        assert!(
+            delta < 0.15,
+            "total {} расходится с in_tok {last_in} на {:.0}%",
+            b.total,
+            delta * 100.0
         );
     }
 

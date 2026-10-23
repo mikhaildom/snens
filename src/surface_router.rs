@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use super::{
     approvals::approve,
+    dashboard::{reviews, ticket, tickets},
     pairing,
     commands::{message, stop, tool_result},
     events::{events, history, ingest, session_updates},
@@ -57,6 +58,11 @@ pub(super) fn app(state: Arc<Runtime>, token: String) -> Router {
             post(tool_result),
         )
         .route("/v1/search", get(search))
+        // Дашборд: тикеты инстанса и ревью-сессии. Только чтение — это данные,
+        // сложенные самим инстансом, а не действие клиента.
+        .route("/v1/tickets", get(tickets))
+        .route("/v1/tickets/{name}", get(ticket))
+        .route("/v1/reviews", get(reviews))
         .route("/v1/sessions/{id}/context", get(context_breakdown))
         .route("/v1/sessions/{id}/attachments", post(upload_attachment))
         .route("/v1/sessions/{id}/file", get(session_file))

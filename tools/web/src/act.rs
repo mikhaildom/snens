@@ -21,13 +21,13 @@ pub fn run_with(l: &mut crate::Live, args: &Args) -> Result<(), String> {
     let raw = args
         .flag("json")
         .map(str::to_string)
-        .or_else(|| args.positional.get(0).cloned())
+        .or_else(|| args.positional.first().cloned())
         .ok_or("web act: нужен --json '<массив действий>' или JSON вторым аргументом")?;
-    let actions: Value = serde_json::from_str(&raw).map_err(|e| format!("web act: не JSON: {e}"))?;
-    let list = actions
-        .as_array()
-        .cloned()
-        .ok_or("web act: ожидается массив действий, напр. [{\"click\":\"e3\"},{\"press\":\"Enter\"}]")?;
+    let actions: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("web act: не JSON: {e}"))?;
+    let list = actions.as_array().cloned().ok_or(
+        "web act: ожидается массив действий, напр. [{\"click\":\"e3\"},{\"press\":\"Enter\"}]",
+    )?;
     if list.is_empty() {
         return Err("web act: пустой список действий".into());
     }
@@ -79,12 +79,13 @@ fn node_of(refs: &[crate::snap::Ref], addr: &str) -> Result<i64, String> {
         })
 }
 
-fn apply(cdp: &mut crate::cdp::Cdp, refs: &[crate::snap::Ref], a: &Value) -> Result<String, String> {
+fn apply(
+    cdp: &mut crate::cdp::Cdp,
+    refs: &[crate::snap::Ref],
+    a: &Value,
+) -> Result<String, String> {
     let obj = a.as_object().ok_or("act: действие не объект")?;
-    let (name, arg) = obj
-        .iter()
-        .next()
-        .ok_or("act: пустое действие")?;
+    let (name, arg) = obj.iter().next().ok_or("act: пустое действие")?;
     match name.as_str() {
         "click" => {
             let (x, y) = point(cdp, refs, arg)?;
@@ -178,8 +179,14 @@ fn apply(cdp: &mut crate::cdp::Cdp, refs: &[crate::snap::Ref], a: &Value) -> Res
 
 fn ref_and_text(arg: &Value) -> Result<(String, String), String> {
     let o = arg.as_object().ok_or("act type: нужен {ref, text}")?;
-    let addr = o.get("ref").and_then(Value::as_str).ok_or("type: нет ref")?;
-    let text = o.get("text").and_then(Value::as_str).ok_or("type: нет text")?;
+    let addr = o
+        .get("ref")
+        .and_then(Value::as_str)
+        .ok_or("type: нет ref")?;
+    let text = o
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or("type: нет text")?;
     Ok((addr.to_string(), text.to_string()))
 }
 
@@ -201,11 +208,10 @@ fn point(
                 .and_then(|x| x.get("content"))
                 .and_then(Value::as_array)
                 .cloned()
-                .ok_or_else(|| format!("{addr}: у элемента нет рамки (скрыт или нулевой размер)"))?;
-            let n: Vec<f64> = quad
-                .iter()
-                .filter_map(Value::as_f64)
-                .collect();
+                .ok_or_else(|| {
+                    format!("{addr}: у элемента нет рамки (скрыт или нулевой размер)")
+                })?;
+            let n: Vec<f64> = quad.iter().filter_map(Value::as_f64).collect();
             if n.len() < 8 {
                 return Err(format!("{addr}: неполная рамка элемента"));
             }
@@ -305,7 +311,11 @@ fn press(cdp: &mut crate::cdp::Cdp, combo: &str) -> Result<(), String> {
             match (cs.next(), cs.next()) {
                 (Some(c), None) if c.is_ascii_alphanumeric() => {
                     let up = c.to_ascii_uppercase();
-                    (Box::leak(up.to_string().into_boxed_str()) as &'static str, up as u32, Some(c))
+                    (
+                        Box::leak(up.to_string().into_boxed_str()) as &'static str,
+                        up as u32,
+                        Some(c),
+                    )
                 }
                 _ => return Err(format!("press: неизвестная клавиша {key}")),
             }
@@ -346,7 +356,9 @@ fn settle(l: &mut crate::Live) {
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
         if url != old && !url.is_empty() {
-            l.cdp.wait_ready(std::time::Duration::from_millis(3000)).ok();
+            l.cdp
+                .wait_ready(std::time::Duration::from_millis(3000))
+                .ok();
             return;
         }
         if std::time::Instant::now() >= until {
@@ -385,7 +397,11 @@ fn delta(l: &mut crate::Live) -> Result<(), String> {
             println!("{line}");
         }
         if s.text.lines().count() > 15 {
-            println!("… ещё {} строк: {}", s.text.lines().count() - 15, path.display());
+            println!(
+                "… ещё {} строк: {}",
+                s.text.lines().count() - 15,
+                path.display()
+            );
         }
         return Ok(());
     }

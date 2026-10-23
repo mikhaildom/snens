@@ -95,7 +95,8 @@ impl Store {
                 *mut rusqlite::ffi::sqlite3,
                 *mut *mut std::os::raw::c_char,
                 *const rusqlite::ffi::sqlite3_api_routines,
-            ) -> std::os::raw::c_int = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+            ) -> std::os::raw::c_int =
+                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
             sqlite3_auto_extension(Some(init));
         }
         let db = Connection::open(path).map_err(|e| format!("{path:?}: {e}"))?;
@@ -109,7 +110,8 @@ impl Store {
     }
 
     fn ensure_vec(&self, dim: usize) -> Result<(), String> {
-        let sql = format!("create virtual table if not exists facts_vec using vec0(emb int8[{dim}]);");
+        let sql =
+            format!("create virtual table if not exists facts_vec using vec0(emb int8[{dim}]);");
         self.db.execute_batch(&sql).map_err(|e| e.to_string())
     }
 
@@ -394,15 +396,16 @@ impl Store {
 
     pub fn finish(&self, id: i64, state: &str) -> Result<(), String> {
         self.db
-            .execute("update turns set state = ?1 where id = ?2", params![state, id])
+            .execute(
+                "update turns set state = ?1 where id = ?2",
+                params![state, id],
+            )
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn stats(&self) -> Result<Stats, String> {
-        let count = |sql: &str| -> i64 {
-            self.db.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
-        };
+        let count = |sql: &str| -> i64 { self.db.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
         let facts = count("select count(*) from facts where valid_to is null");
         let stale = count("select count(*) from facts where valid_to is not null");
         let pending = count("select count(*) from turns where state = 'new'");
@@ -511,10 +514,22 @@ mod tests {
         let a = crate::api::quantize(&[1.0, 0.0, 0.0, 0.0]);
         let b = crate::api::quantize(&[0.0, 1.0, 0.0, 0.0]);
         let uid_a = s
-            .insert(&fact("пользователь живёт в Нидерландах", "fact", "user", &a, dim))
+            .insert(&fact(
+                "пользователь живёт в Нидерландах",
+                "fact",
+                "user",
+                &a,
+                dim,
+            ))
             .unwrap();
-        s.insert(&fact("сервер VPN стоит в Финляндии", "fact", "world", &b, dim))
-            .unwrap();
+        s.insert(&fact(
+            "сервер VPN стоит в Финляндии",
+            "fact",
+            "world",
+            &b,
+            dim,
+        ))
+        .unwrap();
 
         let by_text = s.bm25_search("Нидерландах", 5).unwrap();
         assert_eq!(by_text.len(), 1, "BM25 не нашёл факт по слову");
@@ -524,7 +539,13 @@ mod tests {
 
         // Противоречащий факт закрывает старый, но остаётся в таймлайне.
         let uid_a2 = s
-            .insert(&fact("пользователь переехал в Германию", "fact", "user", &a, dim))
+            .insert(&fact(
+                "пользователь переехал в Германию",
+                "fact",
+                "user",
+                &a,
+                dim,
+            ))
             .unwrap();
         assert!(s.supersede(&uid_a, &uid_a2).unwrap());
         let live = s.bm25_search("Нидерландах", 5).unwrap();
@@ -542,10 +563,9 @@ mod tests {
         first.created = Some(1_700_000_000);
         let dup = fact("  Пользователь живёт в Нидерландах ", "fact", "user", &a, 4);
         assert_eq!(s.insert_batch(&[first, dup]).unwrap(), 1, "дубль не отсеян");
-        let created: i64 = s
-            .db
-            .query_row("select created from facts", [], |r| r.get(0))
-            .unwrap();
+        let created: i64 =
+            s.db.query_row("select created from facts", [], |r| r.get(0))
+                .unwrap();
         assert_eq!(created, 1_700_000_000, "дата исходной записи потеряна");
         assert_eq!(s.count_source("import").unwrap(), 0, "источник не auto");
         assert_eq!(s.close_source("test").unwrap(), 1);

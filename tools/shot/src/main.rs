@@ -90,7 +90,10 @@ fn num<T: std::str::FromStr>(argv: &[String], i: usize, name: &str) -> T {
         die(&format!("shot: {name} без значения\n{USAGE}"), 2);
     });
     v.parse().unwrap_or_else(|_| {
-        die(&format!("shot: {name} ждёт число, получено {v}\n{USAGE}"), 2)
+        die(
+            &format!("shot: {name} ждёт число, получено {v}\n{USAGE}"),
+            2,
+        )
     })
 }
 
@@ -98,14 +101,17 @@ fn parse_size(s: &str) -> Size {
     let (w, h) = s
         .split_once(['x', 'X', '×'])
         .unwrap_or_else(|| die(&format!("shot: --size ждёт WxH, получено {s}\n{USAGE}"), 2));
-    let w: u32 = w.parse().unwrap_or_else(|_| {
-        die(&format!("shot: --size: ширина не число: {w}\n{USAGE}"), 2)
-    });
-    let h: u32 = h.parse().unwrap_or_else(|_| {
-        die(&format!("shot: --size: высота не число: {h}\n{USAGE}"), 2)
-    });
+    let w: u32 = w
+        .parse()
+        .unwrap_or_else(|_| die(&format!("shot: --size: ширина не число: {w}\n{USAGE}"), 2));
+    let h: u32 = h
+        .parse()
+        .unwrap_or_else(|_| die(&format!("shot: --size: высота не число: {h}\n{USAGE}"), 2));
     if w == 0 || h == 0 || w > 10_000 || h > 10_000 {
-        die(&format!("shot: --size: {s} вне разумного (1..10000)\n{USAGE}"), 2);
+        die(
+            &format!("shot: --size: {s} вне разумного (1..10000)\n{USAGE}"),
+            2,
+        );
     }
     Size { w, h }
 }
@@ -113,13 +119,16 @@ fn parse_size(s: &str) -> Size {
 fn parse_crop(s: &str) -> (u32, u32, u32, u32) {
     let parts: Vec<&str> = s.split(',').map(str::trim).collect();
     if parts.len() != 4 {
-        die(&format!("shot: --crop ждёт X,Y,W,H, получено {s}\n{USAGE}"), 2);
+        die(
+            &format!("shot: --crop ждёт X,Y,W,H, получено {s}\n{USAGE}"),
+            2,
+        );
     }
     let mut n = [0u32; 4];
     for (i, p) in parts.iter().enumerate() {
-        n[i] = p.parse().unwrap_or_else(|_| {
-            die(&format!("shot: --crop: не число: {p}\n{USAGE}"), 2)
-        });
+        n[i] = p
+            .parse()
+            .unwrap_or_else(|_| die(&format!("shot: --crop: не число: {p}\n{USAGE}"), 2));
     }
     if n[2] == 0 || n[3] == 0 {
         die(&format!("shot: --crop: нулевые W/H\n{USAGE}"), 2);
@@ -151,8 +160,8 @@ fn parse(argv: &[String]) -> Args {
                 i += 1;
                 continue;
             }
-            "--size" | "--selector" | "--crop" | "--script" | "--wait-ms" | "--timeout" | "--chrome"
-            | "--out-dir" => {
+            "--size" | "--selector" | "--crop" | "--script" | "--wait-ms" | "--timeout"
+            | "--chrome" | "--out-dir" => {
                 // Значение проверяем сразу: пустой --size молчаливого дефолта не заслуживает.
                 match arg {
                     "--size" => {
@@ -217,10 +226,7 @@ fn parse(argv: &[String]) -> Args {
     a.url = url.unwrap_or_else(|| die(&format!("shot: не указан URL\n{USAGE}"), 2));
     if !(a.url.starts_with("http://") || a.url.starts_with("https://")) {
         die(
-            &format!(
-                "shot: только http/https, получено {}\n{USAGE}",
-                a.url
-            ),
+            &format!("shot: только http/https, получено {}\n{USAGE}", a.url),
             2,
         );
     }
@@ -241,7 +247,10 @@ fn parse(argv: &[String]) -> Args {
     }
     if let Some(p) = &a.script {
         if !p.is_file() {
-            die(&format!("shot: --script: нет файла {}\n{USAGE}", p.display()), 2);
+            die(
+                &format!("shot: --script: нет файла {}\n{USAGE}", p.display()),
+                2,
+            );
         }
     }
     a
@@ -265,7 +274,8 @@ impl TempDir {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let path = base.join(format!("shot-{}-{nanos}", std::process::id()));
-        fs::create_dir_all(&path).map_err(|e| format!("временный каталог {}: {e}", path.display()))?;
+        fs::create_dir_all(&path)
+            .map_err(|e| format!("временный каталог {}: {e}", path.display()))?;
         Ok(TempDir { path })
     }
 }
@@ -381,11 +391,14 @@ fn find_chrome(a: &Args) -> Result<PathBuf, String> {
             return Ok(p);
         }
     }
-    Err("Chrome не найден: задай --chrome, SNENS_CHROME или поставь Google Chrome for Testing"
-        .into())
+    Err(
+        "Chrome не найден: задай --chrome, SNENS_CHROME или поставь Google Chrome for Testing"
+            .into(),
+    )
 }
 
-fn launch_chrome(bin: &Path, profile: &Path) -> Result<ChromeGuard, String> {    let child = Command::new(bin)
+fn launch_chrome(bin: &Path, profile: &Path) -> Result<ChromeGuard, String> {
+    let child = Command::new(bin)
         .arg("--headless=new")
         .arg("--remote-debugging-port=0")
         .arg(format!("--user-data-dir={}", profile.display()))
@@ -420,7 +433,11 @@ fn launch_chrome(bin: &Path, profile: &Path) -> Result<ChromeGuard, String> {   
 }
 
 /// Порт и путь браузерного сокета: Chrome пишет `<порт>\n/devtools/browser/<id>`.
-fn wait_devtools(profile: &Path, guard: &mut ChromeGuard, until: Instant) -> Result<(u16, String), String> {
+fn wait_devtools(
+    profile: &Path,
+    guard: &mut ChromeGuard,
+    until: Instant,
+) -> Result<(u16, String), String> {
     let f = profile.join("DevToolsActivePort");
     loop {
         if let Ok(txt) = fs::read_to_string(&f) {
@@ -534,15 +551,22 @@ impl Cdp {
                 }
                 Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
                 Ok(Message::Close(_)) => return Err("CDP: Chrome закрыл соединение".into()),
-                Err(e) if is_timeout(&e) => return Err(self.left().err().unwrap_or_else(|| {
-                    "CDP: Chrome не ответил (страница держит открытый поток?)".into()
-                })),
+                Err(e) if is_timeout(&e) => {
+                    return Err(self.left().err().unwrap_or_else(|| {
+                        "CDP: Chrome не ответил (страница держит открытый поток?)".into()
+                    }))
+                }
                 Err(e) => return Err(format!("CDP: {e}")),
             }
         }
     }
 
-    fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Result<Value, String> {
+    fn call(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
         self.id += 1;
         let id = self.id;
         let mut msg = json!({"id": id, "method": method, "params": params});
@@ -711,10 +735,7 @@ fn shift_to_view(cdp: &mut Cdp, session: &str, selector: &str) -> Result<Rect, S
         if done {
             break;
         }
-        cdp.eval(
-            session,
-            &format!("window.scrollBy({dx:.1}, {dy:.1}); 0"),
-        )?;
+        cdp.eval(session, &format!("window.scrollBy({dx:.1}, {dy:.1}); 0"))?;
         std::thread::sleep(Duration::from_millis(60));
     }
     last.ok_or_else(|| format!("--selector: не удалось измерить `{selector}`"))
@@ -796,10 +817,7 @@ fn png_dims(b: &[u8]) -> Option<(u32, u32)> {
 
 /// Имя кадра: хост + размер + чем снят. Так файлы различимы в канале вложений.
 fn shot_name(url: &str, w: u32, h: u32, tag: &str) -> String {
-    let rest = url
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(url);
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let host: String = rest
         .split(['/', '?', '#'])
         .next()
@@ -878,7 +896,10 @@ fn run_inner(a: &Args, bin: &Path, tmp: &TempDir, deadline: Instant) -> Result<(
     let out_dir = match &a.out_dir {
         Some(d) => {
             if d.is_file() {
-                return Err(format!("--out-dir {} — это файл, а не каталог", d.display()));
+                return Err(format!(
+                    "--out-dir {} — это файл, а не каталог",
+                    d.display()
+                ));
             }
             fs::create_dir_all(d).map_err(|e| format!("--out-dir {}: {e}", d.display()))?;
             d.clone()
@@ -971,14 +992,20 @@ fn shots_and_probe(cdp: &mut Cdp, session: &str, a: &Args, out_dir: &Path) -> Re
                 r.h.round() as i64,
                 r.dpr
             );
-            (Some(clip_of(r.x + r.sx, r.y + r.sy, r.w, r.h, r.dpr)), "-sel")
+            (
+                Some(clip_of(r.x + r.sx, r.y + r.sy, r.w, r.h, r.dpr)),
+                "-sel",
+            )
         } else if let Some((cx, cy, cw, ch)) = a.crop {
             let dpr = cdp
                 .eval(session, "window.devicePixelRatio || 1")?
                 .as_f64()
                 .unwrap_or(1.0);
             let dpr = if dpr > 0.0 { dpr } else { 1.0 };
-            (Some(clip_of(cx as f64, cy as f64, cw as f64, ch as f64, dpr)), "-crop")
+            (
+                Some(clip_of(cx as f64, cy as f64, cw as f64, ch as f64, dpr)),
+                "-crop",
+            )
         } else {
             (None, "")
         };
@@ -995,12 +1022,15 @@ fn probe(cdp: &mut Cdp, session: &str, a: &Args) -> Result<(), String> {
     let Some(script) = &a.script else {
         return Ok(());
     };
-    let src = fs::read_to_string(script)
-        .map_err(|e| format!("--script {}: {e}", script.display()))?;
+    let src =
+        fs::read_to_string(script).map_err(|e| format!("--script {}: {e}", script.display()))?;
     // Тело async-функции: `return` определяет результат, await разрешён.
     let expr = format!("(async () => {{\n{src}\n}})()");
     let v = cdp.eval(session, &expr)?;
-    println!("{}", serde_json::to_string(&v).unwrap_or_else(|_| "null".into()));
+    println!(
+        "{}",
+        serde_json::to_string(&v).unwrap_or_else(|_| "null".into())
+    );
     Ok(())
 }
 

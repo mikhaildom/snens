@@ -1,36 +1,68 @@
 // agent — подагенты snens: запустить, ждать, спросить, ответить, посмотреть.
 //
-// Тул, а не часть ядра: он говорит с сессиями через расклад на диске (лог ребёнка
-// и его ящик), а не через внутренности харнесса. Надёжность конца ребёнка — по
+// Тул, а не часть ядра: он говорит с сессиями через расклад на диске (лог сессии
+// и её ящик), а не через внутренности харнесса. Надёжность конца ребёнка — по
 // записи `Done` в его логе; её пишет харнесс, поэтому «модель забыла отчитаться»
 // тут ничего не ломает.
+//
+// Слои: cfg — окружение и конфиг, mail — ящик и дерево (дети/родитель/братья),
+// log — чтение чужого лога, здесь — команды и разбор аргументов.
+mod cfg;
+mod log;
+mod mail;
+
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use cfg::Cfg;
 
 const HELP: &str = "\
 agent — подагенты snens: запустить, ждать, спросить, ответить, посмотреть.
-agent start \"задача\" | wait <id> [--timeout S] [--progress S] | status <id> | result <id> | ask \"вопрос\" | send <id> \"текст\" | list | kill <id>
+agent start \"задача\" | wait <id> [--timeout S] [--progress S] | status <id> | result <id>
+      ask [<id>|--parent] [--timeout S] \"вопрос\" | send <id> \"текст\" | peers
+      broadcast \"текст\" | list | kill <id>
 
 Подагент — отдельная сессия snens со своим логом. start возвращает её id (печатает
 в stdout). Надёжный признак конца — запись Done в логе ребёнка, её пишет харнесс:
-даже если ребёнок не отчитался, wait её увидит. ask ждёт ответа родителя из ящика;
-send отвечает/пишет ребёнку. Контекст (SNENS_SESSION, SNENS_MAIL_DIR, SNENS_PARENT)
-харнесс передаёт переменными окружения.
+даже если ребёнок не отчитался, wait её увидит. Контекст (SNENS_SESSION,
+SNENS_MAIL_DIR, SNENS_PARENT) харнесс передаёт переменными окружения.
 
 status — неблокирующий снимок: жив/готов, число ходов, последний вызов инструмента,
 сколько секунд назад была запись в логе. wait печатает прогресс раз в 30 с
-(--progress S), а по таймауту выходит с кодом 3 — «ещё работает», не ошибка.";
+(--progress S). Коды выхода wait: 0 — Done, 3 — истёк таймаут («ещё работает»),
+4 — в моём ящике вопрос (kind=ask): он напечатан в stdout, на него отвечают
+`agent send <id> \"...\"`, вопрос остаётся в ящике и доедет до хода сам.
 
-fn die(msg: String) -> ! {
+list — дерево: родитель (^), братья (=), я (>), дети (-) с состоянием, числом
+ходов и временем последней записи. peers — id братьев построчно. ask без id
+спрашивает родителя (обратная совместимость); ответ ждём только от адресата.
+broadcast шлёт steer всем братьям и родителю.";
+
+pub fn die(msg: String) -> ! {
     eprintln!("{msg}");
     std::process::exit(1);
 }
 
+/// Rust игнорирует SIGPIPE, поэтому `agent list | head` падал бы паникой
+/// «failed printing to stdout». Возвращаем дефолтное поведение обычного CLI.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 fn main() {
+    restore_sigpipe();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() || argv[0] == "-h" || argv[0] == "--help" {
         println!("{HELP}");
@@ -44,335 +76,16 @@ fn main() {
         "result" => cmd_result(&cfg, &argv[1..]),
         "ask" => cmd_ask(&cfg, &argv[1..]),
         "send" => cmd_send(&cfg, &argv[1..]),
-        "list" => cmd_list(&cfg, &argv[1..]),
+        "peers" => cmd_peers(&cfg),
+        "broadcast" => cmd_broadcast(&cfg, &argv[1..]),
+        "list" => cmd_list(&cfg),
         "kill" => cmd_kill(&cfg, &argv[1..]),
         other => die(format!("agent: неизвестная команда {other}")),
     }
 }
 
-/// Конфигурация: ящик и сессии. Переменные окружения приоритетнее файла — харнесс
-/// передаёт их вызываемому тулу; запущенный человеком тул читает config.toml.
-struct Cfg {
-    mail_dir: PathBuf,
-    sessions_dir: PathBuf,
-    me: String,
-    parent: String,
-}
-
-#[derive(Deserialize, Default)]
-struct File {
-    #[serde(default)]
-    mail_dir: String,
-    #[serde(default)]
-    sessions_dir: String,
-}
-
-impl Cfg {
-    fn load() -> Cfg {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_default();
-        let f: File = std::env::var("SNENS_CONFIG")
-            .ok()
-            .or_else(|| Some(format!("{home}/.config/snens/config.toml")))
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default();
-        let mail = std::env::var("SNENS_MAIL_DIR").unwrap_or_else(|_| {
-            if f.mail_dir.is_empty() {
-                format!("{home}/.local/share/snens/mail")
-            } else {
-                f.mail_dir.replace('~', &home)
-            }
-        });
-        // SNENS_SESSIONS_DIR — чтобы status/wait можно было проверять на копии логов
-        // и смотреть чужие инстансы, не трогая свой config.toml.
-        let sessions = std::env::var("SNENS_SESSIONS_DIR").unwrap_or_else(|_| {
-            if f.sessions_dir.is_empty() {
-                format!("{home}/.local/share/snens/sessions")
-            } else {
-                f.sessions_dir.replace('~', &home)
-            }
-        });
-        Cfg {
-            mail_dir: PathBuf::from(mail),
-            sessions_dir: PathBuf::from(sessions),
-            me: std::env::var("SNENS_SESSION").unwrap_or_default(),
-            parent: std::env::var("SNENS_PARENT").unwrap_or_default(),
-        }
-    }
-}
-
-// --- сообщение в ящике: формат общий с ядром (mail.rs) ---
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Msg {
-    ts: u64,
-    from: String,
-    kind: String,
-    text: String,
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn new_dir(cfg: &Cfg, id: &str) -> PathBuf {
-    cfg.mail_dir.join(id).join("new")
-}
-
-fn send(cfg: &Cfg, to: &str, from: &str, kind: &str, text: &str) {
-    let dir = new_dir(cfg, to);
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| die(format!("agent: ящик {to}: {e}")));
-    let msg = Msg {
-        ts: now(),
-        from: from.to_string(),
-        kind: kind.to_string(),
-        text: text.to_string(),
-    };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let name = format!("{nanos:020}-{}-{}.json", sanitize(from), std::process::id());
-    let path = dir.join(&name);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_string(&msg).unwrap_or_default())
-        .unwrap_or_else(|e| die(format!("agent: запись сообщения: {e}")));
-    let _ = std::fs::rename(&tmp, &path);
-}
-
-/// Забрать входящие в `read/` (как ядро): ровно один потребитель на сообщение.
-fn drain(cfg: &Cfg, id: &str) -> Vec<Msg> {
-    let dir = new_dir(cfg, id);
-    let done = cfg.mail_dir.join(id).join("read");
-    let mut names: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-    names.sort();
-    let mut out = Vec::new();
-    for p in names {
-        let Ok(text) = std::fs::read_to_string(&p) else {
-            continue;
-        };
-        let Ok(m) = serde_json::from_str::<Msg>(&text) else {
-            let _ = std::fs::remove_file(&p);
-            continue;
-        };
-        let _ = std::fs::create_dir_all(&done);
-        let _ = std::fs::rename(&p, done.join(p.file_name().unwrap_or_default()));
-        out.push(m);
-    }
-    out
-}
-
-// --- лог ребёнка: конец и финальный текст ---
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum Rec {
-    Meta {},
-    Assistant {
-        text: Option<String>,
-        #[serde(default)]
-        tool_calls: Vec<serde_json::Value>,
-    },
-    Done {
-        status: String,
-    },
-    #[serde(other)]
-    Other,
-}
-
-/// Снимок живого лога: что ребёнок делает сейчас. `raw` — все строки, включая
-/// те, что не разбираются в `Rec` (usage, steer и прочее), из них берём след
-/// инструмента и время последней записи.
-#[derive(Deserialize)]
-struct LooseRec {
-    #[serde(default)]
-    ts: u64,
-    #[serde(default)]
-    kind: String,
-    #[serde(default)]
-    tool: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<serde_json::Value>,
-    #[serde(default)]
-    argv: Vec<String>,
-}
-
-fn read_log(cfg: &Cfg, id: &str) -> Vec<Rec> {
-    let path = cfg.sessions_dir.join(format!("{id}.jsonl"));
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Rec>(l).ok())
-        .collect()
-}
-
-fn done_status(cfg: &Cfg, id: &str) -> Option<String> {
-    read_log(cfg, id).into_iter().rev().find_map(|r| match r {
-        Rec::Done { status } => Some(status),
-        _ => None,
-    })
-}
-
-fn final_text(cfg: &Cfg, id: &str) -> Option<String> {
-    read_log(cfg, id).into_iter().rev().find_map(|r| match r {
-        Rec::Assistant {
-            text: Some(t),
-            tool_calls,
-            ..
-        } if tool_calls.is_empty() && !t.trim().is_empty() => Some(t),
-        _ => None,
-    })
-}
-
-fn child_pid(cfg: &Cfg, parent: &str, id: &str) -> Option<u32> {
-    std::fs::read_to_string(cfg.mail_dir.join(parent).join("children").join(id))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-#[cfg(unix)]
-fn alive(pid: u32) -> bool {
-    unsafe { libc_kill(pid) }
-}
-#[cfg(not(unix))]
-fn alive(_pid: u32) -> bool {
-    true
-}
-
-#[cfg(unix)]
-unsafe fn libc_kill(pid: u32) -> bool {
-    // kill(pid, 0): сигнал 0 не шлётся, только проверка существования.
-    extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    kill(pid as i32, 0) == 0
-}
-
-fn state(cfg: &Cfg, id: &str) -> String {
-    if done_status(cfg, id).is_none() {
-        return if is_live(cfg, id) {
-            "работает".into()
-        } else {
-            "убит".into()
-        };
-    }
-    match done_status(cfg, id).as_deref() {
-        Some("ok") => "готов".into(),
-        Some(s) => format!("неудача ({s})"),
-        None => "работает".into(),
-    }
-}
-
-/// Живой ли процесс ребёнка. pid регистрируется у родителя, который его запустил;
-/// для вызовов из чужой сессии пробуем оба ящика.
-fn is_live(cfg: &Cfg, id: &str) -> bool {
-    child_pid(cfg, &cfg.parent_or_me(), id)
-        .or_else(|| child_pid(cfg, &cfg.me, id))
-        .map(alive)
-        .unwrap_or_else(|| log_grows(cfg, id))
-}
-
-/// Запасной признак жизни, когда pid неизвестен: лог менялся последние 90 с.
-/// Ребёнок может думать долго без записей — тогда ответ честно «не знаю».
-fn log_grows(cfg: &Cfg, id: &str) -> bool {
-    std::fs::metadata(cfg.sessions_dir.join(format!("{id}.jsonl")))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|e| e.as_secs() < 90)
-        .unwrap_or(false)
-}
-
-/// Неблокирующий снимок состояния подагента: то, что родитель раньше добывал
-/// `agent list` + `ps aux`.
-fn snapshot(cfg: &Cfg, id: &str) -> String {
-    let path = cfg.sessions_dir.join(format!("{id}.jsonl"));
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let recs: Vec<LooseRec> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<LooseRec>(l).ok())
-        .collect();
-    let steps = recs.iter().filter(|r| r.kind == "assistant").count();
-    let last = recs.iter().rev().find(|r| r.kind == "assistant");
-    let last_tool = recs
-        .iter()
-        .rev()
-        .find_map(|r| {
-            r.tool.clone().or_else(|| {
-                r.tool_calls.first().and_then(|c| {
-                    c.get("name")
-                        .and_then(|n| n.as_str())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            c.get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|n| n.as_str())
-                                .map(str::to_string)
-                        })
-                })
-            })
-        })
-        .unwrap_or_else(|| "—".into());
-    let ago = recs
-        .iter()
-        .rev()
-        .map(|r| r.ts)
-        .find(|t| *t > 0)
-        .map(|t| now().saturating_sub(t))
-        .unwrap_or(0);
-    let hint = last
-        .and_then(|r| r.tool_calls.first())
-        .map(hint_of)
-        .unwrap_or_default();
-    let hint = if hint.is_empty() {
-        last.and_then(|r| r.argv.first().cloned())
-            .unwrap_or_default()
-    } else {
-        hint
-    };
-    let mut out = format!(
-        "подагент {id}: {}\nходов: {steps}; последний инструмент: {last_tool}",
-        state(cfg, id)
-    );
-    if !hint.is_empty() {
-        let short: String = hint.chars().take(120).collect();
-        out.push_str(&format!(" ({short})"));
-    }
-    out.push_str(&format!("\nзапись в логе: {ago} с назад"));
-    out
-}
-
 /// Короткий след вызова: command для run, args для тула — как в TUI.
-fn hint_of(call: &serde_json::Value) -> String {
+pub fn hint_of(call: &serde_json::Value) -> String {
     let raw = call
         .get("function")
         .and_then(|f| f.get("arguments"))
@@ -404,20 +117,39 @@ fn hint_of(call: &serde_json::Value) -> String {
     }
 }
 
-impl Cfg {
-    fn parent_or_me(&self) -> String {
-        if self.parent.is_empty() {
-            self.me.clone()
-        } else {
-            self.parent.clone()
-        }
-    }
+// --- разбор аргументов ---
+
+/// Разобранные аргументы: позиционные по порядку + известные флаги. Флаги и их
+/// значения вырезаются, чтобы «--timeout 30» не попал в текст вопроса.
+struct Args {
+    pos: Vec<String>,
+    timeout: Option<u64>,
+    progress: Option<u64>,
+    parent_flag: bool,
 }
 
-// --- команды ---
+fn parse_args(args: &[String]) -> Args {
+    let mut out = Args {
+        pos: Vec::new(),
+        timeout: None,
+        progress: None,
+        parent_flag: false,
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--timeout" => out.timeout = it.next().and_then(|v| v.parse().ok()),
+            "--progress" => out.progress = it.next().and_then(|v| v.parse().ok()),
+            "--parent" => out.parent_flag = true,
+            _ => out.pos.push(a.clone()),
+        }
+    }
+    out
+}
 
-fn take_text(args: &[String]) -> String {
-    let joined = args.join(" ");
+/// Текст: позиционные строки, а если их нет — stdin.
+fn take_text(rest: &[String]) -> String {
+    let joined = rest.join(" ");
     if !joined.trim().is_empty() {
         return joined;
     }
@@ -426,8 +158,16 @@ fn take_text(args: &[String]) -> String {
     s.trim().to_string()
 }
 
+fn need_id(pos: &[String], what: &str) -> String {
+    pos.first()
+        .cloned()
+        .unwrap_or_else(|| die(format!("agent {what}: нужен id подагента")))
+}
+
+// --- команды ---
+
 fn cmd_start(cfg: &Cfg, args: &[String]) {
-    let task = take_text(args);
+    let task = take_text(&parse_args(args).pos);
     if task.trim().is_empty() {
         die("agent start: нужна задача".into());
     }
@@ -454,70 +194,62 @@ fn cmd_start(cfg: &Cfg, args: &[String]) {
     println!("{id}");
 }
 
-fn parse_timeout(args: &[String], default: u64) -> u64 {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--timeout" {
-            if let Some(v) = it.next() {
-                return v.parse().unwrap_or(default);
-            }
-        }
-    }
-    default
-}
-
-fn parse_flag(args: &[String], name: &str, default: u64) -> u64 {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == name {
-            if let Some(v) = it.next() {
-                return v.parse().unwrap_or(default);
-            }
-        }
-    }
-    default
-}
-
-fn first_arg(args: &[String]) -> String {
-    args.iter()
-        .find(|a| !a.starts_with("--"))
-        .cloned()
-        .unwrap_or_else(|| die("agent: нужен id подагента".into()))
-}
-
 fn cmd_status(cfg: &Cfg, args: &[String]) {
-    let id = first_arg(args);
+    let id = need_id(&parse_args(args).pos, "status");
     if !cfg.sessions_dir.join(format!("{id}.jsonl")).is_file() {
         die(format!("agent status: нет лога подагента {id}"));
     }
-    println!("{}", snapshot(cfg, &id));
+    println!("{}", log::snapshot(cfg, &id));
+}
+
+/// Вопрос, лежащий в ящике: только смотрим, не забираем. Заберёт его ход сессии
+/// на ближайшей границе — тогда вопрос попадёт в контекст и на него ответят.
+fn pending_question(cfg: &Cfg, me: &str) -> Option<mail::Msg> {
+    mail::peek(&cfg.mail_dir, me)
+        .into_iter()
+        .find(|m| m.kind == "ask")
 }
 
 fn cmd_wait(cfg: &Cfg, args: &[String]) {
-    let id = first_arg(args);
-    let timeout = parse_timeout(args, 3600);
+    let a = parse_args(args);
+    let id = need_id(&a.pos, "wait");
+    let timeout = a.timeout.unwrap_or(3600);
     // Прогресс идёт в stderr: stdout остаётся чистым (его читают как результат),
     // а тишина на 20 минут перестаёт быть нормой.
-    let every = parse_flag(args, "--progress", 30).max(5);
+    let every = a.progress.unwrap_or(30).max(5);
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut last_report = Instant::now();
     loop {
-        if let Some(s) = done_status(cfg, &id) {
-            let text = final_text(cfg, &id).unwrap_or_default();
+        if let Some(s) = log::done_status(cfg, &id) {
+            let text = log::final_text(cfg, &id).unwrap_or_default();
             println!("подагент {id}: {s}");
             if !text.trim().is_empty() {
                 println!("{text}");
             }
             return;
         }
+        // Пока ждём ребёнка, нам мог прийти вопрос. Ждать дальше — гарантированный
+        // дедлок «родитель ждёт ребёнка, ребёнок ждёт родителя»: выходим кодом 4 и
+        // отдаём вопрос вызывающему. Из ящика не забираем — он доедет до хода.
+        if !cfg.me.is_empty() {
+            if let Some(q) = pending_question(cfg, &cfg.me) {
+                println!("в ящике вопрос от {}: {}", q.from, q.text);
+                eprintln!(
+                    "agent wait: вышел по вопросу (код 4). Ответить: agent send {} \"...\"; \
+                     вопрос остался в ящике и доедет до хода сам",
+                    q.from
+                );
+                std::process::exit(4);
+            }
+        }
         // Нет Done, а процесс мёртв — его сняли (OOM/SIGKILL), а не «ещё думает».
-        if !is_live(cfg, &id) {
+        if !log::is_alive(cfg, &id) {
             die(format!(
                 "agent wait: процесс подагента {id} мёртв, а Done в логе нет — он был снят"
             ));
         }
         if last_report.elapsed() >= Duration::from_secs(every) {
-            eprintln!("{}", snapshot(cfg, &id));
+            eprintln!("{}", log::snapshot(cfg, &id));
             last_report = Instant::now();
         }
         if Instant::now() >= deadline {
@@ -525,7 +257,7 @@ fn cmd_wait(cfg: &Cfg, args: &[String]) {
             // от падения (1) и понимал, что повторять бессмысленно только если жив.
             eprintln!(
                 "agent wait: {id} ещё работает, истёк таймаут {timeout}s (код 3 — не ошибка)\n{}",
-                snapshot(cfg, &id)
+                log::snapshot(cfg, &id)
             );
             std::process::exit(3);
         }
@@ -534,51 +266,91 @@ fn cmd_wait(cfg: &Cfg, args: &[String]) {
 }
 
 fn cmd_result(cfg: &Cfg, args: &[String]) {
-    let id = first_arg(args);
-    match final_text(cfg, &id) {
+    let id = need_id(&parse_args(args).pos, "result");
+    match log::final_text(cfg, &id) {
         Some(t) => println!("{t}"),
         None => die(format!("agent result: у {id} нет финального текста")),
     }
 }
 
-fn cmd_ask(cfg: &Cfg, args: &[String]) {
-    if cfg.parent.is_empty() {
-        die("agent ask: я не подагент (нет SNENS_PARENT) — спрашивать некого".into());
+/// Адресат ask: `--parent` или первый позиционный, если это существующий ящик
+/// либо за ним есть ещё текст. Иначе весь первый позиционный — сам вопрос. Без
+/// явного адресата спрашиваем родителя: SNENS_PARENT, а если её нет — обратным
+/// поиском по `children/`.
+fn ask_target(cfg: &Cfg, a: &Args) -> (String, Vec<String>) {
+    let parent = || {
+        if cfg.parent.is_empty() {
+            mail::parent_of(&cfg.mail_dir, &cfg.me).unwrap_or_default()
+        } else {
+            cfg.parent.clone()
+        }
+    };
+    if a.parent_flag {
+        return (parent(), a.pos.clone());
     }
-    let question = take_text(args);
+    let Some(first) = a.pos.first() else {
+        return (parent(), Vec::new());
+    };
+    if mail::box_dir(&cfg.mail_dir, first).is_dir() || a.pos.len() > 1 {
+        (first.clone(), a.pos[1..].to_vec())
+    } else {
+        (parent(), a.pos.clone())
+    }
+}
+
+/// Жив ли адресат. pid регистрирует тот, кто запустил сессию, поэтому: свой
+/// ребёнок — pid у меня, брат — у общего родителя, а родитель нигде (его pid
+/// знает только его родитель) — про такого честно `None`, «не знаю».
+fn target_alive(cfg: &Cfg, target: &str) -> Option<bool> {
+    log::child_pid(cfg, &cfg.me, target)
+        .or_else(|| log::child_pid(cfg, &cfg.parent_or_me(), target))
+        .map(log::alive)
+}
+
+fn cmd_ask(cfg: &Cfg, raw: &[String]) {
+    let a = parse_args(raw);
+    let (target, rest) = ask_target(cfg, &a);
+    if target.is_empty() || target == cfg.me {
+        die("agent ask: некого спрашивать (нет адресата и нет SNENS_PARENT)".into());
+    }
+    let question = take_text(&rest);
     if question.trim().is_empty() {
         die("agent ask: пустой вопрос".into());
     }
-    send(cfg, &cfg.parent, &cfg.me, "ask", &question);
-    // Ждём ответ родителя: он приходит тем же каналом, что steer человека.
-    let timeout = parse_timeout(args, 900);
+    let me = cfg.me_or_die("ask");
+    let asked_at = log::now();
+    mail::send(&cfg.mail_dir, &target, &me, "ask", &question);
+    let timeout = a.timeout.unwrap_or(900);
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
-        for m in drain(cfg, &cfg.me) {
-            if m.kind == "steer" && m.from == cfg.parent {
-                println!("{}", m.text);
-                return;
-            }
-            // Не ответ (итог другого подагента, чей-то steer) — вернём в ящик:
-            // его прочитает цикл сессии на ближайшей границе хода.
-            send(cfg, &cfg.me, &m.from, &m.kind, &m.text);
+        // Фильтр по адресату и по времени: остальное (итоги других детей, steer
+        // человека, чужие вопросы) не выедаем — оно должно доехать до хода сессии,
+        // а старое слово того же адресата — не ответ на этот вопрос. Именно
+        // поэтому здесь фильтр, а не «забрать всё и вернуть обратное»: возврат
+        // переупорядочивал сообщения и мог ходить по кругу.
+        let got = mail::drain_filter(&cfg.mail_dir, &me, |m| {
+            m.kind == "steer" && m.from == target && m.ts >= asked_at
+        });
+        if let Some(m) = got.into_iter().next() {
+            println!("{}", m.text);
+            return;
         }
-        // Родитель умер, пока мы ждали, — вопрос читать некому. Не висим: говорим
+        // Адресат умер, пока мы ждали, — вопрос читать некому. Не висим: говорим
         // об этом и отдаём ход, чтобы ребёнок действовал сам.
-        let plive = child_pid(cfg, &cfg.parent, &cfg.me)
-            .map(alive)
-            .or_else(|| {
-                // pid родителя не зарегистрирован у нас — считаем живым, пока лог растёт
-                let _ = &cfg.parent;
-                None
-            })
-            .unwrap_or(true);
-        if !plive {
-            die("agent ask: родитель больше не работает — ответа нет, действуй сам".into());
+        if target_alive(cfg, &target) == Some(false) {
+            die(format!(
+                "agent ask: {target} больше не работает — ответа нет, действуй сам"
+            ));
         }
         if Instant::now() >= deadline {
+            let left = mail::peek(&cfg.mail_dir, &me).len();
             die(format!(
-                "agent ask: родитель не ответил за {timeout}s — ответа нет, действуй сам"
+                "agent ask: {target} не ответил за {timeout}s — ответа нет, действуй сам{}",
+                if left > 0 {
+                    format!(" (в ящике ждёт {left} сообщ.)")
+                } else {
+                    String::new()
+                }
             ));
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -586,52 +358,140 @@ fn cmd_ask(cfg: &Cfg, args: &[String]) {
 }
 
 fn cmd_send(cfg: &Cfg, args: &[String]) {
-    let id = first_arg(args);
-    let rest: Vec<String> = args.iter().filter(|a| *a != &id).cloned().collect();
-    let text = take_text(&rest);
+    let pos = parse_args(args).pos;
+    let id = need_id(&pos, "send");
+    let text = take_text(&pos[1..]);
     if text.trim().is_empty() {
         die("agent send: пустой текст".into());
     }
     let from = if cfg.me.is_empty() { "human" } else { &cfg.me };
-    send(cfg, &id, from, "steer", &text);
+    mail::send(&cfg.mail_dir, &id, from, "steer", &text);
     println!("отправлено {id}");
 }
 
-fn cmd_list(cfg: &Cfg, _args: &[String]) {
-    let me = if cfg.me.is_empty() {
-        die("agent list: не знаю свою сессию (нет SNENS_SESSION)".into())
+/// Братья: другие дети того же родителя. Родитель — из SNENS_PARENT, а если её
+/// нет — обратным поиском по `children/`.
+fn peers_of(cfg: &Cfg, me: &str) -> (Option<String>, Vec<String>) {
+    let parent = if cfg.parent.is_empty() {
+        mail::parent_of(&cfg.mail_dir, me)
     } else {
-        cfg.me.clone()
+        Some(cfg.parent.clone())
     };
-    let dir = cfg.mail_dir.join(&me).join("children");
-    let mut ids: Vec<String> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .flatten()
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    ids.sort();
-    if ids.is_empty() {
-        println!("(детей нет)");
+    let sibs = parent
+        .as_deref()
+        .map(|p| mail::siblings(&cfg.mail_dir, p, me))
+        .unwrap_or_default();
+    (parent, sibs)
+}
+
+fn cmd_peers(cfg: &Cfg) {
+    let me = cfg.me_or_die("peers");
+    let (parent, sibs) = peers_of(cfg, &me);
+    match parent {
+        None => eprintln!("agent peers: родитель не найден, братьев не определить"),
+        Some(p) if sibs.is_empty() => eprintln!("agent peers: братьев нет (родитель {p})"),
+        Some(p) => eprintln!("agent peers: родитель {p}, братьев {}", sibs.len()),
+    }
+    // stdout — только id: его читают и подставляют в другую команду.
+    for s in sibs {
+        println!("{s}");
+    }
+}
+
+fn cmd_broadcast(cfg: &Cfg, args: &[String]) {
+    let text = take_text(&parse_args(args).pos);
+    if text.trim().is_empty() {
+        die("agent broadcast: пустой текст".into());
+    }
+    let me = cfg.me_or_die("broadcast");
+    let (parent, sibs) = peers_of(cfg, &me);
+    let mut sent = Vec::new();
+    for s in &sibs {
+        mail::send(&cfg.mail_dir, s, &me, "steer", &text);
+        sent.push(s.clone());
+    }
+    // Родителю тоже: он держит контекст дерева, и один и тот же текст ему полезен.
+    if let Some(p) = parent {
+        if p != me {
+            mail::send(&cfg.mail_dir, &p, &me, "steer", &text);
+            sent.push(p);
+        }
+    }
+    if sent.is_empty() {
+        println!("отправлено 0: братьев и родителя нет");
         return;
     }
-    for id in ids {
-        let st = state(cfg, &id);
-        let tail = final_text(cfg, &id)
+    println!("отправлено {}: {}", sent.len(), sent.join(" "));
+}
+
+fn ago_human(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs} с назад"),
+        60..=3599 => format!("{} мин назад", secs / 60),
+        _ => format!("{} ч назад", secs / 3600),
+    }
+}
+
+/// Одна строка дерева: метка, id, состояние, ходы, время последней записи.
+fn node_line(cfg: &Cfg, id: &str, mark: &str, indent: &str, tail: &str) -> String {
+    let (steps, ago) = log::stats(cfg, id);
+    format!(
+        "{indent}{mark} {id}: {}, ходов {steps}, запись {}{tail}",
+        log::state(cfg, id),
+        ago_human(ago)
+    )
+}
+
+fn cmd_list(cfg: &Cfg) {
+    let me = cfg.me.clone();
+    let parent = if me.is_empty() {
+        None
+    } else if cfg.parent.is_empty() {
+        mail::parent_of(&cfg.mail_dir, &me)
+    } else {
+        Some(cfg.parent.clone())
+    };
+    let sibs = parent
+        .as_deref()
+        .map(|p| mail::siblings(&cfg.mail_dir, p, &me))
+        .unwrap_or_default();
+    let kids = mail::children(&cfg.mail_dir, &me);
+
+    println!("дерево (> я, ^ родитель, = брат, - ребёнок)");
+    match parent.as_deref() {
+        Some(p) => println!("{}", node_line(cfg, p, "^", "", "")),
+        None => println!("  (родителя нет — корневая сессия)"),
+    }
+    if sibs.is_empty() {
+        println!("  (братьев нет)");
+    }
+    for s in &sibs {
+        println!("{}", node_line(cfg, s, "=", "  ", ""));
+    }
+    if me.is_empty() {
+        println!("  (я — без SNENS_SESSION, себя в дереве не знаю)");
+    } else {
+        println!("{}", node_line(cfg, &me, ">", "", ""));
+    }
+    if kids.is_empty() {
+        println!("  (детей нет)");
+        return;
+    }
+    for id in kids {
+        let tail = log::final_text(cfg, &id)
             .map(|t| {
                 let one = t.split_whitespace().collect::<Vec<_>>().join(" ");
                 let s: String = one.chars().take(100).collect();
                 format!(" — {s}")
             })
             .unwrap_or_default();
-        println!("{id}: {st}{tail}");
+        println!("{}", node_line(cfg, &id, "-", "  ", &tail));
     }
 }
 
 fn cmd_kill(cfg: &Cfg, args: &[String]) {
-    let id = first_arg(args);
-    let pid = child_pid(cfg, &cfg.me, &id);
+    let id = need_id(&parse_args(args).pos, "kill");
+    let pid = log::child_pid(cfg, &cfg.me, &id).or_else(|| log::child_pid(cfg, &cfg.parent, &id));
     let Some(pid) = pid else {
         die(format!("agent kill: не знаю pid подагента {id}"));
     };

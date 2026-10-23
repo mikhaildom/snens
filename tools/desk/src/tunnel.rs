@@ -69,7 +69,10 @@ fn ps_encoded(script: &str) -> String {
 fn powershell(host: &str, script: &str) -> Result<String, String> {
     ssh(
         host,
-        &format!("powershell -NoProfile -EncodedCommand {}", ps_encoded(script)),
+        &format!(
+            "powershell -NoProfile -EncodedCommand {}",
+            ps_encoded(script)
+        ),
     )
 }
 
@@ -134,7 +137,9 @@ pub fn ensure(host: &str, remote_port: u16) -> Result<u16, String> {
         }
         if Instant::now() >= until {
             let _ = Command::new("kill").arg(pid.to_string()).status();
-            return Err(format!("ssh-туннель к {host}:{remote_port} не открыл порт за 12 с"));
+            return Err(format!(
+                "ssh-туннель к {host}:{remote_port} не открыл порт за 12 с"
+            ));
         }
         std::thread::sleep(Duration::from_millis(120));
     }
@@ -211,7 +216,11 @@ pub fn start_agent(host: &str, port: u16) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(300));
             }
             // Скрипт агента кладём через stdin (аргументы ssh ломают кавычки).
-            put_file(host, "snens-desk-agent.ps1", include_str!("../agent/desk-agent.ps1"))?;
+            put_file(
+                host,
+                "snens-desk-agent.ps1",
+                include_str!("../agent/desk-agent.ps1"),
+            )?;
             let task = "snens-desk-agent";
             let tr = format!(
                 r"powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\%USERNAME%\snens-desk-agent.ps1 -Port {port}"
@@ -250,7 +259,9 @@ fn listening(host: &str, port: u16) -> Result<bool, String> {
     } else {
         let out = ssh(
             host,
-            &format!("sh -c 'ss -ltn 2>/dev/null | grep -q \":{port} \" && echo LISTENING || echo free'"),
+            &format!(
+                "sh -c 'ss -ltn 2>/dev/null | grep -q \":{port} \" && echo LISTENING || echo free'"
+            ),
         )?;
         Ok(out.contains("LISTENING"))
     }
@@ -303,12 +314,19 @@ fn base64(data: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
-
 
 /// Ждём, пока агент ответит на ping через туннель.
 fn wait_agent(host: &str, port: u16, budget: Duration) -> Result<(), String> {
@@ -347,7 +365,8 @@ fn ping(local_port: u16) -> Result<(), String> {
     let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(3))
         .map_err(|e| format!("{addr}: {e}"))?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-    s.write_all(b"{\"cmd\":\"ping\"}\n").map_err(|e| format!("{e}"))?;
+    s.write_all(b"{\"cmd\":\"ping\"}\n")
+        .map_err(|e| format!("{e}"))?;
     let mut buf = Vec::new();
     let mut one = [0u8; 1];
     loop {

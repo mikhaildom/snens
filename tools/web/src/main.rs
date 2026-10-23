@@ -19,9 +19,9 @@ use serde_json::{json, Value};
 
 pub mod act;
 pub mod cdp;
+pub mod launch;
 pub mod snap;
 pub mod state;
-pub mod launch;
 pub mod tunnel;
 
 const USAGE: &str = "web <команда> … — браузер машины пользователя через CDP: снимок дерева с адресами, действия по адресам и батчем, скриншот как fallback";
@@ -102,12 +102,15 @@ impl Args {
                 if let Some(v) = v {
                     a.flags.insert(k, v);
                 } else if let Some(next) = it.peek() {
-                    // Значение флага — только если это не следующий флаг и не
-                    // подкоманда в известной позиции; иначе голый флаг.
-                    if !next.starts_with("--") && !a.positional.is_empty() {
-                        let v = it.next().unwrap().clone();
-                        a.flags.insert(k, v);
-                    } else if !next.starts_with("--") && !is_command(next) {
+                    // Значение флага — только если следующее слово не флаг и не
+                    // подкоманда в известной позиции; иначе это голый флаг.
+                    // Два условия в одном: «позиционные уже были» (значит это
+                    // аргументы, а не подкоманда) или «слово не команда».
+                    // Проверка на `--` общая: значение самого флага флагом быть
+                    // не может.
+                    let takes_value =
+                        !next.starts_with("--") && (!a.positional.is_empty() || !is_command(next));
+                    if takes_value {
                         let v = it.next().unwrap().clone();
                         a.flags.insert(k, v);
                     } else {
@@ -132,9 +135,7 @@ impl Args {
     }
 
     pub fn num(&self, name: &str, def: f64) -> f64 {
-        self.flag(name)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(def)
+        self.flag(name).and_then(|v| v.parse().ok()).unwrap_or(def)
     }
 }
 
@@ -164,7 +165,11 @@ fn is_command(s: &str) -> bool {
 fn port_from(args: &Args) -> u16 {
     args.flag("port")
         .and_then(|p| p.parse().ok())
-        .or_else(|| std::env::var("SNENS_CDP_PORT").ok().and_then(|p| p.parse().ok()))
+        .or_else(|| {
+            std::env::var("SNENS_CDP_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+        })
         .unwrap_or(9222)
 }
 
@@ -231,7 +236,9 @@ pub fn live(args: &Args) -> Result<Live, String> {
         }
     };
     let url = ep.ws_url(Some(&tab)).map_err(|e| {
-        format!("{e}\nвкладка {tab} пропала — `web status`, чтобы увидеть живые, `web connect` заново")
+        format!(
+            "{e}\nвкладка {tab} пропала — `web status`, чтобы увидеть живые, `web connect` заново"
+        )
     })?;
     let host_header = format!("127.0.0.1:{}", ep.remote_port);
     let timeout = args.num("timeout", 30.0);
@@ -247,12 +254,20 @@ pub fn live(args: &Args) -> Result<Live, String> {
             let mut b = b.with_session(sid.clone());
             // Проверяем, что сессия живая, до того как отдать её вызывающему:
             // иначе первая же команда упадёт непонятной ошибкой.
-            b.call("Runtime.evaluate", json!({"expression": "1", "returnByValue": true}))?;
+            b.call(
+                "Runtime.evaluate",
+                json!({"expression": "1", "returnByValue": true}),
+            )?;
             b
         }
         Err(e) => return Err(e),
     };
-    Ok(Live { cdp, tab, port: ep.port, ep })
+    Ok(Live {
+        cdp,
+        tab,
+        port: ep.port,
+        ep,
+    })
 }
 
 /// Вкладки: сначала обычный `/json/list`, а если его нет (Chrome ≥144 в режиме
@@ -363,7 +378,13 @@ fn cmd_connect(args: &Args) -> Result<(), String> {
             _ => String::new(),
         },
         trunc(&tab, 8),
-        trunc(targets[0].get("title").and_then(Value::as_str).unwrap_or(""), 60)
+        trunc(
+            targets[0]
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            60
+        )
     );
     for (i, t) in targets.iter().enumerate().take(10) {
         println!("{}", tab_line(i, t));
@@ -377,7 +398,10 @@ fn cmd_status(args: &Args) -> Result<(), String> {
         Some((t, tab)) => {
             println!("привязка: 127.0.0.1:{}, вкладка {}", t.port, trunc(&tab, 8));
             if let Some(tn) = tunnel::load() {
-                println!("туннель: {} (pid {}), порт там {}", tn.host, tn.pid, tn.remote_port);
+                println!(
+                    "туннель: {} (pid {}), порт там {}",
+                    tn.host, tn.pid, tn.remote_port
+                );
             }
         }
         None => println!("привязки нет (`web connect`)"),
@@ -402,7 +426,7 @@ fn cmd_tabs(args: &Args) -> Result<(), String> {
 fn cmd_use(args: &Args) -> Result<(), String> {
     let want = args
         .positional
-        .get(0)
+        .first()
         .ok_or("web use: нужен id вкладки или её номер из `web tabs`")?;
     let ep = endpoint(args);
     if state::load_target().is_none() {
@@ -443,7 +467,7 @@ fn cmd_use(args: &Args) -> Result<(), String> {
 fn cmd_open(args: &Args) -> Result<(), String> {
     let url = args
         .positional
-        .get(0)
+        .first()
         .ok_or("web open: нужен URL")?
         .clone();
     if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")) {
@@ -471,14 +495,18 @@ fn cmd_open(args: &Args) -> Result<(), String> {
         )?;
         l = live(args)?;
     } else {
-        let r = l.cdp.call("Page.navigate", json!({"url": url, "transitionType": "typed"}))?;
+        let r = l.cdp.call(
+            "Page.navigate",
+            json!({"url": url, "transitionType": "typed"}),
+        )?;
         if let Some(err) = r.get("errorText").and_then(Value::as_str) {
             if !err.is_empty() {
                 return Err(format!("страница не открылась: {url}: {err}"));
             }
         }
     }
-    l.cdp.wait_ready(Duration::from_secs(args.num("wait", 15.0) as u64))?;
+    l.cdp
+        .wait_ready(Duration::from_secs(args.num("wait", 15.0) as u64))?;
     report_page(&mut l.cdp, "открыто")
 }
 
@@ -511,11 +539,7 @@ fn cmd_snap(args: &Args) -> Result<(), String> {
     let path = state::save_page(&l.tab, &full)?;
     state::save_url(&l.tab, &s.url);
     let refs_path = state::save_refs(&l.tab, &s.refs)?;
-    println!(
-        "{} — {}",
-        trunc(&s.url, 120),
-        trunc(&s.title, 80)
-    );
+    println!("{} — {}", trunc(&s.url, 120), trunc(&s.title, 80));
     println!(
         "дерево: {} узлов, интерактивных {} → {}",
         s.total,
@@ -548,7 +572,10 @@ fn cmd_text(args: &Args) -> Result<(), String> {
     let cut: String = text.chars().take(limit).collect();
     println!("{cut}");
     if text.chars().count() > limit {
-        println!("… обрезано: {} символов всего, --limit чтобы поднять", text.chars().count());
+        println!(
+            "… обрезано: {} символов всего, --limit чтобы поднять",
+            text.chars().count()
+        );
     }
     Ok(())
 }
@@ -561,13 +588,16 @@ fn cmd_eval(args: &Args) -> Result<(), String> {
     let expr = args
         .flag("expr")
         .map(str::to_string)
-        .or_else(|| args.positional.get(0).cloned())
+        .or_else(|| args.positional.first().cloned())
         .ok_or("web eval: нужно JS-выражение (аргументом или --expr)")?;
     let mut l = live(args)?;
     let v = l.cdp.eval(&expr)?;
     match v {
         Value::String(s) => println!("{s}"),
-        other => println!("{}", serde_json::to_string_pretty(&other).unwrap_or_default()),
+        other => println!(
+            "{}",
+            serde_json::to_string_pretty(&other).unwrap_or_default()
+        ),
     }
     Ok(())
 }
@@ -701,7 +731,9 @@ fn cmd_show(args: &Args) -> Result<(), String> {
         Some(h) => h.to_string(),
         None => match state::load_launch() {
             Some((h, _)) => h,
-            None => return Err("web show: нужен --tunnel user@machine или сначала `web launch`".into()),
+            None => {
+                return Err("web show: нужен --tunnel user@machine или сначала `web launch`".into())
+            }
         },
     };
     launch::show_window(&host)?;
@@ -751,7 +783,10 @@ fn cmd_shot(args: &Args) -> Result<(), String> {
             let d = std::env::var("SNENS_ATTACH_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| state::dir());
-            d.join(format!("web-{}.png", l.tab.chars().take(8).collect::<String>()))
+            d.join(format!(
+                "web-{}.png",
+                l.tab.chars().take(8).collect::<String>()
+            ))
         });
     if let Some(parent) = out.parent() {
         let _ = std::fs::create_dir_all(parent);

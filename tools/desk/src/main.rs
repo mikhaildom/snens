@@ -198,10 +198,7 @@ fn cmd_launch(args: &Args) -> Result<(), String> {
     // Проверяем, что он действительно отвечает, а не просто «команда прошла».
     let up = tunnel::ensure(&host, port)?;
     let _ = up;
-    let v = call(
-        args,
-        json!({"cmd": "ping"}),
-    )?;
+    let v = call(args, json!({"cmd": "ping"}))?;
     println!(
         "готов: сессия {}, pid {}",
         v.get("session").map(|x| x.to_string()).unwrap_or_default(),
@@ -283,10 +280,7 @@ fn refs_path(host: &str) -> std::path::PathBuf {
 
 fn cmd_snap(args: &Args) -> Result<(), String> {
     let host = tunnel::host(args)?;
-    let v = call(
-        args,
-        json!({"cmd": "snap", "window": window_flag(args)}),
-    )?;
+    let v = call(args, json!({"cmd": "snap", "window": window_flag(args)}))?;
     let tree = v.get("tree").and_then(Value::as_str).unwrap_or("");
     let refs = v.get("refs").cloned().unwrap_or(Value::Array(vec![]));
     let dir = refs_path(&host);
@@ -310,7 +304,11 @@ fn cmd_snap(args: &Args) -> Result<(), String> {
     }
     let n = tree.lines().count();
     if n > 12 {
-        println!("… ещё {} строк, читать: grep -n <слово> {}", n - 12, page.display());
+        println!(
+            "… ещё {} строк, читать: grep -n <слово> {}",
+            n - 12,
+            page.display()
+        );
     }
     Ok(())
 }
@@ -322,7 +320,8 @@ fn cmd_act(args: &Args) -> Result<(), String> {
         .map(str::to_string)
         .or_else(|| args.positional.get(1).cloned())
         .ok_or("desk act: нужен --json '<массив действий>'")?;
-    let actions: Value = serde_json::from_str(&raw).map_err(|e| format!("desk act: не JSON: {e}"))?;
+    let actions: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("desk act: не JSON: {e}"))?;
     if !actions.is_array() {
         return Err("desk act: ожидается массив действий, напр. [{\"click\":\"e3\"}]".into());
     }

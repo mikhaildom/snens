@@ -43,7 +43,10 @@ fn large_cyrillic_content_is_written_verbatim() {
     let ev: serde_json::Value = serde_json::from_str(out.trim()).expect("ответ не JSON");
     assert_eq!(ev["bytes"].as_u64().unwrap() as usize, s.len());
     assert_eq!(ev["bytes_on_disk"].as_u64().unwrap() as usize, disk.len());
-    assert_eq!(ev["lines"].as_u64().unwrap() as u64, s.matches('\n').count() as u64);
+    assert_eq!(
+        ev["lines"].as_u64().unwrap() as u64,
+        s.matches('\n').count() as u64
+    );
 }
 
 /// Битый content — отказ, файла нет. Раньше порча молча уезжала на диск.
@@ -67,5 +70,8 @@ fn append_separates_lines_and_reports_counts() {
     assert_eq!(std::fs::read_to_string(&p).unwrap(), "первая\nвторая\n");
     let ev: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(ev["appended"], true);
-    assert_eq!(ev["bytes_on_disk"].as_u64().unwrap(), "первая\nвторая\n".len() as u64);
+    assert_eq!(
+        ev["bytes_on_disk"].as_u64().unwrap(),
+        "первая\nвторая\n".len() as u64
+    );
 }

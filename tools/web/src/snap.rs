@@ -100,7 +100,12 @@ pub fn take(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
     // Корни — узлы, на которые никто не ссылается как на ребёнка.
     let mut claimed: HashMap<&str, ()> = HashMap::new();
     for n in &nodes {
-        for c in n.get("childIds").and_then(Value::as_array).into_iter().flatten() {
+        for c in n
+            .get("childIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             if let Some(s) = c.as_str() {
                 claimed.insert(s, ());
             }
@@ -233,7 +238,12 @@ fn walk(
         return;
     }
     if ignored(n) {
-        for c in n.get("childIds").and_then(Value::as_array).into_iter().flatten() {
+        for c in n
+            .get("childIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             if let Some(child) = c.as_str().and_then(|cid| by_id.get(cid)) {
                 walk(child, by_id, depth, depth_cap, counter, snap);
             }
@@ -270,8 +280,17 @@ fn walk(
         snap.text.push_str(&l);
         snap.text.push('\n');
     }
-    let child_depth = if snap.text.len() > text_len { depth + 1 } else { depth };
-    for c in n.get("childIds").and_then(Value::as_array).into_iter().flatten() {
+    let child_depth = if snap.text.len() > text_len {
+        depth + 1
+    } else {
+        depth
+    };
+    for c in n
+        .get("childIds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         if let Some(cid) = c.as_str() {
             if let Some(child) = by_id.get(cid) {
                 walk(child, by_id, child_depth, depth_cap, counter, snap);

@@ -69,7 +69,11 @@ pub fn embed_batch(cfg: &Cfg, texts: &[String]) -> Option<Vec<Vec<f32>>> {
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let vec = item["embedding"].as_array()?;
-        out.push(vec.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect());
+        out.push(
+            vec.iter()
+                .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                .collect(),
+        );
     }
     (out.len() == texts.len()).then_some(out)
 }

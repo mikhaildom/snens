@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::{cfg::Config, R};
 
 /// Один тикет: front-matter плюс тело. Хранится целиком, чтобы `grep` не
@@ -20,9 +22,89 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    fn hit_count(&self) -> u64 {
+    pub fn hit_count(&self) -> u64 {
         self.hits.trim().parse().unwrap_or(0)
     }
+
+    /// Первая непустая строка секции «Симптом» — то же, что видит список в CLI.
+    pub fn symptom(&self) -> String {
+        symptom(&self.body)
+    }
+
+    /// Когда файл трогали последний раз (unix, сек). `0` — метаданных нет.
+    pub fn mtime(&self) -> u64 {
+        mtime(&self.path)
+    }
+}
+
+/// Строка списка для поверхности: только то, что видно в дашборде, без тела.
+#[derive(Clone, Debug, Serialize)]
+pub struct Summary {
+    pub name: String,
+    pub status: String,
+    pub kind: String,
+    pub target: String,
+    pub family: String,
+    pub weight: String,
+    pub hits: u64,
+    pub symptom: String,
+    /// Время правки файла, unix-секунды. По нему и сортируется список.
+    pub mtime: u64,
+}
+
+impl From<&Ticket> for Summary {
+    fn from(t: &Ticket) -> Self {
+        Summary {
+            name: t.name.clone(),
+            status: t.status.clone(),
+            kind: t.kind.clone(),
+            target: t.target.clone(),
+            family: t.family.clone(),
+            weight: t.weight.clone(),
+            hits: t.hit_count(),
+            symptom: clip(&t.symptom(), 200),
+            mtime: t.mtime(),
+        }
+    }
+}
+
+/// Время правки файла в unix-секундах; `0`, если метаданные не читаются.
+fn mtime(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Тикеты для дашборда: свежие сверху. Сортировка по mtime, а не по имени:
+/// имя — дата создания, а дописанная «История» старый тикет делает свежим.
+/// При равном mtime имя решает, чтобы порядок был устойчив между запросами.
+pub fn summaries(dir: &Path) -> Vec<Summary> {
+    let mut out: Vec<Summary> = load_all(dir).iter().map(Summary::from).collect();
+    out.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(a.name.cmp(&b.name)));
+    out
+}
+
+/// Допустимое имя тикета: имя файла без `.md`. Приходит из URL, поэтому `../`,
+/// слэши и точки в начале отсекаются здесь, а не в каждом хендлере.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Один тикет по имени. Имя — ровно имя файла без `.md`: префиксы и поиск
+/// остаются в CLI, поверхность отдаёт то, что попросили.
+pub fn find(dir: &Path, name: &str) -> Option<Ticket> {
+    if !valid_name(name) {
+        return None;
+    }
+    load_all(dir).into_iter().find(|t| t.name == name)
 }
 
 /// Поле front-matter: первая строка `key:`, значение триммится.
@@ -347,5 +429,64 @@ mod tests {
     #[test]
     fn missing_dir_is_not_an_error() {
         assert!(open_list(Path::new("/нет/такого/каталога")).contains("тикетов нет"));
+    }
+
+    #[test]
+    fn summaries_carry_fields_symptom_and_mtime() {
+        let d = tmp();
+        let rows = summaries(&d);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let row = rows.iter().find(|r| r.name == "2026-09-22-read").unwrap();
+        assert_eq!(row.status, "open");
+        assert_eq!(row.kind, "defect");
+        assert_eq!(row.target, "read");
+        assert_eq!(row.hits, 2, "hits приходят числом, а не строкой");
+        assert_eq!(row.symptom, "Отказ без подсказки");
+        assert!(row.mtime > 0, "mtime не доехал: {row:?}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn summaries_are_newest_first() {
+        let d = tmp();
+        // Портим порядок имён: файл с «младшим» именем должен всплыть наверх
+        // именно из-за mtime, а не по алфавиту. Пауза — чтобы mtime различались
+        // даже на ФС с секундной точностью.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(d.join("2026-01-01-fresh.md"), DONE).unwrap();
+        let rows = summaries(&d);
+        assert_eq!(rows[0].name, "2026-01-01-fresh", "{rows:?}");
+        assert!(rows.windows(2).all(|w| w[0].mtime >= w[1].mtime), "{rows:?}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn symptom_is_clipped_for_dashboard() {
+        let long = format!("---\nstatus: open\n---\n## Симптом\n{}\n", "я".repeat(500));
+        let t = parse("x", PathBuf::from("x"), &long);
+        let s = clip(&t.symptom(), 200);
+        assert!(s.chars().count() <= 201, "не обрезано: {}", s.chars().count());
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn find_takes_exact_name_and_refuses_traversal() {
+        let d = tmp();
+        assert!(find(&d, "2026-09-22-read").is_some());
+        assert!(find(&d, "2026-09-22-r").is_none(), "префикс — дело CLI");
+        assert!(find(&d, "../2026-09-22-read").is_none());
+        assert!(find(&d, "/etc/passwd").is_none());
+        assert!(find(&d, "").is_none());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn empty_dir_gives_empty_list() {
+        let d = std::env::temp_dir().join(format!("snens-tickets-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(summaries(&d).is_empty());
+        assert!(summaries(Path::new("/нет/такого/каталога")).is_empty());
+        std::fs::remove_dir_all(&d).ok();
     }
 }

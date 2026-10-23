@@ -567,11 +567,28 @@ impl Config {
     }
 
     /// Каталог симлинков на тулы — сосед каталога тулов, чтобы всё жило в одном месте.
+    ///
+    /// Исключение — поставка: там тулы лежат рядом с exe (`%LOCALAPPDATA%\snens\
+    /// tools`), а писать в каталог установки нельзя: обновление перезаписывает
+    /// бандл, и каталог может быть только для чтения. Поэтому в поставке `bin/`
+    /// живёт в каталоге данных.
     pub fn bin_path(&self) -> PathBuf {
-        self.tools_path()
-            .parent()
-            .map(|p| p.join("bin"))
-            .unwrap_or_else(|| PathBuf::from("bin"))
+        let tools = self.tools_path();
+        let shipped = tools.parent().is_some_and(|p| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(Path::to_path_buf))
+                .is_some_and(|exe| exe == p)
+        });
+        let base = if shipped {
+            self.data_path()
+        } else {
+            tools
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+        base.join("bin")
     }
 
     /// Программа долгой памяти: имя — из каталога тулов (там же, где `bin/`),

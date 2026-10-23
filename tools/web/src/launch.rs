@@ -30,8 +30,16 @@ fn base64(data: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -40,7 +48,10 @@ fn base64(data: &[u8]) -> String {
 fn powershell(host: &str, script: &str) -> Result<String, String> {
     ssh(
         host,
-        format!("powershell -NoProfile -EncodedCommand {}", ps_encoded(script)),
+        format!(
+            "powershell -NoProfile -EncodedCommand {}",
+            ps_encoded(script)
+        ),
     )
 }
 
@@ -77,12 +88,19 @@ pub fn remote_os(host: &str) -> Result<&'static str, String> {
     match ssh(host, "cmd /c echo SNENS_WINDOWS") {
         Ok(s) if s.contains("SNENS_WINDOWS") => return Ok("windows"),
         Ok(_) => {}
-        Err(e) if e.contains("Permission denied") || e.contains("Connection refused") || e.contains("timed out") => {
+        Err(e)
+            if e.contains("Permission denied")
+                || e.contains("Connection refused")
+                || e.contains("timed out") =>
+        {
             return Err(format!("ssh до {host} не работает: {e}"));
         }
         Err(_) => {}
     }
-    if ssh(host, "uname -s").map(|s| !s.trim().is_empty()).unwrap_or(false) {
+    if ssh(host, "uname -s")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
         return Ok("unix");
     }
     Err(format!(
@@ -330,8 +348,11 @@ fn wait_port(host: &str, port: u16, budget: Duration) -> Result<(), String> {
             return Ok(());
         }
         if Instant::now() >= until {
-            let diag = ssh(host, format!("cmd /c type C:\\Users\\%USERNAME%\\snens-chrome-visible.out 2>nul"))
-                .unwrap_or_default();
+            let diag = ssh(
+                host,
+                "cmd /c type C:\\Users\\%USERNAME%\\snens-chrome-visible.out 2>nul",
+            )
+            .unwrap_or_default();
             return Err(format!(
                 "Chrome на {host} не поднял отладку на порту {port} за {} с.{}\n\
                  Частые причины: порт занят другим Chrome (тогда профиль агента не свой), \
