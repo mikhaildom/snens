@@ -286,11 +286,40 @@ pub struct Session {
     id: String,
     path: PathBuf,
     file: Mutex<File>,
+    /// Эксклюзивность «один писатель на журнал» — отдельный `.lock`-файл, а не
+    /// сам журнал. На Windows `fs2` лочит весь файл (LockFileEx), и любой
+    /// читатель того же журнала получает os error 33: `history` не работал
+    /// вовсе, пока сессия открыта. На Linux flock такого запрета не даёт —
+    /// поэтому баг был невидим. Отдельный файл держит то же правило (второй
+    /// писатель не откроется), но чтение данных ничем не ограничено.
+    #[allow(dead_code)] // держится ради блокировки: закрытие файла снимает её (RAII)
+    lock: Option<File>,
     lines: AtomicU64,
     /// Сессия-родитель, если это подагент; читается из `Meta` при открытии.
     parent: String,
     /// Каталог, где искать источник `Replay` (он лежит рядом с этим логом).
     dir: PathBuf,
+}
+
+/// Держать эксклюзивную «пишущую» блокировку журнала отдельным файлом.
+///
+/// Почему не блокировать сам журнал: на Windows `fs2` использует LockFileEx,
+/// которая запрещает ЧТЕНИЕ залоченного файла другими хендлами. Пока сессия
+/// открыта, `history`, discovery и поиск получали os error 33 — то есть сессия
+/// была нечитаемой (на Linux flock такого запрета не даёт, и баг не проявлялся).
+/// Отдельный `.lock` сохраняет правило «один писатель», ничего не ломая читателям.
+fn hold_writer_lock(dir: &Path, id: &str) -> R<File> {
+    let path = dir.join(format!("{id}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.try_lock_exclusive().map_err(|e| {
+        format!("session {id} is already open for writing (possibly by surface API); stop that writer before resuming: {e}")
+    })?;
+    Ok(file)
 }
 
 impl Session {
@@ -324,21 +353,21 @@ impl Session {
             .read(true)
             .append(true)
             .open(&path)?;
-        file.try_lock_exclusive().map_err(|e| {
-            format!("session {id} is already open for writing (possibly by surface API); stop that writer before resuming: {e}")
-        })?;
-        let lines = AtomicU64::new(recover_tail(&mut file, &path)?.max(1));
+        let lock = hold_writer_lock(dir, id)?;
+        // Один проход по файлу: число записей и `Meta.parent`. Раньше здесь
+        // стояли `count_lines` и `read_file`, оба открывали файл заново — под
+        // эксклюзивной блокировкой на Windows это невозможно, и открытие
+        // сессии вставало насмерть (на Linux flock такого запрета не даёт).
+        let (lines, recs) = recover_tail(&mut file, &path)?;
+        let lines = AtomicU64::new(lines.max(1));
         let dir = dir.to_path_buf();
         // Родитель неизменяем и живёт в `Meta`: при открытии существующего лога
         // берём его оттуда, а не из аргумента (resume подагента не должен терять связь).
         let parent = if exists {
-            read_file(&path)
-                .ok()
-                .and_then(|rs| {
-                    rs.into_iter().find_map(|r| match r {
-                        Rec::Meta { parent, .. } => Some(parent),
-                        _ => None,
-                    })
+            recs.into_iter()
+                .find_map(|r| match r {
+                    Rec::Meta { parent, .. } => Some(parent),
+                    _ => None,
                 })
                 .unwrap_or_default()
         } else {
@@ -349,6 +378,7 @@ impl Session {
                 id: id.to_string(),
                 path,
                 file: Mutex::new(file),
+                lock: Some(lock),
                 lines,
                 parent: parent.clone(),
                 dir,
@@ -366,6 +396,7 @@ impl Session {
             id: id.to_string(),
             path,
             file: Mutex::new(file),
+            lock: Some(lock),
             lines,
             parent,
             dir,
@@ -467,12 +498,13 @@ impl Session {
         }
         std::fs::rename(&tmp, &self.path)?;
         // Дескриптор указывает на старый (уже отвязанный) инод: дописывать через
-        // него — значит писать в никуда. Переоткрываем сами, пока держим лок.
+        // него — значит писать в никуда. Переоткрываем сами; эксклюзивность
+        // пишущего держит отдельный `.lock`-файл (`hold_writer_lock`), сам журнал
+        // не блокируем — иначе читатели на Windows получают os error 33.
         let file = OpenOptions::new()
             .read(true)
             .append(true)
             .open(&self.path)?;
-        file.try_lock_exclusive()?;
         *self.file.lock().map_err(|_| "session log lock poisoned")? = file;
         self.lines.store(out.len() as u64, Ordering::Relaxed);
         Ok(())
@@ -489,24 +521,26 @@ impl Session {
 /// второй хендл не мог читать область, залоченную первым (`recover_tail`
 /// работает под эксклюзивной блокировкой). Создание сессии вставало насмерть:
 /// CPU в цикле, запрос висит, ядро не отвечает ни на что.
-fn recover_tail(file: &mut File, path: &Path) -> R<u64> {
+fn recover_tail(file: &mut File, path: &Path) -> R<(u64, Vec<Rec>)> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let complete_end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
 
     let mut lines = 0u64;
+    let mut recs = Vec::new();
     for (i, line) in bytes[..complete_end].split(|b| *b == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        serde_json::from_slice::<Rec>(line).map_err(|e| {
+        let rec = serde_json::from_slice::<Rec>(line).map_err(|e| {
             format!(
                 "corrupt session log {} at complete line {}: {e}",
                 path.display(),
                 i + 1
             )
         })?;
+        recs.push(rec);
         lines += 1;
     }
 
@@ -520,7 +554,7 @@ fn recover_tail(file: &mut File, path: &Path) -> R<u64> {
         }
         file.sync_data()?;
     }
-    Ok(lines)
+    Ok((lines, recs))
 }
 
 /// Первые `n` записей файла без чтения остального. Нужно там, где всё решается
@@ -600,19 +634,28 @@ pub fn read_file(path: &Path) -> R<Vec<Rec>> {
     }
     let f = File::open(path)?;
     let mut out = Vec::new();
-    for (i, line) in BufReader::new(f).lines().enumerate() {
-        let line = line?;
+    let mut lines: Vec<String> = Vec::new();
+    for line in BufReader::new(f).lines() {
+        lines.push(line?);
+    }
+    let total = lines.iter().filter(|l| !l.trim().is_empty()).count() as u64;
+    let mut seen = 0u64;
+    for line in &lines {
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<Rec>(&line) {
+        seen += 1;
+        match serde_json::from_str::<Rec>(line) {
             Ok(r) => out.push(r),
-            // Битая последняя строка — оборванная запись, а не порча данных.
+            // Битая ПОСЛЕДНЯЯ запись — оборванная строка (процесс убили посреди
+            // записи), это не порча. Проверяем счётчиком, а не повторным
+            // открытием файла: под эксклюзивной блокировкой (Windows) второе
+            // открытие того же файла не читается вовсе.
             Err(e) => {
-                if i as u64 + 1 == count_lines(path)? {
+                if seen == total {
                     continue;
                 }
-                eprintln!("[log] строка {} пропущена: {e}", i + 1);
+                eprintln!("[log] строка {} пропущена: {e}", seen);
             }
         }
     }
@@ -651,13 +694,6 @@ pub fn read_head_bytes(path: &Path, max_bytes: u64) -> R<Vec<Rec>> {
     Ok(out)
 }
 
-fn count_lines(path: &Path) -> R<u64> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let f = File::open(path)?;
-    Ok(BufReader::new(f).lines().count() as u64)
-}
 
 pub fn latest(dir: &Path) -> R<String> {
     let mut best: Option<(std::time::SystemTime, String)> = None;
