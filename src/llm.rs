@@ -109,6 +109,30 @@ impl SseFrames {
     }
 }
 
+// ---------- подпись приложения ----------
+
+/// Атрибуция приложения в OpenRouter: роутер группирует запросы по этим заголовкам,
+/// и в аналитике/рейтингах мы видим «snens», а не безымянный источник.
+///
+/// `HTTP-Referer` — обязательный идентификатор (без него приложение не заводится),
+/// `X-OpenRouter-Title` — отображаемое имя. Заголовки ставим только для роутера:
+/// у строгих апстримов (Nous) лишний `Origin`/`Referer` — повод для 403.
+const APP_REFERER: (&str, &str) = ("HTTP-Referer", "https://docs.svuvi.ch");
+const APP_TITLE: (&str, &str) = ("X-OpenRouter-Title", "snens agent");
+
+/// Заголовки атрибуции для адреса провайдера. Пусто — не роутер: подписываться
+/// нечем и незачем.
+pub fn attribution_headers(base_url: &str) -> Vec<(String, String)> {
+    let host = base_url.trim().to_ascii_lowercase();
+    if !host.contains("openrouter") {
+        return Vec::new();
+    }
+    vec![
+        (APP_REFERER.0.to_string(), APP_REFERER.1.to_string()),
+        (APP_TITLE.0.to_string(), APP_TITLE.1.to_string()),
+    ]
+}
+
 // ---------- openai-compatible ----------
 
 pub struct OpenAi {
@@ -204,6 +228,11 @@ impl OpenAi {
         }
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
         let mut req = self.client.post(&url).bearer_auth(&self.key).json(&body);
+        // Подпись идут первыми: заголовки из конфига человека важнее дефолтов
+        // (reqwest добавляет повторы, и побеждает последнее значение).
+        for (k, v) in attribution_headers(&cfg.base_url) {
+            req = req.header(k, v);
+        }
         for (k, v) in &cfg.headers {
             req = req.header(k, v);
         }
@@ -526,6 +555,67 @@ mod tests {
         let mut f = SseFrames::default();
         f.push(b"data: {\"choices\":[");
         assert!(f.next().is_none(), "неполный кадр выдан за целый");
+    }
+
+    /// Подпись — только роутеру. У строгого апстрима лишний `Referer`/`Origin`
+    /// может дать 403, поэтому проверяем и обратную сторону.
+    #[test]
+    fn attribution_only_for_openrouter() {
+        let h = attribution_headers("https://openrouter.ai/api/v1");
+        assert_eq!(
+            h,
+            vec![
+                ("HTTP-Referer".to_string(), "https://docs.svuvi.ch".to_string()),
+                ("X-OpenRouter-Title".to_string(), "snens agent".to_string()),
+            ]
+        );
+        assert!(attribution_headers("https://inference-api.nousresearch.com/v1").is_empty());
+    }
+
+    /// Заголовки реально уезжают в запрос, а правка человека их перебивает:
+    /// reqwest допускает повторы, побеждать должен последний добавленный.
+    #[tokio::test]
+    async fn attribution_headers_reach_request_and_config_wins() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut b = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut b).unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&b[..n]);
+            }
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 14\r\n\r\ndata: [DONE]\n\n",
+            )
+            .unwrap();
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        });
+
+        // Подпись включается по подстроке base_url, а локальный сервер в его
+        // адресе её не несёт — поэтому маркер живёт в пути, URL тот же.
+        let mut cfg = crate::cfg::Config {
+            base_url: format!("http://{addr}/openrouter.ai"),
+            model: "test/model".into(),
+            ..Default::default()
+        };
+        cfg.headers.insert("x-openrouter-title".into(), "мой snens".into());
+
+        let llm = OpenAi::new("test-key".into()).unwrap();
+        let mut noop = |_: Delta| {};
+        llm.reply(&cfg, vec![], vec![], &mut noop).await.unwrap();
+        let head = server.join().unwrap();
+
+        assert!(head.contains("http-referer: https://docs.svuvi.ch"), "{head}");
+        let titles = head.matches("x-openrouter-title:").count();
+        assert_eq!(titles, 2, "подпись + правка человека: {head}");
+        assert!(head.contains("x-openrouter-title: \u{43c}\u{43e}\u{439} snens"), "{head}");
     }
 
     /// Сквозная проверка production-пути: локальный HTTP-сервер отдаёт SSE, где
