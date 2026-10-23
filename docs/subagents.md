@@ -142,7 +142,7 @@ snens steer <ID> "текст"
 можно собрать руками, а `SNENS_MAIL_DIR`/`SNENS_SESSIONS_DIR` уводят тул в `/tmp`.
 
 ```sh
-A=~/projects/snens/tools/agent/target/debug/agent  # cargo build --manifest-path …
+A=<путь>/agent/target/debug/agent  # cargo build --manifest-path …
 export SNENS_MAIL_DIR=/tmp/t/mail SNENS_SESSIONS_DIR=/tmp/t/sessions
 SNENS_SESSION=C1 SNENS_PARENT=P $A list       # я, родитель, братья, дети
 SNENS_SESSION=C1 SNENS_PARENT=P $A peers      # id братьев построчно
