@@ -174,6 +174,23 @@ h3 {
 
 p { margin: 0 0 calc(var(--step) * 1.5); }
 
+/* Пункт-определение: абзац, начинающийся с жирного (`**Симптом**`). В FAQ и
+   подобных текстах это единица чтения, поэтому жирное идёт отдельной строкой и
+   пункт отделяется линией — иначе 18 отказов подряд сливаются в кирпич. */
+main p > strong:first-child {
+  display: block;
+  margin-bottom: 2px;
+}
+
+main p {
+  padding-left: 0;
+}
+
+main p:has(> strong:first-child) {
+  border-left: var(--bar) solid var(--hair);
+  padding-left: calc(var(--step) * 1.5);
+}
+
 a { color: var(--ink); text-decoration-color: var(--accent); text-underline-offset: 2px; }
 
 ul, ol { margin: 0 0 calc(var(--step) * 1.5); padding-left: calc(var(--step) * 4); }

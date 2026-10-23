@@ -112,39 +112,42 @@ TABLE_SEP = re.compile(r"^\|[-\s:|]+\|$")
 
 
 LINK = re.compile(r"\[((?:[^\[\]]|\[[^\]]*\])*)\]\(([^)\s]+)\)(\{\.[\w-]+\})?")
+CODE = re.compile(r"`([^`]+)`")
 
 
-def inline(text: str) -> str:
-    """Инлайн-разметка: ссылки, код, жирный. Экранирование — первым.
+def inline(text: str, depth: int = 0) -> str:
+    """Инлайн-разметка: код, ссылки, жирный. Один проход с плейсхолдерами.
 
-    Ссылки разбираются раньше кода: `[`/llm/index.txt`](/llm/index.txt)` — обычное
-    дело в этих текстах, и код внутри текста ссылки должен остаться кодом. Найденные
-    ссылки убираются в маркеры-плейсхолдеры, чтобы правила ниже их не портили; текст
-    ссылки рендерится рекурсивно (без вложенных ссылок).
+    Код и ссылки прячутся в маркеры `\x00depth:N\x00` ДО правил жирного: иначе
+    `**… `--help` …**` ломается — жирный открывается до кода, а закрывается после,
+    и в каждом куске по отдельности пары нет. Содержимое кода больше не
+    участвует в разборе; текст ссылки рендерится рекурсивно, и глубина в маркере
+    не даёт внутреннему вызову перепутать чужие маркеры со своими.
     Класс в фигурных скобках (`](url){.cta}`) — кнопка: HTML в контент не пускаем.
     """
-    src = html.escape(text, quote=False)
-    links: list[str] = []
+    stash: list[str] = []
+    token = re.compile(rf"\x00{depth}:(\d+)\x00")
 
-    def stash(m: re.Match) -> str:
-        label = inline(m.group(1))
-        href = m.group(2)
+    def keep(fragment: str) -> str:
+        stash.append(fragment)
+        return f"\x00{depth}:{len(stash) - 1}\x00"
+
+    def code(m: re.Match) -> str:
+        return keep(f"<code>{m.group(1)}</code>")
+
+    def link(m: re.Match) -> str:
+        label = inline(m.group(1), depth + 1)
         cls = m.group(3)
         attr = f' class="{cls[2:-1]}"' if cls else ""
-        links.append(f'<a{attr} href="{href}">{label}</a>')
-        return f"\x00{len(links) - 1}\x00"
+        return keep(f'<a{attr} href="{m.group(2)}">{label}</a>')
 
-    src = LINK.sub(stash, src)
-
-    out: list[str] = []
-    for i, chunk in enumerate(re.split(r"`([^`]+)`", src)):
-        if i % 2:
-            out.append(f"<code>{chunk}</code>")
-            continue
-        chunk = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", chunk)
-        out.append(chunk)
-    src = "".join(out)
-    return re.sub(r"\x00(\d+)\x00", lambda m: links[int(m.group(1))], src)
+    src = html.escape(text, quote=False)
+    src = CODE.sub(code, src)
+    src = LINK.sub(link, src)
+    src = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", src)
+    while token.search(src):
+        src = token.sub(lambda m: stash[int(m.group(1))], src)
+    return src
 
 
 def render(md: str) -> str:
