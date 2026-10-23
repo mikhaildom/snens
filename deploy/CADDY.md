@@ -15,7 +15,10 @@
 
 1. Заменить блок домена в `/etc/caddy/Caddyfile` содержимым
    `deploy/caddy-sites.conf` этого репозитория.
-2. `sudo caddy validate --config /etc/caddy/Caddyfile` — проверка синтаксиса.
+2. Проверить **до** reload: `caddy adapt --config /etc/caddy/Caddyfile --adapter
+   caddyfile >/dev/null && echo ок`. Ненулевой код означает ошибку синтаксиса в
+   конфиге; `caddy validate` здесь не годится — без прав на `/var/log/caddy` он ругается
+   на лог и всё равно отдаёт 0.
 3. `sudo systemctl reload caddy` — без простоя.
 4. В `/etc/hosts` или DNS ничего менять не нужно: имена прежние и новое уже
    указывают на эту машину.
@@ -44,7 +47,24 @@ curl -sSI https://docs.svuvi.ch/index.txt | head -3        # 301 на новый
 
 ## Почему это не сделал агент
 
-`/etc/caddy/Caddyfile` принадлежит root, а `snens-priv` (брокер привилегий) умеет
-только `systemctl restart|reload|start|stop|status` для юнитов из whitelist,
-`mkdir -p` и `chown` в разрешённых корнях. Правки в `/etc` в whitelist нет
-намеренно — это граница, которую агент не обходит.
+`/etc/caddy/Caddyfile` принадлежит root, а брокера `snens-priv` на этом хосте нет
+(`/etc/snens-priv.conf` отсутствует, любой вызов — «действие не разрешено»). Правка
+`/etc` — граница, которую агент не обходит.
+
+## Ловушка: блок обязан быть многострочным
+
+Однострочная запись роняет парсер, и `systemctl reload` сообщает только
+«Job for caddy.service failed»:
+
+```
+Error: Unexpected '}' because no matching opening brace, at /etc/caddy/Caddyfile:151
+```
+
+Ловить надо **до** reload — `systemctl status` покажет лишь факт падения:
+
+```sh
+caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null && echo ок
+```
+
+`caddy validate` для этого не годится без прав на `/var/log/caddy`: он читает файл, но
+ругается на лог-каталог и всё равно возвращает 0.
