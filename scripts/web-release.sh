@@ -116,9 +116,13 @@ DEST="$WEBROOT/releases/web/$VERSION"
 mkdir -p "$DEST"
 # Каталог версии неизменяем: люди со старой версией могут её ещё качать.
 cp "$OUT/$ARCHIVE" "$OUT/$ARCHIVE.sha256" "$DEST/"
-# Caddy читает не нашим пользователем, а umask бывает 077.
-find "$DEST" -type d -exec chmod 0755 {} +
-find "$DEST" -type f -exec chmod 0644 {} +
+# Права для Caddy: он чужой пользователь, а mkdir -p с umask 077 делал
+# родительские каталоги 0700 — сайт отдавал 403 на весь релиз.
+. "$REPO/scripts/publish-perms.sh"
+publish_perms "$WEBROOT" "$DEST" || die "не выставить права на $DEST"
+# Проверка по факту: бит «others» на всех родителях и на самом файле.
+# Если 403 случится, лучше здесь и с именем пути, чем у человека в браузере.
+publish_readable "$DEST/$ARCHIVE" || die "файл нечитаем для Caddy: $DEST/$ARCHIVE"
 say "выложено: $DEST"
 
 say "5/5 проверка ссылки"
