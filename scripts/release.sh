@@ -15,7 +15,13 @@
 #
 # Использование:
 #   TAURI_SIGNING_PRIVATE_KEY_PATH=~/.config/snens/updater.key scripts/release.sh
-#   scripts/release.sh --check          # проверить окружение, ничего не собирать
+#   scripts/release.sh --check               # проверить окружение, ничего не собирать
+#   scripts/release.sh --skip-gate           # собрать без гейта (только для отладки)
+#
+# Гейт — `scripts/release-check.sh --skip-site`: тесты, смоук, версия, чистый
+# worktree, тег. Без него релиз не собирается: артефакт с непроверенного дерева
+# уже один раз уехал людям (версия 0.2.4 была собрана с правок, проверенных
+# только на двух машинах).
 set -eu
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,10 +34,25 @@ say() { printf '>>> %s\n' "$*"; }
 die() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
 check_only=0
-[ "${1:-}" = "--check" ] && check_only=1
+skip_gate=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check_only=1 ;;
+        --skip-gate) skip_gate=1 ;;
+        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) printf 'release: неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
+    esac
+    shift
+done
 
 [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}${TAURI_SIGNING_PRIVATE_KEY:-}" ] ||
     die "нет ключа подписи: задай TAURI_SIGNING_PRIVATE_KEY_PATH (updater.key)"
+
+if [ "$check_only" = 0 ] && [ "$skip_gate" = 0 ]; then
+    say "0/4 гейт: scripts/release-check.sh --skip-site"
+    "$REPO/scripts/release-check.sh" --skip-site ||
+        die "гейт не пройден — релиз не собираю (--skip-gate только для отладки)"
+fi
 
 if [ "$check_only" = 1 ]; then
     say "версия: $VERSION"
@@ -42,14 +63,14 @@ if [ "$check_only" = 1 ]; then
     exit 0
 fi
 
-say "1/4 раскладка sidecar'ов и клиента"
+say "1/5 раскладка sidecar'ов и клиента"
 "$REPO/scripts/desktop-stage.sh"
 
-say "2/4 сборка бандлов (nsis/appimage/deb) с подписью"
+say "2/5 сборка бандлов (nsis/appimage/deb) с подписью"
 cd "$DESKTOP"
 npx tauri build
 
-say "3/4 манифест latest.json"
+say "3/5 манифест latest.json"
 python3 - "$OUT" "$VERSION" "$BASE_URL" <<'PY'
 import json, sys
 from pathlib import Path
@@ -108,7 +129,7 @@ DEST="$WEBROOT/$SUBDIR"
 #  - задан SNENS_RELEASE_HOST — печатаем готовый rsync, который человек
 #    запустит (на Windows rsync есть в Git Bash, а ключ и доступ — его дело).
 if [ "${SNENS_RELEASE_PUBLISH:-0}" = 1 ] && [ -d "$WEBROOT" ] && [ -w "$WEBROOT" ]; then
-    say "4/4 выкладка в $DEST"
+    say "4/5 выкладка в $DEST"
     mkdir -p "$DEST"
     # Каталог версии неизменяем: обновление кладёт новый, а не перезаписывает старый
     # (люди с прошлой версией могут ещё качать её артефакт).

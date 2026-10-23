@@ -447,7 +447,7 @@ async fn run_loop<L: Llm>(
             // Подагенты: пока есть живые дети, не выходим — ждём их вопросы и
             // итоги. Иначе вопрос ребёнка родителю никто не прочитает и он уедет
             // в таймаут. Это supervisor вокруг цикла, а не вызов инструмента.
-            if supervisor(sess, cfg, ui).await {
+            if supervisor(sess, cfg, ui, queued.as_ref()).await {
                 continue;
             }
             if let Some(rx) = queued.as_ref() {
@@ -623,7 +623,16 @@ const SUPERVISE_LIMIT_SECS: u64 = 1800;
 /// Это харнесс вокруг цикла, а не вызов инструмента, поэтому «модель забыла» тут
 /// ничего не ломает. Возвращает true, если в ящике появилось сообщение — тогда
 /// нужен ещё ход (его прочитает дренаж в начале цикла).
-async fn supervisor(sess: &Session, cfg: &Config, ui: &crate::render::Ui) -> bool {
+async fn supervisor(
+    sess: &Session,
+    cfg: &Config,
+    ui: &crate::render::Ui,
+    queued: Option<
+        &std::sync::Arc<
+            tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<QueuedInput>>,
+        >,
+    >,
+) -> bool {
     let parent = sess.id();
     let mail_dir = cfg.mail_path();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(SUPERVISE_LIMIT_SECS);
@@ -632,6 +641,17 @@ async fn supervisor(sess: &Session, cfg: &Config, ui: &crate::render::Ui) -> boo
         // Сообщение уже ждёт — не нужно ждать детей, отдаём ход.
         if mail::has_pending(&mail_dir, parent) {
             return true;
+        }
+        // Слово человека в очереди тоже важнее ожидания детей: иначе steer лежит
+        // невидимым до конца подагентов, хотя поверхность уже приняла его и
+        // показала отправленным. `try_lock`, а не `lock`: очередь в этот момент
+        // не держит никто, а блокировать цикл ожидания из-за неё нельзя.
+        if let Some(rx) = queued {
+            if let Ok(rx) = rx.try_lock() {
+                if !rx.is_empty() {
+                    return true;
+                }
+            }
         }
         let running = crate::subagent::children(cfg, parent)
             .into_iter()

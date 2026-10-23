@@ -12,11 +12,12 @@
 |---|---|
 | `src/` | ядро: цикл «модель → тул → результат», HTTP API и SSE, TUI, журнал сессий, контекст, память, подагенты |
 | `tools/` | инструменты, по крейту на тул: `read`, `edit`, `write`, `grep`, `fetch`, `search`, `shot`, `view`, `web`, `desk`, `agent`, `audit`, `memory` |
+| `web/` | веб-клиент как бинарь: статика и прокси `/api` к ядру |
 | `desktop/` | окно на Tauri 2, ядро sidecar'ом |
 | `site/` | сайт и документация: `content/*.md` — страницы, `llm/*.txt` — плейнтекст для агентов |
 | `docs/` | устройство подсистем: API поверхности, контекст, память, подагенты, пейринг |
 | `prompts/` | системные инструкции ревью и improve |
-| `scripts/` | релиз десктопа, публикация сайта, обслуживание |
+| `scripts/` | релиз десктопа и веб-клиента, гейт, версия, публикация сайта, обслуживание |
 | `deploy/` | unit'ы systemd, блоки Caddy, пример правила sudo |
 
 ## Быстрый старт
@@ -36,6 +37,17 @@ snens tui
 `snens build` кладёт бинарники тулов в `tools/<имя>/<имя>`; чтобы он нашёл
 workspace, в `config.toml` нужен `tools_dir = "<клон>/tools"`.
 
+Веб-клиент — отдельный бинарь:
+
+```sh
+cd ../snens-web && npm i && npm run build          # бандл
+cargo build --release -p snens-web                 # бинарь
+snens-web --listen 127.0.0.1:5180 --api http://127.0.0.1:7420 \
+          --token-file ~/.local/share/snens/api.token
+```
+
+Процесс разработки и релиза — [`docs/release.md`](docs/release.md).
+
 | команда | что |
 |---|---|
 | `snens run [--new] "запрос"` | ответ в терминале, без флагов — продолжение последней сессии |
@@ -51,7 +63,7 @@ workspace, в `config.toml` нужен `tools_dir = "<клон>/tools"`.
 | сайт | https://snens.svuvi.ch/ |
 | документация для агентов (плейнтекст) | https://snens.svuvi.ch/llm/index.txt |
 | релизы десктопа | https://snens.svuvi.ch/releases/ |
-| веб-клиент | https://git.svuvi.ch/svuvich/snens-web |
+| веб-клиент | этот же репозиторий: `web/`, бандл — `../snens-web` |
 | плагин памяти | https://git.svuvi.ch/svuvich/snens-memory |
 
 Правки в ядре проверяются `cargo test`; интеграционный цикл — `snens verify`

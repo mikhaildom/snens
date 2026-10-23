@@ -42,7 +42,17 @@ fn flat(kind: &str, fields: serde_json::Value) -> serde_json::Value {
 
 #[derive(Clone)]
 pub struct Reporter {
-    tx: Option<mpsc::UnboundedSender<(String, serde_json::Value)>>,
+    tx: Option<mpsc::UnboundedSender<Msg>>,
+}
+
+/// Что уезжает в отправщик: обычное событие или требование закрыть пачку.
+/// Закрытие отдельным сообщением, а не просто «дропнуть канал»: подагент
+/// обязан дождаться, пока кадр уйдёт, иначе процесс выйдет раньше запроса и
+/// терминатор `Done` никто не увидит — ровно так карточка подагента висела
+/// «работает» до перезагрузки окна.
+enum Msg {
+    Event(String, serde_json::Value),
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 impl Reporter {
@@ -57,7 +67,7 @@ impl Reporter {
         if token.is_empty() {
             return Self { tx: None };
         }
-        let (tx, mut rx) = mpsc::unbounded_channel::<(String, serde_json::Value)>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
         let url = format!("{base}/v1/sessions/{session}/ingest");
         tokio::spawn(async move {
             let client = match reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
@@ -65,28 +75,54 @@ impl Reporter {
                 Err(_) => return,
             };
             let mut batch: Vec<serde_json::Value> = Vec::new();
-            loop {
-                // Ждём первое событие бесконечно (пока жив отправитель), дальше
-                // добираем пачку коротким окном.
-                let Some((kind, fields)) = rx.recv().await else {
-                    break;
-                };
-                batch.push(flat(&kind, fields));
-                while batch.len() < 32 {
-                    match tokio::time::timeout(FLUSH_EVERY, rx.recv()).await {
-                        Ok(Some((kind, fields))) => batch.push(flat(&kind, fields)),
-                        _ => break,
-                    }
-                }
-                let body = json!({"events": std::mem::take(&mut batch)});
+            // Отправка одной пачки. Пустая пачка — тоже отправка: это просьба
+            // пересчитать карточку подагента (см. `ingest` на поверхности).
+            async fn post(
+                client: &reqwest::Client,
+                url: &str,
+                token: &str,
+                batch: &mut Vec<serde_json::Value>,
+            ) {
+                let body = json!({"events": std::mem::take(batch)});
                 // Ответ не проверяем: поверхность могла закрыться, а подагент
-                // обязан доработать. Следующая пачка попробует снова.
+                // обязан доработать.
                 let _ = client
-                    .post(&url)
-                    .bearer_auth(&token)
+                    .post(url)
+                    .bearer_auth(token)
                     .json(&body)
                     .send()
                     .await;
+            }
+            loop {
+                // Ждём первое событие бесконечно (пока жив отправитель), дальше
+                // добираем пачку коротким окном.
+                let first = match rx.recv().await {
+                    Some(Msg::Event(kind, fields)) => Msg::Event(kind, fields),
+                    Some(Msg::Flush(ack)) => {
+                        post(&client, &url, &token, &mut batch).await;
+                        let _ = ack.send(());
+                        continue;
+                    }
+                    None => break,
+                };
+                if let Msg::Event(kind, fields) = first {
+                    batch.push(flat(&kind, fields));
+                }
+                let mut flush: Option<tokio::sync::oneshot::Sender<()>> = None;
+                while batch.len() < 32 {
+                    match tokio::time::timeout(FLUSH_EVERY, rx.recv()).await {
+                        Ok(Some(Msg::Event(kind, fields))) => batch.push(flat(&kind, fields)),
+                        Ok(Some(Msg::Flush(ack))) => {
+                            flush = Some(ack);
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                post(&client, &url, &token, &mut batch).await;
+                if let Some(ack) = flush {
+                    let _ = ack.send(());
+                }
             }
         });
         Self { tx: Some(tx) }
@@ -129,6 +165,24 @@ impl Reporter {
                 ("context.pressure", json!({"approx":approx,"budget":budget}))
             }
         };
-        let _ = tx.send((kind.to_string(), fields));
+        let _ = tx.send(Msg::Event(kind.to_string(), fields));
+    }
+
+    /// Дождаться, пока последняя пачка уйдёт.
+    ///
+    /// Зовётся после цикла и после того, как в журнал лёг `Done`: пустая пачка
+    /// заставляет поверхность пересчитать карточку, и та видит завершение.
+    /// Без этого подтверждения процесс мог выйти раньше запроса, и карточка
+    /// подагента висела «работает» до перезагрузки окна.
+    pub async fn finish(&self) {
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if tx.send(Msg::Flush(ack_tx)).is_err() {
+            return;
+        }
+        // Потолок, чтобы подагент не висел на мёртвой поверхности.
+        let _ = tokio::time::timeout(Duration::from_secs(10), ack_rx).await;
     }
 }

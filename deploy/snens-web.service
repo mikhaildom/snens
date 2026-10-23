@@ -1,19 +1,20 @@
 [Unit]
-Description=snens production web client (vite :5180 → /api :7420)
+Description=snens web client (snens-web :5180 → /api :7420)
+Documentation=https://snens.svuvi.ch/docs/surfaces.html
 After=network.target snens.service
+Wants=snens.service
 
 [Service]
 Type=simple
-WorkingDirectory=%h/projects/snens-web
-Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-# Порт веб-клиента: свой, чтобы не совпасть с тем, который человек держит
-# открытым в браузере (`npm run dev` по умолчанию берёт 5174).
-Environment=SNENS_WEB_PORT=5180
-# Клиент — собранный dist, а не dev-сервер: npx vite в поставке не нужен.
-Environment=SNENS_WEB_DIST=%h/.local/share/snens/web
+# Клиент — один бинарь со статикой рядом (`web/`), а не dev-сервер vite:
+# в поставке не нужны ни node, ни npx. Бинарь и каталог клиента ставит релиз
+# веб-клиента (`scripts/web-release.sh`), здесь только запуск.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=SNENS_WEB_LISTEN=127.0.0.1:5180
 Environment=SNENS_API_BASE=http://127.0.0.1:7420
 Environment=SNENS_API_TOKEN_FILE=%h/.local/share/snens/api.token
-ExecStart=/usr/local/bin/npx vite
+Environment=SNENS_WEB_DIST=%h/.local/share/snens/web
+ExecStart=%h/.local/bin/snens-web
 Restart=on-failure
 RestartSec=2
 

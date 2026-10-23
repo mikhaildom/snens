@@ -39,7 +39,7 @@ libc = "0.2"
 [workspace]
 # Плагин долгой памяти — тоже член workspace: память входит в поставку, и
 # установщик должен получить её бинарь той же командой, что и остальные тулы.
-members = ["tools/agent", "tools/audit", "tools/desk", "tools/edit", "tools/fetch", "tools/grep", "tools/memory", "tools/read", "tools/search", "tools/shot", "tools/view", "tools/web", "tools/write"]
+members = ["web", "tools/agent", "tools/audit", "tools/desk", "tools/edit", "tools/fetch", "tools/grep", "tools/memory", "tools/read", "tools/search", "tools/shot", "tools/view", "tools/web", "tools/write"]
 resolver = "2"
 
 # Релизные сборки тулов: размер и старт важнее скорости компиляции — бинарь

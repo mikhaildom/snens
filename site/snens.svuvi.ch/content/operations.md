@@ -35,8 +35,9 @@ cp deploy/snens.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now snens.service
 ```
 
-Отдельный юнит для веб-клиента нужен, только если он живёт на vite и проксирует `/api`
-в ядро; в поставке клиент отдаёт само ядро из `web/`.
+Отдельный юнит для веб-клиента — `snens-web.service`: бинарь `snens-web` отдаёт собранный
+клиент и проксирует `/api` в ядро, подставляя Bearer из файла токена. В поставке десктопа
+клиент отдаёт само ядро из `web/`.
 
 ## Рестарт обрывает работу
 

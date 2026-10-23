@@ -1,0 +1,18 @@
+[package]
+name = "snens-web"
+version = "0.2.4"
+edition = "2021"
+description = "Веб-клиент snens: статика + прокси /api к ядру"
+
+[[bin]]
+name = "snens-web"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "sync"] }
+# Прокси к ядру: тот же клиент, что у ядра, — новых зависимостей в дереве нет.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+futures-util = "0.3"
+http-body-util = "0.1"

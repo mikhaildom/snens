@@ -446,7 +446,11 @@ pub async fn selftest() -> R<()> {
     std::fs::set_permissions(&mbin, std::fs::Permissions::from_mode(0o755))?;
 
     let mut cfg3 = cfg.clone();
-    // Канал выключен по умолчанию: без программы ядро не зовёт ничего.
+    // Канал выключен явно, а не «по дефолту»: память в поставке включена
+    // (плагин едет в workspace), и полагаться на дефолт значило бы
+    // проверять не то — тест падал на «выключенном канале», который
+    // на самом деле был включён.
+    cfg3.memory.enabled = false;
     let sess_off = Session::open(&dir, "t3-off")?;
     sess_off.append(Rec::User {
         ts: log::now(),
@@ -471,9 +475,13 @@ pub async fn selftest() -> R<()> {
         "выключенный канал всё равно впрыснул справку"
     );
 
-    cfg3.memory.cmd = "memory".into();
+    cfg3.memory.cmd = mbin.display().to_string();
     // Канал включён и справка — на каждый ход: selftest проверяет сам контракт
-    // argv, а не дефолтную политику (она в unit-тестах cfg).
+    // argv, а не дефолтную политику (она в unit-тестах cfg). Путь абсолютный
+    // намеренно: имя без слэша ищется рядом с бинарём ядра (так ищется
+    // штатный плагин в поставке), и рядом с локальной сборкой может оказаться
+    // настоящий плагин инстанса — тогда selftest проверял бы не свой фейк, а
+    // чужую базу памяти.
     cfg3.memory.enabled = true;
     cfg3.memory.recall = crate::cfg::RecallMode::Always;
     cfg3.memory.retain = true;

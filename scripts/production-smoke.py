@@ -294,11 +294,18 @@ def production_server_smoke(temp, checks, llm):
             status, response = http_json(base, "/v1/sessions", token)
             assert status == 200, response
             matches = [row for row in response["sessions"] if row["id"] == sid]
-            assert matches == [{"id": sid, "surface": "legacy", "state": "idle", "run_id": None}], matches
+            # `legacy` — историческое имя метки; discovery отдаёт такие сессии как
+            # `local` (см. build_session: «surface local вместо legacy»). Остальные
+            # поля в строке есть, поэтому сверяем подмножество, а не всю запись.
+            assert len(matches) == 1, matches
+            row = matches[0]
+            assert row["id"] == sid, row
+            assert row["surface"] == "local", row
+            assert row["state"] == "idle" and row["run_id"] is None, row
             ids = {row["id"] for row in response["sessions"]}
             assert sid in ids and uuid_sid in ids, ids
             assert invalid.stem not in ids and invalid_suffix.stem not in ids
-            assert all(row["surface"] == "legacy" for row in response["sessions"] if row["id"] in (sid, uuid_sid))
+            assert all(row["surface"] == "local" for row in response["sessions"] if row["id"] in (sid, uuid_sid))
         checks.check("production serve discovers timestamp-counter and UUID JSONL, rejects invalid basenames", discovery)
         checks.check("JSONL authoritative history projection preserves physical sequence and raw bytes",
                      lambda: check_projection(base, token, sid, rows, raw, log_path))
@@ -327,7 +334,7 @@ def production_server_smoke(temp, checks, llm):
             user_messages = [m for m in history["messages"] if m.get("role") == "user"]
             assert [m.get("content") for m in user_messages] == ["late-legacy-post-marker"], history
             status, listed = http_json(base, "/v1/sessions", token)
-            assert status == 200 and any(s["id"] == late_id and s["surface"] == "legacy" for s in listed["sessions"]), listed
+            assert status == 200 and any(s["id"] == late_id and s["surface"] == "local" for s in listed["sessions"]), listed
         checks.check("late legacy JSONL POST hydrates on demand without prior GET/list; retry is idempotent", late_legacy_post_without_discovery)
 
         def invalid_history():
@@ -337,9 +344,13 @@ def production_server_smoke(temp, checks, llm):
         checks.check("history distinguishes invalid and unknown IDs", invalid_history)
 
         def external_writer_busy_guard():
+            # Эксклюзивность пишущего держит отдельный `<id>.lock`, а не сам
+            # журнал (на Windows flock журнала запрещал чтение — см. 1cf1e76).
+            # Лочим тот же файл, который лочит ядро.
             import fcntl
-            log_file = open(log_path, "ab")
-            fcntl.flock(log_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_path = log_path.with_suffix(".lock")
+            lock_file = open(lock_path, "ab")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             before_size = log_path.stat().st_size
             try:
                 payload = json.dumps({"command_id": str(uuid.uuid4()), "text": "must-not-start"}).encode()
@@ -354,8 +365,8 @@ def production_server_smoke(temp, checks, llm):
                 state_code, state = http_json(base, f"/v1/sessions/{sid}", token)
                 assert state_code == 200 and state["state"] == "idle" and state["run_id"] is None, state
             finally:
-                fcntl.flock(log_file.fileno(), fcntl.LOCK_UN)
-                log_file.close()
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
         checks.check("session writer lock rejects API run without leaving running state or JSONL changes", external_writer_busy_guard)
 
         def transient_cursor_survives_crash_restart():

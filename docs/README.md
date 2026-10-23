@@ -6,6 +6,7 @@
 
 - `context.md`, `review.md`, `subagents.md`, `tools-typed-schema.md`, `pairing.md`,
   `surface-api.md`, `surface-config.md` — устройство подсистем и отвергнутые пути.
+- `release.md` — процесс релиза: версия, гейт, артефакты, проверка выложенного.
 - `roadmap/` — планы того, чего в дереве нет. В шапке файла стоит статус.
 - `agent-docs.md` — как устроен и как выкладывается сайт документации.
 

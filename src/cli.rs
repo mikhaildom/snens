@@ -269,6 +269,10 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
         };
         let _ = mail::send(&cfg.mail_path(), &parent, &id, "report", &body);
     }
+    // Пустая пачка перед выходом: поверхность пересчитает карточку подагента и
+    // увидит `Done`, который лёг выше. Без этого подтверждения процесс мог выйти
+    // раньше запроса, и карточка висела «работает» до перезагрузки окна.
+    reporter.finish().await;
     res
 }
 

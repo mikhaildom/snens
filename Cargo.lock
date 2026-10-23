@@ -1545,6 +1545,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "snens-web"
+version = "0.2.4"
+dependencies = [
+ "axum",
+ "futures-util",
+ "http-body-util",
+ "reqwest",
+ "tokio",
+ "tower-http",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1830,6 +1842,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 
