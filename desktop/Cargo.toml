@@ -1,6 +1,6 @@
 [package]
 name = "snens-desktop"
-version = "0.1.0"
+version = "0.2.3"
 edition = "2021"
 description = "Окно snens: веб-клиент и своё ядро (или подключение к удалённому)"
 license = "MIT"
@@ -18,9 +18,21 @@ tauri-plugin-shell = "2"
 tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Только для проверки готовности ядра до открытия окна: блокирующий клиент в
-# отдельном потоке setup — так проще, чем делать setup асинхронным.
+# Проверка готовности ядра до открытия окна: блокирующий клиент в отдельном
+# потоке setup — так проще, чем делать setup асинхронным.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# Только Windows: job object с KILL_ON_JOB_CLOSE. Без него ядро переживает
+# окно (закрыл крестик, упало приложение — процесс живёт), держит лок данных,
+# и следующий запуск молча не поднимается: паника в GUI-сборке не видна.
+# Версия та же, что уже в дереве через tauri.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 lto = true

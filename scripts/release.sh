@@ -120,7 +120,10 @@ if [ "${SNENS_RELEASE_PUBLISH:-0}" = 1 ] && [ -d "$WEBROOT" ] && [ -w "$WEBROOT"
     done
     cp -p "$OUT/latest.json" "$DEST/latest.json"
     # Caddy читает не нашим пользователем, а umask бывает 077.
-    chmod -R a+rX "$DEST"
+    # Каталоги — 0755, файлы — 0644. Раньше здесь был только `chmod -R a+rX`,
+    # а umask 077 делал новые каталоги 0700: Caddy отдавал 403 на установщик,
+    # а причина не видна ни в логе сборки, ни в `ls` файлов. Проверено живьём.
+    find "$DEST" -type d -exec chmod 0755 {} +
     find "$DEST" -type f -exec chmod 0644 {} +
     say "выложено: $DEST"
     ls -l "$DEST/latest.json" "$DEST/$VERSION" | sed 's/^/  /'

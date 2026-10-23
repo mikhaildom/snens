@@ -11,7 +11,9 @@
 //! - `daemon.rs` — запуск и остановка ядра, ожидание его готовности;
 //! - `connection.rs` — что окно знает о ядре: адрес, токен, свой или чужой;
 //! - `tray.rs` — иконка в системном трее и меню;
-//! - здесь — сборка приложения и жизненный цикл окна.
+//! - `single.rs` — один экземпляр на пользователя: второй запуск поднимает
+//!   окно первого и выходит;
+//! - `job.rs` — жизнь ядра привязана к жизни окна (Windows: job object).
 
 // Консольного окна у GUI-сборки нет вовсе. Это атрибут самого exe: без него
 // Windows показывает чёрное пустое окно терминала рядом с интерфейсом, и его
@@ -20,6 +22,8 @@
 
 mod connection;
 mod daemon;
+mod job;
+mod single;
 mod tray;
 
 use tauri::{Manager, RunEvent, WindowEvent};
@@ -27,6 +31,12 @@ use tauri::{Manager, RunEvent, WindowEvent};
 use daemon::Daemon;
 
 fn main() {
+    // Второй экземпляр не должен поднимать второе ядро и воровать окно: он
+    // поднимает окно первого и уходит. Без этого запуск по шорткату молча
+    // ничего не делал (паника в setup у GUI-сборки не видна).
+    if single::already_running() {
+        return;
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -52,8 +62,12 @@ fn main() {
                 *state.connection.lock().unwrap() = Some(conn.clone());
                 *state.remote.lock().unwrap() = remote;
             }
-            tray::install(app.handle())?;
+            // Порядок важен: СНАЧАЛА окно, потом трей. Трей поднимает своё
+            // скрытое окно-посредник, и если оно создано раньше главного,
+            // WebView2 получает "Invalid window handle" (HRESULT 0x80070578) и
+            // приложение падает в setup — проверено на живой Windows.
             open_window(app.handle(), &conn, remote)?;
+            tray::install(app.handle())?;
             Ok(())
         })
         .on_window_event(|window, event| {

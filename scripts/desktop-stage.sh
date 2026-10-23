@@ -46,8 +46,12 @@ mkdir -p "$DESKTOP/binaries"
 say "target triple: $TRIPLE"
 say "бинарники: $BIN_SRC"
 
-# Ядро и плагин памяти — sidecar'ы: они едут в бандле и обновляются вместе с ним.
-for name in snens memory; do
+# Ядро — sidecar: едет в бандле и обновляется вместе с ним.
+#
+# Плагина памяти здесь НЕТ намеренно: он тул (`tools/memory/memory`), и
+# sidecar'ом ехал вторым таким же файлом (5.3 МБ в бандле). Одна роль — одно
+# место: ядро запускает его по argv-контракту, значит он в реестре тулов.
+for name in snens; do
     src="$BIN_SRC/$name"
     [ -f "$src" ] || die "нет $src — собери: cargo build --release --workspace"
     dst="$DESKTOP/binaries/$name-$TRIPLE"

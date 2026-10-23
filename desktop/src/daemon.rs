@@ -25,6 +25,9 @@ const PING_BUDGET: Duration = Duration::from_secs(20);
 /// Запущенное ядро и то, что окно о нём знает.
 pub struct Daemon {
     child: Mutex<Option<Child>>,
+    /// Привязка жизни ядра к жизни окна (Windows: job object). Из `Daemon`
+    /// никогда не достаётся — держится только ради ручки.
+    job: Mutex<Option<crate::job::Job>>,
     pub connection: Mutex<Option<Connection>>,
     /// Окно работает с чужим ядром: своего процесса нет, `child` пуст.
     pub remote: Mutex<bool>,
@@ -34,6 +37,7 @@ impl Daemon {
     pub fn new() -> Self {
         Self {
             child: Mutex::new(None),
+            job: Mutex::new(None),
             connection: Mutex::new(None),
             remote: Mutex::new(false),
         }
@@ -50,6 +54,11 @@ impl Daemon {
         if let Some(mut child) = stopped {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        // Ручку job закрываем ПОСЛЕ kill+wait: закрытие само по себе убивает
+        // содержимое, но порядок делает намерение явным.
+        if let Some(job) = self.job.lock().map(|mut g| g.take()).unwrap_or(None) {
+            crate::job::close(job);
         }
     }
 }
@@ -93,11 +102,16 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     let child = cmd.spawn()?;
-    app.state::<Daemon>()
-        .child
-        .lock()
-        .map_err(|_| "состояние отравлено")?
-        .replace(child);
+    // Привязка к job — ДО того, как что-либо может упасть ниже: если setup
+    // упадёт или окно выгрузят, ядро умрёт вместе с процессом и не оставит
+    // за собой лок `surface-api/server.lock` (из-за него следующий запуск
+    // молча не поднимался).
+    let job = crate::job::attach(&child);
+    {
+        let state = app.state::<Daemon>();
+        *state.child.lock().map_err(|_| "состояние отравлено")? = Some(child);
+        *state.job.lock().map_err(|_| "состояние отравлено")? = job;
+    }
 
     let ready = wait_ready_file(&ready_path, READY_BUDGET)
         .ok_or("ядро не сообщило адрес за 30 с")?;
