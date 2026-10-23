@@ -48,11 +48,6 @@ pub struct Session {
     /// сессия ещё не закрывалась. Нужна, чтобы отличить «закончил» от «упал».
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done: Option<String>,
-    /// Сколько занял последний ход, мс (из `ToolResult`/`Done` в журнале нет —
-    /// считаем по `updated_at` и первой записи; оставлено для будущего).
-    /// Сейчас не заполняется: см. `turns`/`done`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_ms: Option<u64>,
     /// Когда подагент начал работу: unix-время первой записи журнала. Вместе с
     /// `done_at` даёт длительность — клиент рисует «работает 4 мин» или
     /// «заняло 12 мин», не опрашивая ядро повторно.
@@ -132,7 +127,6 @@ impl Session {
             context_target: None,
             turns: None,
             done: None,
-            last_ms: None,
             started_at: None,
             done_at: None,
         }
@@ -167,12 +161,29 @@ pub struct Runtime {
     /// Живут только в памяти: заявка одноразовая и короткоживущая, рестарт её
     /// отменяет (шим получит отказ).
     pub approvals: Mutex<BTreeMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// Действующее приглашение пейринга (docs/pairing.md). Отдельная ячейка, а
+    /// не поле store: код живёт минуты, в SQLite ему делать нечего, а рестарт
+    /// ядра его законно отменяет.
+    pub pending: crate::pairing::Pending,
+    /// Подключённые устройства: проверка токена по реестру, а не по одному файлу.
+    pub registry: crate::clients::Registry,
     /// Поток изменений списка сессий (`GET /v1/events`): клиент делает upsert
     /// вместо опроса `GET /v1/sessions`. Несёт уже собранный JSON события:
     /// разный вид у разных подписчиков не нужен.
     pub tx_updates: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 impl Runtime {
+    /// Соединение с SQLite под замком.
+    ///
+    /// Отравленный замок (`PoisonError`) не паникует: он значит, что паника уже
+    /// случилась в другом потоке, а нам нужна база такой, какая есть. Падать
+    /// здесь — это 500 без тела на каждой записи сессии после первой аварии.
+    /// Вызывать только из синхронных `save_*`/`persist_*`: под замком ни одного
+    /// `await`, иначе async-воркер встал бы вместе с базой.
+    fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // Полная перезапись store (`persist_store`) нужна только там, где меняется
     // всё сразу: старт (миграция legacy `store.json`), shutdown, пересборка
     // после `interrupt_running`. В горячем пути — никогда: она переписывает все
@@ -180,7 +191,7 @@ impl Runtime {
 
     /// Записать одну сессию (upsert).
     pub fn save_session(&self, s: &Session) -> crate::R<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         db.execute(
             "INSERT INTO sessions(id,surface,state,run_id,context_budget,context_target,parent)\n             VALUES(?1,?2,?3,?4,?5,?6,?7)\n             ON CONFLICT(id) DO UPDATE SET surface=excluded.surface,state=excluded.state,\n               run_id=excluded.run_id,context_budget=excluded.context_budget,\n               context_target=excluded.context_target,parent=excluded.parent",
             params![
@@ -198,7 +209,7 @@ impl Runtime {
 
     /// Записать одно событие и сдвинуть курсор сессии — одной транзакцией.
     pub fn save_event(&self, e: &Event) -> crate::R<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let tx = db.unchecked_transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO events(session_id,seq,run_id,kind,fields) VALUES(?1,?2,?3,?4,?5)",
@@ -220,7 +231,7 @@ impl Runtime {
 
     /// Удалить все строки сессии.
     pub fn drop_session(&self, id: &str) -> crate::R<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let tx = db.unchecked_transaction()?;
         for table in [
             "message_attachments",
@@ -241,7 +252,7 @@ impl Runtime {
     /// Записать сессию и все её сообщения с вложениями (грубый, но безопасный
     /// способ для путей, которые меняют состав очереди целиком).
     pub fn save_session_messages(&self, id: &str, data: &Store) -> crate::R<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let tx = db.unchecked_transaction()?;
         if let Some(s) = data.sessions.get(id) {
             tx.execute(
@@ -287,7 +298,7 @@ impl Runtime {
 
     /// Мелкие справочники: одна строка — одна запись.
     pub fn save_command(&self, command_id: &str, payload: &serde_json::Value) -> crate::R<()> {
-        self.db.lock().unwrap().execute(
+        self.db().execute(
             "INSERT OR REPLACE INTO commands VALUES(?1,?2)",
             params![command_id, serde_json::to_string(payload)?],
         )?;
@@ -295,7 +306,7 @@ impl Runtime {
     }
 
     pub fn save_surface_tools(&self, id: &str, defs: &[serde_json::Value]) -> crate::R<()> {
-        self.db.lock().unwrap().execute(
+        self.db().execute(
             "INSERT OR REPLACE INTO surface_tools VALUES(?1,?2)",
             params![id, serde_json::to_string(defs)?],
         )?;
@@ -303,7 +314,7 @@ impl Runtime {
     }
 
     pub fn save_tool_result(&self, key: &str, payload: &serde_json::Value) -> crate::R<()> {
-        self.db.lock().unwrap().execute(
+        self.db().execute(
             "INSERT OR REPLACE INTO tool_results VALUES(?1,?2)",
             params![key, serde_json::to_string(payload)?],
         )?;
@@ -311,7 +322,7 @@ impl Runtime {
     }
 
     pub fn save_tool_request(&self, key: &str, payload: &serde_json::Value) -> crate::R<()> {
-        self.db.lock().unwrap().execute(
+        self.db().execute(
             "INSERT OR REPLACE INTO tool_requests VALUES(?1,?2)",
             params![key, serde_json::to_string(payload)?],
         )?;
@@ -319,7 +330,7 @@ impl Runtime {
     }
 
     pub fn save_review(&self, id: &str, turns: u64) -> crate::R<()> {
-        self.db.lock().unwrap().execute(
+        self.db().execute(
             "INSERT OR REPLACE INTO reviews VALUES(?1,?2)",
             params![id, turns as i64],
         )?;
@@ -327,7 +338,7 @@ impl Runtime {
     }
 
     pub fn save_attachment(&self, id: &str, a: &Attachment) -> crate::R<()> {
-        self.db.lock().unwrap().execute(
+        self.db().execute(
             "INSERT OR REPLACE INTO attachments VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
                 id,
@@ -343,6 +354,12 @@ impl Runtime {
     }
 
 
+    ///
+    /// Инвариант: `emit` берёт мьютекс store сам, поэтому вызывать его ПОД
+    /// `self.data.lock()` нельзя — это взаимная блокировка (tokio-мьютекс не
+    /// реентрантен). Порядок такой: собрать данные под замком, отпустить,
+    /// потом `emit`. Отдельно: `emit` → `refresh_child` → снова `data`, и это
+    /// безопасно ровно потому, что к моменту вызова замок уже отпущен.
     pub async fn emit(
         &self,
         id: &str,
@@ -423,14 +440,20 @@ impl Runtime {
             before != after
         };
         if changed {
-            self.publish_session(fresh).await;
+            self.publish_session(fresh);
         }
     }
 
     /// Разослать подписчикам свежую запись списка сессий. Отдельный канал, а не
     /// шина событий транскрипта: у тех `session_id` один, а тут меняется сам
     /// список.
-    pub async fn publish_session(&self, session: Session) {
+    /// Опубликовать карточку сессии в `GET /v1/events`.
+    ///
+    /// Не `async`: внутри только `broadcast::send`, а он синхронный. Раньше был
+    /// `async` без единого `await` — и вызывался под мьютексом store
+    /// (`message`), где любой лишний `await` означал бы `Send`-обязательства
+    /// под замком. Функции здесь нечего ждать.
+    pub fn publish_session(&self, session: Session) {
         let _ = self.tx_updates.send(serde_json::json!({
             "type": "session.updated",
             "session": session,
@@ -619,8 +642,7 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                 // В store не хранятся: выводятся из журнала при discovery.
                 turns: None,
                 done: None,
-                last_ms: None,
-                started_at: None,
+                    started_at: None,
                 done_at: None,
             })
         })? {
@@ -769,10 +791,6 @@ pub fn open_store(dir: &Path) -> crate::R<(Store, Connection)> {
         }
     }
     Ok((read_store(&db)?, db))
-}
-#[allow(dead_code)]
-pub fn load(dir: &Path) -> crate::R<Store> {
-    Ok(open_store(dir)?.0)
 }
 pub fn interrupt_running(store: &mut Store, sequences: &mut BTreeMap<String, u64>) {
     let running: Vec<String> = store

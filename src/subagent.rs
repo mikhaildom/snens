@@ -48,29 +48,6 @@ pub struct Child {
     pub state: State,
 }
 
-/// Прочитать журнал ребёнка **один раз** и достать оба признака.
-///
-/// Раньше `done_of` и `started_of` открывали и разбирали один и тот же файл
-/// каждый сам: на карточку подагента это два полных прохода, а третий рядом
-/// делал `progress` ради счётчика ходов.
-pub fn journal_signs(path: &Path) -> (Option<String>, Option<u32>) {
-    let Ok(records) = log::read_file(path) else {
-        return (None, None);
-    };
-    let mut done = None;
-    let mut pid = None;
-    for rec in &records {
-        match rec {
-            log::Rec::Done { status, .. } => done = Some(status.clone()),
-            log::Rec::Started { pid: p, .. } => {
-                pid.get_or_insert(*p);
-            }
-            _ => {}
-        }
-    }
-    (done, pid)
-}
-
 /// Индекс детей в ящике: pid из регистрации при спавне. Нужен только когда в
 /// журнале нет `Started` — то есть процесс умер, не успев записать первую строку
 /// (или лог остался от версии до этой записи).
@@ -165,9 +142,14 @@ pub fn describe(state: &State) -> &'static str {
 /// третьей стороной. Теперь состояние подагента — факт его журнала, а ящик лишь
 /// индекс.
 pub fn state_of(cfg: &Config, parent: &str, id: &str) -> State {
+    // Через факты, а не своим проходом по журналу: `journal_signs` дублировал
+    // полный разбор файла, который для той же сессии уже делает `surface_facts`
+    // (и кэширует по mtime). Теперь источник признаков один на всё ядро.
     let path = cfg.sessions_path().join(format!("{id}.jsonl"));
-    let (done, started) = journal_signs(&path);
-    state_from_signs(cfg, parent, id, done, started)
+    let progress = crate::surface_facts::facts(&path, true)
+        .progress
+        .unwrap_or_default();
+    state_from_signs(cfg, parent, id, progress.done_sign, progress.started_pid)
 }
 
 /// То же по уже прочитанным признакам журнала: список сессий читает файл один

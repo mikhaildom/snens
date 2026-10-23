@@ -183,6 +183,28 @@ impl Client {
         self.json(reqwest::Method::GET, "/v1/memory", None).await
     }
 
+    /// Открыть приглашение пейринга на ядре (docs/pairing.md). Требует уже
+    /// действующего токена: открыть пейринг может только тот, кто уже внутри.
+    pub async fn pair_open(&self) -> Result<Value, String> {
+        self.json(reqwest::Method::POST, "/v1/pair/start", Some(serde_json::json!({})))
+            .await
+    }
+
+    /// Подключённые устройства: id, имя, когда создан и когда последний раз видели.
+    pub async fn clients(&self) -> Result<Value, String> {
+        self.json(reqwest::Method::GET, "/v1/clients", None).await
+    }
+
+    /// Отозвать устройство: его токен перестаёт работать со следующего запроса.
+    pub async fn revoke_client(&self, id: &str) -> Result<Value, String> {
+        self.json(
+            reqwest::Method::DELETE,
+            &format!("/v1/clients/{id}"),
+            None,
+        )
+        .await
+    }
+
     /// Сменить тумблеры памяти (то же, что `snens memory …`). `patch` —
     /// объект с полями `enabled`/`recall`/`retain`.
     pub async fn set_memory(&self, patch: Value) -> Result<Value, String> {

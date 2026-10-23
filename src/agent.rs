@@ -105,13 +105,9 @@ pub struct SurfaceRunOptions<'a> {
 }
 
 pub struct SurfaceToolRequest {
-    #[allow(dead_code)]
     pub call_id: String,
-    #[allow(dead_code)]
     pub name: String,
-    #[allow(dead_code)]
     pub args: String,
-    #[allow(dead_code)]
     pub result: tokio::sync::oneshot::Sender<SurfaceToolResult>,
 }
 #[derive(Clone)]

@@ -24,36 +24,19 @@ pub async fn entry() -> R<()> {
     let cmd = argv.first().map(String::as_str).unwrap_or("help");
     match cmd {
         "serve" => {
-            let parsed = flags(&argv[1..])?;
-            validate_options(
-                &parsed,
-                &[
-                    "config",
-                    "listen",
-                    "token-file",
-                    "data-dir",
-                    "allow-remote",
-                    "insecure-public",
-                    "tls-cert",
-                    "tls-key",
-                ],
-            )?;
+            let parsed = flags_for(&argv[1..], &SERVE_SPEC)?;
             serve(&parsed).await
         }
         "tui" => {
-            let parsed = flags(&argv[1..])?;
-            validate_options(&parsed, &["config", "endpoint", "token-file", "session"])?;
+            let parsed = flags_for(&argv[1..], &TUI_SPEC)?;
             set_effective_config(parsed.get("config").map(String::as_str))?;
             tui(&parsed).await
         }
+        // `tui-local` — прежний локальный TUI: своя спека, а не белый список
+        // руками. Раньше правило «что допустимо» здесь было четвёртой копией и
+        // уже расходилось с `TUI_SPEC`.
         "tui-local" => {
-            let parsed = crate::parse_args(
-                &std::iter::once("tui-local".to_string())
-                    .chain(argv[1..].iter().cloned())
-                    .collect::<Vec<_>>(),
-            )
-            .1;
-            validate_options(&parsed, &["config", "session"])?;
+            let parsed = flags_for(&argv[1..], &TUI_LOCAL_SPEC)?;
             set_effective_config(parsed.get("config").map(String::as_str))?;
             crate::tui::cmd(&parsed).await
         }
@@ -64,11 +47,13 @@ pub async fn entry() -> R<()> {
         // Retain all established CLI commands on the existing dispatcher. Preserve
         // an explicit config for subprocesses as well as for this process.
         _ => {
-            let explicit = argv
-                .windows(2)
-                .find(|w| w[0] == "--config")
-                .map(|w| w[1].as_str());
-            set_effective_config(explicit)?;
+            // `--config` для legacy-подкоманд раньше искался `windows(2)`: если
+            // флаг стоял последним или был один, пара не находилась и конфиг
+            // молча игнорировался. Берём его тем же парсером, что и остальное.
+            let explicit = parse_flags(&argv[1..], &CLI_SPEC)
+                .ok()
+                .and_then(|(parsed, _)| parsed.get("config").cloned());
+            set_effective_config(explicit.as_deref())?;
             crate::legacy_main().await
         }
     }
@@ -167,13 +152,6 @@ fn set_effective_config(explicit: Option<&str>) -> R<PathBuf> {
     Ok(path)
 }
 
-fn validate_options(flags: &BTreeMap<String, String>, allowed: &[&str]) -> R<()> {
-    if let Some(key) = flags.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("option --{key} is not valid for this command").into());
-    }
-    Ok(())
-}
-
 fn token_path(flag: Option<&String>, data: &Path) -> PathBuf {
     match flag {
         Some(path) => PathBuf::from(path), // explicit path is literal, including absolute paths
@@ -219,44 +197,99 @@ fn load_token(path: &Path, create: bool) -> R<String> {
     Ok(value)
 }
 
-fn flags(args: &[String]) -> R<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
-    let mut args = args.iter();
-    while let Some(key) = args.next() {
-        if !matches!(
-            key.as_str(),
-            "--config"
-                | "--listen"
-                | "--token-file"
-                | "--endpoint"
-                | "--session"
-                | "--data-dir"
-                | "--allow-remote"
-                | "--insecure-public"
-                | "--tls-cert"
-                | "--tls-key"
-        ) {
+/// Единственный разбор флагов на всё ядро.
+///
+/// Раньше парсеров было три: этот, `cli::parse_args` (свой список «что берёт
+/// значение», своё поведение на дублях и на неизвестных флагах) и таблица
+/// разрешённых опций в `validate_options`. Списки расходились: новый флаг,
+/// добавленный в одном месте, молча получал `"1"` в другом. Теперь правило одно,
+/// а различия — в `FlagSpec`.
+pub struct FlagSpec {
+    /// Флаги, которые носят значение (`--config PATH`).
+    pub values: &'static [&'static str],
+    /// Флаги-переключатели (`--allow-remote`): значения не носят.
+    pub switches: &'static [&'static str],
+    /// Строгий режим — для команд ядра: неизвестный флаг и повтор — ошибка.
+    /// Мягкий — для подкоманд: они принимают свои переключатели (`--detach`,
+    /// `--new`), а повтор просто перебивает прежнее значение.
+    pub strict: bool,
+}
+
+pub fn parse_flags(args: &[String], spec: &FlagSpec) -> R<(BTreeMap<String, String>, Vec<String>)> {
+    let mut flags = BTreeMap::new();
+    let mut positional = Vec::new();
+    let mut it = args.iter();
+    while let Some(key) = it.next() {
+        if !key.starts_with("--") {
+            positional.push(key.clone());
+            continue;
+        }
+        let takes_value = spec.values.contains(&key.as_str());
+        if spec.strict && !takes_value && !spec.switches.contains(&key.as_str()) {
             return Err(format!("unknown option {key}").into());
         }
-        // Флаги-переключатели значения не носят: `--allow-remote` без аргумента
-        // — это включено, а не ошибка разбора (прежний парсер требовал значение
-        // у каждого флага и падал на первом же переключателе).
-        let is_switch = matches!(key.as_str(), "--allow-remote" | "--insecure-public");
-        let value = if is_switch {
-            "1".to_string()
-        } else {
-            args.next()
+        let value = if takes_value {
+            it.next()
                 .ok_or_else(|| format!("missing value for {key}"))?
                 .clone()
+        } else {
+            "1".to_string()
         };
-        if out
-            .insert(key.trim_start_matches("--").to_owned(), value)
-            .is_some()
-        {
+        let previous = flags.insert(key.trim_start_matches("--").to_owned(), value);
+        if spec.strict && previous.is_some() {
             return Err(format!("duplicate option {key}").into());
         }
     }
-    Ok(out)
+    Ok((flags, positional))
+}
+
+/// Что принимает `serve` (правило было в `validate_options`). Перечни у команд
+/// разные намеренно: `serve --endpoint` — опечатка, а не настройка, и раньше она
+/// ловилась именно здесь.
+const SERVE_SPEC: FlagSpec = FlagSpec {
+    values: &[
+        "--config",
+        "--listen",
+        "--token-file",
+        "--data-dir",
+        "--tls-cert",
+        "--tls-key",
+    ],
+    switches: &["--allow-remote", "--insecure-public"],
+    strict: true,
+};
+
+/// Что принимает `tui`.
+const TUI_SPEC: FlagSpec = FlagSpec {
+    values: &["--config", "--endpoint", "--token-file", "--session"],
+    switches: &[],
+    strict: true,
+};
+
+/// Что принимает `tui-local` (прежний локальный TUI).
+const TUI_LOCAL_SPEC: FlagSpec = FlagSpec {
+    values: &["--config", "--session"],
+    switches: &[],
+    strict: true,
+};
+
+/// Мягкая спека подкоманд: они принимают свои переключатели (`--detach`,
+/// `--new`, `--json`), а повтор флага перебивает прежнее значение.
+pub const CLI_SPEC: FlagSpec = FlagSpec {
+    values: &[
+        "--session",
+        "--config",
+        "--parent",
+        "--older-than",
+        "--endpoint",
+        "--token-file",
+    ],
+    switches: &[],
+    strict: false,
+};
+
+fn flags_for(args: &[String], spec: &FlagSpec) -> R<BTreeMap<String, String>> {
+    Ok(parse_flags(args, spec)?.0)
 }
 
 #[cfg(test)]
@@ -273,17 +306,21 @@ mod tests {
     }
     #[test]
     fn cli_flags_are_strict_and_unique() {
-        assert!(flags(&["--endpoint".into(), "http://localhost".into()]).is_ok());
-        assert!(flags(&["--endpoint".into()]).is_err());
-        assert!(flags(&["--bad".into(), "x".into()]).is_err());
-        let parsed = flags(&["--endpoint".into(), "http://localhost".into()]).unwrap();
-        assert!(validate_options(&parsed, &["config", "listen", "token-file"]).is_err());
-        assert!(flags(&[
-            "--session".into(),
-            "a".into(),
-            "--session".into(),
-            "b".into()
-        ])
-        .is_err());
+        // Перечни у команд разные: `--endpoint` — настройка `tui`, а не `serve`.
+        let serve = |a: &[String]| flags_for(a, &SERVE_SPEC);
+        let tui = |a: &[String]| flags_for(a, &TUI_SPEC);
+        assert!(tui(&["--endpoint".into(), "http://localhost".into()]).is_ok());
+        assert!(serve(&["--endpoint".into(), "http://localhost".into()]).is_err());
+        // Флаг со значением не может остаться без него.
+        assert!(serve(&["--config".into()]).is_err());
+        // Неизвестный флаг и повтор — ошибка строгого режима.
+        assert!(serve(&["--bad".into(), "x".into()]).is_err());
+        assert!(serve(&["--config".into(), "a".into(), "--config".into(), "b".into()]).is_err());
+        // Переключатель значения не носит: `--allow-remote` — это «включено».
+        let parsed = tui(&["--endpoint".into(), "http://localhost".into()]).unwrap();
+        assert_eq!(parsed["endpoint"], "http://localhost");
+        let parsed = serve(&["--allow-remote".into()]).unwrap();
+        assert_eq!(parsed["allow-remote"], "1");
     }
+
 }

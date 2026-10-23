@@ -4,6 +4,7 @@ mod askpass;
 mod attach;
 mod cfg;
 mod cfg_edit;
+mod clients;
 mod context;
 mod context_document;
 #[cfg(test)]
@@ -17,6 +18,7 @@ mod llm;
 mod log;
 mod mail;
 mod memory;
+mod pairing;
 mod production;
 mod project;
 mod prompt;
@@ -124,6 +126,8 @@ async fn legacy_main() -> R<()> {
         Some("config") => settings::cmd(&flags, positional),
         Some("providers") => providers::cmd(&flags, positional),
         Some("memory") => cmd_memory(&flags, positional),
+        Some("pair") => cmd_pair(&flags).await,
+        Some("clients") => cmd_clients(&flags, positional).await,
         Some("build") => cmd_build(&flags, positional),
         Some("review") => review::cmd(&flags).await,
         Some("improve") => improve::cmd(&flags).await,
@@ -136,26 +140,21 @@ async fn legacy_main() -> R<()> {
     }
 }
 
-#[allow(clippy::type_complexity)]
+/// Разбор аргументов подкоманд. Тот же парсер, что у `serve`/`tui`
+/// (`production::parse_flags`), но мягкий: подкоманды принимают свои
+/// переключатели (`--new`, `--detach`, `--json`), а повтор флага перебивает
+/// прежнее значение.
 fn parse_args(argv: &[String]) -> (Option<String>, BTreeMap<String, String>, Vec<String>) {
-    let mut flags = BTreeMap::new();
-    let mut positional = Vec::new();
-    let mut it = argv.iter();
-    let cmd = it.next().cloned();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--session" | "--config" | "--parent" | "--older-than" => {
-                if let Some(v) = it.next() {
-                    flags.insert(a.trim_start_matches("--").to_string(), v.clone());
-                }
-            }
-            other if other.starts_with("--") => {
-                flags.insert(other.trim_start_matches("--").to_string(), "1".into());
-            }
-            other => positional.push(other.to_string()),
-        }
+    let cmd = argv.first().cloned();
+    let rest = argv.get(1..).unwrap_or_default();
+    // Спека подкоманд — в `production`, рядом с остальными: держать её копию
+    // здесь значило бы снова завести второй список «что берёт значение».
+    match crate::production::parse_flags(rest, &crate::production::CLI_SPEC) {
+        Ok((flags, positional)) => (cmd, flags, positional),
+        // Мягкий режим ошибается только на отсутствующем значении; раньше такой
+        // флаг просто выбрасывался. Пустая карта — то же поведение для вызывающих.
+        Err(_) => (cmd, BTreeMap::new(), rest.to_vec()),
     }
-    (cmd, flags, positional)
 }
 
 fn session_id(cfg: &cfg::Config, flags: &BTreeMap<String, String>) -> R<String> {
@@ -685,6 +684,98 @@ async fn cmd_tools(flags: &BTreeMap<String, String>) -> R<()> {
 /// Без аргументов печатает `enabled`/`recall`/`retain`/`cmd`; с аргументами
 /// правит указанные ключи в `[memory]` конфига. Действует со следующего хода:
 /// живой процесс перечитывает секцию на старте цикла (`Config::memory_now`).
+/// `snens pair` — открыть приглашение и напечатать код (docs/pairing.md).
+///
+/// Идёт через HTTP к живому ядру, а не пишет файл сам: приглашение живёт в
+/// памяти процесса, и второй процесс, положивший его «рядом», ядро бы не увидело.
+async fn cmd_pair(flags: &BTreeMap<String, String>) -> R<()> {
+    if flags.contains_key("help") || flags.contains_key("h") {
+        println!(
+            "snens pair [--config PATH] [--endpoint URL] [--token-file PATH]\n\
+             \x20 открыть приглашение: код на 5 минут и адрес для приложения"
+        );
+        return Ok(());
+    }
+    let (client, _) = surface_client_for(flags)?;
+    let reply = client
+        .pair_open()
+        .await
+        .map_err(|e| format!("ядро не ответило: {e}"))?;
+    let code = reply["code"].as_str().unwrap_or("?");
+    let left = reply["seconds_left"].as_u64().unwrap_or(0);
+    println!("Код пейринга: {code}");
+    println!("Действует {}:{:02}.", left / 60, left % 60);
+    for e in reply["endpoints"].as_array().cloned().unwrap_or_default() {
+        if let Some(e) = e.as_str() {
+            println!("Адрес: {e}");
+        }
+    }
+    println!("Введите адрес и код в приложении — токен оно получит само.");
+    Ok(())
+}
+
+/// `snens clients [revoke <id>]` — кто подключён и отзыв доступа.
+async fn cmd_clients(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
+    if flags.contains_key("help") || flags.contains_key("h") {
+        println!(
+            "snens clients            — подключённые устройства\n\
+             \x20 snens clients revoke <id>  — отозвать (токен перестаёт работать сразу)"
+        );
+        return Ok(());
+    }
+    let (client, _) = surface_client_for(flags)?;
+    let mut args = positional.into_iter();
+    match args.next().as_deref() {
+        Some("revoke") => {
+            let id = args.next().ok_or("clients revoke: нужен id устройства")?;
+            client
+                .revoke_client(&id)
+                .await
+                .map_err(|e| format!("отзыв не удался: {e}"))?;
+            println!("отозвано: {id}");
+        }
+        _ => {
+            let reply = client.clients().await.map_err(|e| format!("ядро не ответило: {e}"))?;
+            let items = reply["clients"].as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                println!("подключённых устройств нет");
+            }
+            for c in items {
+                let seen = c["last_seen"].as_u64().unwrap_or(0);
+                println!(
+                    "{} · {} · создан {}",
+                    c["name"].as_str().unwrap_or("?"),
+                    c["id"].as_str().unwrap_or("?"),
+                    if seen > 0 { "использовался" } else { "ещё не входил" }
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Клиент поверхности по флагам: адрес, токен из файла, конфиг — как у `tui`.
+fn surface_client_for(
+    flags: &BTreeMap<String, String>,
+) -> R<(crate::surface_client::Client, cfg::Config)> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let token_path = flags
+        .get("token-file")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cfg.data_path().join("api.token"));
+    let token = std::fs::read_to_string(&token_path)
+        .map_err(|e| format!("нет токена {}: {e} (ядро запущено?)", token_path.display()))?
+        .trim()
+        .to_string();
+    let endpoint = flags
+        .get("endpoint")
+        .cloned()
+        .unwrap_or_else(|| "http://127.0.0.1:7420".into());
+    let client = crate::surface_client::Client::new(endpoint, token)
+        .map_err(|e| format!("клиент поверхности: {e}"))?;
+    Ok((client, cfg))
+}
+
 fn cmd_memory(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
     if flags.contains_key("help") || flags.contains_key("h") {
         println!(

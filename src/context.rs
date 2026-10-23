@@ -291,7 +291,12 @@ fn purge_message_calls(messages: Vec<Value>, path: &Path) -> Vec<Value> {
             if let Some(calls) = m.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 calls.retain(|c| !c["id"].as_str().is_some_and(|id| removed.contains(id)));
                 if calls.is_empty() {
-                    m.as_object_mut().unwrap().remove("tool_calls");
+                    // Без `unwrap`: сообщение пришло от провайдера или из
+                    // журнала, и «не объект» здесь — повод оставить запись как
+                    // есть, а не упасть в проекции контекста каждого хода.
+                    if let Some(object) = m.as_object_mut() {
+                        object.remove("tool_calls");
+                    }
                     if m["content"].is_null() || m["content"] == "" {
                         return None;
                     }

@@ -4,6 +4,8 @@
 // профиль, активный не удаляется) живут в `providers_tests.rs`.
 
 use super::*;
+use crate::cfg::Config;
+use crate::surface_runtime::{self as rt, Runtime};
 use axum::body::to_bytes;
 use axum::response::IntoResponse;
 use tokio::sync::{Mutex, broadcast};
@@ -43,6 +45,8 @@ async fn provider_runtime(name: &str) -> (Arc<Runtime>, PathBuf) {
         event_seq: Default::default(),
         review_gen: Default::default(),
         approvals: Default::default(),
+        pending: Default::default(),
+        registry: Default::default(),
         tx_updates: broadcast::channel(16).0,
     });
     (runtime, dir)

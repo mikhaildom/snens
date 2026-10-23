@@ -554,10 +554,12 @@ mod tests {
             }
         });
 
-        let mut cfg = crate::cfg::Config::default();
-        cfg.base_url = format!("http://{addr}");
         // Модель и провайдер больше не зашиты в дефолты — тест задаёт их сам.
-        cfg.model = "test/model".into();
+        let cfg = crate::cfg::Config {
+            base_url: format!("http://{addr}"),
+            model: "test/model".into(),
+            ..Default::default()
+        };
         let llm = OpenAi::new("test-key".into()).unwrap();
         let mut noop = |_: Delta| {};
         let reply = llm

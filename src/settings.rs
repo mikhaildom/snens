@@ -196,7 +196,12 @@ pub fn prepare(cfg: &Config, patch: &Value) -> R<Vec<crate::cfg_edit::Edit>> {
                     crate::cfg_edit::string(&mode),
                 ));
             }
-            _ => unreachable!("ключи перечислены в KEYS и разобраны выше"),
+            // Не `unreachable!`: `KEYS` — публичный список, и новый ключ,
+            // добавленный только в него, паниковал бы на живом `PUT /v1/config`
+            // (и на `snens config k=v`). Ошибка честнее — клиент увидит, что
+            // ключ не принят, а сервис останется живым. Инвариант проверяется
+            // тестом `every_key_has_a_handler` ниже.
+            other => return Err(format!("{other}: ключ не поддержан").into()),
         }
     }
     // Цель уборки не может быть больше бюджета: иначе она недостижима и правка
@@ -403,6 +408,25 @@ mod tests {
         let reloaded = Config::load(Some(&path.display().to_string())).unwrap();
         assert_eq!(reloaded.context_budget, 100_000);
         assert_eq!(reloaded.context_target, 70_000);
+        std::fs::remove_file(&path).ok();
+    }
+    /// Каждый ключ из `KEYS` обязан разбираться в `prepare`. Инвариант раньше
+    /// держался только на `unreachable!` — то есть падением на живом сервере,
+    /// когда ключ добавляли в список и забывали ветку.
+    #[test]
+    fn every_key_has_a_handler() {
+        let (cfg, path) = cfg_with("model = \"a\"\n", "keys");
+        // Значение-заглушка: важно не «принято», а «не паника и не „не поддержан“».
+        for key in KEYS {
+            let patch = json!({ *key: "1" });
+            if let Err(error) = prepare(&cfg, &patch) {
+                let text = error.to_string();
+                assert!(
+                    !text.contains("ключ не поддержан"),
+                    "{key}: ключ из KEYS без ветки разбора — {text}"
+                );
+            }
+        }
         std::fs::remove_file(&path).ok();
     }
 }

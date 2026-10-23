@@ -37,7 +37,88 @@ pub struct Facts {
     /// Ходы, признак закрытия и границы работы. Заполняется только для
     /// подагентов: пользовательским сессиям счётчик ходов не показывается, а
     /// полный разбор мегабайтного лога на каждый список слишком дорог.
-    pub progress: Option<crate::surface_server::discovery::Progress>,
+    pub progress: Option<Progress>,
+}
+
+/// Что видно про подагента по его журналу: сколько ходов, когда начал, когда
+/// закончил и чем. Границы нужны для длительности — по ним клиент рисует «работает
+/// 3 мин» без опроса.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub turns: u64,
+    pub done: Option<String>,
+    /// Время первой записи журнала (unix, сек) — старт подагента.
+    pub started_at: Option<u64>,
+    /// Время записи `Done` — конец работы.
+    pub done_at: Option<u64>,
+    /// Признаки журнала для состояния подагента (`subagent::state_from_signs`)
+    /// — ровно те, что раньше добывал отдельный `journal_signs`. Лежат здесь,
+    /// потому что проход по журналу дорогой: один файл на карточку читался
+    /// дважды (`progress` ради ходов и `journal_signs` ради состояния).
+    ///
+    /// `done_sign` — последняя запись `Done` как есть, без поправки на работу
+    /// после неё (та поправка — только для показа `done`); состояние подагента
+    /// считается по факту закрытия, как и раньше.
+    pub done_sign: Option<String>,
+    /// Первый `Started` — pid, объявленный самим подагентом.
+    pub started_pid: Option<u32>,
+}
+
+/// Полный разбор журнала ради счётчика ходов. Дорого (весь файл), поэтому
+/// вызывается только для подагентов и только из `surface_facts`.
+pub fn progress_uncached(path: &Path) -> Progress {
+    let Ok(records) = crate::log::read_file(path) else {
+        return Progress::default();
+    };
+    let mut turns = 0u64;
+    let mut done = None;
+    let mut started_at = records.first().map(|r| r.ts());
+    let mut done_at = None;
+    let mut started_pid = None;
+    let mut done_sign = None;
+    for rec in &records {
+        match rec {
+            crate::log::Rec::Assistant { .. } => turns += 1,
+            crate::log::Rec::Done { status, .. } => {
+                done = Some(status.clone());
+                done_sign = Some(status.clone());
+                done_at = Some(rec.ts());
+            }
+            // Первый `Started` — pid, объявленный самим подагентом. Тот же проход,
+            // что и остальные признаки: отдельный `journal_signs` читал файл снова.
+            crate::log::Rec::Started { pid, .. } => {
+                started_pid.get_or_insert(*pid);
+            }
+            _ => {}
+        }
+    }
+    if started_at == Some(0) {
+        started_at = records.iter().map(|r| r.ts()).find(|t| *t > 0);
+    }
+    // Перезапущенная сессия: `Done` есть, но после него снова работали —
+    // последняя `Assistant` новые ходы добавляет, и закрытие уже не текущее.
+    // Порядок в журнале хронологический, поэтому просто смотрим, что было
+    // последним из двух событий.
+    let last_done = records
+        .iter()
+        .rposition(|r| matches!(r, crate::log::Rec::Done { .. }));
+    let last_assistant = records
+        .iter()
+        .rposition(|r| matches!(r, crate::log::Rec::Assistant { .. }));
+    if let (Some(d), Some(a)) = (last_done, last_assistant) {
+        if a > d {
+            done = None;
+            done_at = None;
+        }
+    }
+    Progress {
+        turns,
+        done,
+        started_at,
+        done_at,
+        done_sign,
+        started_pid,
+    }
 }
 
 /// Ключ кэша: путь, mtime (сек) и размер файла.
@@ -125,7 +206,7 @@ fn read_facts(path: &Path, want_progress: bool) -> Facts {
         out.model = tail_model(path);
     }
     if want_progress {
-        out.progress = Some(crate::surface_server::discovery::progress_uncached(path));
+        out.progress = Some(progress_uncached(path));
     }
     out
 }

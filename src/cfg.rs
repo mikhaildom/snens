@@ -654,14 +654,6 @@ impl Config {
         self.set_keys(&[(Some(section.to_string()), key.to_string(), value.to_string())])
     }
 
-    /// Правка одного ключа верхнего уровня.
-    pub fn set_top_key(&self, key: &str, value: &str, path: Option<&Path>) -> R<PathBuf> {
-        let target = path.map(Path::to_path_buf);
-        let edits = self.parse_edits(&[(None, key.to_string(), value.to_string())])?;
-        let path = target.unwrap_or_else(|| self.source_path.clone().unwrap_or_else(config_path));
-        crate::cfg_edit::write(&path, &edits)
-    }
-
     /// Пачка правок: одна запись файла, поэтому пачка либо применяется целиком,
     /// либо не применяется вовсе. `(секция, ключ, TOML-значение)`.
     pub fn set_keys(&self, changes: &[(Option<String>, String, String)]) -> R<PathBuf> {
