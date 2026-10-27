@@ -87,7 +87,9 @@ impl Args {
                     .and_then(|p| p.parent().map(|d| d.join("web")))
             })
             .unwrap_or_else(|| PathBuf::from("web"));
-        let token_file = token_file.filter(|p| !p.trim().is_empty()).map(PathBuf::from);
+        let token_file = token_file
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from);
 
         Ok(Some(Args {
             listen,

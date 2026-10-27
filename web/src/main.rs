@@ -14,8 +14,8 @@ mod proxy;
 mod static_files;
 
 use axum::{
-    Router,
     routing::{any, get},
+    Router,
 };
 use std::{sync::Arc, time::Duration};
 

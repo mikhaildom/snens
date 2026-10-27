@@ -97,7 +97,10 @@ pub async fn proxy(State(up): State<Shared>, req: Request) -> Response {
         Ok(m) => m,
         Err(_) => return (StatusCode::BAD_REQUEST, "неизвестный метод").into_response(),
     };
-    let mut out = up.client.request(method, &url).headers(forward_headers(&parts.headers));
+    let mut out = up
+        .client
+        .request(method, &url)
+        .headers(forward_headers(&parts.headers));
     if let Some(t) = token(&up) {
         out = out.bearer_auth(t);
     }
@@ -132,8 +135,10 @@ pub async fn proxy(State(up): State<Shared>, req: Request) -> Response {
         "no-store".parse().expect("статическая строка"),
     );
     // Тело — поток: SSE и стриминг ответа модели сохраняются как есть.
-    let body = Body::from_stream(upstream.bytes_stream().map(|chunk| {
-        chunk.map_err(|e| std::io::Error::other(e.to_string()))
-    }));
+    let body = Body::from_stream(
+        upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string()))),
+    );
     (status, headers, body).into_response()
 }

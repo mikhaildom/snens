@@ -39,9 +39,7 @@ fn content_type(path: &std::path::Path) -> &'static str {
 /// Ассеты с хешем в имени кешируются навсегда: имя меняется вместе с
 /// содержимым. `index.html` — никогда: иначе обновление клиента не доедет.
 fn cache_control(path: &std::path::Path) -> &'static str {
-    let immutable = path
-        .components()
-        .any(|c| c.as_os_str() == "assets");
+    let immutable = path.components().any(|c| c.as_os_str() == "assets");
     if immutable {
         "public, max-age=31536000, immutable"
     } else {
