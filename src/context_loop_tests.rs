@@ -80,6 +80,7 @@ impl Fixture {
             text: GOAL.into(),
             source: "test".into(),
             parts: Vec::new(),
+            ask: None,
         })?;
         if large {
             // 240k байт в результате тула: порог перейдён (>= 40k + бюджет).
@@ -373,6 +374,7 @@ async fn forty_k_budget_real_loop_compacts_and_resumes_without_replaying_payload
         source: "test-resume".into(),
         text: "Continue from the saved note.".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
     let expected = context::effective(&resumed.read()?, &f.cfg)?;
     let resume_fake = EditingLlm::new(f.mirror_path(), Script::Resume(expected));

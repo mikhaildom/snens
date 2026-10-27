@@ -76,6 +76,10 @@ pub struct Message {
     pub attachment_ids: Vec<String>,
     pub state: String,
     pub run_id: Option<String>,
+    /// Ответ на вопрос артефакта (`snens.ask`): ссылка на артефакт и вопрос.
+    /// Пишется в журнал при старте хода и едет в `Rec::User.ask`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<crate::log::AskRef>,
 }
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Attachment {
@@ -682,6 +686,7 @@ fn read_store(c: &Connection) -> crate::R<Store> {
             Ok((
                 sid,
                 Message {
+                    ask: None,
                     id: mid,
                     command_id: r.get(2)?,
                     text: r.get(3)?,
@@ -964,6 +969,7 @@ mod tests {
                 attachment_ids: Vec::new(),
                 state: "applied".into(),
                 run_id: None,
+                ask: None,
             }],
         );
         d.events.insert(
@@ -1021,6 +1027,7 @@ mod tests {
                 attachment_ids: Vec::new(),
                 state: "accepted".into(),
                 run_id: Some("r".into()),
+                ask: None,
             }],
         );
         let mut sequences = BTreeMap::from([("s".to_string(), 9)]);
@@ -1089,6 +1096,7 @@ mod tests {
                 attachment_ids: vec!["a2".into(), "a1".into()],
                 state: "applied".into(),
                 run_id: None,
+                ask: None,
             }],
         );
 
@@ -1123,6 +1131,7 @@ mod tests {
                 width: 640,
                 height: 480,
             }],
+            ask: None,
         };
         let decoded: Rec = serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
         match decoded {

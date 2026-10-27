@@ -145,6 +145,7 @@ mod tests {
             text: text.into(),
             source: "cli".into(),
             parts: Vec::new(),
+            ask: None,
         }
     }
 

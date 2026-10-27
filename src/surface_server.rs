@@ -36,6 +36,8 @@ mod approvals;
 mod events;
 #[path = "surface_settings.rs"]
 mod settings;
+#[path = "surface_genui.rs"]
+mod genui;
 #[path = "surface_pairing.rs"]
 mod pairing;
 #[path = "surface_router.rs"]

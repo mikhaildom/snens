@@ -21,6 +21,7 @@ tools/*/search
 tools/*/fetch
 tools/*/grep
 tools/*/shot
+tools/*/genui
 tools/*/web
 tools/*/desk
 # Строки выше совпадают и с путями внутри тулов — после того как git один

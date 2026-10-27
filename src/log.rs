@@ -62,6 +62,11 @@ pub enum Rec {
         source: String,
         #[serde(default)]
         parts: Vec<Part>,
+        /// Ответ человека на вопрос из артефакта (`snens.ask`): ссылка на артефакт
+        /// и вопрос. `None` — обычная реплика. Отдельного вида записи нет: это
+        /// слово человека, просто собранное интерфейсом, а не пальцами.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ask: Option<AskRef>,
     },
     Assistant {
         ts: u64,
@@ -249,6 +254,30 @@ pub fn turns_word(turns: u64) -> &'static str {
     } else {
         "ходов"
     }
+}
+
+/// Ссылка на вопрос артефакта, на который человек ответил.
+///
+/// Хранится вместе с репликой (`Rec::User.ask`), а не отдельной записью:
+/// ответ — это слово человека, просто собранное интерфейсом. По нему ядро
+/// понимает, что вопрос уже отвечен (`409 ask_answered`), а проекция пишет
+/// модели компактную строку вместо полного текста интерфейса.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct AskRef {
+    /// `seq` записи `assistant`, в которой лежал артефакт: имя артефакта
+    /// уникально внутри сообщения, а не сессии.
+    #[serde(default)]
+    pub seq: u64,
+    /// Имя артефакта из заголовка фенса (`id=…`).
+    #[serde(default)]
+    pub artifact: String,
+    /// Имя вопроса внутри артефакта (`snens.ask({id})`).
+    #[serde(default)]
+    pub id: String,
+    /// Текст вопроса: человеку он нужен в раскрытой строке ответа, модели —
+    /// чтобы связывать ответ с вопросом в своей же разметке.
+    #[serde(default)]
+    pub question: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -809,6 +838,7 @@ mod writer_safety_tests {
             text: text.to_string(),
             source: "test".to_string(),
             parts: vec![],
+            ask: None,
         }
     }
 

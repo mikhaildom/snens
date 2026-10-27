@@ -100,6 +100,7 @@ pub async fn selftest() -> R<()> {
         text: "проверь тулы".into(),
         source: "selftest".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
 
     let fake = Fake::new(vec![
@@ -274,6 +275,7 @@ pub async fn selftest() -> R<()> {
         text: "позови типизированный тул".into(),
         source: "selftest".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
     let dir_out = sess_t.path().with_extension("out");
     let call = |args: &str| Call {
@@ -379,6 +381,7 @@ pub async fn selftest() -> R<()> {
         text: "два больших вывода".into(),
         source: "selftest".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
     let big = |id: &str| Reply {
         reasoning: String::new(),
@@ -457,6 +460,7 @@ pub async fn selftest() -> R<()> {
         text: "проверь память".into(),
         source: "selftest".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
     let fake_off = Fake::new(vec![Reply {
         reasoning: String::new(),
@@ -491,6 +495,7 @@ pub async fn selftest() -> R<()> {
         text: "проверь память".into(),
         source: "selftest".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
     let fake3 = Fake::new(vec![Reply {
         reasoning: String::new(),

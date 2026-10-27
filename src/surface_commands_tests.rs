@@ -25,17 +25,20 @@ fn message_idempotency_checks_text_payload() {
         attachment_ids: vec!["attachment-id".into()],
         state: "applied".into(),
         run_id: Some("run-id".into()),
+        ask: None,
     };
     assert!(same_message_payload(
         &existing,
         "original input",
-        &["attachment-id".into()]
+        &["attachment-id".into()],
+        &None
     ));
-    assert!(!same_message_payload(&existing, "original input", &[]));
+    assert!(!same_message_payload(&existing, "original input", &[], &None));
     assert!(!same_message_payload(
         &existing,
         "changed input",
-        &["attachment-id".into()]
+        &["attachment-id".into()],
+        &None
     ));
 }
 

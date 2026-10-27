@@ -91,6 +91,9 @@ pub async fn run_agent<L: Llm>(
 pub struct QueuedInput {
     pub text: String,
     pub parts: Vec<crate::log::Part>,
+    /// Ответ на вопрос артефакта: едет в журнал вместе с текстом, чтобы
+    /// одноразовость пережила очередь и границу хода.
+    pub ask: Option<crate::log::AskRef>,
 }
 
 pub struct SurfaceRunOptions<'a> {
@@ -254,6 +257,7 @@ async fn run_loop<L: Llm>(
                     text: input.text,
                     source: "surface-steer".into(),
                     parts: input.parts,
+                    ask: input.ask,
                 })?;
             }
         }
@@ -330,6 +334,7 @@ async fn run_loop<L: Llm>(
                 source: format!("context-cleanup:{pressure_next}"),
                 text,
                 parts: Vec::new(),
+                ask: None,
             })?;
             msgs = mirror.prepare(&sess.read()?, cfg)?;
             project::apply_cleared(&mut msgs, &project::cleared_map(&sess.read()?));
@@ -464,6 +469,7 @@ async fn run_loop<L: Llm>(
                             text: input.text,
                             source: "surface-steer".into(),
                             parts: input.parts,
+                            ask: input.ask,
                         })?;
                     }
                     continue;
@@ -695,6 +701,7 @@ async fn final_answer<L: Llm>(
         text: LIMIT_NOTE.into(),
         source: "limit".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
     let log = sess.read()?;
     // `project::msgs`, а не `context::effective`: последний — база зеркала, а на
@@ -859,6 +866,7 @@ mod tests {
             text: "hello".into(),
             source: "surface".into(),
             parts: Vec::new(),
+            ask: None,
         })?;
         let observe = |_| {};
 
@@ -935,6 +943,7 @@ mod tests {
             text: "поработай".into(),
             source: "test".into(),
             parts: Vec::new(),
+            ask: None,
         })?;
         let run_once = || Reply {
             reasoning: String::new(),
@@ -1014,6 +1023,7 @@ mod tests {
             text: "поработай".into(),
             source: "test".into(),
             parts: Vec::new(),
+            ask: None,
         })?;
         let fake = Fake::new(vec![text_reply(""), text_reply("готово")]);
         run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await?;
@@ -1050,6 +1060,7 @@ mod tests {
             text: "поработай".into(),
             source: "test".into(),
             parts: Vec::new(),
+            ask: None,
         })?;
         let fake = Fake::new(vec![text_reply(""), text_reply("")]);
         let err = run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await;

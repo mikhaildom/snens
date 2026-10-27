@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "enum": ["list", "new", "check"],
+      "description": "list — что есть в библиотеке компонентов; new — скелет нового компонента; check — проверить артефакт (lint + рендер в браузере)"
+    },
+    "target": {
+      "type": "string",
+      "description": "check: файл .html или <session>:<seq>[:<artifact>] — артефакт берётся из журнала сессии, то есть проверяется ровно то, что увидит человек. new: имя компонента"
+    },
+    "force": {
+      "type": "boolean",
+      "description": "new: перезаписать существующий компонент"
+    },
+    "no_browser": {
+      "type": "boolean",
+      "description": "check: только статика (чужие теги, приватная сеть, размер, незакрытый фенс), без Chrome"
+    },
+    "json": {
+      "type": "boolean",
+      "description": "list: отдать JSON вместо текста"
+    },
+    "data": {
+      "type": "string",
+      "description": "check: путь к JSON, который артефакт получит как snens.data"
+    }
+  },
+  "required": ["command"],
+  "x-snens": {
+    "argv": [
+      {"field": "command"},
+      {"field": "target"},
+      {"flag": "--force", "field": "force", "boolean": true},
+      {"flag": "--no-browser", "field": "no_browser", "boolean": true},
+      {"flag": "--json", "field": "json", "boolean": true},
+      {"flag": "--data", "field": "data"}
+    ],
+    "stdin": {"mode": "none"}
+  }
+}

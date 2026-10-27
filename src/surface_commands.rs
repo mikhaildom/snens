@@ -139,9 +139,33 @@ pub(super) struct Send {
     text: String,
     #[serde(default)]
     attachment_ids: Vec<String>,
+    /// Ответ человека на вопрос артефакта (`snens.ask`): ссылка на артефакт и
+    /// вопрос. Есть — ядро проверяет, что вопрос ещё не отвечен, и пишет
+    /// ответ записью `Rec::User` с этим же полем.
+    #[serde(default)]
+    ask: Option<SendAsk>,
 }
-pub(super) fn same_message_payload(existing: &rt::Message, text: &str, attachment_ids: &[String]) -> bool {
-    existing.text == text && existing.attachment_ids == attachment_ids
+
+/// Ссылка на вопрос артефакта, как её присылает клиент. `seq` — номер записи
+/// `assistant` с артефактом (он же `seq` в истории), `artifact` и `id` — имена
+/// из заголовка фенса и из `snens.ask`.
+#[derive(Deserialize)]
+pub(super) struct SendAsk {
+    seq: u64,
+    #[serde(default)]
+    artifact: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    question: String,
+}
+pub(super) fn same_message_payload(
+    existing: &rt::Message,
+    text: &str,
+    attachment_ids: &[String],
+    ask: &Option<crate::log::AskRef>,
+) -> bool {
+    existing.text == text && existing.attachment_ids == attachment_ids && &existing.ask == ask
 }
 
 pub(super) async fn ensure_writer(s: &Arc<Runtime>, id: &str) -> crate::R<Arc<crate::log::Session>> {
@@ -205,13 +229,57 @@ pub(super) async fn message(
     if let Err(e) = ensure_writer(&s, &id).await {
         return err("session_owned", &e.to_string(), StatusCode::CONFLICT).into_response();
     }
+    // Ответ на вопрос артефакта: проверка до любых записей. `artifact` клиент
+    // может не прислать — тогда имя берём из самого журнала, а не из его слов:
+    // иначе опечатка в клиенте делала бы вопрос «другим» и разрешала повтор.
+    let ask = match b.ask.as_ref() {
+        None => None,
+        Some(a) => {
+            let path = discovery::path(&s.cfg, &id);
+            let log = path
+                .as_deref()
+                .map(crate::log::read_file)
+                .transpose()
+                .unwrap_or_else(|_| Some(Vec::new()))
+                .unwrap_or_default();
+            let Some(found) = crate::surface_artifact::find(&log, a.seq) else {
+                return err(
+                    "artifact_not_found",
+                    "no artifact in that record",
+                    StatusCode::CONFLICT,
+                )
+                .into_response();
+            };
+            let artifact = if a.artifact.is_empty() {
+                found.id.clone()
+            } else {
+                a.artifact.clone()
+            };
+            let id_question = if a.id.is_empty() { "q".to_string() } else { a.id.clone() };
+            let key = format!("{}:{}:{}", found.seq, artifact, id_question);
+            if crate::surface_artifact::answered(&log).contains(&key) {
+                return err(
+                    "ask_answered",
+                    "this question is already answered",
+                    StatusCode::CONFLICT,
+                )
+                .into_response();
+            }
+            Some(crate::log::AskRef {
+                seq: found.seq,
+                artifact,
+                id: id_question,
+                question: a.question.clone(),
+            })
+        }
+    };
     let mut d = s.data.lock().await;
     if let Some(m) = d
         .messages
         .get(&id)
         .and_then(|v| v.iter().find(|m| m.command_id == b.command_id))
     {
-        if !same_message_payload(m, &b.text, &b.attachment_ids) {
+        if !same_message_payload(m, &b.text, &b.attachment_ids, &ask) {
             return err(
                 "idempotency_conflict",
                 "command_id reused with different payload",
@@ -248,6 +316,7 @@ pub(super) async fn message(
         attachment_ids: b.attachment_ids.clone(),
         state: state.into(),
         run_id: run_id.clone(),
+        ask: ask.clone(),
     });
     let result = serde_json::json!({"message_id":mid,"run_id":run_id,"state":state});
     // Сессия обязана быть в store: выше её либо нашли (`known`), либо вставили,
@@ -291,11 +360,12 @@ pub(super) async fn message(
         let Some(run_id) = run_id else {
             return err("conflict", "run_id is not current", StatusCode::CONFLICT).into_response();
         };
-        launch(s.clone(), id, run_id, b.text, surface, parts).await
+        launch(s.clone(), id, run_id, b.text, surface, parts, ask).await
     } else if let Some(c) = s.controls.lock().await.get(&id) {
         let _ = c.queued.send(crate::agent::QueuedInput {
             text: b.text.clone(),
             parts,
+            ask,
         });
     }
     (StatusCode::ACCEPTED, Json(result)).into_response()

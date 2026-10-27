@@ -116,6 +116,7 @@ async fn failed_launch_clears_running_state_and_cancels_queued_messages() {
                 attachment_ids: Vec::new(),
                 state: "accepted".into(),
                 run_id: Some("run".into()),
+                ask: None,
             }],
         );
     }

@@ -246,6 +246,7 @@ mod tests {
             text: "задача".into(),
             source: "agent".into(),
             parts: vec![],
+            ask: None,
         })
         .unwrap();
         register_child(&cfg.mail_path(), "me", "old", me).unwrap();

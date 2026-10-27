@@ -21,6 +21,7 @@ use super::{
     http::{AuthCtx, auth},
     query::{context_breakdown, search},
     sessions::{create, delete_session, get_session, list, register_tools},
+    genui::get as genui_lib,
     settings::{
         activate_provider, delete_provider, get_config, get_memory, get_model, get_providers,
         post_provider, put_config, put_memory, put_model, put_provider,
@@ -75,6 +76,9 @@ pub(super) fn app(state: Arc<Runtime>, token: String) -> Router {
         // поверхность эмитит их в общий поток — клиент стримит подагента так же,
         // как корневую сессию.
         .route("/v1/sessions/{id}/ingest", post(ingest))
+        // Библиотека компонентов генеративного UI: исходники целиком, чтобы
+        // клиент инжектил их в артефакт инлайном (сети в песочнице нет).
+        .route("/v1/genui", get(genui_lib))
         .route("/v1/model", get(get_model).put(put_model))
         .route("/v1/memory", get(get_memory).put(put_memory))
         .route("/v1/config", get(get_config).put(put_config))

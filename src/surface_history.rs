@@ -46,6 +46,11 @@ pub struct HistoryMessage {
     /// следующей за ней записи `usage` того же хода.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Ответ человека на вопрос из артефакта (`snens.ask`): какой артефакт, какой
+    /// вопрос и что уехало модели. Есть — клиент рисует серую строку с
+    /// раскрытием, а не реплику человека.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask: Option<crate::log::AskRef>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -100,6 +105,7 @@ pub fn read_with(
                 text,
                 source,
                 parts,
+                ask,
             } => Some(HistoryMessage {
                 seq,
                 ts,
@@ -121,6 +127,7 @@ pub fn read_with(
                 via: None,
                 from: None,
                 usage: None,
+                ask,
             }),
             Rec::Steer {
                 ts,
@@ -148,6 +155,7 @@ pub fn read_with(
                     argv: None,
                     parts: None,
                     usage: None,
+                    ask: None,
                 })
             }
             // These records are internal prompt context, not transcript.
@@ -172,6 +180,7 @@ pub fn read_with(
                 via: None,
                 from: None,
                 usage: None,
+                ask: None,
             }),
             Rec::Recall { .. } | Rec::ContextNotice { .. } => None,
             // Отметка саморевью — служебная строка журнала, но в транскрипте
@@ -199,6 +208,7 @@ pub fn read_with(
                 via: None,
                 from: None,
                 usage: None,
+                ask: None,
             }),
             Rec::Assistant {
                 ts,
@@ -232,6 +242,7 @@ pub fn read_with(
                     via: None,
                     from: None,
                     usage: None,
+                    ask: None,
                 })
             }
             Rec::ToolResult {
@@ -265,6 +276,7 @@ pub fn read_with(
                     via: None,
                     from: None,
                     usage: None,
+                    ask: None,
                 })
             }
             // Расход хода лежит отдельной записью сразу после `assistant`.

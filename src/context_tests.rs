@@ -31,6 +31,7 @@ impl Fixture {
                 text: text.into(),
                 source: "human".into(),
                 parts: Vec::new(),
+                ask: None,
             })
             .unwrap();
     }

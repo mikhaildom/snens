@@ -124,10 +124,11 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
     for r in log {
         match r {
             Rec::User {
+                ts: _,
                 text,
                 source,
                 parts,
-                ..
+                ask,
             } => {
                 // Инструкции ревью и улучшения — системные по смыслу: это не запрос
                 // пользователя, а рамка задачи. Роль в проекции, лог остаётся как есть.
@@ -147,10 +148,29 @@ fn build(log: &[Rec], cfg: &Config) -> Vec<Value> {
                     out.push(json!({"role": "system", "content": REPLAY_NOTE}));
                 }
                 let role = if frame { "system" } else { "user" };
+                // Ответ из артефакта модели виден коротко: имя артефакта, вопрос и
+                // сам ответ. Полная разметка интерфейса лежит выше, в записи
+                // `assistant`, и второй раз платить за неё незачем.
+                let label = match ask {
+                    Some(a) if !a.artifact.is_empty() => {
+                        let q = if a.question.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" «{}»", a.question)
+                        };
+                        format!("[ответ на артефакт «{}»{q}] ", a.artifact)
+                    }
+                    _ => String::new(),
+                };
+                let text = if label.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{label}{text}")
+                };
                 let content = if parts.is_empty() {
                     json!(text)
                 } else {
-                    content_value(text, parts, cfg)
+                    content_value(&text, parts, cfg)
                 };
                 out.push(json!({"role": role, "content": content}));
             }
@@ -639,6 +659,7 @@ mod tests {
             text: text.into(),
             source: source.into(),
             parts: Vec::new(),
+            ask: None,
         }
     }
 
@@ -652,9 +673,47 @@ mod tests {
     /// Справка памяти живёт ровно один ход: в проекции она есть только пока
     /// запрос человека — последний. На следующем ходу её нет, и в префиксе
     /// остаётся только диалог.
+    /// Ответ на вопрос артефакта виден модели коротко и с именем артефакта:
+    /// полная разметка интерфейса уже лежит выше, в записи `assistant`, и второй
+    /// раз платить за неё незачем.
     #[test]
-    fn recall_is_visible_for_one_turn_only() {
+    fn artifact_answer_reaches_model_with_compact_label() {
         let cfg = Config::default();
+        let log = vec![
+            Rec::Assistant {
+                ts: 0,
+                text: Some("```artifact id=quiz\n<b>1</b>\n```".into()),
+                tool_calls: vec![],
+                reasoning: None,
+            },
+            Rec::User {
+                ts: 0,
+                text: "2".into(),
+                source: "artifact".into(),
+                parts: Vec::new(),
+                ask: Some(crate::log::AskRef {
+                    seq: 1,
+                    artifact: "quiz".into(),
+                    id: "q1".into(),
+                    question: "какой вариант?".into(),
+                }),
+            },
+        ];
+        let out = msgs(&log, &cfg);
+        let content = out
+            .iter()
+            .filter(|m| m["role"] == json!("user"))
+            .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            content,
+            vec!["[ответ на артефакт «quiz» «какой вариант?»] 2"],
+            "проекция потеряла пометку или раздулась разметкой"
+        );
+    }
+
+    #[test]
+    fn recall_is_visible_for_one_turn_only() {        let cfg = Config::default();
         let mut log = vec![user("первый", "cli"), recall("факт про X")];
         let first = msgs(&log, &cfg);
         assert_eq!(
@@ -903,6 +962,7 @@ mod tests {
             text: "inspect".into(),
             source: "surface".into(),
             parts: vec![image, document],
+            ask: None,
         }];
         let projected = msgs(&log, &Config::default());
         let content = projected.iter().find(|m| m["role"] == "user").unwrap()["content"]
@@ -1196,6 +1256,7 @@ mod tests {
                 text: "goal".into(),
                 source: "human".into(),
                 parts: vec![],
+                ask: None,
             },
             tool_rec("old", &"x".repeat(6000), 6000),
             tool_rec("fresh", &"y".repeat(6000), 6000),
@@ -1232,6 +1293,7 @@ mod tests {
                 text: "решение: не переспрашивать".into(),
                 source: "human".into(),
                 parts: vec![],
+                ask: None,
             },
             tool_rec("big", &"z".repeat(6000), 6000),
         ];
@@ -1265,6 +1327,7 @@ mod tests {
                 text: "привет, посмотри файл".into(),
                 source: "surface".into(),
                 parts: Vec::new(),
+                ask: None,
             },
             Rec::Assistant {
                 ts: 0,
@@ -1316,6 +1379,7 @@ mod tests {
                 text: "x".repeat(30_000),
                 source: "surface".into(),
                 parts: Vec::new(),
+                ask: None,
             },
         ];
         let raw = estimate_tokens(&build(&log, &cfg));

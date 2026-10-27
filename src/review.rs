@@ -58,7 +58,18 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
     }
     let sess = log::Session::open(&dir, &rid)?;
 
-    let audit = audit_report(cfg, &src).await?;
+    let mut audit = audit_report(cfg, &src).await?;
+    // Строка про артефакты: у ревью нет других сессий, и «повторяется ли
+    // разметка» оно решить не может — но заметить, что вопросы артефактов
+    // остались без ответа или что их много, обязано. Считается по журналу,
+    // а не по HTML: разбор интерфейса — работа `genui check`.
+    if let Ok(log) = log::read_file(&src) {
+        let stats = crate::surface_artifact::AskStats::of(&log);
+        let line = stats.line();
+        if !line.is_empty() {
+            audit.push_str(&format!("\n{line}\n"));
+        }
+    }
     let tickets = ticket_list(&cfg.tickets_path());
     let template = match &cfg.review_prompt {
         Some(p) => std::fs::read_to_string(p).map_err(|e| format!("review_prompt {p}: {e}"))?,
@@ -78,6 +89,7 @@ pub async fn run(cfg: &Config, id: &str, llm: &llm::OpenAi) -> R<()> {
         text,
         source: "review".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
     eprintln!("[snens] ревью {rid} → {} ({})", cfg.base_url, cfg.model);
     agent::run_agent(&sess, cfg, llm, &crate::render::Ui::plain()).await
@@ -256,6 +268,7 @@ mod tests {
                     text: format!("ход {i}"),
                     source: "cli".into(),
                     parts: Vec::new(),
+                    ask: None,
                 })
                 .unwrap();
                 sess.append(log::Rec::Assistant {

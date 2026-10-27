@@ -74,6 +74,7 @@ pub(super) async fn launch(
     text: String,
     surface: String,
     parts: Vec<crate::log::Part>,
+    ask: Option<crate::log::AskRef>,
 ) {
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -172,11 +173,16 @@ pub(super) async fn launch(
                 return;
             }
         };
+        // Ответ из артефакта помечается своим источником: в журнале видно, что
+        // текст собран интерфейсом, а не набран руками. Для проекции это ничего
+        // не меняет — роль всё равно `user`, различия едут полем `ask`.
+        let source = if ask.is_some() { "artifact" } else { "surface" };
         if let Err(error) = sess.append(crate::log::Rec::User {
             ts: crate::log::now(),
             text,
-            source: "surface".into(),
+            source: source.into(),
             parts,
+            ask,
         }) {
             finalize_launch_error(&s, &id, &run, &error.to_string()).await;
             return;
