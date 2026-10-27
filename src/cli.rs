@@ -34,6 +34,7 @@ mod sesscwd;
 mod settings;
 mod subagent;
 mod sweep;
+mod surface_artifact;
 mod surface_client;
 mod surface_ingest;
 mod surface_facts;
@@ -195,6 +196,7 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
         text: prompt,
         source: "cli".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
 
     let key = cfg.api_key()?;
@@ -243,6 +245,7 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
         text: prompt,
         source: "agent".into(),
         parts: Vec::new(),
+        ask: None,
     })?;
     let key = cfg.api_key()?;
     let llm = llm::OpenAi::new(key)?;
@@ -900,6 +903,12 @@ fn cmd_build(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()>
         if !dir.join("Cargo.toml").is_file() {
             return Err(format!("нет тула {name} в {}", tools_dir.display()).into());
         }
+        if !dir.join("src/main.rs").is_file() {
+            return Err(format!(
+                "{name} — библиотека, а не тул: собирается вместе с теми, кто её использует"
+            )
+            .into());
+        }
         targets.push(name.clone());
     }
 
@@ -922,6 +931,11 @@ fn cmd_build(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()>
     for e in std::fs::read_dir(&tools_dir)?.flatten() {
         let dir = e.path();
         if !dir.join("Cargo.toml").is_file() {
+            continue;
+        }
+        // Крейт без `src/main.rs` — библиотека (например `cdp`, транспорт для
+        // `shot` и `genui`), а не тул: бинарника у неё нет, и копировать нечего.
+        if !dir.join("src/main.rs").is_file() {
             continue;
         }
         let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {

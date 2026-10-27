@@ -127,6 +127,12 @@ pub async fn discover(cfg: &Config) -> Vec<Tool> {
         };
         let bin = d.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         if !bin.is_file() {
+            // Каталог без бинарника — библиотечный крейт (`tools/cdp`: транспорт
+            // для `shot` и `genui`), а не сломанный тул. Иначе каждый старт
+            // писал бы по строке об ошибке про то, чего в реестре и не должно быть.
+            if d.join("Cargo.toml").is_file() && !d.join("src/main.rs").is_file() {
+                continue;
+            }
             eprintln!(
                 "[snens] тул {name}: нет исполняемого файла {}",
                 bin.display()
