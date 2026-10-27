@@ -529,11 +529,13 @@ unset SNENS_SESSION SNENS_MAIL_DIR SNENS_PARENT 2>/dev/null || true
 # Родитель не задан — ask некуда слать.
 t agent ask "вопрос"
 want 1 "$rc" "agent: ask без родителя — код 1"
-has "я не подагент" "$err" "agent: ask без родителя — текст"
+has "некого спрашивать" "$err" "agent: ask без родителя — текст"
 
+# Без SNENS_SESSION дерево тоже печатается: себя в нём не знаешь, но структуру
+# сессий Mail-ящика видно — это осознанное поведение, а не отказ.
 t agent list
-want 1 "$rc" "agent: list без сессии — код 1"
-has "нет SNENS_SESSION" "$err" "agent: list без сессии — текст"
+want 0 "$rc" "agent: list без сессии — код 0"
+has "себя в дереве не знаю" "$out" "agent: list без сессии — объясняет, что себя не знает"
 
 t agent wait "нет-такого" --timeout 1
 want 1 "$rc" "agent: wait несуществующего — код 1"
@@ -560,6 +562,21 @@ t agent send kid "привет"
 want 0 "$rc" "agent: send — код 0"
 ls "$TMP/mail/kid/new"/*.json >/dev/null 2>&1 && ok "agent: send положил сообщение в ящик" || bad "agent: send не положил сообщение в ящик"
 has "\"kind\":\"steer\"" "$(cat "$TMP/mail/kid/new"/*.json)" "agent: send — вид steer"
+
+# genui: интерфейсные артефакты. Полный набор (рендер в браузере, фикстуры
+# песочницы) — рядом, tools/genui/selftest.sh; здесь контракт реестра.
+t genui --help
+want 0 "$rc" "genui: --help — код 0"
+has "genui check" "$out" "genui: --help описывает проверку"
+
+ghome=$TMP/genui-lib
+SNENS_GENUI_DIR=$ghome t genui new card
+want 0 "$rc" "genui: new — код 0"
+[ -f "$TMP/genui-lib/components/card.js" ] && ok "genui: new создал компонент" \
+  || bad "genui: new не создал компонент"
+SNENS_GENUI_DIR=$ghome t genui list
+want 0 "$rc" "genui: list — код 0"
+has "my-card" "$out" "genui: list показывает новый тег"
 
 if [ "$fails" -ne 0 ]; then
   echo
