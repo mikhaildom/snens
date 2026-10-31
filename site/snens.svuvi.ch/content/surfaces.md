@@ -96,7 +96,7 @@ vite: браузер не должен знать токен инстанса. �
 
 ```sh
 cp .env.example .env && chmod 600 .env   # TELEGRAM_TOKEN, ALLOWED_USER_IDS
-go build -o bin/snens-telegram ./cmd/snens-telegram
+scripts/build.sh                        # соберёт bin/snens-telegram
 bin/snens-telegram --env .env
 ```
 
