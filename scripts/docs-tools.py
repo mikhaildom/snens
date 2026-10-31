@@ -109,11 +109,21 @@ def read_text(path):
 
 
 def tool_dirs():
-    return sorted(
+    dirs = sorted(
         d
         for d in os.listdir(TOOLS_DIR)
         if os.path.isdir(os.path.join(TOOLS_DIR, d))
     )
+    # Каталог без src/main.rs — библиотечный крейт (`tools/cdp`: транспорт для
+    # `shot` и `genui`), а не тул реестра. То же правило, что в src/registry.rs.
+    return [
+        d
+        for d in dirs
+        if not (
+            os.path.isfile(os.path.join(TOOLS_DIR, d, "Cargo.toml"))
+            and not os.path.isfile(os.path.join(TOOLS_DIR, d, "src", "main.rs"))
+        )
+    ]
 
 
 def rust_sources(tool_dir):
