@@ -40,6 +40,8 @@ mod settings;
 mod genui;
 #[path = "surface_pairing.rs"]
 mod pairing;
+#[path = "surface_fork.rs"]
+mod fork;
 #[path = "surface_router.rs"]
 mod router;
 #[path = "surface_history.rs"]
