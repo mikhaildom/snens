@@ -54,10 +54,14 @@ pub fn attach(child: &std::process::Child) -> Option<Job> {
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         );
         if ok == 0 {
+            // Не оставляем открытую ручку: attach зовётся на каждый перезапуск,
+            // и утечка копилась бы до выхода окна.
+            windows_sys::Win32::Foundation::CloseHandle(job);
             return None;
         }
         let handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
         if AssignProcessToJobObject(job, handle) == 0 {
+            windows_sys::Win32::Foundation::CloseHandle(job);
             return None;
         }
         Some(Job { handle: job })

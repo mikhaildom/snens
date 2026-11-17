@@ -42,21 +42,27 @@ pub fn load_stored(app: &tauri::AppHandle) -> Option<Connection> {
     (conn.base_url.starts_with("http") && conn.token.trim().len() >= 32).then_some(conn)
 }
 
-/// Запомнить (или забыть, если `None`) удалённое соединение.
-pub fn save_stored(app: &tauri::AppHandle, conn: &Connection) {
+/// Запомнить (или забыть, если `None`) удалённое соединение. Ошибка записи
+/// возвращается наружу: молча «сохранённое» соединение теряется при следующем
+/// запуске, и человек видит окно на своём ядре без объяснения.
+pub fn save_stored(app: &tauri::AppHandle, conn: &Connection) -> Result<(), String> {
     let Some(path) = stored_path(app) else {
-        return;
+        return Err("не нашёл каталог конфигурации приложения".into());
     };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("не удалось создать {}: {e}", dir.display()))?;
     }
-    let body = serde_json::to_string_pretty(conn).unwrap_or_default();
+    let body = serde_json::to_string_pretty(conn)
+        .map_err(|e| format!("не удалось сериализовать соединение: {e}"))?;
     // Пишем через временный файл: оборванная запись (диск, антивирус) не должна
     // оставить окно без адреса, по которому оно уже работало.
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    std::fs::write(&tmp, body).map_err(|e| format!("не удалось записать {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("не удалось сохранить {}: {e}", path.display())
+    })
 }
 
 pub fn forget_stored(app: &tauri::AppHandle) {
@@ -81,10 +87,21 @@ pub fn reopen(app: tauri::AppHandle, state: tauri::State<'_, crate::Daemon>) -> 
         .clone()
         .ok_or("нет соединения")?;
     let remote = state.remote.lock().map(|g| *g).unwrap_or(false);
-    if let Some(w) = app.get_webview_window("main") {
+    // Старое окно сносим ДО создания нового (метка `main` должна освободиться),
+    // но если новое не собралось — поднимаем его обратно на том же соединении:
+    // иначе остаётся приложение без единого окна (трей показывает то же окно).
+    let previous = app.get_webview_window("main");
+    if let Some(w) = previous {
         let _ = w.destroy();
     }
-    crate::open_window(&app, &conn, remote).map_err(|e| e.to_string())
+    if let Err(e) = crate::open_window(&app, &conn, remote) {
+        let restored = crate::open_window(&app, &conn, remote);
+        return match restored {
+            Ok(()) => Err(format!("окно не пересоздалось: {e}")),
+            Err(_) => Err(format!("окно потеряно: {e}")),
+        };
+    }
+    Ok(())
 }
 
 /// Ответ команды: адрес и токен текущего соединения.
@@ -114,7 +131,7 @@ pub fn set_remote(
         base_url: base,
         token: token.trim().to_string(),
     };
-    save_stored(&app, &conn);
+    save_stored(&app, &conn)?;
     *state
         .connection
         .lock()
