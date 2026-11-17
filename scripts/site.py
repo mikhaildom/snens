@@ -143,7 +143,11 @@ def inline(text: str, depth: int = 0) -> str:
         return keep(f"<code>{m.group(1)}</code>")
 
     def link(m: re.Match) -> str:
-        label = inline(m.group(1), depth + 1)
+        # `src` уже прошёл `html.escape`, поэтому метка в группе тоже
+        # экранирована. Без `unescape` рекурсивный `inline()` экранировал бы её
+        # второй раз (`&amp;amp;` на странице), а метка с `&lt;`/`&gt;`
+        # превращалась бы в мусор.
+        label = inline(html.unescape(m.group(1)), depth + 1)
         cls = m.group(3)
         attr = f' class="{cls[2:-1]}"' if cls else ""
         return keep(f'<a{attr} href="{m.group(2)}">{label}</a>')

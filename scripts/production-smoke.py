@@ -476,7 +476,13 @@ def run_tui(config, endpoint, token_path, session_id, commands, timeout=8):
         argv = [str(BIN), "tui", "--config", str(config), "--endpoint", endpoint, "--token-file", str(token_path)]
         if session_id is not None:
             argv.extend(["--session", session_id])
-        os.execve(str(BIN), argv, env)
+        # `execve` может не состояться (нет бинаря, нет прав, плохой argv).
+        # Исключение вылетело бы в ветку родителя, и форк ушёл бы дальше по тесту
+        # с копией его состояния — вплоть до дедлока в llm.shutdown().
+        try:
+            os.execve(str(BIN), argv, env)
+        finally:
+            os._exit(127)
     output = bytearray()
     deadline = time.monotonic() + timeout
     sent = False

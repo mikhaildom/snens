@@ -22,8 +22,36 @@
 # Валидация без выполнения: SNENS_PRIV_DRYRUN=1 snens-priv <действие> … — печатает
 # «ok: <команда>» и выходит 0, либо отказывает кодом 2. Для тестов.
 set -eu
+# PATH фиксируем: брокер — root-граница, и `sed`/`tr` в conf_get не должны
+# резолвиться из PATH вызывающего (иначе это произвольное исполнение от root).
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 
-CONF="${SNENS_PRIV_CONF:-/etc/snens-priv.conf}"
+# Конфиг — и есть граница прав, поэтому он не должен перенаправляться окружением
+# и не должен быть доступен на запись кому-то, кроме root.
+# 1) под euid 0 (в т.ч. через sudo) SNENS_PRIV_CONF игнорируется;
+# 2) файл обязан принадлежать root (или самому вызывающему в dryrun-режиме) и
+#    быть недоступен на запись группе/others — иначе whitelist правит любой.
+if [ "$(id -u)" = 0 ]; then
+    CONF=/etc/snens-priv.conf
+else
+    CONF="${SNENS_PRIV_CONF:-/etc/snens-priv.conf}"
+fi
+if [ -e "$CONF" ]; then
+    [ -f "$CONF" ] || { echo "snens-priv: конфиг не файл: $CONF" >&2; exit 2; }
+    _conf_uid="$(stat -c '%u' "$CONF" 2>/dev/null || echo -1)"
+    # Не-root вызывает брокер только для dryrun (реальные действия требуют
+    # root): там конфиг может быть своим собственным, но всё равно не чужим.
+    if [ "$(id -u)" = 0 ]; then
+        [ "$_conf_uid" = 0 ] ||
+            { echo "snens-priv: конфиг не принадлежит root: $CONF" >&2; exit 2; }
+    else
+        [ "$_conf_uid" = 0 ] || [ "$_conf_uid" = "$(id -u)" ] ||
+            { echo "snens-priv: конфиг принадлежит не тебе и не root: $CONF" >&2; exit 2; }
+    fi
+    [ -z "$(find "$CONF" -maxdepth 0 -perm /022 -print 2>/dev/null)" ] ||
+        { echo "snens-priv: конфиг доступен на запись не владельцу: $CONF" >&2; exit 2; }
+fi
 
 die() {
     echo "snens-priv: $*" >&2
@@ -68,11 +96,23 @@ allowed_unit() {
 # и только с префиксом: иначе `mkdir -p /var/www/../../etc/x` обошёл бы границу.
 allowed_path() {
     case "$1" in
-        *..*) return 1 ;;
+        *..* | '') return 1 ;;
+        # Только абсолютный: относительный путь разрешился бы от cwd брокера.
+        /*) : ;;
+        *) return 1 ;;
     esac
+    # Текстовая проверка `..` не спасает от симлинков: если под разрешённым
+    # корнем есть ссылка наружу (`/var/www/site/link -> /etc`), то
+    # `mkdir -p /var/www/site/link/x` создал бы /etc/x от root, а `chown` по
+    # ссылке сменил бы владельца чужого файла. Поэтому сравниваем РАЗРЕШЁННЫЕ
+    # пути: `realpath -m` достраивает несуществующие хвосты, не трогая диск.
+    _target="$(realpath -m -- "$1" 2>/dev/null)" || return 1
+    [ -n "$_target" ] || return 1
     for root in $ROOTS; do
-        case "$1" in
-            "$root" | "$root"/*) return 0 ;;
+        _root="$(realpath -m -- "$root" 2>/dev/null)" || continue
+        [ -n "$_root" ] || continue
+        case "$_target" in
+            "$_root" | "$_root"/*) return 0 ;;
         esac
     done
     return 1

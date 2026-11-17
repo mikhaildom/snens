@@ -78,14 +78,23 @@ def decode_rust_string(src, i, where):
             i += 1
             continue
         if e == "x":
-            out.append(chr(int(src[i + 1 : i + 3], 16)))
+            # Битый hex — не DocsError, а ValueError, и main() печатал бы сырой
+            # traceback вместо одной строки `docs-tools: ...`.
+            try:
+                out.append(chr(int(src[i + 1 : i + 3], 16)))
+            except ValueError:
+                raise DocsError("%s: некорректный escape \\x" % where)
             i += 3
             continue
         if e == "u":
             close = src.find("}", i)
             if src[i + 1 : i + 2] != "{" or close < 0:
                 raise DocsError("%s: неизвестный escape \\u" % where)
-            out.append(chr(int(src[i + 2 : close], 16)))
+            try:
+                out.append(chr(int(src[i + 2 : close], 16)))
+            except ValueError:
+                # В том числе code point > 0x10FFFF и суррогаты.
+                raise DocsError("%s: некорректный escape \\u{...}" % where)
             i = close + 1
             continue
         raise DocsError("%s: неизвестный escape \\%s" % (where, e))

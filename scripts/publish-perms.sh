@@ -16,14 +16,31 @@ publish_perms() {
     _root="$1"
     _leaf="$2"
     [ -d "$_root" ] || return 1
-    _dir="$_leaf"
-    while [ "$_dir" != "$_root" ] && [ "$_dir" != "/" ] && [ "$_dir" != "." ]; do
+    [ -d "$_leaf" ] || return 1
+    # Граница сравнивается канонически: с завершающим слэшем, относительным
+    # путём или `..` в аргументе сырое сравнение никогда не совпало бы с
+    # `dirname`-цепочкой, цикл не остановился бы на границе и сделал бы
+    # `chmod 0755` на /var/www и /var. `pwd -P` разрешает и симлинки.
+    _root_p="$(cd "$_root" 2>/dev/null && pwd -P)" || return 1
+    _leaf_p="$(cd "$_leaf" 2>/dev/null && pwd -P)" || return 1
+    [ -n "$_root_p" ] && [ -n "$_leaf_p" ] || return 1
+    # И что лист вообще лежит под корнем: иначе граница бессмысленна.
+    case "$_leaf_p" in
+        "$_root_p" | "$_root_p"/*) : ;;
+        *) return 1 ;;
+    esac
+    _dir="$_leaf_p"
+    while [ "$_dir" != "$_root_p" ] && [ "$_dir" != "/" ] && [ "$_dir" != "." ]; do
         chmod 0755 "$_dir" 2>/dev/null || return 1
         _dir="$(dirname "$_dir")"
     done
     # Файлы: каталог версии неизменяем, поэтому рекурсивно, а не только лист.
+    # `-type d`/`-type f` — только каталоги и обычные файлы (симлинки не трогаем),
+    # а x-бит у файлов не снимаем: нынешний лист — tar.gz и .sha256, но
+    # `chmod 0644` по всем файлам убил бы исполняемое, если оно там окажется.
     find "$_leaf" -type d -exec chmod 0755 {} + 2>/dev/null || true
-    find "$_leaf" -type f -exec chmod 0644 {} + 2>/dev/null || true
+    find "$_leaf" -type f -perm -u+x -exec chmod 0755 {} + 2>/dev/null || true
+    find "$_leaf" -type f ! -perm -u+x -exec chmod 0644 {} + 2>/dev/null || true
     return 0
 }
 
@@ -37,8 +54,10 @@ publish_readable() {
     _dir="$(dirname "$_path")"
     while [ "$_dir" != "/" ] && [ "$_dir" != "." ]; do
         _perm="$(stat -c '%a' "$_dir" 2>/dev/null || echo 0)"
+        # Нужен бит x у others, а не любая из 5/6/7: 6 = rw- — в каталог не
+        # войти, Caddy всё равно отдаст 403. Годятся 1, 3, 5, 7.
         case "$_perm" in
-            *[5-7]) : ;;
+            *[1357]) : ;;
             *) return 1 ;;
         esac
         _dir="$(dirname "$_dir")"
