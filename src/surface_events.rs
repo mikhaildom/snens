@@ -295,10 +295,16 @@ pub(super) fn session_event_stream(
     )
 }
 pub(super) fn sse(e: Event) -> SseEvent {
-    SseEvent::default()
-        .id(e.seq.to_string())
-        .json_data(e)
-        .unwrap_or_else(|_| SseEvent::default())
+    let seq = e.seq;
+    match SseEvent::default().id(seq.to_string()).json_data(&e) {
+        Ok(frame) => frame,
+        // Пустой кадр хуже пропуска: клиент не поймёт, что событие было. Говорим
+        // в stderr и отдаём кадр без данных — он не сломает разбор.
+        Err(error) => {
+            eprintln!("[snens] SSE: событие {seq} не сериализовано: {error}");
+            SseEvent::default().id(seq.to_string())
+        }
+    }
 }
 
 /// `GET /v1/events` — поток изменений списка сессий.
@@ -312,19 +318,36 @@ pub(super) async fn session_updates(State(s): State<Arc<Runtime>>) -> impl IntoR
     // должен пропустить ближайшее изменение.
     let rx = s.tx_updates.subscribe();
     let live = futures_util::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(value) => {
-                    let frame = SseEvent::default()
-                        .json_data(value)
-                        .unwrap_or_else(|_| SseEvent::default());
-                    return Some((Ok::<_, std::convert::Infallible>(frame), rx));
-                }
-                // Медленный клиент теряет кадры, а не поток: полный список он
-                // перечитывает на старте и может перечитать после обрыва.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        // Один `recv` на кадр: `unfold` сам зовёт замыкание снова, поэтому
+        // `loop` здесь не нужен (и clippy справедливо ругался).
+        match rx.recv().await {
+            Ok(value) => {
+                // Ошибку сериализации не выдаём пустым кадром (клиент получил
+                // бы событие без данных и без id): говорим в stderr и шлём
+                // типизированный маркер пересинхронизации.
+                let frame = match SseEvent::default().json_data(&value) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        eprintln!("[snens] /v1/events: кадр не сериализован: {error}");
+                        SseEvent::default()
+                            .json_data(serde_json::json!({"type":"resync"}))
+                            .unwrap_or_default()
+                    }
+                };
+                Some((Ok::<_, std::convert::Infallible>(frame), rx))
             }
+            // Медленный клиент потерял кадры. Молча продолжать нельзя:
+            // пропущенный кадр — это устаревшая карточка (подагент висит
+            // «работает»), а узнать об этом клиенту неоткуда. Шлём маркер,
+            // по которому он перечитает список.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                eprintln!("[snens] /v1/events: подписчик отстал на {skipped} кадров");
+                let frame = SseEvent::default()
+                    .json_data(serde_json::json!({"type":"resync"}))
+                    .unwrap_or_default();
+                Some((Ok::<_, std::convert::Infallible>(frame), rx))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
         }
     });
     Sse::new(live)

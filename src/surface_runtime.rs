@@ -876,8 +876,17 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                     seq: r.get::<_, i64>(1)? as u64,
                     run_id: r.get(2)?,
                     kind: r.get(3)?,
-                    fields: serde_json::from_str(&r.get::<_, String>(4)?)
-                        .unwrap_or(serde_json::Value::Null),
+                    fields: serde_json::from_str(&r.get::<_, String>(4)?).map_err(|e| {
+                        // Битый payload события — это порча store, а не «пустые
+                        // поля»: все остальные колонки здесь возвращают ошибку,
+                        // и молчаливый `Null` прятал бы её, отдавая клиенту
+                        // событие без данных.
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
                 },
             ))
         })? {
