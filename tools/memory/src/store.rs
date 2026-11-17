@@ -87,7 +87,10 @@ create table if not exists turns(
   user text not null,
   assistant text not null,
   context text not null default '',
-  state text not null default 'new'
+  state text not null default 'new',
+  -- сколько раз ход уже пытались разобрать: транзиентный сбой провайдера не
+  -- должен съедать ход навсегда.
+  attempts integer not null default 0
 );
 ";
 
@@ -120,6 +123,12 @@ impl Store {
         db.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| e.to_string())?;
         db.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        // Старые базы колонки не имеют — добавляем на месте (ошибка «duplicate
+        // column name» при повторном открытии ожидаема и не фатальна).
+        let _ = db.execute(
+            "alter table turns add column attempts integer not null default 0",
+            [],
+        );
         // Размерность вектора — параметр таблицы, поэтому создаётся лениво.
         Ok(Store { db })
     }
@@ -457,7 +466,12 @@ impl Store {
     pub fn pending(&self, limit: usize) -> Result<Vec<(i64, String, String, String)>, String> {
         let mut st = self
             .db
-            .prepare("select id, user, assistant, context from turns where state = 'new' order by id limit ?1")
+            // 'retry' — транзиентный сбой: ход ждёт следующего flush, но не
+            // бесконечно (attempts ограничивает).
+            .prepare(
+                "select id, user, assistant, context from turns \
+                 where state = 'new' or (state = 'retry' and attempts < 5) order by id limit ?1",
+            )
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map(params![limit as i64], |r| {
@@ -482,6 +496,18 @@ impl Store {
         Ok(())
     }
 
+    /// Отметить неудачную попытку: ход вернётся в очередь, пока попыток меньше
+    /// пяти. Так транзиентный сбой провайдера не теряет ход навсегда.
+    pub fn retry(&self, id: i64) -> Result<(), String> {
+        self.db
+            .execute(
+                "update turns set state = 'retry', attempts = attempts + 1 where id = ?1",
+                params![id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn stats(&self) -> Result<Stats, String> {
         // Ошибку базы не превращаем в ноль: «пусто» и «сломалось» — разные ответы.
         let count = |sql: &str| -> Result<i64, String> {
@@ -489,7 +515,9 @@ impl Store {
         };
         let facts = count("select count(*) from facts where valid_to is null")?;
         let stale = count("select count(*) from facts where valid_to is not null")?;
-        let pending = count("select count(*) from turns where state = 'new'")?;
+        let pending = count(
+            "select count(*) from turns where state = 'new' or (state = 'retry' and attempts < 5)",
+        )?;
         let mut kinds = Vec::new();
         let mut st = self
             .db

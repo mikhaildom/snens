@@ -136,15 +136,17 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
     }
     let cand = 30;
     let mut fused: Vec<(i64, f64, Option<f64>, Option<f64>)> = Vec::new();
-    let by_vec = api::embed(cfg, &query)
-        .map(|e| {
+    // Ошибка поиска — не «ничего не помню»: сломанная база (нет vec0, чужая
+    // размерность, битый файл) иначе даёт код 0 и пустой ответ. Отсутствие
+    // провайдера эмбеддингов сюда не относится — это `api::embed` → None.
+    let by_vec = match api::embed(cfg, &query) {
+        Some(e) => {
             let q = api::quantize(&e);
-            store
-                .vector_search(&q, cfg.embed_dim, cand)
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let by_text = store.bm25_search(&query, cand).unwrap_or_default();
+            store.vector_search(&q, cfg.embed_dim, cand)?
+        }
+        None => Vec::new(),
+    };
+    let by_text = store.bm25_search(&query, cand)?;
 
     let rank_of = |list: &[(i64, f64)], id: i64| list.iter().position(|(x, _)| *x == id);
     let mut ids: Vec<i64> = by_vec.iter().map(|(i, _)| *i).collect();
@@ -363,8 +365,10 @@ fn flush(cfg: &Cfg, store: &Store) -> Result<i32, String> {
                 superseded += s;
             }
             Err(e) => {
-                eprintln!("memory: flush {id}: {e}");
-                store.finish(id, "failed")?;
+                // Транзиентный сбой (таймаут, 429, кривой JSON модели) не должен
+                // съедать ход: возвращаем в очередь с ограничением по попыткам.
+                eprintln!("memory: flush {id}: {e} (попытка отложена)");
+                store.retry(id)?;
             }
         }
     }

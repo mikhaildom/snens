@@ -356,13 +356,8 @@ pub fn start_agent(host: &str, port: u16) -> Result<(), String> {
     }
 }
 
-/// Положить текстовый файл на ту сторону.
-///
-/// Только base64 + декодирование на месте: `more`/`type` перекодируют поток в
-/// ANSI, и кириллица в скрипте превращается в мусор — PowerShell тогда падает на
-/// случайной кавычке посреди строки. Base64 переживает любую кодировку, а файл
-/// пишем UTF-8 с BOM, чтобы PowerShell 5.1 читал его правильно.
-/// Слушает ли кто-то порт на той стороне (именно LISTENING, не TIME_WAIT).
+/// Слушает ли кто-то порт на той стороне (именно LISTENING, не TIME_WAIT:
+/// `netstat | findstr :9227` ловит и хвосты прошлых соединений).
 fn listening(host: &str, port: u16) -> Result<bool, String> {
     if remote_os(host)? == "windows" {
         let out = powershell(
@@ -383,10 +378,13 @@ fn listening(host: &str, port: u16) -> Result<bool, String> {
     }
 }
 
+/// Положить текстовый файл на ту сторону через scp.
+///
+/// Не через `cmd /c echo … >> file` (содержимое молча теряется — проверено: файл
+/// доезжал короче на ~900 байт) и не через `more` (перекодирует поток в ANSI, и
+/// кириллица в скрипте превращается в мусор, на котором PowerShell падает).
+/// scp копирует байт в байт.
 fn put_file(host: &str, name: &str, content: &str) -> Result<(), String> {
-    // Через `cmd /c echo ... >> file` содержимое молча теряется (проверено:
-    // файл доезжал короче исходного на ~900 байт), а через `more` ломается
-    // кодировка. scp копирует байт в байт, поэтому кладём файл им.
     //
     // BOM обязателен: PowerShell 5.1 без него читает .ps1 как ANSI, кириллица
     // превращается в мусор и скрипт падает на случайной кавычке.
@@ -451,17 +449,19 @@ fn base64(data: &[u8]) -> String {
 /// Ждём, пока агент ответит на ping через туннель.
 fn wait_agent(host: &str, port: u16, budget: Duration) -> Result<(), String> {
     let until = Instant::now() + budget;
-    let mut last;
+    // String, а не &'static str: Box::leak в цикле терял по строке на каждой
+    // неудачной попытке.
+    let mut last = String::new();
     loop {
-        match ensure(host, port) {
+        let step = match ensure(host, port) {
             Ok(local) => {
                 if ping(local).is_ok() {
                     return Ok(());
                 }
-                last = "порт открыт, но агент не отвечает на ping";
+                "порт открыт, но агент не отвечает на ping".to_string()
             }
-            Err(e) => last = Box::leak(e.into_boxed_str()),
-        }
+            Err(e) => e,
+        };
         if Instant::now() >= until {
             let diag = ssh(host, "cmd /c type C:\\Users\\%USERNAME%\\snens-desk.out")
                 .unwrap_or_else(|_| "нет snens-desk.out".into());
@@ -471,6 +471,7 @@ fn wait_agent(host: &str, port: u16, budget: Duration) -> Result<(), String> {
                 diag.trim()
             ));
         }
+        last = step;
         std::thread::sleep(Duration::from_millis(400));
     }
 }

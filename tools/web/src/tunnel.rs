@@ -219,22 +219,57 @@ pub fn remote_browser_path(host: &str, local_port: u16, remote_port: u16) -> Opt
     }
     check_host(host).ok()?;
     for cmd in remote_candidates() {
-        let out = Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg("--")
-            .arg(host)
-            .arg(cmd)
-            .output()
-            .ok()?;
+        // Не `.ok()?`: сбой первого кандидата (Windows-команда на unix) не должен
+        // прекращать поиск — следующий ещё может сработать. И общий таймаут:
+        // ConnectTimeout покрывает только рукопожатие, а зависшая удалённая
+        // команда держала бы вызывающего бесконечно.
+        let Ok(out) = ssh_with_timeout(host, cmd, Duration::from_secs(10)) else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
         let text = String::from_utf8_lossy(&out.stdout);
         if let Some(p) = parse_devtools_active_port(&text) {
             return Some(p);
         }
     }
     None
+}
+
+/// ssh с общим ограничением времени: ждём не дольше `budget`, иначе гасим.
+fn ssh_with_timeout(
+    host: &str,
+    cmd: &str,
+    budget: Duration,
+) -> Result<std::process::Output, String> {
+    check_host(host)?;
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg("--")
+        .arg(host)
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("ssh {host}: {e}"))?;
+    let until = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Ok(None) => {}
+            Err(e) => return Err(format!("ssh {host}: {e}")),
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("ssh {host}: не ответил за {budget:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Команда для той стороны. ОС той машины наша сборка не знает, поэтому

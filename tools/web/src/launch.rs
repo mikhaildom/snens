@@ -159,7 +159,14 @@ pub fn ours_on_port(host: &str, port: u16) -> Result<bool, String> {
 /// Chrome молча прилипнет к уже запущенному процессу с ЧУЖИМ профилем (проверено:
 /// так и вышло на 9222 с профилем человека), и отладка будет не туда.
 pub fn port_free(host: &str, port: u16) -> Result<bool, String> {
-    if remote_os(host)? == "windows" {
+    let os = remote_os(host)?;
+    port_free_on(host, os, port)
+}
+
+/// То же, но ОС уже известна: `pick_port` перебирает до десяти портов, и каждый
+/// `remote_os` — это лишний ssh-вызов.
+fn port_free_on(host: &str, os: &str, port: u16) -> Result<bool, String> {
+    if os == "windows" {
         let out = powershell(
             host,
             &format!(
@@ -197,8 +204,9 @@ pub fn port_free(host: &str, port: u16) -> Result<bool, String> {
 
 /// Первый свободный порт начиная с `from` (не больше десяти попыток).
 pub fn pick_port(host: &str, from: u16) -> Result<u16, String> {
+    let os = remote_os(host)?;
     for p in from..from.saturating_add(10) {
-        if port_free(host, p)? {
+        if port_free_on(host, os, p)? {
             return Ok(p);
         }
     }
@@ -317,14 +325,22 @@ pub fn show_window(host: &str) -> Result<(), String> {
 [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
 [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
 [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 public delegate bool EnumProc(IntPtr h, IntPtr p);
 '@
+# PID-ы нашего профиля: без этого находился первый попавшийся «Google Chrome» —
+# личный браузер человека, а не агентский.
+$ours = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+  Where-Object { $_.CommandLine -match 'snens-chrome' -and $_.CommandLine -notmatch '--type=' } |
+  ForEach-Object { $_.ProcessId })
 $found = $false
 $cb = [W.U+EnumProc]{
   param($h, $p)
+  $pid2 = 0
+  [void][W.U]::GetWindowThreadProcessId($h, [ref]$pid2)
   $sb = New-Object System.Text.StringBuilder 512
   [void][W.U]::GetWindowText($h, $sb, 512)
-  if ($sb.ToString() -like '*Google Chrome*') {
+  if ($ours -contains $pid2 -and $sb.ToString() -like '*Google Chrome*') {
     [void][W.U]::ShowWindow($h, 9)
     [void][W.U]::BringWindowToTop($h)
     [void][W.U]::SetForegroundWindow($h)

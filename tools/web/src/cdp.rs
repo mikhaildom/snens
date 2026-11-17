@@ -165,6 +165,11 @@ impl Endpoint {
 
     /// ws браузера: из `/json/version`, а если его нет (режим одобрения) — из
     /// известного пути `/devtools/browser/<uuid>`.
+    /// Контракт режима одобрения (Chrome 144+): `/json/*` там нет, а прямой
+    /// `/devtools/page/<id>` отвечает 403. Поэтому вызывающий обязан быть готов
+    /// откатиться на `Target.attachToTarget` через ws браузера: `main.rs` делает
+    /// это в `live()`. Здесь возвращается адрес, который может не открыться —
+    /// и это не ошибка этой функции.
     pub fn browser_ws(&self) -> Result<String, String> {
         if let Ok(ws) = self.ws_url(None) {
             return Ok(ws);

@@ -35,11 +35,15 @@ impl TempDir {
         let base = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
+        // Счётчик в процессе: два TempDir в одну наносекунду (грубые часы)
+        // иначе получили бы один каталог, и Drop первого удалил бы живой второй.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let path = base.join(format!("{tag}-{}-{nanos}", std::process::id()));
+        let path = base.join(format!("{tag}-{}-{nanos}-{seq}", std::process::id()));
         fs::create_dir_all(&path)
             .map_err(|e| format!("временный каталог {}: {e}", path.display()))?;
         Ok(TempDir { path })
@@ -116,7 +120,9 @@ fn playwright_chrome() -> Option<PathBuf> {
     let base = PathBuf::from(home).join(".cache/ms-playwright");
     let mut best: Option<(u64, PathBuf)> = None;
     for e in fs::read_dir(&base).ok()? {
-        let e = e.ok()?;
+        // Одна нечитаемая запись не должна обнулять весь поиск: рабочий Chrome
+        // иначе выглядит как «не найден».
+        let Ok(e) = e else { continue };
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(ver) = name.strip_prefix("chromium-") else {
             continue;
@@ -248,6 +254,11 @@ pub struct Cdp {
     events: VecDeque<Value>,
 }
 
+/// Таймаут отличаем по префиксу сообщения — договор внутри крейта: `left()`,
+/// `read_json_within` и ожидание события кладут ровно эту строку. Вынесено в
+/// константу, чтобы формулировка не разъезжалась по файлу.
+const TIMEOUT_PREFIX: &str = "таймаут";
+
 fn is_timeout(e: &tungstenite::Error) -> bool {
     match e {
         tungstenite::Error::Io(io) => matches!(
@@ -281,7 +292,7 @@ impl Cdp {
         let now = Instant::now();
         if now >= self.deadline {
             Err(format!(
-                "таймаут {} с: Chrome не довёл работу до конца (страница держит открытый поток?)",
+                "{TIMEOUT_PREFIX} {} с: Chrome не довёл работу до конца (страница держит открытый поток?)",
                 self.timeout_s
             ))
         } else {
@@ -330,7 +341,7 @@ impl Cdp {
                 Err(e) if is_timeout(&e) => {
                     return Err(match (cap, self.left()) {
                         // Свой бюджет истёк, а общий дедлайн ещё жив: это не сбой.
-                        (Some(_), Ok(_)) => "таймаут ожидания события".to_string(),
+                        (Some(_), Ok(_)) => format!("{TIMEOUT_PREFIX} ожидания события"),
                         (_, Err(e)) => e,
                         _ => "CDP: Chrome не ответил (страница держит открытый поток?)".into(),
                     })
@@ -412,7 +423,7 @@ impl Cdp {
                     self.events.push_back(v);
                 }
                 Ok(_) => {}
-                Err(e) if e.starts_with("таймаут") => return Ok(None),
+                Err(e) if e.starts_with(TIMEOUT_PREFIX) => return Ok(None),
                 // Закрытие страницы посреди ожидания — это конец потока, а не сбой.
                 Err(e) => return Err(e),
             }
@@ -567,9 +578,19 @@ impl Browser {
                         return Ok(());
                     }
                 }
-                // Контекст исполнения пропадает при навигации — это не ошибка.
-                Err(e) if e.starts_with("таймаут") => return Err(e),
-                Err(e) => last = e,
+                // Контекст исполнения пропадает при навигации — это не ошибка,
+                // ждём дальше. Всё остальное (закрытый сокет, сдохший таргет)
+                // повторять бессмысленно: бюджет кончится, и вызывающий получит
+                // «не догрузилась» вместо настоящей причины.
+                Err(e)
+                    if e.contains("Cannot find context")
+                        || e.contains("Execution context")
+                        || e.contains("context was destroyed") =>
+                {
+                    last = e
+                }
+                Err(e) if e.starts_with(TIMEOUT_PREFIX) => return Err(e),
+                Err(e) => return Err(e),
             }
             if Instant::now() >= until {
                 return Err(format!(
