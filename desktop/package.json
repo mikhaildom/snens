@@ -3,12 +3,13 @@
   "private": true,
   "version": "0.2.4",
   "description": "Окно snens: веб-клиент и ядро как sidecar",
+  "packageManager": "npm@11.13.0",
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "2.12.5"
   }
 }

@@ -67,7 +67,13 @@ say "1/5 раскладка sidecar'ов и клиента"
 "$REPO/scripts/desktop-stage.sh"
 
 say "2/5 сборка бандлов (nsis/appimage/deb) с подписью"
+# Подпись и упаковка идут через `@tauri-apps/cli`: версия зафиксирована точно
+# (2.12.5 — та, что тянет `tauri` 2.12.5 из desktop/Cargo.lock), а
+# `package-lock.json` закоммичен. Без этого `npm ci` падает на отсутствии
+# lockfile, а голый `npx` скачивает тот 2.x, который редит реестр на момент
+# релиза — то есть инсталлятор подписывается непроверенным CLI.
 cd "$DESKTOP"
+npm ci --no-audit --no-fund
 npx tauri build
 
 say "3/5 манифест latest.json"
