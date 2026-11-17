@@ -1,6 +1,7 @@
 // grep — поиск по файлам: путь, строка, текст совпадения. Обход и фильтры свои,
 // потому что `grep -rn` из оболочки тащит в контекст служебный мусор (.git, target,
 // node_modules) и не умеет ни лимита с пометкой, ни «нет совпадений — это ответ».
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -11,6 +12,9 @@ const LINE_MAX: usize = 400;
 const SKIP_BYTES: u64 = 1024 * 1024;
 /// Первые килобайты файла: NUL в них — достаточный признак бинарника.
 const SNIFF: usize = 8192;
+/// Предел для файла, названного руками: `read_text` читает его целиком в память,
+/// а в контекст модели он всë равно не поместится — говорим вслух, а не падаем по OOM.
+const NAMED_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const SKIP_DIRS: [&str; 10] = [
     ".git",
     "target",
@@ -80,7 +84,12 @@ fn parse(argv: &[String]) -> Args {
     while i < argv.len() {
         let a = argv[i].as_str();
         if only_paths {
-            paths.push(a.to_string());
+            // `--` выключает разбор опций, но не превращает шаблон в путь: первый
+            // позиционный аргумент всё ещё шаблон (`grep -- -foo file`).
+            match pattern {
+                None => pattern = Some(a.to_string()),
+                Some(_) => paths.push(a.to_string()),
+            }
             i += 1;
             continue;
         }
@@ -185,8 +194,13 @@ fn ignored_dir(name: &str) -> bool {
 
 /// Обход: симлинки не разворачиваем (циклы), каталоги-исключения режем целиком.
 fn walk(dir: &Path, rel: &str, args: &Args, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            // Молчаливый пропуск неотличим от «здесь ничего не нашлось» — говорим вслух.
+            eprintln!("grep: пропущен {}: {e}", dir.display());
+            return;
+        }
     };
     let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
     entries.sort();
@@ -245,13 +259,14 @@ fn hits(line: &str, pattern: &str, ignore_case: bool, word: bool) -> bool {
     if pattern.is_empty() {
         return false;
     }
+    // В общем случае (без --ignore-case) оба строковых среза уже есть — копии не нужны.
     let (hay, needle) = if ignore_case {
-        (line.to_lowercase(), pattern.to_lowercase())
+        (Cow::Owned(line.to_lowercase()), Cow::Owned(pattern.to_lowercase()))
     } else {
-        (line.to_string(), pattern.to_string())
+        (Cow::Borrowed(line), Cow::Borrowed(pattern))
     };
     let mut from = 0;
-    while let Some(pos) = hay[from..].find(&needle) {
+    while let Some(pos) = hay[from..].find(needle.as_ref()) {
         let start = from + pos;
         let end = start + needle.len();
         if !word {
@@ -265,7 +280,9 @@ fn hits(line: &str, pattern: &str, ignore_case: bool, word: bool) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        // Шаг на ширину символа, а не на байт: иначе `from` встанет внутрь
+        // многобайтового символа и следующая нарезка `hay[from..]` запаникует.
+        from = start + hay[start..].chars().next().map_or(1, char::len_utf8);
         if from >= hay.len() {
             return false;
         }
@@ -307,13 +324,20 @@ fn scan_file(file: &str, path: &Path, args: &Args, budget: usize) -> Option<Foun
     let mut last: Option<usize> = None;
     for &m in matched.iter().take(take) {
         let lo = m.saturating_sub(args.context);
-        let hi = (m + args.context).min(lines.len().saturating_sub(1));
-        for (i, line) in lines.iter().enumerate().take(hi + 1).skip(lo) {
+        let hi = m
+            .saturating_add(args.context)
+            .min(lines.len().saturating_sub(1));
+        for (i, line) in lines[lo..=hi]
+            .iter()
+            .enumerate()
+            .map(|(k, l)| (k + lo, l))
+        {
             if let Some(prev) = last {
                 if i <= prev {
                     // Строка уже выведена; остаётся уточнить, что она совпадение.
+                    // Блоки идут по возрастанию номеров, так что нужная строка — в хвосте.
                     if i == m {
-                        if let Some(r) = rows.iter_mut().find(|r| r.num == m + 1) {
+                        if let Some(r) = rows.iter_mut().rev().find(|r| r.num == m + 1) {
                             r.is_match = true;
                         }
                     }
@@ -362,9 +386,20 @@ fn main() {
             die(format!("grep: нет такого пути: {root}"));
         };
         if md.is_dir() {
-            walk(&p, "", &args, &mut files);
+            // Путь корня остаётся в имени файла: иначе `grep pat src` печатал бы
+            // `main.rs:12`, и два корня с одинаковыми именами сливались бы в выводе.
+            // `.` — исключение: он и означает «текущий каталог», имя без префикса.
+            let prefix = if root == "." { "" } else { root.as_str() };
+            walk(&p, prefix, &args, &mut files);
         } else if md.is_file() {
-            // Названный файл — выбор человека, --glob и размер тут не указ.
+            // Названный файл — выбор человека, --glob и размер тут не указ. Но не
+            // любой: чтение идёт целиком в память, и гигабайтный лог её съест.
+            if md.len() > NAMED_MAX_BYTES {
+                die(format!(
+                    "grep: {root} — {} байт, больше предела {NAMED_MAX_BYTES}: читать целиком нельзя, сузь через --context/--limit по другому пути",
+                    md.len()
+                ));
+            }
             files.push((root.clone(), p));
         } else {
             die(format!("grep: не файл и не каталог: {root}"));
@@ -375,16 +410,25 @@ fn main() {
     let mut shown = 0usize;
     let mut out: Vec<String> = Vec::new();
     let mut listed: Vec<String> = Vec::new();
+    // Сколько файлов с совпадениями нашлось всего — для честной пометки об обрезке
+    // при --files-only: `found.total` считает совпадения, а лимит тут про файлы.
+    let mut files_hit = 0usize;
     for (file, path) in &files {
+        if args.files_only {
+            let Some(found) = scan_file(file, path, &args, 1) else {
+                continue;
+            };
+            files_hit += 1;
+            if listed.len() < args.limit {
+                listed.push(found.file);
+            }
+            continue;
+        }
         let budget = args.limit.saturating_sub(shown);
         let Some(found) = scan_file(file, path, &args, budget.max(1)) else {
             continue;
         };
         total += found.total;
-        if args.files_only {
-            listed.push(found.file);
-            continue;
-        }
         if budget == 0 {
             continue;
         }
@@ -399,8 +443,23 @@ fn main() {
         shown += found.shown;
     }
 
-    if args.files_only && !listed.is_empty() {
+    if args.files_only {
+        if listed.is_empty() {
+            println!(
+                "grep: нет совпадений: {} в {}",
+                args.pattern,
+                args.paths.join(" ")
+            );
+            return;
+        }
         println!("{}", listed.join("\n"));
+        if files_hit > listed.len() {
+            println!(
+                "обрезано: показано {} файлов из {}, сузь шаблон или путь",
+                listed.len(),
+                files_hit
+            );
+        }
         return;
     }
     if out.is_empty() {
@@ -577,6 +636,28 @@ mod tests {
         let got = clip(&long);
         assert_eq!(got.chars().count(), LINE_MAX + 1);
         assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn word_match_does_not_panic_on_multibyte_needle() {
+        // Совпадение начинается с многобайтового символа: шаг на байт поставил бы
+        // `from` внутрь символа и следующая нарезка запаниковала бы.
+        assert!(hits("фыва ы", "ы", false, true));
+        assert!(hits("фыва ы", "ы", true, true));
+        assert!(!hits("лыжи", "ы", false, true));
+    }
+
+    #[test]
+    fn named_dir_root_keeps_its_prefix() {
+        // `grep pat src` печатает `src/main.rs`, а не `main.rs`: тело `walk`
+        // складывает имена от переданного префикса.
+        let d = scratch("prefix");
+        put(&d, "src/main.rs", b"needle\n");
+        let a = args("needle");
+        let mut files = Vec::new();
+        walk(&d.join("src"), "src", &a, &mut files);
+        assert_eq!(files.first().map(|(r, _)| r.as_str()), Some("src/main.rs"));
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
