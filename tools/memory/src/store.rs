@@ -96,17 +96,23 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        // Расширение регистрируется один раз на процесс — до первого соединения,
-        // иначе `vec0` не появится в схеме.
-        unsafe {
-            // Регистрация расширения — до первого соединения: иначе vec0 не будет.
+        // Расширение регистрируется ровно один раз на процесс и до первого
+        // соединения: повторная регистрация добавляла дубль в глобальный список,
+        // а проигнорированный код возврата превращался в «no such module: vec0».
+        static REG: std::sync::OnceLock<std::os::raw::c_int> = std::sync::OnceLock::new();
+        let rc = *REG.get_or_init(|| unsafe {
+            // SAFETY: transmute сигнатуры sqlite3_vec_init в рукописный тип — то,
+            // ради чего крейт sqlite-vec и написан; вызов идёт до первого соединения.
             let init: unsafe extern "C" fn(
                 *mut rusqlite::ffi::sqlite3,
                 *mut *mut std::os::raw::c_char,
                 *const rusqlite::ffi::sqlite3_api_routines,
             ) -> std::os::raw::c_int =
                 std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
-            sqlite3_auto_extension(Some(init));
+            sqlite3_auto_extension(Some(init))
+        });
+        if rc != 0 {
+            return Err("не удалось зарегистрировать расширение sqlite-vec".into());
         }
         let db = Connection::open(path).map_err(|e| format!("{path:?}: {e}"))?;
         db.pragma_update(None, "journal_mode", "WAL")
@@ -119,6 +125,24 @@ impl Store {
     }
 
     fn ensure_vec(&self, dim: usize) -> Result<(), String> {
+        // Таблица уже есть с другой размерностью — `if not exists` молча это
+        // проглотит, и ошибка вылезет низкоуровневым сбоем `vec_int8`. Проверяем.
+        if self.has_vec_table()? {
+            let sql: String = self
+                .db
+                .query_row(
+                    "select sql from sqlite_master where type = 'table' and name = 'facts_vec'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !sql.contains(&format!("int8[{dim}]")) {
+                return Err(format!(
+                    "таблица векторов создана с другой размерностью ({sql}), а в конфиге {dim}:                      удали память или верни embed_dim"
+                ));
+            }
+            return Ok(());
+        }
         let sql =
             format!("create virtual table if not exists facts_vec using vec0(emb int8[{dim}]);");
         self.db.execute_batch(&sql).map_err(|e| e.to_string())
@@ -145,15 +169,26 @@ impl Store {
         k: usize,
     ) -> Result<Vec<(i64, f64)>, String> {
         self.ensure_vec(dim)?;
+        // k у KNN ограничивает выборку ДО фильтра по valid_to, а устаревшие факты
+        // свои векторы сохраняют. Берём с запасом, чтобы после фильтра осталось
+        // не меньше k живых.
         let sql = "select f.id, v.distance from facts_vec v join facts f on f.id = v.rowid \
                    where v.emb match vec_int8(?1) and v.k = ?2 and f.valid_to is null";
         let mut st = self.db.prepare(sql).map_err(|e| e.to_string())?;
         let rows = st
-            .query_map(params![emb, k as i64], |r| {
+            .query_map(params![emb, (k.saturating_mul(4) as i64).max(k as i64)], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
             })
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut out = Vec::new();
+        for row in rows {
+            // Ошибка ряда — не «нет попадания»: неполная выдача выдаёт себя за полную.
+            out.push(row.map_err(|e| e.to_string())?);
+            if out.len() >= k {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// BM25 по FTS5. Возвращает `(id, score)`; score FTS5 отрицательный, меньше —
@@ -175,30 +210,43 @@ impl Store {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
             })
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn load(&self, ids: &[i64]) -> Result<Vec<Hit>, String> {
-        let mut out = Vec::new();
-        let mut st = self
-            .db
-            .prepare("select uid, text from facts where id = ?1 and valid_to is null")
-            .map_err(|e| e.to_string())?;
-        for id in ids {
-            if let Ok(row) = st.query_row(params![id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            }) {
-                out.push(Hit {
-                    uid: row.0,
-                    text: row.1,
-                    bm25: None,
-                    vec: None,
-                    rrf: 0.0,
-                    rerank: None,
-                });
-            }
+        if ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        // Один запрос на всю пачку: точечные выборки по одному id давали до 60
+        // обращений к таблице за один recall.
+        let sql = format!(
+            "select id, uid, text from facts where valid_to is null and id in ({})",
+            ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+        );
+        let mut st = self.db.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    Hit {
+                        uid: r.get::<_, String>(1)?,
+                        text: r.get::<_, String>(2)?,
+                        bm25: None,
+                        vec: None,
+                        rrf: 0.0,
+                        rerank: None,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut found: std::collections::HashMap<i64, Hit> = std::collections::HashMap::new();
+        for row in rows {
+            let (id, hit) = row.map_err(|e| e.to_string())?;
+            found.insert(id, hit);
+        }
+        // Порядок — как просили: ids приходят из поиска по убыванию релевантности.
+        Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
     }
 
     /// uid по id, в том же порядке: `load` отдаёт только живые факты, поэтому
@@ -331,23 +379,24 @@ impl Store {
     /// вызовам.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn supersede(&self, old_uid: &str, new_uid: &str) -> Result<bool, String> {
-        let now = crate::now();
-        let n = self
-            .db
-            .execute(
-                "update facts set valid_to = ?1, supersedes = null where uid = ?2 and valid_to is null",
-                params![now, old_uid],
-            )
-            .map_err(|e| e.to_string())?;
-        if n > 0 {
-            self.db
+        // Две записи — одной транзакцией: иначе смерть процесса между ними
+        // оставляла закрытый факт без указателя на замену.
+        let tx = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let ok = supersede_row(&tx, old_uid, new_uid)?;
+        if ok {
+            // Ссылка потеряется, если нового факта нет: это ошибка, а не «ок».
+            let n = tx
                 .execute(
                     "update facts set supersedes = ?1 where uid = ?2",
                     params![old_uid, new_uid],
                 )
                 .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err(format!("supersede: факта {new_uid} нет — ссылка не поставлена"));
+            }
         }
-        Ok(n > 0)
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(ok)
     }
 
     pub fn forget(&self, uid: &str) -> Result<bool, String> {
@@ -434,10 +483,13 @@ impl Store {
     }
 
     pub fn stats(&self) -> Result<Stats, String> {
-        let count = |sql: &str| -> i64 { self.db.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
-        let facts = count("select count(*) from facts where valid_to is null");
-        let stale = count("select count(*) from facts where valid_to is not null");
-        let pending = count("select count(*) from turns where state = 'new'");
+        // Ошибку базы не превращаем в ноль: «пусто» и «сломалось» — разные ответы.
+        let count = |sql: &str| -> Result<i64, String> {
+            self.db.query_row(sql, [], |r| r.get(0)).map_err(|e| e.to_string())
+        };
+        let facts = count("select count(*) from facts where valid_to is null")?;
+        let stale = count("select count(*) from facts where valid_to is not null")?;
+        let pending = count("select count(*) from turns where state = 'new'")?;
         let mut kinds = Vec::new();
         let mut st = self
             .db
@@ -555,7 +607,10 @@ pub fn fts_query(query: &str) -> String {
         .filter(|w| w.chars().count() >= 3)
         .map(|w| w.to_lowercase())
         .collect();
-    terms.dedup();
+    // `dedup()` снимает только соседние дубли, а `vpn x vpn` оставлял оба
+    // «vpn» и съедал бюджет truncate(8) впустую.
+    let mut seen = std::collections::HashSet::new();
+    terms.retain(|t| seen.insert(t.clone()));
     terms.truncate(8);
     terms
         .into_iter()

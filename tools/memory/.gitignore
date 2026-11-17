@@ -2,5 +2,9 @@
 /memory
 *.db
 *.db-journal
+# WAL-режим (PRAGMA journal_mode=WAL) создаёт эти файлы: в них те же данные,
+# что и в базе, и в git они попадать не должны.
+*.db-wal
+*.db-shm
 /.cargo
 /.env
