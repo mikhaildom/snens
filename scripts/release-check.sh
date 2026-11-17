@@ -182,16 +182,20 @@ else
     bad "нет cargo в PATH"
 fi
 
+# Ядро ищем ДО шага 5 и независимо от --fast: путь нужен и смоуку, и selftest
+# в шаге 8. Раньше при --fast SNENS_BIN оставался пустым, и шаг 8 всегда писал
+# «нет собранного ядра» даже когда ядро собрано — то есть --fast не мог пройти.
+if have cargo; then
+    TARGET_DIR="$(cd "$REPO" && cargo metadata --no-deps --format-version 1 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null || true)"
+    [ -n "$SNENS_BIN" ] || SNENS_BIN="${TARGET_DIR:+$TARGET_DIR/debug/snens}"
+fi
+
 # --- 5. смоук поверхности ---------------------------------------------------
 say "5/9 смоук поверхности (мок-провайдер)"
 if [ "$FAST" = 1 ]; then
     printf '  --   пропущено (--fast)\n'
 elif have python3; then
-    # `cargo metadata` под `set -e` без охраны обрывал скрипт: неудачная
-    # подстановка — это код возврата присваивания, а не пустая строка.
-    TARGET_DIR="$(cd "$REPO" && cargo metadata --no-deps --format-version 1 2>/dev/null \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null || true)"
-    [ -n "$SNENS_BIN" ] || SNENS_BIN="${TARGET_DIR:+$TARGET_DIR/debug/snens}"
     if [ -z "$SNENS_BIN" ]; then
         bad "cargo metadata не вернул target-каталог (нет cargo или сломан манифест)"
     elif [ ! -x "$SNENS_BIN" ]; then
