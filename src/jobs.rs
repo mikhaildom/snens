@@ -268,14 +268,18 @@ mod tests {
         std::fs::create_dir_all(&jobs).unwrap();
         let log = jobs.join("7-1.log");
         std::fs::write(&log, "готово\n").unwrap();
+        // Пид заведомо мёртвого процесса: без `done` задание считается снятым,
+        // и будильник обязан это увидеть (иначе о нём узнают по другому поводу).
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        let _ = dead.wait();
         let job = Job {
             id: "7-1".into(),
             command: "make all".into(),
             cwd: root.display().to_string(),
             timeout_s: 60,
             log: log.display().to_string(),
-            // pid 0 не существует: задание считается снятым, если нет `done`.
-            pid: 0,
+            pid: dead_pid,
             started: 0,
         };
         std::fs::write(

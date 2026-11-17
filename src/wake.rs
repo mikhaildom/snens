@@ -104,4 +104,64 @@ mod tests {
             std::path::Path::new("/tmp/sessions/1-2.out/jobs")
         );
     }
+
+    /// Главный контракт будильника: всё, что вернулось, попадает в текст хода с
+    /// пометкой источника, и забирается ровно один раз.
+    #[test]
+    fn collect_takes_mail_and_finished_jobs_once() {
+        let root = std::env::temp_dir().join(format!("snens-wake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sessions")).unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "sessions_dir = \"{}/sessions\"\nmail_dir = \"{}/mail\"\n",
+            root.display(),
+            root.display()
+        ))
+        .unwrap();
+        let id = "1700000000-111";
+        // Итог подагента лежит в ящике.
+        crate::mail::send(&cfg.mail_path(), id, "1700000000-222", "report", "база собрана")
+            .unwrap();
+        // И готовое фоновое задание — рядом с журналом сессии.
+        let sess = sess_path(&cfg, id);
+        let jobs = crate::jobs::dir(&sess);
+        std::fs::create_dir_all(&jobs).unwrap();
+        let log = jobs.join("7-1.log");
+        std::fs::write(&log, "тесты прошли\n").unwrap();
+        std::fs::write(
+            jobs.join("7-1.json"),
+            serde_json::to_vec(&crate::jobs::Job {
+                id: "7-1".into(),
+                command: "cargo test".into(),
+                cwd: root.display().to_string(),
+                timeout_s: 600,
+                log: log.display().to_string(),
+                pid: std::process::id(),
+                started: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            jobs.join("7-1.done"),
+            serde_json::to_vec(&crate::jobs::Done {
+                exit: 0,
+                ms: 900,
+                timed_out: false,
+                bytes: 12,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(has_pending(&cfg, id));
+        let first = collect(&cfg, id);
+        let text = first.as_turn();
+        assert!(text.contains("[report от 1700000000-222]"), "{text}");
+        assert!(text.contains("база собрана"), "{text}");
+        assert!(text.contains("[задание 7-1 завершилось"), "{text}");
+        assert!(text.contains("тесты прошли"), "{text}");
+        assert!(!has_pending(&cfg, id), "второй раз будить нечем");
+        assert!(collect(&cfg, id).is_empty(), "выдано дважды");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
