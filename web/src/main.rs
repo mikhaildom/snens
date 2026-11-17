@@ -21,7 +21,19 @@ use std::{sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<String> = match std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        // `args()` на не-UTF-8 аргументе паниковал бы (путь с байтами вне utf-8
+        // на Linux — обычное дело).
+        Err(a) => {
+            eprintln!("snens-web: аргумент не в UTF-8: {}", a.to_string_lossy());
+            std::process::exit(2);
+        }
+    };
     let args = match cli::Args::parse(&argv) {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -35,23 +47,20 @@ async fn main() {
     };
 
     // Клиент без `index.html` — это не «пустая страница», а собранная не туда
-    // поставка. Говорим сразу и с путём: иначе человек видит 404 и не знает, что
-    // искать.
+    // поставка. Говорим сразу и с путём: иначе человек видит 404 и не знает,
+    // что искать. Сам файл читается на каждый запрос (пересборка без рестарта
+    // не должна оставлять старый index со ссылками на старые хеши ассетов).
     let index = args.dist.join("index.html");
-    let index_html = match tokio::fs::read_to_string(&index).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "snens-web: нет собранного клиента: {} ({e})\n\
-                 собери его (`npm run build` в snens-web) или укажи --dist",
-                index.display()
-            );
-            std::process::exit(1);
-        }
-    };
+    if let Err(e) = tokio::fs::metadata(&index).await {
+        eprintln!(
+            "snens-web: нет собранного клиента: {} ({e})\n\
+             собери его (`npm run build` в snens-web) или укажи --dist",
+            index.display()
+        );
+        std::process::exit(1);
+    }
     let static_state = Arc::new(static_files::Static {
         dist: args.dist.clone(),
-        index: index_html,
     });
 
     // Два роутера с разным состоянием: у прокси оно своё (адрес ядра и токен).
@@ -110,11 +119,42 @@ async fn main() {
         }
     );
 
+    // SIGTERM слушает systemd/docker, Ctrl-C — терминал. Без SIGTERM процесс
+    // убивался бы жёстко и graceful_shutdown не отрабатывал. Дренаж ограничен
+    // таймаутом: открытый SSE-клиент иначе держал бы serve бесконечно.
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        let ctrl_c = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        #[cfg(unix)]
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(e) => {
+                    eprintln!("snens-web: не подписаться на SIGTERM: {e}");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
     };
     if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            // Даём текущим ответам закрыться, но не ждём вечно: SSE-потоки
+            // живут часами, а рестарт юнита — секунды.
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                std::process::exit(0);
+            });
+        })
         .await
     {
         eprintln!("snens-web: сервер упал: {e}");
