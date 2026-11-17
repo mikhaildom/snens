@@ -158,9 +158,7 @@ pub(super) async fn upload_attachment(
     options.mode(0o600);
     let write_result = async {
         let mut f = options.open(&path).await?;
-        if let Err(e) = f.write_all(&body).await {
-            return Err(e);
-        }
+        f.write_all(&body).await?;
         f.sync_all().await
     }
     .await;

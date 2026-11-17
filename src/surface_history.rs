@@ -71,11 +71,7 @@ pub struct Usage {
 /// только поверхности, которая решила её показать (веб-клиент, галочка в
 /// настройках). По умолчанию выключено: справка — это контекст промпта, а не
 /// транскрипт, и в общей ленте/поиске ей не место.
-pub fn read_with(
-    path: &Path,
-    _cfg: &Config,
-    with_recall: bool,
-) -> crate::R<Vec<HistoryMessage>> {
+pub fn read_with(path: &Path, _cfg: &Config, with_recall: bool) -> crate::R<Vec<HistoryMessage>> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
@@ -187,7 +183,9 @@ pub fn read_with(
             // ей место: человек должен видеть, где проходила граница разбора.
             // Отдельная роль `review` (как `recall` у справки памяти): клиент
             // рисует её тонкой серой строкой и не путает с репликой.
-            Rec::Review { ts, turns, text, .. } => Some(HistoryMessage {
+            Rec::Review {
+                ts, turns, text, ..
+            } => Some(HistoryMessage {
                 seq,
                 ts,
                 role: "review",
@@ -290,14 +288,23 @@ pub fn read_with(
                 reason_tok,
                 ..
             } => {
-                if let Some(last) = rows.iter_mut().rev().find(|r| r.role == "assistant") {
-                    last.usage = Some(Usage {
-                        in_tok,
-                        cached_tok,
-                        out_tok,
-                        reason_tok,
-                        cost_micro,
-                    });
+                // Приклеиваем расход к записи, стоящей НЕПОСРЕДСТВЕННО перед
+                // `usage`, и только если у неё ещё нет своего.
+                // Обратный поиск «последний assistant где угодно» перезаписывал
+                // уже приклеенный расход предыдущего хода: для пустого ответа
+                // провайдера агент пишет `Usage` без `Assistant` (agent.rs:407)
+                // и повторяет запрос — и ход N показывал цену выброшенного ответа.
+                match rows.last_mut() {
+                    Some(last) if last.role == "assistant" && last.usage.is_none() => {
+                        last.usage = Some(Usage {
+                            in_tok,
+                            cached_tok,
+                            out_tok,
+                            reason_tok,
+                            cost_micro,
+                        });
+                    }
+                    _ => {}
                 }
                 None
             }
@@ -343,9 +350,15 @@ mod tests {
         let shown = read_with(&path, &Config::default(), true).unwrap();
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].role, "recall");
-        assert!(shown[0].content.as_deref().unwrap().contains("PRIVATE_RECALL_MARKER"));
+        assert!(shown[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("PRIVATE_RECALL_MARKER"));
         // `context_notice` остаётся служебным даже с флагом: это не память.
-        assert!(!serde_json::to_string(&shown).unwrap().contains("PRIVATE_CONTEXT_MARKER"));
+        assert!(!serde_json::to_string(&shown)
+            .unwrap()
+            .contains("PRIVATE_CONTEXT_MARKER"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -370,7 +383,11 @@ mod tests {
 
         let rows = read_with(&path, &Config::default(), false).unwrap();
         let roles: Vec<&str> = rows.iter().map(|r| r.role).collect();
-        assert_eq!(roles, ["user", "review", "assistant", "review"], "маркер не отличим от реплики");
+        assert_eq!(
+            roles,
+            ["user", "review", "assistant", "review"],
+            "маркер не отличим от реплики"
+        );
         assert_eq!(rows[1].content.as_deref(), Some("саморевью · 12 ходов"));
         assert_eq!(rows[1].seq, 2, "seq — физическая строка журнала");
         // Без текста строка собирается из числа ходов и остаётся короткой.
@@ -432,18 +449,19 @@ mod tests {
             "{\"kind\":\"user\",\"ts\":1,\"text\":\"ok\",\"source\":\"tui\"}\n{broken}\n",
         )
         .unwrap();
-        assert!(
-            read_with(&path, &Config::default(), false)
-                .unwrap_err()
-                .to_string()
-                .contains("physical line 2")
-        );
+        assert!(read_with(&path, &Config::default(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("physical line 2"));
         fs::write(
             &path,
             "{\"kind\":\"user\",\"ts\":1,\"text\":\"ok\",\"source\":\"tui\"}\n{incomplete",
         )
         .unwrap();
-        assert_eq!(read_with(&path, &Config::default(), false).unwrap().len(), 1);
+        assert_eq!(
+            read_with(&path, &Config::default(), false).unwrap().len(),
+            1
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

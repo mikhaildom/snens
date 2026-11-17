@@ -6,10 +6,10 @@
 
 use crate::surface_runtime::{self as rt, Runtime};
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -33,14 +33,13 @@ pub(super) fn spawn_approval_server(s: Arc<Runtime>) {
     tokio::spawn(async move {
         let path = crate::approval::sock_path(&s.cfg.sessions_path());
         let _ = std::fs::remove_file(&path);
-        let Ok(listener) = tokio::net::UnixListener::bind(&path) else {
-            eprintln!("[snens] не удалось поднять сокет одобрений {}", path.display());
+        let Ok(listener) = bind_private(&path) else {
+            eprintln!(
+                "[snens] не удалось поднять сокет одобрений {} (или он не стал 0600)",
+                path.display()
+            );
             return;
         };
-        let _ = std::fs::set_permissions(
-            &path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        );
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
@@ -51,6 +50,31 @@ pub(super) fn spawn_approval_server(s: Arc<Runtime>) {
             });
         }
     });
+}
+
+#[cfg(unix)]
+fn bind_private(path: &std::path::Path) -> std::io::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    // Сокет создаётся с 0600 сразу: между `bind` и `chmod` он бы жил с
+    // `0777 & ~umask` (обычно 0755), и любой локальный пользователь мог бы
+    // подсунуть заявку на `sudo` — владелец увидел бы чужой argv.
+    let old = unsafe { libc::umask(0o177) };
+    let bound = tokio::net::UnixListener::bind(path);
+    unsafe { libc::umask(old) };
+    let listener = bound?;
+    // Даже с umask проверяем: на файловой системе без прав режим мог не
+    // примениться — тогда сокет убираем и сервер не поднимаем (молчаливый
+    // 0755-сокет хуже, чем отсутствие одобрений).
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        let _ = std::fs::remove_file(path);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("режим сокета {mode:o}, ожидался 600"),
+        ));
+    }
+    Ok(listener)
 }
 
 #[cfg(unix)]
@@ -71,7 +95,10 @@ pub(super) async fn handle_approval_conn(
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        s.approvals.lock().await.insert(id.clone(), tx);
+        s.approvals
+            .lock()
+            .await
+            .insert(id.clone(), (req.session.clone(), tx));
         // Точное действие в карточке: argv как есть, плюс cwd и сессия.
         let detail = req
             .argv
@@ -110,7 +137,11 @@ pub(super) async fn handle_approval_conn(
 /// элементы с пробелами оборачиваем в кавычки, чтобы владелец видел точную
 /// границу аргумента, а не «одну длинную команду».
 pub(super) fn shell_quote(arg: &str) -> String {
-    if arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'') {
+    if arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+    {
         format!("{:?}", arg)
     } else {
         arg.to_string()
@@ -131,13 +162,25 @@ pub(super) async fn approve(
     if !rt::valid_id(&id) || aid.is_empty() {
         return err("invalid", "invalid id", StatusCode::BAD_REQUEST).into_response();
     }
-    let Some(tx) = s.approvals.lock().await.remove(&aid) else {
+    let Some((owner, tx)) = s.approvals.lock().await.remove(&aid) else {
         // Уже решено/истекло: повтор идемпотентен как «нет» — карточку давно сняли.
         return err("gone", "approval is no longer pending", StatusCode::GONE).into_response();
     };
+    // Решение принадлежит той сессии, где висит карточка: иначе резолв летел бы
+    // в чужой поток, а в настоящей сессии карточка оставалась бы висеть.
+    if owner != id {
+        // Заявка не снимается: её законный владелец ещё может решить.
+        s.approvals.lock().await.insert(aid.clone(), (owner, tx));
+        return err(
+            "not_found",
+            "approval belongs to another session",
+            StatusCode::NOT_FOUND,
+        )
+        .into_response();
+    }
     let _ = s
         .emit(
-            &id,
+            &owner,
             None,
             "approval.resolved",
             serde_json::json!({"approval_id":aid,"allow":b.allow}),

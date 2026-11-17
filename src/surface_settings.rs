@@ -6,10 +6,10 @@
 
 use crate::surface_runtime::Runtime;
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -28,7 +28,10 @@ pub(super) struct ModelBody {
 }
 /// Сменить основную модель: правит `model = "..."` в конфиге и сразу делает её
 /// текущей для новых ходов (перечитка в `run_loop`). Активный ход не трогаем.
-pub(super) async fn put_model(State(s): State<Arc<Runtime>>, Json(body): Json<ModelBody>) -> impl IntoResponse {
+pub(super) async fn put_model(
+    State(s): State<Arc<Runtime>>,
+    Json(body): Json<ModelBody>,
+) -> impl IntoResponse {
     let slug = body.model.trim();
     if slug.is_empty() {
         return err("invalid", "empty model slug", StatusCode::BAD_REQUEST).into_response();
@@ -110,8 +113,8 @@ pub(super) async fn post_provider(
         Ok(draft) => draft,
         Err(e) => return err("invalid", &e, StatusCode::BAD_REQUEST).into_response(),
     };
-    let activate = live.providers.is_empty()
-        || body.get("activate").and_then(|v| v.as_bool()) == Some(true);
+    let activate =
+        live.providers.is_empty() || body.get("activate").and_then(|v| v.as_bool()) == Some(true);
     if let Err(e) = crate::providers::write_profile(&s.cfg, &name, &draft, None, activate) {
         return err("invalid", &e.to_string(), StatusCode::BAD_REQUEST).into_response();
     }
@@ -214,7 +217,9 @@ pub(super) async fn put_config(
     };
     let path = match crate::settings::commit(&s.cfg, &edits) {
         Ok(path) => path,
-        Err(e) => return err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+        Err(e) => {
+            return err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response()
+        }
     };
     Json(crate::settings::state(&s.cfg, &path)).into_response()
 }
@@ -248,7 +253,10 @@ pub(super) struct MemoryBody {
 
 /// Сменить тумблеры памяти и сразу сделать их текущими для новых ходов
 /// (перечитка в память-модуле). Активный ход не трогаем.
-pub(super) async fn put_memory(State(s): State<Arc<Runtime>>, Json(body): Json<MemoryBody>) -> impl IntoResponse {
+pub(super) async fn put_memory(
+    State(s): State<Arc<Runtime>>,
+    Json(body): Json<MemoryBody>,
+) -> impl IntoResponse {
     if body.enabled.is_none() && body.recall.is_none() && body.retain.is_none() {
         return err("invalid", "empty memory patch", StatusCode::BAD_REQUEST).into_response();
     }
@@ -258,16 +266,35 @@ pub(super) async fn put_memory(State(s): State<Arc<Runtime>>, Json(body): Json<M
     }
     if let Some(v) = &body.recall {
         if !matches!(v.as_str(), "always" | "session" | "off") {
-            return err("invalid", "recall must be always|session|off", StatusCode::BAD_REQUEST)
-                .into_response();
+            return err(
+                "invalid",
+                "recall must be always|session|off",
+                StatusCode::BAD_REQUEST,
+            )
+            .into_response();
         }
         changes.push(("recall", format!("\"{v}\"")));
     }
     if let Some(v) = body.retain {
         changes.push(("retain", v.to_string()));
     }
-    for (key, value) in changes {
-        if let Err(e) = s.cfg.set_memory_key(key, &value) {
+    // Одна запись файла на всю пачку: `set_memory_key` пишет файл на каждый
+    // ключ, и ошибка на втором оставляла первый уже применённым, а хендлер
+    // отвечал 500 — секция `[memory]` оставалась полуприменённой.
+    let batch: Vec<(Option<String>, String, String)> = changes
+        .into_iter()
+        .map(|(key, value)| (Some("memory".to_string()), key.to_string(), value))
+        .collect();
+    // Запись файла — блокирующая: не на async-воркере.
+    let cfg = s.cfg.clone();
+    let written = tokio::task::spawn_blocking(move || cfg.set_keys(&batch)).await;
+    match written {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response();
+        }
+        Err(e) => {
             return err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
                 .into_response();
         }

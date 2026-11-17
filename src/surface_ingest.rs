@@ -42,8 +42,19 @@ fn flat(kind: &str, fields: serde_json::Value) -> serde_json::Value {
 
 #[derive(Clone)]
 pub struct Reporter {
-    tx: Option<mpsc::UnboundedSender<Msg>>,
+    tx: Option<mpsc::Sender<Msg>>,
+    /// Переполнение уже объявлено: иначе строка в stderr печаталась бы на
+    /// каждую потерянную дельту и залила бы лог подагента.
+    reported_overflow: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Потолок очереди на отправку.
+///
+/// Дельта приходит на каждый токен ответа, а отправщик умеет ждать до 5 с на
+/// запрос: неограниченный канал копил бы события без границы, если поверхность
+/// тормозит или лежит. Телеметрия — не повод съесть память подагента, поэтому
+/// канал ограничен, а переполнение теряет события (`try_send`).
+const QUEUE: usize = 1024;
 
 /// Что уезжает в отправщик: обычное событие или требование закрыть пачку.
 /// Закрытие отдельным сообщением, а не просто «дропнуть канал»: подагент
@@ -60,17 +71,37 @@ impl Reporter {
     /// или это не подагент (у корневой сессии шина своя).
     pub fn new(session: &str, parent: &str) -> Self {
         if parent.is_empty() {
-            return Self { tx: None };
+            return Self {
+                tx: None,
+                reported_overflow: Default::default(),
+            };
         }
         let base = std::env::var("SNENS_SURFACE_URL").unwrap_or_else(|_| DEFAULT_BASE.to_string());
         let token = std::env::var("SNENS_SURFACE_TOKEN").unwrap_or_default();
         if token.is_empty() {
-            return Self { tx: None };
+            return Self {
+                tx: None,
+                reported_overflow: Default::default(),
+            };
         }
-        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        // Адрес без хвостового `/` и только http(s): переменную выставляет
+        // окружение (в т.ч. heredoc-скрипты), и `http://host:7420//v1/…` или
+        // `ftp://…` уехали бы с bearer-токеном без предупреждения.
+        let base = base.trim_end_matches('/');
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            eprintln!("[snens] SNENS_SURFACE_URL не http(s), телеметрия выключена: {base}");
+            return Self {
+                tx: None,
+                reported_overflow: Default::default(),
+            };
+        }
+        let (tx, mut rx) = mpsc::channel::<Msg>(QUEUE);
         let url = format!("{base}/v1/sessions/{session}/ingest");
         tokio::spawn(async move {
-            let client = match reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+            {
                 Ok(c) => Arc::new(c),
                 Err(_) => return,
             };
@@ -82,16 +113,26 @@ impl Reporter {
                 url: &str,
                 token: &str,
                 batch: &mut Vec<serde_json::Value>,
-            ) {
+            ) -> bool {
                 let body = json!({"events": std::mem::take(batch)});
-                // Ответ не проверяем: поверхность могла закрыться, а подагент
-                // обязан доработать.
-                let _ = client
-                    .post(url)
-                    .bearer_auth(token)
-                    .json(&body)
-                    .send()
-                    .await;
+                match client.post(url).bearer_auth(token).json(&body).send().await {
+                    Ok(response) => {
+                        // 401 (чужой токен) и 404 (неизвестная сессия) полностью
+                        // выключали стрим молча — без этой строки причину
+                        // «карточка не двигается» искать нечем.
+                        if !response.status().is_success() {
+                            eprintln!(
+                                "[snens] ingest: поверхность ответила {} — телеметрия подагента не доходит",
+                                response.status()
+                            );
+                            return false;
+                        }
+                        true
+                    }
+                    // Поверхности нет (TUI, `snens run` без сервера): молчим,
+                    // работа важнее телеметрии.
+                    Err(_) => false,
+                }
             }
             loop {
                 // Ждём первое событие бесконечно (пока жив отправитель), дальше
@@ -109,8 +150,13 @@ impl Reporter {
                     batch.push(flat(&kind, fields));
                 }
                 let mut flush: Option<tokio::sync::oneshot::Sender<()>> = None;
+                // Дедлайн — на ВСЮ пачку, а не на каждое событие: окно от
+                // последнего события растягивало пачку на секунды при ровном
+                // потоке (30 событий по 200 мс), хотя комментарий обещает
+                // «больше этого в пачке не ждём».
+                let deadline = tokio::time::Instant::now() + FLUSH_EVERY;
                 while batch.len() < 32 {
-                    match tokio::time::timeout(FLUSH_EVERY, rx.recv()).await {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
                         Ok(Some(Msg::Event(kind, fields))) => batch.push(flat(&kind, fields)),
                         Ok(Some(Msg::Flush(ack))) => {
                             flush = Some(ack);
@@ -125,7 +171,10 @@ impl Reporter {
                 }
             }
         });
-        Self { tx: Some(tx) }
+        Self {
+            tx: Some(tx),
+            reported_overflow: Default::default(),
+        }
     }
 
     /// Сигнал агента → событие поверхности. Имена и поля совпадают с теми, что
@@ -135,10 +184,17 @@ impl Reporter {
             return;
         };
         let (kind, fields) = match signal {
-            SurfaceSignal::Delta { text, kind } => ("assistant.delta", json!({"text":text,"kind":kind})),
-            SurfaceSignal::ToolStarted { name, call_id, args } => {
-                ("tool.started", json!({"name":name,"call_id":call_id,"args":args}))
+            SurfaceSignal::Delta { text, kind } => {
+                ("assistant.delta", json!({"text":text,"kind":kind}))
             }
+            SurfaceSignal::ToolStarted {
+                name,
+                call_id,
+                args,
+            } => (
+                "tool.started",
+                json!({"name":name,"call_id":call_id,"args":args}),
+            ),
             SurfaceSignal::ToolCompleted {
                 name,
                 call_id,
@@ -165,7 +221,16 @@ impl Reporter {
                 ("context.pressure", json!({"approx":approx,"budget":budget}))
             }
         };
-        let _ = tx.send(Msg::Event(kind.to_string(), fields));
+        // Очередь полная — событие теряем: телеметрия не стоит того, чтобы
+        // растить память процесса (и это видно строкой в stderr).
+        if let Err(_error) = tx.try_send(Msg::Event(kind.to_string(), fields)) {
+            if !self
+                .reported_overflow
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!("[snens] ingest: очередь событий переполнена, дельты теряются");
+            }
+        }
     }
 
     /// Дождаться, пока последняя пачка уйдёт.
@@ -179,7 +244,9 @@ impl Reporter {
             return;
         };
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if tx.send(Msg::Flush(ack_tx)).is_err() {
+        // Здесь именно `send().await`, а не `try_send`: подтверждение не должно
+        // теряться на переполненной очереди, иначе `Done` так и не доедет.
+        if tx.send(Msg::Flush(ack_tx)).await.is_err() {
             return;
         }
         // Потолок, чтобы подагент не висел на мёртвой поверхности.
