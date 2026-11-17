@@ -456,19 +456,20 @@ impl Runtime {
         Ok(())
     }
 
+    /// Собрать событие и отдать его без записи в базу — запись делает вызывающий.
     ///
-    /// Инвариант: `emit` берёт мьютекс store сам, поэтому вызывать его ПОД
-    /// `self.data.lock()` нельзя — это взаимная блокировка (tokio-мьютекс не
-    /// реентрантен). Порядок такой: собрать данные под замком, отпустить,
-    /// потом `emit`. Отдельно: `emit` → `refresh_child` → снова `data`, и это
-    /// безопасно ровно потому, что к моменту вызова замок уже отпущен.
-    pub async fn emit(
+    /// `emit` пишет SQLite прямо под замком `data`, а это fsync на блокирующем
+    /// замке: каждый emit держал и воркер, и store (все хендлеры стоят
+    /// в очереди). Поэтому порядок такой: под замком только последовательность
+    /// и память, потом запись — уже без `data`. Курсор двигается в памяти там же,
+    /// где берётся номер, так что пара «событие + курсор» остаётся согласованной.
+    pub async fn build_event(
         &self,
         id: &str,
         run: Option<String>,
         kind: &str,
         fields: serde_json::Value,
-    ) -> crate::R<Event> {
+    ) -> Event {
         let mut d = self.data.lock().await;
         let seq = {
             let mut sequences = self.event_seq.lock().await;
@@ -488,24 +489,51 @@ impl Runtime {
             kind: kind.into(),
             fields,
         };
-        if kind != "assistant.delta" {
+        // Дельта в историю не идёт, но занятый ею номер — идёт: иначе после
+        // падения ядра нумерация откатится и повторит уже доставленные номера,
+        // а клиент с курсором молча перестанет получать события.
+        if e.kind != "assistant.delta" {
             d.events.entry(id.into()).or_default().push(e.clone());
-            // Точечная запись одного события вместе с курсором: полная перезапись
-            // store на каждое событие — O(n²) по объёму истории (замер: ~140 мс
-            // при 15 тыс. событий) и она же держала оба мьютекса всё это время.
-            self.save_event(&e)?;
-        } else {
-            // Дельта в историю не идёт, но занятый ею номер — идёт: иначе после
-            // падения ядра нумерация откатится и повторит уже доставленные номера,
-            // а клиент с курсором молча перестанет получать события.
-            self.save_cursor(&e.session_id, e.seq)?;
         }
-        drop(d);
-        // Карточка подагента живёт потоком (`GET /v1/sessions` без запроса), но
-        // обновляется отдельным шагом: событий у ребёнка много, а меняется из
-        // них немногое. Признак «это подагент» проверяет сам шаг — по журналу.
-        self.refresh_child(id).await;
+        e
+    }
+
+    /// Дописать событие в базу и разослать его. Вызывать без замка `data`.
+    pub async fn publish_event(&self, e: Event) {
+        let saved = if e.kind != "assistant.delta" {
+            self.save_event(&e)
+        } else {
+            self.save_cursor(&e.session_id, e.seq)
+        };
+        if let Err(error) = saved {
+            eprintln!(
+                "[snens] событие {} сессии {} не записано: {error}",
+                e.kind, e.session_id
+            );
+        }
         let _ = self.tx.send(e.clone());
+        // Карточка подагента — отдельным шагом и своим сигналом: у ребёнка
+        // событий много, а меняется из них немногое. Само решение «это
+        // подагент» принимается по слоту store, без чтения журнала на каждую
+        // дельту (см. `refresh_child`).
+        self.refresh_child(&e.session_id).await;
+    }
+
+    ///
+    /// Инвариант: `emit` берёт мьютекс store сам, поэтому вызывать его ПОД
+    /// `self.data.lock()` нельзя — это взаимная блокировка (tokio-мьютекс не
+    /// реентрантен). Порядок такой: собрать данные под замком, отпустить,
+    /// потом `emit`. Отдельно: `emit` → `refresh_child` → снова `data`, и это
+    /// безопасно ровно потому, что к моменту вызова замок уже отпущен.
+    pub async fn emit(
+        &self,
+        id: &str,
+        run: Option<String>,
+        kind: &str,
+        fields: serde_json::Value,
+    ) -> crate::R<Event> {
+        let e = self.build_event(id, run, kind, fields).await;
+        self.publish_event(e.clone()).await;
         Ok(e)
     }
 
@@ -516,7 +544,31 @@ impl Runtime {
     /// пачками по 32), а меняется при этом только счётчик ходов и состояние —
     /// кадр на каждую дельту был бы теми же данными тридцать два раза.
     pub async fn refresh_child(&self, id: &str) {
-        let Some(mut fresh) = crate::surface_server::discovery::session_by_id(&self.cfg, id) else {
+        // Дешёвая проверка до любого чтения журнала: признак «подагент» уже
+        // лежит в слоте store. Раньше `session_by_id` звался на КАЖДОЕ событие
+        // (включая дельты) и до этой проверки — обычная сессия платила чтением
+        // головы журнала за каждую дельту хода.
+        let parent_known = {
+            let d = self.data.lock().await;
+            match d.sessions.get(id) {
+                Some(slot) => Some(slot.is_child()),
+                // Слота нет — решение возможно только по журналу.
+                None => None,
+            }
+        };
+        if parent_known == Some(false) {
+            return;
+        }
+        // Чтение журнала — блокирующее: не на async-воркере.
+        let cfg = self.cfg.clone();
+        let read_id = id.to_string();
+        let fresh = tokio::task::spawn_blocking(move || {
+            crate::surface_server::discovery::session_by_id(&cfg, &read_id)
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(mut fresh) = fresh else {
             return;
         };
         // Подагент ли это — по журналу (`Meta.parent`), а не по store: в store
@@ -524,15 +576,12 @@ impl Runtime {
         if !fresh.is_child() {
             return;
         }
-        let before = {
-            let d = self.data.lock().await;
-            match d.sessions.get(id) {
-                Some(s) => (s.turns, s.done.clone(), s.state.clone()),
-                None => (None, None, String::new()),
-            }
-        };
         let changed = {
             let mut d = self.data.lock().await;
+            let before = match d.sessions.get(id) {
+                Some(x) => (x.turns, x.done.clone(), x.state.clone()),
+                None => (None, None, String::new()),
+            };
             if let Some(slot) = d.sessions.get_mut(id) {
                 // `state` берём из журнала и pid (это и есть правда про
                 // подагента: работает/готов/прерван), из слота — только то,
@@ -540,14 +589,23 @@ impl Runtime {
                 // говорил «running» там, где `GET /v1/sessions` уже отдавал «idle».
                 fresh.run_id = slot.run_id.clone();
                 fresh.title = slot.title.clone().or(fresh.title);
+                // `build_session` строит запись с нуля (`context_budget`/
+                // `context_target` там всегда `None`). Без переноса из слота
+                // пересборка карточки стирала бюджет сессии и в памяти, и в
+                // SQLite — уборка контекста у подагента теряла свой порог.
+                fresh.context_budget = slot.context_budget;
+                fresh.context_target = slot.context_target;
             }
             let after = (fresh.turns, fresh.done.clone(), fresh.state.clone());
-            d.sessions.insert(id.to_string(), fresh.clone());
-            let _ = self.save_session(&fresh);
-            before != after
+            let snapshot = fresh.clone();
+            d.sessions.insert(id.to_string(), fresh);
+            (before, after, snapshot)
         };
-        if changed {
-            self.publish_session(fresh);
+        let (before, after, snapshot) = changed;
+        // Запись — без async-замка: блокирующий SQLite под ним держал всё.
+        let _ = self.save_session(&snapshot);
+        if before != after {
+            self.publish_session(snapshot);
         }
     }
 

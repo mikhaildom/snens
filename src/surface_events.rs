@@ -6,15 +6,15 @@
 
 use crate::surface_runtime::{self as rt, Event, Runtime};
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{
-        IntoResponse,
         sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse,
     },
+    Json,
 };
-use futures_util::{StreamExt, stream};
+use futures_util::{stream, StreamExt};
 use serde::Deserialize;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
@@ -40,7 +40,10 @@ pub(super) struct HistoryQuery {
 
 impl HistoryQuery {
     fn with_recall(&self) -> bool {
-        matches!(self.recall.as_deref(), Some("1") | Some("true") | Some("yes"))
+        matches!(
+            self.recall.as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
     }
 }
 /// Событие от процесса-подагента. Тело — тот же набор полей, что присылает
@@ -86,30 +89,37 @@ pub(super) async fn ingest(
     // другой процесс, а discovery наполняет store только при старте и в
     // `GET /v1/sessions`. Поэтому подхватываем её из журнала на месте — иначе
     // первые события ребёнка уезжали в 404 и стрим начинался с середины.
-    {
-        let known = s.data.lock().await.sessions.contains_key(&id);
-        if !known {
-            // Store не клонируется целиком (там события и сообщения всех
-            // сессий) — discovery нужен только как справочник «кто есть».
-            let found = {
-                let guard = s.data.lock().await;
-                guard.sessions.get(&id).cloned()
-            }
-            .or_else(|| {
-                discovery::session_by_id(&s.cfg, &id)
-            });
-            match found {
-                Some(session) => {
+    let known = s.data.lock().await.sessions.contains_key(&id);
+    if !known {
+        // Чтение журнала — блокирующее: не на воркере.
+        let cfg = s.cfg.clone();
+        let read_id = id.clone();
+        let found = tokio::task::spawn_blocking(move || discovery::session_by_id(&cfg, &read_id))
+            .await
+            .ok()
+            .flatten();
+        match found {
+            Some(session) => {
+                // Проверка и вставка — в одном замке: иначе два параллельных
+                // `ingest` оба видели `None` и второй перетирал слот журнальной
+                // копией, сбрасывая `running`, который только что поставила
+                // поверхность. Запись в базу — уже без замка.
+                let saved = {
                     let mut d = s.data.lock().await;
-                    let saved = session.clone();
-                    d.sessions.insert(id.clone(), session);
-                    d.events.entry(id.clone()).or_default();
-                    let _ = s.save_session(&saved);
+                    if d.sessions.contains_key(&id) {
+                        None
+                    } else {
+                        d.sessions.insert(id.clone(), session.clone());
+                        d.events.entry(id.clone()).or_default();
+                        Some(session)
+                    }
+                };
+                if let Some(session) = saved {
+                    let _ = s.save_session(&session);
                 }
-                None => {
-                    return err("not_found", "unknown session", StatusCode::NOT_FOUND)
-                        .into_response();
-                }
+            }
+            None => {
+                return err("not_found", "unknown session", StatusCode::NOT_FOUND).into_response();
             }
         }
     }
@@ -123,14 +133,20 @@ pub(super) async fn ingest(
             .is_ok()
         {
             accepted += 1;
+        } else {
+            // Событие осталось в памяти, но в базу и в поток не ушло: без
+            // строки в stderr сбой хранилища неотличим от «событий не было».
+            eprintln!(
+                "[snens] ingest: событие {kind} сессии {id} не доставлено",
+                kind = e.kind
+            );
         }
     }
     // Карточка подагента: пересчитать по журналу и pid и опубликовать, если
-    // есть что перерисовать. Пачка — один всплеск работы ребёнка, поэтому кадр
-    // один на пачку, а не на каждое из 32 событий внутри неё.
-    if accepted > 0 {
-        s.refresh_child(&id).await;
-    }
+    // есть что перерисовать. `emit` в цикле выше сам зовёт `refresh_child`, и
+    // для обычной сессии это уже ничего не читает (признак — из слота store),
+    // поэтому лишний вызов здесь не стоит. Нужен он для пустой пачки ниже и для
+    // случаев, когда все события оказались дельтами без записи в историю.
     Json(serde_json::json!({"accepted":accepted})).into_response()
 }
 
@@ -146,15 +162,22 @@ pub(super) async fn history(
         // См. `get_session`: id проверен выше, но паника тут не нужна.
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     };
-    // Из store под мьютексом берём ровно копию нужного и сразу отпускаем: раньше
-    // блокировка держалась всё время разбора журнала (0.3–0.6 с на мегабайтном
-    // логе), и `emit` любой другой сессии стоял в очереди.
-    let (known, events) = {
+    // Снимок событий и курсор — в одном критическом сечении: `emit` двигает
+    // `event_seq` под замком `data`, поэтому беря оба здесь в том же порядке
+    // (data → event_seq) получаем согласованную пару. Иначе событие, пришедшее
+    // за время разбора журнала, попадало в `cursor`, но не в `events`, и клиент,
+    // переподключившийся с этим курсором, терял его навсегда.
+    let (known, events, cursor) = {
         let d = s.data.lock().await;
-        (
-            d.sessions.contains_key(&id),
-            d.events.get(&id).cloned().unwrap_or_default(),
-        )
+        let events = d.events.get(&id).cloned().unwrap_or_default();
+        let cursor = {
+            let sequences = s.event_seq.lock().await;
+            sequences
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| events.iter().map(|event| event.seq).max().unwrap_or(0))
+        };
+        (d.sessions.contains_key(&id), events, cursor)
     };
     if !known && !path.is_file() {
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
@@ -177,17 +200,14 @@ pub(super) async fn history(
             .into_response();
         }
         Err(e) => {
-            return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
-                .into_response();
+            return err(
+                "history_read",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response();
         }
     };
-    let cursor = s
-        .event_seq
-        .lock()
-        .await
-        .get(&id)
-        .copied()
-        .unwrap_or_else(|| events.iter().map(|event| event.seq).max().unwrap_or(0));
     Json(serde_json::json!({"cursor":cursor,"events":events,"messages":messages})).into_response()
 }
 pub(super) async fn events(
