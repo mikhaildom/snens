@@ -5,9 +5,9 @@
 // ради шести строк.
 
 use axum::{
-    Json,
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use std::sync::Arc;
 
@@ -28,11 +28,20 @@ pub(super) async fn auth(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
+    // Схема авторизации по RFC 7235 §2.1 регистронезависима: `bearer`/`BEARER`
+    // — тот же способ входа, и клиент/прокси вправе привести регистр.
+    let bearer = |v: &str| -> Option<String> {
+        let (scheme, token) = v.split_once(' ')?;
+        scheme
+            .eq_ignore_ascii_case("bearer")
+            .then(|| token.trim().to_string())
+            .filter(|t| !t.is_empty())
+    };
     let header_token = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|x| x.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(bearer);
     // `EventSource` в браузере не умеет заголовков, и `fetch`-обёртка над SSE
     // лишает нас авто-переподключения. Поэтому для SSE-маршрутов токен
     // принимается ещё и в query (`?token=…`). Цена решения честная: query
@@ -50,13 +59,17 @@ pub(super) async fn auth(
     } else {
         None
     };
-    let Some(given) = header_token.map(str::to_string).or(query_token) else {
+    let Some(given) = header_token.or(query_token) else {
         return unauthorized();
     };
     // Два законных способа войти: токен инстанса (локальные клиенты: TUI, веб
     // на том же хосте) и токен спаренного устройства из реестра. Второй можно
     // отозвать поштучно, не меняя секрет остальных.
-    if given == ctx.token {
+    //
+    // Сравнение постоянного времени (`==` на секрете выходит на первом
+    // различающемся байте и выдаёт длину): путь по реестру уже был таким,
+    // а главный секрет — токен инстанса — проверялся хуже.
+    if crate::clients::token_eq(given.as_bytes(), ctx.token.as_bytes()) {
         return next.run(req).await;
     }
     if ctx.runtime.registry.owner(&given).is_some() {
@@ -67,13 +80,19 @@ pub(super) async fn auth(
 
 /// Потоки, где токен в query допустим: `EventSource` не умеет заголовков.
 fn is_stream_path(path: &str) -> bool {
-    path.ends_with("/events") || path == "/v1/events"
+    // `/v1/events` уже попадает под `ends_with`, второй операнд был мёртвым.
+    path.ends_with("/events")
 }
 
 fn unauthorized() -> axum::response::Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({"error":{"code":"unauthorized","message":"Bearer token required"}})),
+        // RFC 7235 требует challenge в 401 — без него клиент не знает, каким
+        // способом повторять.
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(
+            serde_json::json!({"error":{"code":"unauthorized","message":"Bearer token required"}}),
+        ),
     )
         .into_response()
 }

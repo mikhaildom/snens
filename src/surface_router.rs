@@ -6,23 +6,23 @@
 
 use crate::surface_runtime::Runtime;
 use axum::{
-    Router,
     routing::{get, post},
+    Router,
 };
 use std::sync::Arc;
 
 use super::{
     approvals::approve,
-    dashboard::{reviews, ticket, tickets},
-    pairing,
     commands::{message, stop, tool_result},
+    dashboard::{reviews, ticket, tickets},
     events::{events, history, ingest, session_updates},
     fork::fork,
     files::{session_file, upload_attachment},
-    http::{AuthCtx, auth},
+    genui::get as genui_lib,
+    http::{auth, AuthCtx},
+    pairing,
     query::{context_breakdown, search},
     sessions::{create, delete_session, get_session, list, register_tools},
-    genui::get as genui_lib,
     settings::{
         activate_provider, delete_provider, get_config, get_memory, get_model, get_providers,
         post_provider, put_config, put_memory, put_model, put_provider,
@@ -31,13 +31,13 @@ use super::{
 
 /// Собрать приложение поверхности: маршруты, состояние, слои middleware.
 ///
-/// Три роутера, а не один, потому что у них РАЗНЫЕ правила доступа:
+/// Два роутера API, а не один, потому что у них РАЗНЫЕ правила доступа:
 ///
-/// - `protected` — всё обычное API: требует bearer-токен;
-/// - `pairing_admin` — открыть приглашение и управлять устройствами: тоже требует
-///   токен (приглашение открывает тот, кто уже внутри);
-/// - `pairing_claim` — обмен кода на токен: единственный маршрут БЕЗ токена, у
-///   клиента его ещё нет. Его защищает код (5 минут, 5 попыток).
+/// - `protected` — всё обычное API и администрирование спаривания
+///   (`/v1/pair/start`, `/v1/pair/status`, `/v1/clients…`): требует bearer-токен
+///   (приглашение открывает тот, кто уже внутри);
+/// - `claim` — обмен кода на токен: единственный маршрут БЕЗ токена, у клиента
+///   его ещё нет. Его защищает код (5 минут, 5 попыток).
 ///
 /// Слои навешиваются на каждый роутер ДО `merge`: `merge` не переносит слои, и
 /// общий `.layer` в конце покрыл бы `claim` тоже — проверено, он отвечал 401.
@@ -104,8 +104,8 @@ pub(super) fn app(state: Arc<Runtime>, token: String) -> Router {
         .route("/v1/clients/{id}", axum::routing::delete(pairing::revoke))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
-            auth_ctx.clone(),
-            auth,
+            // `auth_ctx` больше нигде не нужен — передаём владением.
+            auth_ctx, auth,
         ));
 
     // Без auth: клиент приходит без токена и получает его здесь.
@@ -121,12 +121,23 @@ pub(super) fn app(state: Arc<Runtime>, token: String) -> Router {
         Some(dir) => {
             let index = dir.join("index.html");
             // SPA: клиент — одностраничник, и `/some/route` рисует тот же
-            // index.html. Поэтому «не найдено в каталоге» отдаёт index, а не 404.
-            protected.merge(claim).fallback_service(
-                tower_http::services::ServeDir::new(&dir).fallback(
-                    tower_http::services::ServeFile::new(index),
-                ),
-            )
+            // index.html. Но только для НЕ-API путей: иначе опечатка
+            // (`GET /v1/sessionz`) и недописанный маршрут возвращали 200 и
+            // HTML, и клиент считал это успехом.
+            let spa = tower_http::services::ServeDir::new(&dir)
+                .fallback(tower_http::services::ServeFile::new(index));
+            let assets = Router::new().fallback_service(spa).route(
+                "/v1/{*rest}",
+                axum::routing::any(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(serde_json::json!({
+                            "error":{"code":"not_found","message":"no such API route"}
+                        })),
+                    )
+                }),
+            );
+            protected.merge(claim).merge(assets)
         }
         None => protected.merge(claim),
     };
@@ -144,10 +155,29 @@ pub(super) fn app(state: Arc<Runtime>, token: String) -> Router {
 
 /// Каталог собранного веб-клиента: `SNENS_WEB_DIR`, иначе `web/` рядом с
 /// бинарником (так его кладёт установщик). Нет `index.html` — клиента нет.
+///
+/// Оба случая отсутствия говорят об этом в stderr: без строки «клиента нет»
+/// выглядит как сломанная сборка.
 fn web_root() -> Option<std::path::PathBuf> {
     let candidate = match std::env::var("SNENS_WEB_DIR") {
         Ok(dir) if !dir.trim().is_empty() => std::path::PathBuf::from(dir),
-        _ => std::env::current_exe().ok()?.parent()?.join("web"),
+        _ => match std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|parent| parent.join("web")))
+        {
+            Some(path) => path,
+            None => {
+                eprintln!("[snens] путь к бинарнику не определён: веб-клиент не отдаётся");
+                return None;
+            }
+        },
     };
-    candidate.join("index.html").is_file().then_some(candidate)
+    if candidate.join("index.html").is_file() {
+        return Some(candidate);
+    }
+    eprintln!(
+        "[snens] веб-клиент не найден: {} (нет index.html)",
+        candidate.display()
+    );
+    None
 }

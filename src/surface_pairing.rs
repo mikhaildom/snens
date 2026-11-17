@@ -6,10 +6,10 @@
 // рядом с обработчиками сессий значило бы прятать границу в глубине файла.
 
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -103,17 +103,18 @@ pub async fn status(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
 /// Единственный маршрут без bearer-токена: у клиента его ещё нет. Всё, что его
 /// защищает, — код (5 попыток, 5 минут) и то, что приглашение надо сначала
 /// открыть с локального адреса.
-pub async fn claim(
-    State(s): State<Arc<Runtime>>,
-    Json(b): Json<Claim>,
-) -> impl IntoResponse {
+pub async fn claim(State(s): State<Arc<Runtime>>, Json(b): Json<Claim>) -> impl IntoResponse {
     if let Err(e) = s.pending.claim(&b.code) {
         // 401, а не 400: это неудачная аутентификация, и клиент должен
         // показать «код не подошёл», а не «ошибка сервера».
         return err("pairing", e, StatusCode::UNAUTHORIZED);
     }
     let name = b.name.trim();
-    let name = if name.is_empty() { "устройство" } else { name };
+    let name = if name.is_empty() {
+        "устройство"
+    } else {
+        name
+    };
     let token = clients::new_token();
     let client = Client {
         id: uuid::Uuid::new_v4().to_string(),
@@ -122,8 +123,13 @@ pub async fn claim(
         created_at: clients::now(),
         last_seen: Some(clients::now()),
     };
-    if let Err(e) = clients::save(&s.cfg.data_path(), &client) {
-        return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR);
+    let data = s.cfg.data_path();
+    let to_save = client.clone();
+    let saved = tokio::task::spawn_blocking(move || crate::clients::save(&data, &to_save)).await;
+    match saved {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+        Err(e) => return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
     s.registry.add(client.clone());
     Json(ClaimReply {
@@ -154,18 +160,40 @@ pub async fn list(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
 }
 
 /// `DELETE /v1/clients/{id}` — отозвать устройство.
-pub async fn revoke(
-    State(s): State<Arc<Runtime>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    match clients::revoke(&s.cfg.data_path(), &id) {
-        Ok(true) => {
+pub async fn revoke(State(s): State<Arc<Runtime>>, Path(id): Path<String>) -> impl IntoResponse {
+    // `id` уезжает в `clients::path_of` как имя файла: без проверки
+    // `DELETE /v1/clients/..%2F..%2Fconfig` удалял бы произвольный `*.json` за
+    // пределами реестра (axum декодирует %2F в сегменте).
+    if !client_id_valid(&id) {
+        return err("invalid", "invalid client id", StatusCode::BAD_REQUEST);
+    }
+    // Реестр на диске — блокирующие `remove_file` + `read_dir`: не на воркере.
+    let data = s.cfg.data_path();
+    let revoked_id = id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || crate::clients::revoke(&data, &revoked_id)).await;
+    match result {
+        Ok(Ok(true)) => {
             s.registry.remove(&id);
             Json(serde_json::json!({"revoked": id})).into_response()
         }
-        Ok(false) => err("not_found", "нет такого устройства", StatusCode::NOT_FOUND),
+        Ok(Ok(false)) => err("not_found", "нет такого устройства", StatusCode::NOT_FOUND),
+        Ok(Err(e)) => err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         Err(e) => err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// id устройства — только безопасные символы имени файла и без `..`.
+///
+/// Ровно то, что производит `claim` (uuid), плюс запас на будущие форматы: ни
+/// `/`, ни `\`, ни `..` не проходят, поэтому путь остаётся внутри реестра.
+pub(super) fn client_id_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.contains("..")
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 fn sha256_hex(token: &str) -> String {

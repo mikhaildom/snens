@@ -26,7 +26,18 @@ pub struct ArtifactRef {
     pub id: String,
 }
 
-/// Имя артефакта из открывающей строки фенса. `None` — это не фенс артефакта.
+/// Имя артефакта из открывающей строки фенса.
+///
+/// Три исхода, и их нельзя смешивать:
+///
+/// * `None` — это вообще не фенс артефакта;
+/// * `Some(None)` — фенс без `id=`: анонимный артефакт (клиент зовёт его `#1`);
+/// * `Some(Some(id))` — имя из заголовка.
+///
+/// Невалидное значение `id=` (пустое, `id=quiz 1`, `id=цвиз`) — это ошибка
+/// заголовка по `docs/artifact.md`, а не «анонимный артефакт»: раньше такой фенс
+/// выдавался за `#1`, и ссылка в журнале указывала на другой артефакт, чем тот,
+/// на который ответил человек.
 fn artifact_id(line: &str) -> Option<Option<String>> {
     let rest = line.trim_start().strip_prefix("```")?;
     let rest = rest.trim_start_matches('`');
@@ -40,12 +51,11 @@ fn artifact_id(line: &str) -> Option<Option<String>> {
                 && id
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-            if ok {
-                return Some(Some(id.to_string()));
-            }
+            // `id=` был — значит фенс претендует на имя. Кривое имя — не
+            // «анонимный», а невалидный фенс.
+            return ok.then(|| Some(id.to_string()));
         }
     }
-    // Фенс без `id` — анонимный артефакт; клиент зовёт его `#1`.
     Some(None)
 }
 
@@ -55,7 +65,10 @@ fn artifact_id(line: &str) -> Option<Option<String>> {
 /// номеру. Берётся первый артефакт записи: ответы на второй и дальше в одном
 /// сообщении — редкость, а порядок совпадает с нумерацией клиента (`#1`, `#2`).
 pub fn find(log: &[Rec], seq: u64) -> Option<ArtifactRef> {
-    let rec = log.get(seq.checked_sub(1)? as usize)?;
+    // `as usize` на 32-битной цели молча обрезал бы большое `seq` до маленького
+    // индекса — ответ ссылался бы на чужую запись вместо `None`.
+    let index = usize::try_from(seq.checked_sub(1)?).ok()?;
+    let rec = log.get(index)?;
     let Rec::Assistant { text, .. } = rec else {
         return None;
     };
@@ -78,24 +91,25 @@ pub fn find(log: &[Rec], seq: u64) -> Option<ArtifactRef> {
 /// JS-парсер в ядре. Вопрос из цикла посчитается один раз — тоже приемлемо:
 /// важно заметить системную проблему, а не сосчитать точно.
 pub fn count_questions(text: &str) -> usize {
-    if !text.contains("artifact") {
-        return 0;
-    }
+    // Гейт по слову `artifact` давал `asked = 0` там, где `answered` считал
+    // ответы (текст без слова, но с вопросами) — и сводка врала «0, без ответа
+    // 0». Считаем по самому вызову: лишний `str::matches` — копейки.
     text.matches("snens.ask").count()
 }
 
-/// Отвеченные вопросы сессии: ключи `seq:artifact:id`.
+/// Отвеченные вопросы сессии: `(seq, artifact, id)`.
 ///
 /// Скан по журналу, а не по состоянию поверхности: ответ, полученный до
 /// рестарта, обязан блокировать повтор и после него.
-pub fn answered(log: &[Rec]) -> std::collections::HashSet<String> {
+///
+/// Ключ структурный, а не склеенный через `:`: ни `artifact`, ни `id` не
+/// гарантированно без двоеточий, и `("quiz:q", "")` с `("quiz", "q")`
+/// схлопывались бы в один и тот же ответ.
+pub fn answered(log: &[Rec]) -> std::collections::HashSet<(u64, String, String)> {
     let mut out = std::collections::HashSet::new();
     for rec in log {
-        if let Rec::User {
-            ask: Some(ask), ..
-        } = rec
-        {
-            out.insert(format!("{}:{}:{}", ask.seq, ask.artifact, ask.id));
+        if let Rec::User { ask: Some(ask), .. } = rec {
+            out.insert((ask.seq, ask.artifact.clone(), ask.id.clone()));
         }
     }
     out
@@ -118,9 +132,7 @@ impl AskStats {
                 Rec::Assistant { text, .. } => {
                     asked += count_questions(text.as_deref().unwrap_or(""));
                 }
-                Rec::User {
-                    ask: Some(_), ..
-                } => answered += 1,
+                Rec::User { ask: Some(_), .. } => answered += 1,
                 _ => {}
             }
         }
@@ -133,7 +145,26 @@ impl AskStats {
             return String::new();
         }
         let pending = self.asked.saturating_sub(self.answered);
-        format!("вопросов артефактов {}, без ответа {pending}", self.asked)
+        format!(
+            "{} артефактов {}, без ответа {pending}",
+            questions_word(self.asked),
+            self.asked
+        )
+    }
+}
+
+/// Слово для числа вопросов: «вопрос / вопроса / вопросов».
+fn questions_word(n: usize) -> &'static str {
+    let tail = n % 100;
+    let last = n % 10;
+    if (11..=14).contains(&tail) {
+        "вопросов"
+    } else if last == 1 {
+        "вопрос"
+    } else if (2..=4).contains(&last) {
+        "вопроса"
+    } else {
+        "вопросов"
     }
 }
 
@@ -185,6 +216,24 @@ mod tests {
     }
 
     #[test]
+    fn invalid_id_header_is_not_an_anonymous_artifact() {
+        // По `docs/artifact.md` кривое значение — ошибка фенса. Выдавать его за
+        // `#1` нельзя: ссылка в журнале указывала бы на другой артефакт.
+        for bad in [
+            "```artifact id=",
+            "```artifact id=цвиз",
+            "```artifact id=a/b",
+        ] {
+            let log = vec![assistant(bad)];
+            assert_eq!(find(&log, 1), None, "{bad}");
+        }
+        // А `id=quiz 1` после `split_whitespace` — это валидный `id=quiz`
+        // плюс лишний токен: такой фенс остаётся артефактом `quiz`.
+        let log = vec![assistant("```artifact id=quiz 1")];
+        assert_eq!(find(&log, 1).map(|a| a.id), Some("quiz".into()));
+    }
+
+    #[test]
     fn ordinary_code_fence_is_not_an_artifact() {
         let log = vec![assistant("```html\n<b>x</b>\n```")];
         assert_eq!(find(&log, 1), None);
@@ -219,8 +268,11 @@ mod tests {
         let log = vec![ask(7, "quiz", "q1"), ask(7, "quiz", "q2")];
         let set = answered(&log);
         assert_eq!(set.len(), 2);
-        assert!(set.contains("7:quiz:q1"));
-        assert!(set.contains("7:quiz:q2"));
+        assert!(set.contains(&(7, "quiz".into(), "q1".into())));
+        assert!(set.contains(&(7, "quiz".into(), "q2".into())));
+        // Склейка через ':' склеила бы эти два в один ключ.
+        let tricky = answered(&[ask(7, "quiz:q", ""), ask(7, "quiz", "q")]);
+        assert_eq!(tricky.len(), 2);
     }
 
     #[test]
@@ -243,7 +295,7 @@ mod tests {
         let s = AskStats::of(&log);
         assert_eq!(s.asked, 1);
         assert_eq!(s.answered, 1);
-        assert_eq!(s.line(), "вопросов артефактов 1, без ответа 0");
+        assert_eq!(s.line(), "вопрос артефактов 1, без ответа 0");
         assert_eq!(AskStats::of(&[]).line(), "");
     }
 }

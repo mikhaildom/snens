@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex as StdMutex},
 };
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Session {
@@ -161,10 +161,14 @@ pub struct Runtime {
     /// авторевью запоминает поколение и отменяется, если оно изменилось — тогда
     /// за время простоя началась новая работа и ревью ждёт следующей паузы.
     pub review_gen: Mutex<BTreeMap<String, u64>>,
-    /// Ожидающие решения заявки на привилегированное действие: id → канал ответа.
-    /// Живут только в памяти: заявка одноразовая и короткоживущая, рестарт её
-    /// отменяет (шим получит отказ).
-    pub approvals: Mutex<BTreeMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// Ожидающие решения заявки на привилегированное действие: id → канал ответа
+    /// вместе с сессией-владельцем.
+    ///
+    /// Сессия хранится рядом с каналом, а не только в пути запроса: иначе
+    /// аутентифицированный клиент мог отправить решение в чужой сессий и
+    /// `approval.resolved` уезжало в её поток — карточка в настоящей сессии
+    /// оставалась висеть.
+    pub approvals: Mutex<BTreeMap<String, (String, tokio::sync::oneshot::Sender<bool>)>>,
     /// Действующее приглашение пейринга (docs/pairing.md). Отдельная ячейка, а
     /// не поле store: код живёт минуты, в SQLite ему делать нечего, а рестарт
     /// ядра его законно отменяет.
@@ -185,7 +189,9 @@ impl Runtime {
     /// Вызывать только из синхронных `save_*`/`persist_*`: под замком ни одного
     /// `await`, иначе async-воркер встал бы вместе с базой.
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     // Полная перезапись store (`persist_store`) нужна только там, где меняется
@@ -264,20 +270,36 @@ impl Runtime {
             "surface_tools",
             "reviews",
         ] {
-            tx.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), params![id])?;
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE session_id=?1"),
+                params![id],
+            )?;
         }
-        tx.execute("DELETE FROM event_sequences WHERE session_id=?1", params![id])?;
+        tx.execute(
+            "DELETE FROM event_sequences WHERE session_id=?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Записать сессию и все её сообщения с вложениями (грубый, но безопасный
-    /// способ для путей, которые меняют состав очереди целиком).
-    pub fn save_session_messages(&self, id: &str, data: &Store) -> crate::R<()> {
+    /// Записать одну сессию и её сообщения — без полной перезаписи store.
+    ///
+    /// Вызывать его приходится после того, как async-замок `data` уже отпущен
+    /// (блокирующий SQLite под ним держал бы всех, кому нужен store). Поэтому
+    /// снимок нужной сессии клонируется под замком, а пишется — вне его.
+    /// Берёт `&Store` целиком больше не нужен: полная перезапись на каждый ход —
+    /// это O(объём истории), а нужна запись одной сессии.
+    pub fn save_session_and_messages(
+        &self,
+        id: &str,
+        session: Option<&Session>,
+        messages: &[Message],
+    ) -> crate::R<()> {
         let db = self.db();
         let tx = db.unchecked_transaction()?;
-        if let Some(s) = data.sessions.get(id) {
+        if let Some(s) = session {
             tx.execute(
                 "INSERT INTO sessions(id,surface,state,run_id,context_budget,context_target,parent)\n                 VALUES(?1,?2,?3,?4,?5,?6,?7)\n                 ON CONFLICT(id) DO UPDATE SET surface=excluded.surface,state=excluded.state,\n                   run_id=excluded.run_id,context_budget=excluded.context_budget,\n                   context_target=excluded.context_target,parent=excluded.parent",
                 params![
@@ -291,28 +313,42 @@ impl Runtime {
                 ],
             )?;
         }
-        tx.execute("DELETE FROM message_attachments WHERE session_id=?1", params![id])?;
+        tx.execute(
+            "DELETE FROM message_attachments WHERE session_id=?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
-        if let Some(ms) = data.messages.get(id) {
-            for (seq, m) in ms.iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO messages(session_id,id,command_id,seq,text,state,run_id)\n                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                    params![
-                        id,
-                        m.id,
-                        m.command_id,
-                        seq as i64,
-                        m.text,
-                        m.state,
-                        m.run_id
-                    ],
+        for (seq, m) in messages.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO messages(session_id,id,command_id,seq,text,state,run_id,ask)\n                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    id,
+                    m.id,
+                    m.command_id,
+                    seq as i64,
+                    m.text,
+                    m.state,
+                    m.run_id,
+                    m.ask.as_ref().map(serde_json::to_string).transpose()?
+                ],
+            )?;
+            for (aseq, aid) in m.attachment_ids.iter().enumerate() {
+                // Вложение могло не попасть в базу (legacy-импорт, упавшая
+                // запись). FK-нарушение не гасится `OR IGNORE` — проверяем
+                // строку сами, иначе одно битое вложение роняло бы всю
+                // транзакцию сообщений (500 на ходе).
+                let exists: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM attachments WHERE session_id=?1 AND id=?2",
+                    params![id, aid],
+                    |r| r.get(0),
                 )?;
-                for (aseq, aid) in m.attachment_ids.iter().enumerate() {
-                    tx.execute(
-                        "INSERT INTO message_attachments VALUES(?1,?2,?3,?4)",
-                        params![id, m.id, aid, aseq as i64],
-                    )?;
+                if exists == 0 {
+                    continue;
                 }
+                tx.execute(
+                    "INSERT OR REPLACE INTO message_attachments VALUES(?1,?2,?3,?4)",
+                    params![id, m.id, aid, aseq as i64],
+                )?;
             }
         }
         tx.commit()?;
@@ -376,20 +412,20 @@ impl Runtime {
         Ok(())
     }
 
-
+    /// Собрать событие и отдать его без записи в базу — запись делает вызывающий.
     ///
-    /// Инвариант: `emit` берёт мьютекс store сам, поэтому вызывать его ПОД
-    /// `self.data.lock()` нельзя — это взаимная блокировка (tokio-мьютекс не
-    /// реентрантен). Порядок такой: собрать данные под замком, отпустить,
-    /// потом `emit`. Отдельно: `emit` → `refresh_child` → снова `data`, и это
-    /// безопасно ровно потому, что к моменту вызова замок уже отпущен.
-    pub async fn emit(
+    /// `emit` пишет SQLite прямо под замком `data`, а это fsync на блокирующем
+    /// замке: каждый emit держал и воркер, и store (все хендлеры стоят
+    /// в очереди). Поэтому порядок такой: под замком только последовательность
+    /// и память, потом запись — уже без `data`. Курсор двигается в памяти там же,
+    /// где берётся номер, так что пара «событие + курсор» остаётся согласованной.
+    pub async fn build_event(
         &self,
         id: &str,
         run: Option<String>,
         kind: &str,
         fields: serde_json::Value,
-    ) -> crate::R<Event> {
+    ) -> Event {
         let mut d = self.data.lock().await;
         let seq = {
             let mut sequences = self.event_seq.lock().await;
@@ -409,24 +445,51 @@ impl Runtime {
             kind: kind.into(),
             fields,
         };
-        if kind != "assistant.delta" {
+        // Дельта в историю не идёт, но занятый ею номер — идёт: иначе после
+        // падения ядра нумерация откатится и повторит уже доставленные номера,
+        // а клиент с курсором молча перестанет получать события.
+        if e.kind != "assistant.delta" {
             d.events.entry(id.into()).or_default().push(e.clone());
-            // Точечная запись одного события вместе с курсором: полная перезапись
-            // store на каждое событие — O(n²) по объёму истории (замер: ~140 мс
-            // при 15 тыс. событий) и она же держала оба мьютекса всё это время.
-            self.save_event(&e)?;
-        } else {
-            // Дельта в историю не идёт, но занятый ею номер — идёт: иначе после
-            // падения ядра нумерация откатится и повторит уже доставленные номера,
-            // а клиент с курсором молча перестанет получать события.
-            self.save_cursor(&e.session_id, e.seq)?;
         }
-        drop(d);
-        // Карточка подагента живёт потоком (`GET /v1/sessions` без запроса), но
-        // обновляется отдельным шагом: событий у ребёнка много, а меняется из
-        // них немногое. Признак «это подагент» проверяет сам шаг — по журналу.
-        self.refresh_child(id).await;
+        e
+    }
+
+    /// Дописать событие в базу и разослать его. Вызывать без замка `data`.
+    pub async fn publish_event(&self, e: Event) {
+        let saved = if e.kind != "assistant.delta" {
+            self.save_event(&e)
+        } else {
+            self.save_cursor(&e.session_id, e.seq)
+        };
+        if let Err(error) = saved {
+            eprintln!(
+                "[snens] событие {} сессии {} не записано: {error}",
+                e.kind, e.session_id
+            );
+        }
         let _ = self.tx.send(e.clone());
+        // Карточка подагента — отдельным шагом и своим сигналом: у ребёнка
+        // событий много, а меняется из них немногое. Само решение «это
+        // подагент» принимается по слоту store, без чтения журнала на каждую
+        // дельту (см. `refresh_child`).
+        self.refresh_child(&e.session_id).await;
+    }
+
+    ///
+    /// Инвариант: `emit` берёт мьютекс store сам, поэтому вызывать его ПОД
+    /// `self.data.lock()` нельзя — это взаимная блокировка (tokio-мьютекс не
+    /// реентрантен). Порядок такой: собрать данные под замком, отпустить,
+    /// потом `emit`. Отдельно: `emit` → `refresh_child` → снова `data`, и это
+    /// безопасно ровно потому, что к моменту вызова замок уже отпущен.
+    pub async fn emit(
+        &self,
+        id: &str,
+        run: Option<String>,
+        kind: &str,
+        fields: serde_json::Value,
+    ) -> crate::R<Event> {
+        let e = self.build_event(id, run, kind, fields).await;
+        self.publish_event(e.clone()).await;
         Ok(e)
     }
 
@@ -437,7 +500,28 @@ impl Runtime {
     /// пачками по 32), а меняется при этом только счётчик ходов и состояние —
     /// кадр на каждую дельту был бы теми же данными тридцать два раза.
     pub async fn refresh_child(&self, id: &str) {
-        let Some(mut fresh) = crate::surface_server::discovery::session_by_id(&self.cfg, id) else {
+        // Дешёвая проверка до любого чтения журнала: признак «подагент» уже
+        // лежит в слоте store. Раньше `session_by_id` звался на КАЖДОЕ событие
+        // (включая дельты) и до этой проверки — обычная сессия платила чтением
+        // головы журнала за каждую дельту хода.
+        let parent_known = {
+            let d = self.data.lock().await;
+            // Слота нет (`None`) — решение возможно только по журналу.
+            d.sessions.get(id).map(|slot| slot.is_child())
+        };
+        if parent_known == Some(false) {
+            return;
+        }
+        // Чтение журнала — блокирующее: не на async-воркере.
+        let cfg = self.cfg.clone();
+        let read_id = id.to_string();
+        let fresh = tokio::task::spawn_blocking(move || {
+            crate::surface_server::discovery::session_by_id(&cfg, &read_id)
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(mut fresh) = fresh else {
             return;
         };
         // Подагент ли это — по журналу (`Meta.parent`), а не по store: в store
@@ -445,15 +529,12 @@ impl Runtime {
         if !fresh.is_child() {
             return;
         }
-        let before = {
-            let d = self.data.lock().await;
-            match d.sessions.get(id) {
-                Some(s) => (s.turns, s.done.clone(), s.state.clone()),
-                None => (None, None, String::new()),
-            }
-        };
         let changed = {
             let mut d = self.data.lock().await;
+            let before = match d.sessions.get(id) {
+                Some(x) => (x.turns, x.done.clone(), x.state.clone()),
+                None => (None, None, String::new()),
+            };
             if let Some(slot) = d.sessions.get_mut(id) {
                 // `state` берём из журнала и pid (это и есть правда про
                 // подагента: работает/готов/прерван), из слота — только то,
@@ -461,14 +542,23 @@ impl Runtime {
                 // говорил «running» там, где `GET /v1/sessions` уже отдавал «idle».
                 fresh.run_id = slot.run_id.clone();
                 fresh.title = slot.title.clone().or(fresh.title);
+                // `build_session` строит запись с нуля (`context_budget`/
+                // `context_target` там всегда `None`). Без переноса из слота
+                // пересборка карточки стирала бюджет сессии и в памяти, и в
+                // SQLite — уборка контекста у подагента теряла свой порог.
+                fresh.context_budget = slot.context_budget;
+                fresh.context_target = slot.context_target;
             }
             let after = (fresh.turns, fresh.done.clone(), fresh.state.clone());
-            d.sessions.insert(id.to_string(), fresh.clone());
-            let _ = self.save_session(&fresh);
-            before != after
+            let snapshot = fresh.clone();
+            d.sessions.insert(id.to_string(), fresh);
+            (before, after, snapshot)
         };
-        if changed {
-            self.publish_session(fresh);
+        let (before, after, snapshot) = changed;
+        // Запись — без async-замка: блокирующий SQLite под ним держал всё.
+        let _ = self.save_session(&snapshot);
+        if before != after {
+            self.publish_session(snapshot);
         }
     }
 
@@ -502,7 +592,7 @@ fn schema(c: &Connection) -> crate::R<()> {
     let _: String = c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     c.execute_batch("PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,surface TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,context_budget INTEGER,context_target INTEGER);
-      CREATE TABLE IF NOT EXISTS messages(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL UNIQUE,seq INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
+      CREATE TABLE IF NOT EXISTS messages(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL UNIQUE,seq INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,ask TEXT,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE TABLE IF NOT EXISTS attachments(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL,filename TEXT NOT NULL,name TEXT NOT NULL,part TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE UNIQUE INDEX IF NOT EXISTS attachments_command ON attachments(session_id,command_id);
       CREATE TABLE IF NOT EXISTS message_attachments(session_id TEXT NOT NULL,message_id TEXT NOT NULL,attachment_id TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(session_id,message_id,attachment_id),FOREIGN KEY(session_id,message_id) REFERENCES messages(session_id,id),FOREIGN KEY(session_id,attachment_id) REFERENCES attachments(session_id,id));
@@ -517,11 +607,31 @@ fn schema(c: &Connection) -> crate::R<()> {
     // отдельно, чтобы обновление бинарника не требовало пересоздания store.
     // `parent` — признак подагента. Без него store не отличал ребёнка от
     // пользовательской сессии, и обновление карточки молча не срабатывало.
-    for column in ["context_budget INTEGER", "context_target INTEGER", "parent TEXT"] {
+    for column in [
+        "context_budget INTEGER",
+        "context_target INTEGER",
+        "parent TEXT",
+    ] {
         if let Err(error) = c.execute(&format!("ALTER TABLE sessions ADD COLUMN {column}"), []) {
-            if !error.to_string().to_lowercase().contains("duplicate column") {
+            if !error
+                .to_string()
+                .to_lowercase()
+                .contains("duplicate column")
+            {
                 return Err(error.into());
             }
+        }
+    }
+    // `ask` — ответ на вопрос артефакта (`snens.ask`): в базах, созданных до
+    // этой колонки, её нет, и без миграции повтор после рестарта считался бы
+    // другим payload'ом (409 вместо идемпотентного ответа).
+    if let Err(error) = c.execute("ALTER TABLE messages ADD COLUMN ask TEXT", []) {
+        if !error
+            .to_string()
+            .to_lowercase()
+            .contains("duplicate column")
+        {
+            return Err(error.into());
         }
     }
     Ok(())
@@ -551,7 +661,7 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     for (sid, ms) in &d.messages {
         for (seq, m) in ms.iter().enumerate() {
             tx.execute(
-                "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     sid,
                     m.id,
@@ -559,7 +669,8 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
                     seq as i64,
                     m.text,
                     m.state,
-                    m.run_id
+                    m.run_id,
+                    m.ask.as_ref().map(serde_json::to_string).transpose()?
                 ],
             )?;
         }
@@ -670,7 +781,7 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                 // В store не хранятся: выводятся из журнала при discovery.
                 turns: None,
                 done: None,
-                    started_at: None,
+                started_at: None,
                 done_at: None,
             })
         })? {
@@ -679,14 +790,19 @@ fn read_store(c: &Connection) -> crate::R<Store> {
         }
     }
     {
-        let mut q=c.prepare("SELECT session_id,id,command_id,text,state,run_id FROM messages ORDER BY session_id,seq")?;
+        let mut q=c.prepare("SELECT session_id,id,command_id,text,state,run_id,ask FROM messages ORDER BY session_id,seq")?;
         for row in q.query_map([], |r| {
             let sid: String = r.get(0)?;
             let mid: String = r.get(1)?;
+            // `ask` — часть payload'а идемпотентности (`same`-сравнение в
+            // `surface_commands::message`). Пока колонки не было, после рестарта
+            // повтор ответа на артефакт сравнивал `Some(..)` с `None` и получал
+            // 409 `idempotency_conflict` вместо идемпотентного ответа.
+            let ask: Option<String> = r.get(6)?;
             Ok((
                 sid,
                 Message {
-                    ask: None,
+                    ask: ask.and_then(|raw| serde_json::from_str(&raw).ok()),
                     id: mid,
                     command_id: r.get(2)?,
                     text: r.get(3)?,
@@ -760,8 +876,17 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                     seq: r.get::<_, i64>(1)? as u64,
                     run_id: r.get(2)?,
                     kind: r.get(3)?,
-                    fields: serde_json::from_str(&r.get::<_, String>(4)?)
-                        .unwrap_or(serde_json::Value::Null),
+                    fields: serde_json::from_str(&r.get::<_, String>(4)?).map_err(|e| {
+                        // Битый payload события — это порча store, а не «пустые
+                        // поля»: все остальные колонки здесь возвращают ошибку,
+                        // и молчаливый `Null` прятал бы её, отдавая клиенту
+                        // событие без данных.
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
                 },
             ))
         })? {
@@ -799,7 +924,9 @@ fn read_store(c: &Connection) -> crate::R<Store> {
     }
     {
         let mut q = c.prepare("SELECT session_id,turns FROM reviews")?;
-        for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))? {
+        for row in q.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })? {
             let (id, turns) = row?;
             d.reviews.insert(id, turns);
         }
@@ -954,7 +1081,8 @@ mod tests {
         let dir = temp();
         let (mut d, db) = open_store(&dir).unwrap();
         let id = "s".to_string();
-        d.sessions.insert(id.clone(), Session::new(id.clone(), "test"));
+        d.sessions
+            .insert(id.clone(), Session::new(id.clone(), "test"));
         d.surface_tools.insert(id.clone(),vec![serde_json::json!({"type":"function","function":{"name":"send_file","parameters":{"type":"object"}}})]);
         d.tool_requests
             .insert("s/r/c".into(), serde_json::json!({"status":"pending"}));
@@ -995,13 +1123,12 @@ mod tests {
         assert_eq!(got.tool_requests["s/r/c"]["status"], "pending");
         assert_eq!(got.messages["s"][0].command_id, "cmd");
         assert_eq!(got.commands["cmd"]["ok"], true);
-        assert!(
-            db.execute(
-                "INSERT INTO messages VALUES('s','m2','cmd',1,'dup','accepted',NULL)",
+        assert!(db
+            .execute(
+                "INSERT INTO messages VALUES('s','m2','cmd',1,'dup','accepted',NULL,NULL)",
                 []
             )
-            .is_err()
-        );
+            .is_err());
         drop(db);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1053,10 +1180,7 @@ mod tests {
     fn attachment_metadata_and_message_references_roundtrip_in_order() {
         let dir = temp();
         let (mut store, db) = open_store(&dir).unwrap();
-        store.sessions.insert(
-            "s".into(),
-            Session::new("s", "test"),
-        );
+        store.sessions.insert("s".into(), Session::new("s", "test"));
         let part = |path: &str, bytes| crate::log::Part {
             kind: "image".into(),
             path: path.into(),
@@ -1096,7 +1220,14 @@ mod tests {
                 attachment_ids: vec!["a2".into(), "a1".into()],
                 state: "applied".into(),
                 run_id: None,
-                ask: None,
+                // `ask` обязан пережить рестарт: он участвует в сравнении
+                // payload'а при повторе команды.
+                ask: Some(crate::log::AskRef {
+                    seq: 3,
+                    artifact: "quiz".into(),
+                    id: "q".into(),
+                    question: "какой вариант?".into(),
+                }),
             }],
         );
 
@@ -1105,6 +1236,14 @@ mod tests {
         assert_eq!(loaded.attachments["s"]["a1"], first);
         assert_eq!(loaded.attachments["s"]["a2"], second);
         assert_eq!(loaded.messages["s"][0].attachment_ids, ["a2", "a1"]);
+        assert_eq!(
+            loaded.messages["s"][0]
+                .ask
+                .as_ref()
+                .map(|a| a.artifact.as_str()),
+            Some("quiz"),
+            "ask не пережил перезапись store"
+        );
         drop(db);
         fs::remove_dir_all(dir).unwrap();
     }

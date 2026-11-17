@@ -6,10 +6,10 @@
 
 use crate::surface_runtime::{self as rt, Runtime};
 use axum::{
-    Json,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -66,35 +66,36 @@ pub(super) async fn upload_attachment(
     };
     let digest = format!("{:x}", Sha256::digest(&body));
     let _guard = s.session_lock(&id).await.lock_owned().await;
-    let mut d = s.data.lock().await;
-    if !d.sessions.contains_key(&id) {
-        return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
-    }
-    if let Some(existing) = d
-        .attachments
-        .get(&id)
-        .and_then(|m| m.values().find(|a| a.command_id == q.command_id))
+    // Идемпотентность — под коротким замком store; файловая работа и SQLite — вне
+    // него: раньше весь upload (create_dir_all, sync_all, save_attachment) шёл под
+    // общим мьютексом, и fsync держал всех, кому нужен store.
     {
-        if existing.filename == q.filename && existing.sha256 == digest {
-            let p = &existing.part;
-            return (
-                StatusCode::OK,
-                Json(attachment_response(
-                    &existing.attachment_id,
-                    &existing.name,
-                    &p.path,
-                    &p.mime,
-                    p.bytes,
-                )),
-            )
-                .into_response();
+        let d = s.data.lock().await;
+        if !d.sessions.contains_key(&id) {
+            return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
         }
-        return err(
-            "idempotency_conflict",
-            "command_id reused with different upload",
-            StatusCode::CONFLICT,
-        )
-        .into_response();
+        if let Some(existing) = by_command(&d, &id, &q.command_id) {
+            if existing.filename == q.filename && existing.sha256 == digest {
+                let p = &existing.part;
+                return (
+                    StatusCode::OK,
+                    Json(attachment_response(
+                        &existing.attachment_id,
+                        &existing.name,
+                        &p.path,
+                        &p.mime,
+                        p.bytes,
+                    )),
+                )
+                    .into_response();
+            }
+            return err(
+                "idempotency_conflict",
+                "command_id reused with different upload",
+                StatusCode::CONFLICT,
+            )
+            .into_response();
+        }
     }
     let original = std::path::Path::new(&q.filename);
     let candidate = crate::attach::attachment_kind(original);
@@ -121,13 +122,30 @@ pub(super) async fn upload_attachment(
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
     let dir = s.cfg.sessions_path().join(format!("{id}.attachments"));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    // Файловые операции — блокирующие: не на async-воркере.
+    let prepared = {
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+    };
+    match prepared {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response();
+        }
+        Err(e) => {
+            return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response();
+        }
     }
     let path = dir.join(format!("{aid}{extension}"));
     let mut options = tokio::fs::OpenOptions::new();
@@ -141,6 +159,9 @@ pub(super) async fn upload_attachment(
     }
     .await;
     if let Err(e) = write_result {
+        // Файл мог остаться полузаписанным: без удаления он осиротеет навсегда
+        // (в store на него никто не ссылается).
+        let _ = tokio::fs::remove_file(&path).await;
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
     }
     let (width, height) = if kind == "image" {
@@ -178,14 +199,44 @@ pub(super) async fn upload_attachment(
         part: part.clone(),
         sha256: digest,
     };
-    d.attachments
-        .entry(id.clone())
-        .or_default()
-        .insert(aid.clone(), attachment.clone());
+    // Запись в базу — до памяти и без store-замка: если она не прошла, ни в
+    // store, ни на диске следа не остаётся.
     if let Err(e) = s.save_attachment(&id, &attachment) {
-        d.attachments.get_mut(&id).and_then(|m| m.remove(&aid));
         let _ = tokio::fs::remove_file(&path).await;
         return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
+    {
+        // После `await` состав мог измениться: проверяем идемпотентность заново,
+        // чтобы два одновременных upload'а с одним `command_id` не затёрли друг
+        // друга. Проигравший убирает за собой и файл, и строку в базе.
+        let mut d = s.data.lock().await;
+        if let Some(existing) = by_command(&d, &id, &attachment.command_id) {
+            if existing.sha256 == attachment.sha256 && existing.filename == attachment.filename {
+                let p = &existing.part;
+                return (
+                    StatusCode::OK,
+                    Json(attachment_response(
+                        &existing.attachment_id,
+                        &existing.name,
+                        &p.path,
+                        &p.mime,
+                        p.bytes,
+                    )),
+                )
+                    .into_response();
+            }
+            let _ = tokio::fs::remove_file(&path).await;
+            return err(
+                "idempotency_conflict",
+                "command_id reused with different upload",
+                StatusCode::CONFLICT,
+            )
+            .into_response();
+        }
+        d.attachments
+            .entry(id.clone())
+            .or_default()
+            .insert(aid.clone(), attachment.clone());
     }
     (
         StatusCode::CREATED,
@@ -194,6 +245,18 @@ pub(super) async fn upload_attachment(
         )),
     )
         .into_response()
+}
+
+/// Вложение по `command_id` (ключ идемпотентности загрузки).
+///
+/// Поиск линейный: у сессии десятки вложений, а отдельный индекс пришлось бы
+/// поддерживать в трёх местах (загрузка, удаление, загрузка store). Цена
+/// линейного прохода по десяткам записей ниже цены рассинхронизации индекса —
+/// но O(n) остаётся, поэтому в комментарии это записано явно.
+fn by_command<'a>(d: &'a rt::Store, sid: &str, command_id: &str) -> Option<&'a rt::Attachment> {
+    d.attachments
+        .get(sid)
+        .and_then(|m| m.values().find(|a| a.command_id == command_id))
 }
 
 #[derive(Deserialize)]
@@ -210,15 +273,24 @@ pub(super) async fn session_file(
     Query(q): Query<FileQuery>,
 ) -> impl IntoResponse {
     if !rt::valid_id(&id) || q.path.is_empty() {
-        return err("invalid", "invalid session id or path", StatusCode::BAD_REQUEST).into_response();
+        return err(
+            "invalid",
+            "invalid session id or path",
+            StatusCode::BAD_REQUEST,
+        )
+        .into_response();
     }
     let root = s.cfg.sessions_path();
     let Ok(canonical) = tokio::fs::canonicalize(&q.path).await else {
         return err("not_found", "file not found", StatusCode::NOT_FOUND).into_response();
     };
     let Ok(root) = tokio::fs::canonicalize(&root).await else {
-        return err("storage", "sessions directory is missing", StatusCode::INTERNAL_SERVER_ERROR)
-            .into_response();
+        return err(
+            "storage",
+            "sessions directory is missing",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .into_response();
     };
     // Файл обязан лежать в каталоге, принадлежащем именно этой сессии:
     // `<id>.out/…` (канал вложений инструментов) или `<id>.attachments/…`.
@@ -229,6 +301,21 @@ pub(super) async fn session_file(
             "forbidden",
             "file does not belong to this session",
             StatusCode::FORBIDDEN,
+        )
+        .into_response();
+    }
+    let Ok(meta) = tokio::fs::metadata(&canonical).await else {
+        return err("not_found", "file not found", StatusCode::NOT_FOUND).into_response();
+    };
+    // Потолок отдачи: без него любой большой файл в `<id>.out` выедал всю
+    // память процесса одним GET. `max_attachment_bytes` — тот же порог, что у
+    // загрузки: больше него вложение и не появляется.
+    let limit = s.cfg.max_attachment_bytes as u64;
+    if meta.len() > limit {
+        return err(
+            "too_large",
+            "file exceeds configured size limit",
+            StatusCode::PAYLOAD_TOO_LARGE,
         )
         .into_response();
     }

@@ -11,10 +11,10 @@
 use crate::log::Rec;
 use crate::surface_runtime::{self as rt, Runtime};
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use serde::Serialize;
 use std::path::Path as FsPath;
@@ -47,8 +47,8 @@ pub(super) async fn ticket(
         return err("invalid", "invalid ticket name", StatusCode::BAD_REQUEST).into_response();
     }
     let dir = s.cfg.tickets_path();
-    let query = name.clone();
-    let found = tokio::task::spawn_blocking(move || crate::tickets::find(&dir, &query)).await;
+    // `name` больше не нужен: передаём владением, без клона.
+    let found = tokio::task::spawn_blocking(move || crate::tickets::find(&dir, &name)).await;
     match found {
         Ok(Some(t)) => Json(serde_json::json!({ "name": t.name, "body": t.body })).into_response(),
         Ok(None) => err("not_found", "ticket not found", StatusCode::NOT_FOUND).into_response(),
@@ -75,7 +75,10 @@ pub struct ReviewRow {
 pub(super) async fn reviews(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
     let dir = s.cfg.sessions_path();
     match tokio::task::spawn_blocking(move || rows(&dir)).await {
-        Ok(rows) => Json(serde_json::json!({ "reviews": rows })).into_response(),
+        Ok(Ok(rows)) => Json(serde_json::json!({ "reviews": rows })).into_response(),
+        Ok(Err(e)) => {
+            err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response()
+        }
         Err(e) => err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
     }
 }
@@ -85,11 +88,13 @@ pub(super) async fn reviews(State(s): State<Arc<Runtime>>) -> impl IntoResponse 
 /// Ревью — не отдельный вид хранилища, а журнал `<id>-review.jsonl` рядом с
 /// сессиями (`review::run`). Перечисляем по имени файла, а не по содержимому:
 /// разбирать 400 МБ журналов ради списка незачем.
-pub fn rows(dir: &FsPath) -> Vec<ReviewRow> {
-    let mut out: Vec<ReviewRow> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
+pub fn rows(dir: &FsPath) -> crate::R<Vec<ReviewRow>> {
+    // Ошибку `read_dir` возвращаем, а не выдаём за «ревью нет»: `Result::into_iter()`
+    // давал пустой итератор, и сбой хранилища был неотличим от пустого списка.
+    let entries = std::fs::read_dir(dir)?;
+    let mut out: Vec<ReviewRow> = entries
+        // Отдельная битая запись каталога не должна ронять весь список.
+        .filter_map(Result::ok)
         .filter_map(|e| {
             let path = e.path();
             if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
@@ -101,13 +106,14 @@ pub fn rows(dir: &FsPath) -> Vec<ReviewRow> {
             // и источник обязан быть настоящей сессией.
             if !rt::valid_id(session) {
                 return None;
-            }            Some(summarize(&path, id, session))
+            }
+            Some(summarize(&path, id, session))
         })
         .collect();
     // `ts` у самых старых журналов может быть нулём (меты нет): тогда наверх их
     // вытягивает mtime, а не пустая метка.
     out.sort_by(|a, b| b.ts.cmp(&a.ts).then(a.id.cmp(&b.id)));
-    out
+    Ok(out)
 }
 
 /// Разбор одного журнала ревью.
@@ -132,7 +138,10 @@ fn summarize(path: &FsPath, id: &str, session: &str) -> ReviewRow {
             Rec::User { ts, source, .. } if source == "review" => Some(*ts),
             _ => None,
         })
-        .or_else(|| recs.first().map(Rec::ts))
+        // Первая запись с `ts: 0` (старые журналы без настоящей меты) раньше
+        // глушила `mtime`: `Some(0)` не доходил до `unwrap_or_else`, и такие
+        // строки уезжали в низ списка с нулевым временем.
+        .or_else(|| recs.first().map(Rec::ts).filter(|ts| *ts > 0))
         .unwrap_or_else(|| mtime(path));
     let last_done = recs.iter().rev().find_map(|r| match r {
         Rec::Done { status, .. } => Some(status.clone()),
@@ -165,8 +174,10 @@ fn mtime(path: &FsPath) -> u64 {
 
 /// Обрезка по символам, а не по байтам: иначе кириллицу разрежет посреди буквы.
 fn clip(s: &str, n: usize) -> String {
+    // Один проход: берём n+1 символ и проверяем, остался ли лишний, вместо
+    // повторного `chars().count()` по всей строке ради той же проверки.
     let mut t: String = s.chars().take(n).collect();
-    if s.chars().count() > n {
+    if s.chars().nth(n).is_some() {
         t.push('…');
     }
     t
@@ -208,7 +219,7 @@ mod tests {
         let d = tmp("one");
         let text = review_log("1790081331-79251-review", "1790081331-79251", Some("ok"));
         fs::write(d.join("1790081331-79251-review.jsonl"), text).unwrap();
-        let rows = rows(&d);
+        let rows = rows(&d).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         let r = &rows[0];
         assert_eq!(r.id, "1790081331-79251-review");
@@ -225,7 +236,7 @@ mod tests {
         let d = tmp("running");
         let text = review_log("1790182549-79145-review", "1790182549-79145", None);
         fs::write(d.join("1790182549-79145-review.jsonl"), text).unwrap();
-        assert_eq!(rows(&d)[0].status, "running");
+        assert_eq!(rows(&d).unwrap()[0].status, "running");
         fs::remove_dir_all(&d).ok();
     }
 
@@ -241,9 +252,13 @@ mod tests {
         newer = newer.replace("\"ts\":170", "\"ts\":270");
         fs::write(d.join("1790198941-96971-review.jsonl"), newer).unwrap();
         // Не ревью: обычная сессия и мусор рядом — в список не попадают.
-        fs::write(d.join("1790198941-96971.jsonl"), "{\"kind\":\"meta\",\"ts\":1}\n").unwrap();
+        fs::write(
+            d.join("1790198941-96971.jsonl"),
+            "{\"kind\":\"meta\",\"ts\":1}\n",
+        )
+        .unwrap();
         fs::write(d.join("notes.txt"), "x").unwrap();
-        let rows = rows(&d);
+        let rows = rows(&d).unwrap();
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].id, "1790198941-96971-review");
         assert!(rows[0].ts > rows[1].ts);
@@ -253,8 +268,11 @@ mod tests {
     #[test]
     fn empty_dir_gives_empty_review_list() {
         let d = tmp("empty");
-        assert!(rows(&d).is_empty());
-        assert!(rows(FsPath::new("/нет/такого/каталога")).is_empty());
+        assert!(rows(&d).unwrap().is_empty());
+        assert!(
+            rows(FsPath::new("/нет/такого/каталога")).is_err(),
+            "сбой чтения виден"
+        );
         fs::remove_dir_all(&d).ok();
     }
 
@@ -273,7 +291,7 @@ mod tests {
     fn broken_log_still_gives_a_row() {
         let d = tmp("broken");
         fs::write(d.join("1790182549-79145-review.jsonl"), "не json\n").unwrap();
-        let rows = rows(&d);
+        let rows = rows(&d).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session, "1790182549-79145");
         assert!(rows[0].ts > 0, "mtime подставился: {rows:?}");
