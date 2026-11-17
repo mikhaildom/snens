@@ -10,4 +10,6 @@ edition = "2021"
 [dependencies]
 serde_json = "1"
 # Только ws://127.0.0.1 — TLS-фичи крейта не нужны.
-tungstenite = "0.30"
+# default-features = false: TLS не нужен (только ws://127.0.0.1), а дефолтный
+# набор в новой версии мог бы подтянуть TLS-бэкенд.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

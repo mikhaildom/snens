@@ -180,13 +180,40 @@ pub fn chrome_available(explicit: Option<&str>) -> bool {
 }
 
 fn launch_chrome(bin: &Path, profile: &Path) -> Result<ChromeGuard, String> {
-    let child = Command::new(bin)
+    // Сначала с песочницей; если Chrome падает на старте (в контейнере без
+    // user-namespaces это SIGABRT) — повторяем с --no-sandbox, уже осознанно.
+    launch_chrome_once(bin, profile, false)
+}
+
+/// Повторный запуск без песочницы (см. `open`).
+fn launch_chrome_nosandbox(bin: &Path, profile: &Path) -> Result<ChromeGuard, String> {
+    launch_chrome_once(bin, profile, true)
+}
+
+fn launch_chrome_once(bin: &Path, profile: &Path, no_sandbox: bool) -> Result<ChromeGuard, String> {
+    let mut cmd = Command::new(bin);
+    // Песочница Chrome — защита от эксплойта рендерера, а мы грузим произвольные
+    // URL и артефакты. Отключаем только там, где без неё не запуститься: root
+    // (в контейнерах) или явный SNENS_CHROME_NO_SANDBOX=1.
+    // Без libc: euid читается из /proc на Linux, иначе считаем «не root».
+    let uid_root = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+        })
+        .map(|euid| euid == "0")
+        .unwrap_or(false);
+    if no_sandbox || uid_root || std::env::var("SNENS_CHROME_NO_SANDBOX").as_deref() == Ok("1") {
+        cmd.arg("--no-sandbox");
+    }
+    let child = cmd
         .arg("--headless=new")
         .arg("--remote-debugging-port=0")
         .arg(format!("--user-data-dir={}", profile.display()))
         .args([
             "--no-first-run",
-            "--no-sandbox",
             "--disable-gpu",
             "--hide-scrollbars",
             "--disable-extensions",
@@ -258,6 +285,10 @@ pub struct Cdp {
 /// `read_json_within` и ожидание события кладут ровно эту строку. Вынесено в
 /// константу, чтобы формулировка не разъезжалась по файлу.
 const TIMEOUT_PREFIX: &str = "таймаут";
+
+/// Потолок очереди событий: события, которые никто не читает, не должны
+/// съедать память.
+const MAX_EVENTS: usize = 512;
 
 fn is_timeout(e: &tungstenite::Error) -> bool {
     match e {
@@ -420,6 +451,11 @@ impl Cdp {
                     if hit {
                         return Ok(Some(v));
                     }
+                    // Здесь тоже ограничиваем: ожидание события на болтливой
+                    // странице иначе копило бы очередь без предела.
+                    if self.events.len() >= MAX_EVENTS {
+                        self.events.pop_front();
+                    }
                     self.events.push_back(v);
                 }
                 Ok(_) => {}
@@ -502,11 +538,31 @@ pub fn open(
             d
         }
     };
-    let mut guard = launch_chrome(&bin, &profile)?;
     // Порт ждём отдельным коротким бюджетом: старт хрома — не самая долгая часть,
     // и на нём не нужно съедать весь таймаут страницы.
     let boot_until = (Instant::now() + Duration::from_secs(10)).min(deadline);
-    let (port, path) = wait_devtools(&profile, &mut guard, boot_until)?;
+    let mut guard = launch_chrome(&bin, &profile)?;
+    let boot = wait_devtools(&profile, &mut guard, boot_until);
+    let (guard, port, path) = match boot {
+        Ok((port, path)) => (guard, port, path),
+        // В контейнере без user-namespaces Chrome падает на старте (SIGABRT).
+        // Песочница — защита от эксплойта рендерера, поэтому отключаем её только
+        // после реального падения и говорим об этом вслух.
+        Err(e) if e.contains("на старте") => {
+            eprintln!("внимание: Chrome не стартовал с песочницей ({e}); повторяю с --no-sandbox");
+            drop(guard);
+            // Профиль после падения содержит SingletonLock — второй запуск с ним
+            // тоже упадёт. Чистим: полезных данных там ещё нет.
+            fs::create_dir_all(&profile)
+                .map_err(|e| format!("профиль {}: {e}", profile.display()))?;
+            let _ = fs::remove_dir_all(profile.join("SingletonLock"));
+            let mut guard = launch_chrome_nosandbox(&bin, &profile)?;
+            let boot_until = (Instant::now() + Duration::from_secs(10)).min(deadline);
+            let (port, path) = wait_devtools(&profile, &mut guard, boot_until)?;
+            (guard, port, path)
+        }
+        Err(e) => return Err(e),
+    };
     let ws_url = format!("ws://127.0.0.1:{port}{path}");
     let mut cdp = Cdp::connect(&ws_url, deadline, timeout_s)?;
 
@@ -700,6 +756,9 @@ pub fn shot_name(url: &str, w: u32, h: u32, tag: &str) -> String {
 }
 
 /// Свободное имя в каталоге: одинаковые кадры не должны затирать друг друга.
+/// Уникальное имя в каталоге. Только проверка `exists` — это гонка: два
+/// одновременных прогона выберут одно имя, и `fs::copy` затрёт чужой кадр.
+/// Резервируем имя атомарно (create_new) и отдаём освобождённый путь.
 pub fn unique(dir: &Path, name: &str) -> PathBuf {
     let stem = Path::new(name)
         .file_stem()
@@ -709,13 +768,27 @@ pub fn unique(dir: &Path, name: &str) -> PathBuf {
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("png");
-    let mut p = dir.join(name);
+    let mut cand = dir.join(name);
     let mut i = 1;
-    while p.exists() {
-        p = dir.join(format!("{stem}-{i}.{ext}"));
-        i += 1;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cand)
+        {
+            // Файл зарезервирован нами — дальше в него пишут (copy/rename).
+            Ok(_) => return cand,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                cand = dir.join(format!("{stem}-{i}.{ext}"));
+                i += 1;
+                if i > 10_000 {
+                    return cand;
+                }
+            }
+            // Каталог недоступен — пусть ошибка всплывёт на записи с понятным путём.
+            Err(_) => return cand,
+        }
     }
-    p
 }
 
 /// Канал вложений: модель видит картинку только оттуда. Без переменной файл
