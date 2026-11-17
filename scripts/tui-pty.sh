@@ -30,6 +30,7 @@ SESS="$(date +%s)-$$"
 OWN_SESSION=
 PORT=18765
 MOCK_PID=
+fails=0
 cleanup() {
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
   # Не `pkill -f`: он матчит собственную командную строку и убивает сам прогон.
@@ -45,7 +46,16 @@ trap 'cleanup; exit 130' INT TERM
 
 ok() { echo "ok: $1"; }
 bad() { echo "FAIL: $1"; fails=$((fails + 1)); }
-fails=0
+
+# Всё, без чего прогон бессмысленен: tmux держит pty, python3 — мок-провайдер,
+# snens — то, что собственно проверяется. Без этих проверок первые строки
+# падали бы невнятными ошибками внутри цикла.
+for tool in tmux python3 snens; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "FAIL: нет $tool в PATH — проверка TUI не запущена"
+        exit 1
+    }
+done
 
 # --- мок-провайдер: SSE, ход держится открытым ---
 cat >"$TMP/mock.py" <<'PY'
