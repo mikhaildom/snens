@@ -486,6 +486,9 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Отметить состояние хода. В рабочем коде провал хода идёт через `retry`,
+    /// а успех — через `finish_turn`; остаётся точкой для ручных состояний.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn finish(&self, id: i64, state: &str) -> Result<(), String> {
         self.db
             .execute(
