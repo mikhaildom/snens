@@ -79,6 +79,10 @@ missing=""
 for d in "$REPO"/tools/*/; do
     name="$(basename "$d")"
     [ -f "$d/Cargo.toml" ] || continue
+    # Библиотечный крейт (только `src/lib.rs`, без `main.rs`) — не тул, а общая
+    # часть тулов (`cdp` для shot/genui). Бинарника у него нет и быть не должно:
+    # требовать его значит ломать любую сборку бандла.
+    [ -f "$d/src/lib.rs" ] && [ ! -f "$d/src/main.rs" ] && continue
     bin="$BIN_SRC/$name$EXE"
     if [ ! -f "$bin" ]; then
         say "тул $name: нет бинаря в $BIN_SRC — пропускаю"
