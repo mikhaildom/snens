@@ -5,10 +5,10 @@
 use crate::cfg::Config;
 use crate::surface_runtime::{self as rt, Runtime};
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -38,27 +38,34 @@ pub(super) async fn context_breakdown(
     // ещё и сборка базы ревизии контекста — тем более не в async-воркере.
     let read_path = path.clone();
     let read_cfg = s.cfg.clone();
-    let (breakdown, scale) =
-        match tokio::task::spawn_blocking(move || {
-            let log = crate::log::read_file(&read_path)?;
-            let scale = crate::project::calibration(&log);
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-                crate::project::window_breakdown(&log, &read_cfg),
-                scale,
-            ))
-        })
-        .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
-                    .into_response()
-            }
-            Err(e) => {
-                return err("history_read", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
-                    .into_response()
-            }
-        };
+    let (breakdown, scale) = match tokio::task::spawn_blocking(move || {
+        let log = crate::log::read_file(&read_path)?;
+        let scale = crate::project::calibration(&log);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+            crate::project::window_breakdown(&log, &read_cfg),
+            scale,
+        ))
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            return err(
+                "history_read",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response()
+        }
+        Err(e) => {
+            return err(
+                "history_read",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response()
+        }
+    };
     // Схемы инструментов тоже уезжают в запрос и занимают окно: считаем их
     // оценкой по JSON и приводим тем же коэффициентом, что и остальное.
     let tools = crate::registry::discover(&s.cfg).await;
@@ -122,8 +129,8 @@ pub(super) async fn search(
     let limit = q.limit.unwrap_or(50).min(200);
     let dir = s.cfg.sessions_path();
     let cfg = s.cfg.clone();
-    let found = tokio::task::spawn_blocking(move || search_sessions(&dir, &cfg, &needle, limit))
-        .await;
+    let found =
+        tokio::task::spawn_blocking(move || search_sessions(&dir, &cfg, &needle, limit)).await;
     match found {
         Ok(Ok(hits)) => Json(serde_json::json!({"hits": hits})).into_response(),
         Ok(Err(e)) => err("storage", &e, StatusCode::INTERNAL_SERVER_ERROR).into_response(),
@@ -142,14 +149,19 @@ pub(super) fn search_sessions(
     needle: &str,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let entries = std::fs::read_dir(dir).map_err(|_| "sessions directory is missing".to_string())?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|_| "sessions directory is missing".to_string())?;
     let mut files: Vec<(u64, std::path::PathBuf, String)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+        let Some(id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         if !rt::valid_id(&id) {

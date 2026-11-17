@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex as StdMutex},
 };
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Session {
@@ -185,7 +185,9 @@ impl Runtime {
     /// Вызывать только из синхронных `save_*`/`persist_*`: под замком ни одного
     /// `await`, иначе async-воркер встал бы вместе с базой.
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.db
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     // Полная перезапись store (`persist_store`) нужна только там, где меняется
@@ -264,9 +266,15 @@ impl Runtime {
             "surface_tools",
             "reviews",
         ] {
-            tx.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), params![id])?;
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE session_id=?1"),
+                params![id],
+            )?;
         }
-        tx.execute("DELETE FROM event_sequences WHERE session_id=?1", params![id])?;
+        tx.execute(
+            "DELETE FROM event_sequences WHERE session_id=?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM sessions WHERE id=?1", params![id])?;
         tx.commit()?;
         Ok(())
@@ -291,7 +299,10 @@ impl Runtime {
                 ],
             )?;
         }
-        tx.execute("DELETE FROM message_attachments WHERE session_id=?1", params![id])?;
+        tx.execute(
+            "DELETE FROM message_attachments WHERE session_id=?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
         if let Some(ms) = data.messages.get(id) {
             for (seq, m) in ms.iter().enumerate() {
@@ -313,6 +324,75 @@ impl Runtime {
                         params![id, m.id, aid, aseq as i64],
                     )?;
                 }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Записать одну сессию и её сообщения — без полной перезаписи store.
+    ///
+    /// Отдельно от `save_session_messages`: тот берёт `&Store` целиком, а
+    /// вызывать его приходится после того, как async-замок `data` уже отпущен
+    /// (блокирующий SQLite под ним держал бы всех, кому нужен store). Поэтому
+    /// снимок нужной сессии клонируется под замком, а пишется — вне его.
+    pub fn save_session_and_messages(
+        &self,
+        id: &str,
+        session: Option<&Session>,
+        messages: &[Message],
+    ) -> crate::R<()> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        if let Some(s) = session {
+            tx.execute(
+                "INSERT INTO sessions(id,surface,state,run_id,context_budget,context_target,parent)\n                 VALUES(?1,?2,?3,?4,?5,?6,?7)\n                 ON CONFLICT(id) DO UPDATE SET surface=excluded.surface,state=excluded.state,\n                   run_id=excluded.run_id,context_budget=excluded.context_budget,\n                   context_target=excluded.context_target,parent=excluded.parent",
+                params![
+                    s.id,
+                    s.surface,
+                    s.state,
+                    s.run_id,
+                    s.context_budget,
+                    s.context_target,
+                    s.parent
+                ],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM message_attachments WHERE session_id=?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
+        for (seq, m) in messages.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO messages(session_id,id,command_id,seq,text,state,run_id)\n                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    id,
+                    m.id,
+                    m.command_id,
+                    seq as i64,
+                    m.text,
+                    m.state,
+                    m.run_id
+                ],
+            )?;
+            for (aseq, aid) in m.attachment_ids.iter().enumerate() {
+                // Вложение могло не попасть в базу (legacy-импорт, упавшая
+                // запись). FK-нарушение не гасится `OR IGNORE` — проверяем
+                // строку сами, иначе одно битое вложение роняло бы всю
+                // транзакцию сообщений (500 на ходе).
+                let exists: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM attachments WHERE session_id=?1 AND id=?2",
+                    params![id, aid],
+                    |r| r.get(0),
+                )?;
+                if exists == 0 {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO message_attachments VALUES(?1,?2,?3,?4)",
+                    params![id, m.id, aid, aseq as i64],
+                )?;
             }
         }
         tx.commit()?;
@@ -375,7 +455,6 @@ impl Runtime {
         )?;
         Ok(())
     }
-
 
     ///
     /// Инвариант: `emit` берёт мьютекс store сам, поэтому вызывать его ПОД
@@ -517,9 +596,17 @@ fn schema(c: &Connection) -> crate::R<()> {
     // отдельно, чтобы обновление бинарника не требовало пересоздания store.
     // `parent` — признак подагента. Без него store не отличал ребёнка от
     // пользовательской сессии, и обновление карточки молча не срабатывало.
-    for column in ["context_budget INTEGER", "context_target INTEGER", "parent TEXT"] {
+    for column in [
+        "context_budget INTEGER",
+        "context_target INTEGER",
+        "parent TEXT",
+    ] {
         if let Err(error) = c.execute(&format!("ALTER TABLE sessions ADD COLUMN {column}"), []) {
-            if !error.to_string().to_lowercase().contains("duplicate column") {
+            if !error
+                .to_string()
+                .to_lowercase()
+                .contains("duplicate column")
+            {
                 return Err(error.into());
             }
         }
@@ -670,7 +757,7 @@ fn read_store(c: &Connection) -> crate::R<Store> {
                 // В store не хранятся: выводятся из журнала при discovery.
                 turns: None,
                 done: None,
-                    started_at: None,
+                started_at: None,
                 done_at: None,
             })
         })? {
@@ -799,7 +886,9 @@ fn read_store(c: &Connection) -> crate::R<Store> {
     }
     {
         let mut q = c.prepare("SELECT session_id,turns FROM reviews")?;
-        for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))? {
+        for row in q.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })? {
             let (id, turns) = row?;
             d.reviews.insert(id, turns);
         }
@@ -954,7 +1043,8 @@ mod tests {
         let dir = temp();
         let (mut d, db) = open_store(&dir).unwrap();
         let id = "s".to_string();
-        d.sessions.insert(id.clone(), Session::new(id.clone(), "test"));
+        d.sessions
+            .insert(id.clone(), Session::new(id.clone(), "test"));
         d.surface_tools.insert(id.clone(),vec![serde_json::json!({"type":"function","function":{"name":"send_file","parameters":{"type":"object"}}})]);
         d.tool_requests
             .insert("s/r/c".into(), serde_json::json!({"status":"pending"}));
@@ -995,13 +1085,12 @@ mod tests {
         assert_eq!(got.tool_requests["s/r/c"]["status"], "pending");
         assert_eq!(got.messages["s"][0].command_id, "cmd");
         assert_eq!(got.commands["cmd"]["ok"], true);
-        assert!(
-            db.execute(
+        assert!(db
+            .execute(
                 "INSERT INTO messages VALUES('s','m2','cmd',1,'dup','accepted',NULL)",
                 []
             )
-            .is_err()
-        );
+            .is_err());
         drop(db);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1053,10 +1142,7 @@ mod tests {
     fn attachment_metadata_and_message_references_roundtrip_in_order() {
         let dir = temp();
         let (mut store, db) = open_store(&dir).unwrap();
-        store.sessions.insert(
-            "s".into(),
-            Session::new("s", "test"),
-        );
+        store.sessions.insert("s".into(), Session::new("s", "test"));
         let part = |path: &str, bytes| crate::log::Part {
             kind: "image".into(),
             path: path.into(),

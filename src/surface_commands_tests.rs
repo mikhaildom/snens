@@ -3,43 +3,89 @@
 // что происходит при повторе запроса и при гонке двух result'ов.
 
 use super::{
-    commands::{ToolResultBody, same_message_payload, tool_result},
-    sessions::{Create, create, validate_tools},
+    commands::{ask_matches, resolve_ask, tool_result, SendAsk, ToolResultBody},
+    sessions::{create, validate_tools, Create},
     test_support::runtime,
 };
-use crate::{cfg::Config, surface_runtime::{self as rt, Event}};
+use crate::{cfg::Config, surface_runtime::Event};
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use tokio::sync::oneshot;
 
+/// Повтор команды сравнивается по сохранённому `ask`: пустые поля запроса
+/// означают «возьми из журнала» и совпадают с любым сохранённым значением.
 #[test]
-fn message_idempotency_checks_text_payload() {
-    let existing = rt::Message {
-        id: "message-id".into(),
-        command_id: "command-id".into(),
-        text: "original input".into(),
-        attachment_ids: vec!["attachment-id".into()],
-        state: "applied".into(),
-        run_id: Some("run-id".into()),
-        ask: None,
+fn repeat_payload_compares_text_attachments_and_ask() {
+    let want = SendAsk {
+        seq: 7,
+        artifact: String::new(),
+        id: String::new(),
+        question: "какой вариант?".into(),
     };
-    assert!(same_message_payload(
-        &existing,
-        "original input",
-        &["attachment-id".into()],
-        &None
-    ));
-    assert!(!same_message_payload(&existing, "original input", &[], &None));
-    assert!(!same_message_payload(
-        &existing,
-        "changed input",
-        &["attachment-id".into()],
-        &None
-    ));
+    let have = Some(crate::log::AskRef {
+        seq: 7,
+        artifact: "quiz".into(),
+        id: "q".into(),
+        question: "какой вариант?".into(),
+    });
+    // Пустые artifact/id — не «другой артефакт», а «тот, что в журнале».
+    assert!(ask_matches(&have, Some(&want)));
+    // Заполненное — обязано совпасть точно.
+    let mut other = SendAsk {
+        seq: 7,
+        artifact: "poll".into(),
+        id: String::new(),
+        question: String::new(),
+    };
+    assert!(!ask_matches(&have, Some(&other)));
+    other.artifact = "quiz".into();
+    assert!(ask_matches(&have, Some(&other)));
+    // Наличие/отсутствие `ask` — разные команды.
+    assert!(!ask_matches(&have, None));
+    assert!(!ask_matches(&None, Some(&want)));
+    assert!(ask_matches(&None, None));
+}
+
+#[test]
+fn resolve_ask_rejects_invalid_header_value_and_repeat() {
+    use crate::log::{AskRef, Rec};
+    let assistant = |text: &str| Rec::Assistant {
+        ts: 0,
+        text: Some(text.into()),
+        reasoning: None,
+        tool_calls: Vec::new(),
+    };
+    let answered = Rec::User {
+        ts: 0,
+        text: "1".into(),
+        source: "artifact".into(),
+        parts: Vec::new(),
+        ask: Some(AskRef {
+            seq: 1,
+            artifact: "quiz".into(),
+            id: "q".into(),
+            question: String::new(),
+        }),
+    };
+    let log = vec![
+        assistant("```artifact id=quiz\n<script></script>\n```"),
+        answered,
+    ];
+    let ask = SendAsk {
+        seq: 1,
+        artifact: String::new(),
+        id: String::new(),
+        question: "x".into(),
+    };
+    // Вопрос уже отвечен — ключ структурный, повтор не проходит.
+    let err = resolve_ask(&log, &ask)
+        .err()
+        .expect("ответ не должен пройти");
+    assert_eq!(err.status(), StatusCode::CONFLICT);
 }
 
 #[test]
@@ -48,15 +94,13 @@ fn surface_tool_definitions_are_validated_and_bounded() {
     let cfg = Config::default();
     let valid = serde_json::json!({"type":"function","function":{"name":"send_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}});
     let rt = tokio::runtime::Runtime::new().unwrap();
-    assert!(
-        rt.block_on(validate_tools(vec![valid.clone()], &cfg))
-            .is_ok()
-    );
+    assert!(rt
+        .block_on(validate_tools(vec![valid.clone()], &cfg))
+        .is_ok());
     assert!(rt.block_on(validate_tools(vec![serde_json::json!({"type":"function","function":{"name":"run","parameters":{"type":"object"}}})],&cfg)).is_err());
-    assert!(
-        rt.block_on(validate_tools(vec![valid.clone(), valid], &cfg))
-            .is_err()
-    );
+    assert!(rt
+        .block_on(validate_tools(vec![valid.clone(), valid], &cfg))
+        .is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -124,7 +168,11 @@ async fn repeated_tool_result_is_idempotent_and_never_panics() {
         runtime.save_session(d.sessions.get("a").unwrap()).unwrap();
     }
     let (tx, rx) = oneshot::channel();
-    runtime.pending_tools.lock().await.insert("a/r/c".into(), tx);
+    runtime
+        .pending_tools
+        .lock()
+        .await
+        .insert("a/r/c".into(), tx);
     let first = tool_result(
         State(runtime.clone()),
         Path(("a".into(), "r".into(), "c".into())),
@@ -135,7 +183,11 @@ async fn repeated_tool_result_is_idempotent_and_never_panics() {
     )
     .await
     .into_response();
-    assert_eq!(first.status(), StatusCode::OK, "первый result должен пройти");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "первый result должен пройти"
+    );
     assert!(rx.await.unwrap().text == "первый");
 
     // Канал уже изъят и закрыт: повтор (в том числе от второго процесса)
@@ -150,7 +202,11 @@ async fn repeated_tool_result_is_idempotent_and_never_panics() {
     )
     .await
     .into_response();
-    assert_eq!(second.status(), StatusCode::OK, "тот же payload — идемпотентен");
+    assert_eq!(
+        second.status(),
+        StatusCode::OK,
+        "тот же payload — идемпотентен"
+    );
     drop(runtime);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -170,7 +226,9 @@ async fn create_is_idempotent_per_command_id() {
         context_budget: None,
         context_target: None,
     };
-    let first = create(State(runtime.clone()), Json(body())).await.into_response();
+    let first = create(State(runtime.clone()), Json(body()))
+        .await
+        .into_response();
     assert_eq!(first.status(), StatusCode::CREATED);
     let id = runtime
         .data
@@ -184,14 +242,22 @@ async fn create_is_idempotent_per_command_id() {
         .expect("сессия записана");
 
     // Тот же payload — 200 и тот же id, второго журнала нет.
-    let second = create(State(runtime.clone()), Json(body())).await.into_response();
+    let second = create(State(runtime.clone()), Json(body()))
+        .await
+        .into_response();
     assert_eq!(second.status(), StatusCode::OK);
-    assert_eq!(runtime.data.lock().await.sessions.len(), 3, "создана вторая сессия");
+    assert_eq!(
+        runtime.data.lock().await.sessions.len(),
+        3,
+        "создана вторая сессия"
+    );
 
     // Другой surface под тем же command_id — 409, а не тихая подмена.
     let mut other = body();
     other.surface = "telegram".into();
-    let conflict = create(State(runtime.clone()), Json(other)).await.into_response();
+    let conflict = create(State(runtime.clone()), Json(other))
+        .await
+        .into_response();
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     let _ = id;
     drop(runtime);

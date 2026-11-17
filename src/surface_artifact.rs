@@ -84,18 +84,19 @@ pub fn count_questions(text: &str) -> usize {
     text.matches("snens.ask").count()
 }
 
-/// Отвеченные вопросы сессии: ключи `seq:artifact:id`.
+/// Отвеченные вопросы сессии: `(seq, artifact, id)`.
 ///
 /// Скан по журналу, а не по состоянию поверхности: ответ, полученный до
 /// рестарта, обязан блокировать повтор и после него.
-pub fn answered(log: &[Rec]) -> std::collections::HashSet<String> {
+///
+/// Ключ структурный, а не склеенный через `:`: ни `artifact`, ни `id` не
+/// гарантированно без двоеточий, и `("quiz:q", "")` с `("quiz", "q")`
+/// схлопывались бы в один и тот же ответ.
+pub fn answered(log: &[Rec]) -> std::collections::HashSet<(u64, String, String)> {
     let mut out = std::collections::HashSet::new();
     for rec in log {
-        if let Rec::User {
-            ask: Some(ask), ..
-        } = rec
-        {
-            out.insert(format!("{}:{}:{}", ask.seq, ask.artifact, ask.id));
+        if let Rec::User { ask: Some(ask), .. } = rec {
+            out.insert((ask.seq, ask.artifact.clone(), ask.id.clone()));
         }
     }
     out
@@ -118,9 +119,7 @@ impl AskStats {
                 Rec::Assistant { text, .. } => {
                     asked += count_questions(text.as_deref().unwrap_or(""));
                 }
-                Rec::User {
-                    ask: Some(_), ..
-                } => answered += 1,
+                Rec::User { ask: Some(_), .. } => answered += 1,
                 _ => {}
             }
         }
@@ -219,8 +218,11 @@ mod tests {
         let log = vec![ask(7, "quiz", "q1"), ask(7, "quiz", "q2")];
         let set = answered(&log);
         assert_eq!(set.len(), 2);
-        assert!(set.contains("7:quiz:q1"));
-        assert!(set.contains("7:quiz:q2"));
+        assert!(set.contains(&(7, "quiz".into(), "q1".into())));
+        assert!(set.contains(&(7, "quiz".into(), "q2".into())));
+        // Склейка через ':' склеила бы эти два в один ключ.
+        let tricky = answered(&vec![ask(7, "quiz:q", ""), ask(7, "quiz", "q")]);
+        assert_eq!(tricky.len(), 2);
     }
 
     #[test]
