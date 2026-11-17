@@ -28,7 +28,7 @@ mod tray;
 
 use tauri::{Manager, RunEvent, WindowEvent};
 
-use daemon::Daemon;
+use daemon::{Daemon, Session};
 
 fn main() {
     // Второй экземпляр не должен поднимать второе ядро и воровать окно: он
@@ -63,13 +63,13 @@ fn main() {
                 // уронил бы setup: в GUI-сборке паника не видна (нет ни консоли,
                 // ни трея, ни окна). Отдаём ошибку наружу.
                 *state
-                    .connection
+                    .session
                     .lock()
-                    .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = Some(conn.clone());
-                *state
-                    .remote
-                    .lock()
-                    .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = remote;
+                    .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? =
+                    Some(Session {
+                        connection: conn.clone(),
+                        remote,
+                    });
             }
             // Порядок важен: СНАЧАЛА окно, потом трей. Трей поднимает своё
             // скрытое окно-посредник, и если оно создано раньше главного,
@@ -102,16 +102,46 @@ fn main() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("приложение не собралось");
+        .unwrap_or_else(|e| {
+            // Панику в GUI-сборке некому показать (нет консоли), поэтому хотя бы
+            // сохранём текст в файл рядом с логом ядра и выйдем с кодом 1.
+            let text = format!("snens-desktop: не запустилось: {e}");
+            eprintln!("{text}");
+            if let Ok(dir) = app_handle_log_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join("desktop.log"), &text);
+            }
+            std::process::exit(1);
+        });
 
     app.run(|handle, event| {
-        if let RunEvent::ExitRequested { .. } = event {
-            // Гасим ядро до выхода: иначе оно переживёт окно и следующая
-            // установка не сможет перезаписать его файлы. При удалённом
-            // подключении своего процесса нет — гасить нечего.
+        // Гасим ядро только когда приложение действительно завершается.
+        // `ExitRequested` отменяемо (`api.prevent_exit()` — например, плагином
+        // автообновления), и убитое там ядро оставило бы живое окно без
+        // соединения и без способа поднять его заново.
+        if let RunEvent::Exit = event {
+            // При удалённом подключении своего процесса нет — гасить нечего.
             handle.state::<Daemon>().stop();
         }
     });
+}
+
+/// Каталог логов приложения — без `AppHandle` (он недоступен, когда `build`
+/// уже упал). Правило то же, что у Tauri: `%LOCALAPPDATA%`/`XDG_STATE_HOME`.
+fn app_handle_log_dir() -> Result<std::path::PathBuf, ()> {
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Logs"))
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+            })
+    };
+    base.map(|b| b.join("ch.svuvi.snens").join("logs"))
+        .ok_or(())
 }
 
 /// Открыть окно на ядре `conn`. Окно всегда грузит **свой** бандл клиента

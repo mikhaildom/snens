@@ -22,15 +22,25 @@ use crate::connection::Connection;
 const READY_BUDGET: Duration = Duration::from_secs(30);
 const PING_BUDGET: Duration = Duration::from_secs(20);
 
+/// Текущее соединение окна и откуда оно взялось.
+///
+/// Два поля — одно состояние, и читать их порознь нельзя: `set_remote`
+/// записывает адрес и признак «чужое ядро», и `reopen` между этими записями
+/// увидел бы новый адрес с `remote == false`, то есть окно, которое считает
+/// себя работающим на своём ядре.
+#[derive(Clone)]
+pub struct Session {
+    pub connection: Connection,
+    pub remote: bool,
+}
+
 /// Запущенное ядро и то, что окно о нём знает.
 pub struct Daemon {
     child: Mutex<Option<Child>>,
     /// Привязка жизни ядра к жизни окна (Windows: job object). Из `Daemon`
     /// никогда не достаётся — держится только ради ручки.
     job: Mutex<Option<crate::job::Job>>,
-    pub connection: Mutex<Option<Connection>>,
-    /// Окно работает с чужим ядром: своего процесса нет, `child` пуст.
-    pub remote: Mutex<bool>,
+    pub session: Mutex<Option<Session>>,
 }
 
 impl Daemon {
@@ -38,8 +48,7 @@ impl Daemon {
         Self {
             child: Mutex::new(None),
             job: Mutex::new(None),
-            connection: Mutex::new(None),
-            remote: Mutex::new(false),
+            session: Mutex::new(None),
         }
     }
 
@@ -50,7 +59,11 @@ impl Daemon {
     /// `lock()` живёт до конца выражения и держит заимствование `state`, а
     /// `state` умирает раньше (E0597 — ловится только на Windows-сборке).
     pub fn stop(&self) {
-        let stopped = self.child.lock().map(|mut guard| guard.take()).unwrap_or(None);
+        let stopped = self
+            .child
+            .lock()
+            .map(|mut guard| guard.take())
+            .unwrap_or(None);
         if let Some(mut child) = stopped {
             let _ = child.kill();
             let _ = child.wait();
@@ -64,10 +77,17 @@ impl Daemon {
 }
 
 /// Где лежит sidecar: рядом с exe (так его кладёт установщик).
-fn side(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let dir = exe.parent().unwrap_or(Path::new("."));
-    dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+///
+/// Ошибку не подменяем пустым путём: `unwrap_or_default()` давал `"."`, и ядро
+/// искалось бы в текущем каталоге процесса (а cwd бывает чужим — ярлык с
+/// рабочим столом), то есть бинарник можно подменить.
+fn side(name: &str) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("не удалось определить путь к приложению: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "у пути к приложению нет каталога".to_string())?;
+    Ok(dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
 }
 
 /// Приватный каталог для ready-файла.
@@ -129,7 +149,12 @@ fn core_log(app: &tauri::AppHandle) -> PathBuf {
 /// Лишний `kill` тут не забота, а необходимость: живое ядро держит
 /// `surface-api/server.lock`, и следующий запуск молча не поднимется — ровно
 /// та проблема, ради которой сделан job object.
-fn abandon(app: &tauri::AppHandle, ready: &Path, log: &Path, what: String) -> Box<dyn std::error::Error> {
+fn abandon(
+    app: &tauri::AppHandle,
+    ready: &Path,
+    log: &Path,
+    what: String,
+) -> Box<dyn std::error::Error> {
     app.state::<Daemon>().stop();
     let _ = std::fs::remove_dir_all(ready);
     format!("{what} — смотри {}", log.display()).into()
@@ -137,7 +162,7 @@ fn abandon(app: &tauri::AppHandle, ready: &Path, log: &Path, what: String) -> Bo
 
 /// Запустить своё ядро и дождаться готовности. Возвращает адрес и токен.
 pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Error>> {
-    let bin = side("snens");
+    let bin = side("snens")?;
     if !bin.is_file() {
         return Err(format!(
             "ядро не найдено: {}. Переустанови приложение или укажи адрес в настройках",
@@ -147,10 +172,7 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
     }
     // ready-файл уникален на процесс окна: два окна (или окно и TUI) не должны
     // читать адрес друг друга. Каталог приватный — см. `ready_dir`.
-    let ready_dir = match ready_dir() {
-        Ok(d) => d,
-        Err(e) => return Err(e.into()),
-    };
+    let ready_dir = ready_dir()?;
     let ready_path = ready_dir.join("ready.json");
     let log_path = core_log(app);
     let log = std::fs::File::create(&log_path).ok();
@@ -187,25 +209,31 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
     {
         let state = app.state::<Daemon>();
         let mut child = child;
-        // Отравленный замок — не повод оставить процесс жить: убиваем и уходим.
-        let mut slot = match state.child.lock() {
-            Ok(g) => g,
+        // Замки берём именованными переменными, а не прямо в `match`: временный
+        // `Result` живёт до конца выражения, а `state` умирает раньше — E0597
+        // (лень ревью: ловится только сборкой окна).
+        let child_slot = state.child.lock();
+        match child_slot {
+            Ok(mut guard) => {
+                *guard = Some(child);
+                drop(guard);
+                let job_slot = state.job.lock();
+                match job_slot {
+                    Ok(mut j) => *j = job,
+                    // Замок job не нужен для жизни процесса: `stop()` забирает child.
+                    Err(_) => {
+                        if let Some(j) = job {
+                            crate::job::close(j);
+                        }
+                    }
+                }
+            }
+            // Отравленный замок — не повод оставить процесс жить: убиваем и уходим.
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = std::fs::remove_dir_all(&ready_dir);
                 return Err("внутренняя ошибка окна — перезапусти приложение".into());
-            }
-        };
-        *slot = Some(child);
-        drop(slot);
-        match state.job.lock() {
-            Ok(mut j) => *j = job,
-            // Замок job не нужен для жизни процесса: `stop()` забирает child.
-            Err(_) => {
-                if let Some(j) = job {
-                    crate::job::close(j);
-                }
             }
         }
     }
@@ -216,7 +244,14 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
     };
     let base = match ready.get("url").and_then(|v| v.as_str()) {
         Some(u) => u.to_string(),
-        None => return Err(abandon(app, &ready_dir, &log_path, "ядро не сообщило url".into())),
+        None => {
+            return Err(abandon(
+                app,
+                &ready_dir,
+                &log_path,
+                "ядро не сообщило url".into(),
+            ))
+        }
     };
     let token_file = match ready.get("token_file").and_then(|v| v.as_str()) {
         Some(p) => PathBuf::from(p),
@@ -250,13 +285,8 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
 
     // Адрес получен, но HTTP-сервер мог ещё не подняться: окно на пустоту
     // открывать незачем.
-    if !wait_ready(&base, &token, PING_BUDGET) {
-        return Err(abandon(
-            app,
-            &ready_dir,
-            &log_path,
-            "ядро не отвечает на /v1/model".into(),
-        ));
+    if let Err(e) = wait_ready(&base, &token, PING_BUDGET) {
+        return Err(abandon(app, &ready_dir, &log_path, e));
     }
     Ok(Connection {
         base_url: base,
@@ -313,26 +343,37 @@ fn read_token(path: &Path) -> Option<String> {
 }
 
 /// Ждём, пока ядро ответит на /v1/model: окно не должно открываться на пустоту.
-fn wait_ready(base: &str, token: &str, budget: Duration) -> bool {
+///
+/// Возвращает текст ошибки, а не `bool`: «ядро не отвечает» и «ядро ответило
+/// 401» — разные диагнозы, и второй уводит человека искать сеть вместо токена.
+fn wait_ready(base: &str, token: &str, budget: Duration) -> Result<(), String> {
     let until = Instant::now() + budget;
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(e) => return Err(format!("не создать HTTP-клиент: {e}")),
     };
+    let mut refusal = None;
     while Instant::now() < until {
-        let ok = client
+        match client
             .get(format!("{base}/v1/model"))
             .bearer_auth(token)
             .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        if ok {
-            return true;
+        {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            // 401/403 — токен не тот. Повторять его 20 с незачем.
+            Ok(r) if r.status().is_client_error() => {
+                refusal = Some(r.status().as_u16());
+                break;
+            }
+            Ok(_) | Err(_) => {}
         }
         std::thread::sleep(Duration::from_millis(120));
     }
-    false
+    Err(match refusal {
+        Some(code) => format!("ядро ответило {code}: токен не подходит — перезапусти окно"),
+        None => format!("ядро не отвечает на /v1/model за {} с", budget.as_secs()),
+    })
 }

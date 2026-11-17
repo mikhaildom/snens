@@ -3,3 +3,11 @@
 /resources/
 /target/
 /node_modules/
+# Tauri 2 CLI генерирует ACL/permission-схемы сюда при dev/build: без этой
+# строки любая сборка пачкает git status и может уехать в `git add -A`.
+/gen/schemas/
+
+# Локальные секреты и мусор сборки: ключ апдейтера, env, логи.
+*.key
+.env*
+*.log

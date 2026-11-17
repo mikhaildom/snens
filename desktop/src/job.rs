@@ -22,11 +22,29 @@ pub struct Job {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
-// Ручка ядра Windows — просто число, её можно передавать между потоками.
+// Ручки — просто числа, их можно передавать между потоками. `Send` — чтобы
+// ручка могла уехать в `Daemon` вместе с процессом; `Sync` — потому что через
+// неё ничего не пишется: `close(job)` потребляет `Job`, а `&Job` никуда не
+// отдаётся, так что одновременный доступ только читающий и без гонок.
 #[cfg(windows)]
 unsafe impl Send for Job {}
 #[cfg(windows)]
 unsafe impl Sync for Job {}
+
+/// Закрыть ручку, когда `Job` уронили без `close`.
+///
+/// Без `Drop` любой путь, где `Job` просто уронили, терял бы ручку навсегда —
+/// и до выхода процесса defeated бы весь смысл `KILL_ON_JOB_CLOSE`.
+#[cfg(windows)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+        // `close()` ниже уже закрыл ручку и обнулил её — повторно не закрываем.
+        self.handle = std::ptr::null_mut();
+    }
+}
 
 /// Привязать уже запущенный процесс к новому job с `KILL_ON_JOB_CLOSE`.
 ///
@@ -56,11 +74,13 @@ pub fn attach(child: &std::process::Child) -> Option<Job> {
         if ok == 0 {
             // Не оставляем открытую ручку: attach зовётся на каждый перезапуск,
             // и утечка копилась бы до выхода окна.
+            report("SetInformationJobObject");
             windows_sys::Win32::Foundation::CloseHandle(job);
             return None;
         }
         let handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
         if AssignProcessToJobObject(job, handle) == 0 {
+            report("AssignProcessToJobObject");
             windows_sys::Win32::Foundation::CloseHandle(job);
             return None;
         }
@@ -68,21 +88,39 @@ pub fn attach(child: &std::process::Child) -> Option<Job> {
     }
 }
 
-/// На unix отдельного механизма нет: ядро и так умирает вместе с окном, а
-/// явный `kill` при выходе есть в `Daemon::stop`.
+/// На unix отдельного механизма нет — и это единственное верное место, где
+/// сказать честно: связи по родительству в unix НЕТ (при смерти окна ядро
+/// переезжает под init и продолжает держать `surface-api/server.lock`). Что
+/// есть на самом деле: `Daemon::stop()` в конце `app.run` и, главное, сам ядро
+/// получает SIGKILL по смерти родителя только если его запускать через
+/// `setsid`/`prctl` — чего здесь нет. То есть на unix эту дыру закрывает
+/// исключительно явный `kill`; падение окна без него оставит ядро жить.
 #[cfg(not(windows))]
 pub fn attach(_child: &std::process::Child) -> Option<Job> {
     Some(Job {})
 }
 
-/// Закрыть ручку job, не убивая содержимое (нормальный выход: ядро уже убито
-/// явно). Отдельный метод, а не `Drop`, чтобы порядок был явным: сначала
-/// `kill` + `wait`, потом закрытие.
+/// Код ошибки Win32 — в stderr: без него «привязка не удалась» ничем не
+/// диагностируется (job может не даваться политикой или вложенностью).
 #[cfg(windows)]
-pub fn close(job: Job) {
+fn report(what: &str) {
+    eprintln!(
+        "snens-desktop: {what} не удалось: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Закрыть ручку job, не убивая содержимое (нормальный выход: ядро уже убито
+/// явно). `Drop` делает то же самое, но явный вызов не вредит: он обнуляет
+/// ручку, чтобы `Drop` не закрыл её второй раз.
+#[cfg(windows)]
+pub fn close(mut job: Job) {
     unsafe {
-        windows_sys::Win32::Foundation::CloseHandle(job.handle);
+        if !job.handle.is_null() {
+            windows_sys::Win32::Foundation::CloseHandle(job.handle);
+        }
     }
+    job.handle = std::ptr::null_mut();
 }
 
 #[cfg(not(windows))]
