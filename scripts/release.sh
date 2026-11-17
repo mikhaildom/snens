@@ -86,18 +86,27 @@ patterns = {
     "linux-x86_64-appimage": "appimage/*.AppImage",
 }
 for key, pattern in patterns.items():
-    for path in sorted(root.glob(pattern)):
-        sig = path.with_name(path.name + ".sig")
-        if not sig.is_file():
-            print(f"  {key}: нет подписи {sig.name} — пропускаю")
-            continue
-        platforms[key] = {
-            "url": f"{base}/{version}/{path.name}",
-            "signature": sig.read_text().strip(),
-            "size": path.stat().st_size,
-        }
-        print(f"  {key}: {path.name} ({path.stat().st_size} байт)")
-        break
+    # Только артефакт НЫНЕШНЕЙ версии: `target/release/bundle` не чистится между
+    # релизами, и первый по алфавиту файл часто оказывается прошлогодним —
+    # манифест тогда рекламирует новую версию, а отдаёт старый билд.
+    matches = [p for p in sorted(root.glob(pattern)) if version in p.name]
+    if not matches:
+        print(f"  {key}: нет артефакта версии {version} ({pattern}) — пропускаю")
+        continue
+    if len(matches) > 1:
+        names = ", ".join(p.name for p in matches)
+        sys.exit(f"{key}: под {pattern} подходит несколько артефактов этой версии: {names} — почисти каталог бандлов")
+    path = matches[0]
+    sig = path.with_name(path.name + ".sig")
+    if not sig.is_file():
+        print(f"  {key}: нет подписи {sig.name} — пропускаю")
+        continue
+    platforms[key] = {
+        "url": f"{base}/{version}/{path.name}",
+        "signature": sig.read_text().strip(),
+        "size": path.stat().st_size,
+    }
+    print(f"  {key}: {path.name} ({path.stat().st_size} байт)")
 
 if not platforms:
     sys.exit("нет ни одного подписанного артефакта: обновление собрать не из чего")
@@ -117,6 +126,23 @@ print(f"  манифест: {dest}")
 PY
 
 say "готово. Выложи на $BASE_URL: latest.json и каталог $VERSION/ с артефактами"
+# Каталог версии рядом с бандлами. `tauri build` кладёт артефакты в `nsis/` и
+# `appimage/`, а не в `<версия>/`, и раньше всё ниже (выкладка и печатаемый
+# rsync) ходило по несуществующему пути: копировалось ноль файлов, а манифест
+# обещал URL, которые отдают 404. Собираем здесь ровно то, что попало в
+# манифест; фильтр по версии обязателен — в каталоге бандлов лежат артефакты
+# прошлых релизов (`tauri` его не чистит).
+rm -rf "$OUT/$VERSION"
+mkdir -p "$OUT/$VERSION"
+for f in "$OUT"/nsis/*-setup.exe "$OUT"/nsis/*-setup.exe.sig \
+         "$OUT"/appimage/*.AppImage "$OUT"/appimage/*.AppImage.sig; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+        *"$VERSION"*) cp -p "$f" "$OUT/$VERSION/" ;;
+    esac
+done
+[ -n "$(ls -A "$OUT/$VERSION")" ] ||
+    die "в $OUT нет артефактов версии $VERSION (nsis/appimage) — публиковать нечего"
 # Путь назначения — тот же корень, что раздаёт Caddy (deploy/caddy-sites.conf):
 # сайт берёт `/releases/*` из каталога релизов, один домен на всё.
 WEBROOT="${SNENS_RELEASE_WEBROOT:-/var/www/snens.svuvi.ch}"
@@ -134,7 +160,7 @@ if [ "${SNENS_RELEASE_PUBLISH:-0}" = 1 ] && [ -d "$WEBROOT" ] && [ -w "$WEBROOT"
     # Каталог версии неизменяем: обновление кладёт новый, а не перезаписывает старый
     # (люди с прошлой версией могут ещё качать её артефакт).
     mkdir -p "$DEST/$VERSION"
-    for f in "$OUT"/$VERSION/*; do
+    for f in "$OUT"/"$VERSION"/*; do
         [ -f "$f" ] && cp -p "$f" "$DEST/$VERSION/"
     done
     cp -p "$OUT/latest.json" "$DEST/latest.json"
@@ -148,7 +174,7 @@ if [ "${SNENS_RELEASE_PUBLISH:-0}" = 1 ] && [ -d "$WEBROOT" ] && [ -w "$WEBROOT"
     ls -l "$DEST/latest.json" "$DEST/$VERSION" | sed 's/^/  /'
 else
     say "выложить руками:"
-    say "  rsync -av --mkpath $OUT/latest.json $OUT/$VERSION/ \${SNENS_RELEASE_HOST:-<host>}:$DEST/"
+    say "  rsync -av --mkpath \"$OUT/latest.json\" \"$OUT/$VERSION/\" \"${SNENS_RELEASE_HOST:-<host>}:$DEST/\""
     [ "$WEBROOT" = /var/www/snens.svuvi.ch ] && [ -d "$WEBROOT" ] && [ "${SNENS_RELEASE_PUBLISH:-0}" != 1 ] &&
         say "  (каталог доступен локально: тот же скрипт с SNENS_RELEASE_PUBLISH=1 скопирует сам)"
 fi

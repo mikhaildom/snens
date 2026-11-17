@@ -29,9 +29,11 @@ $cb = [Win+EnumWindowsProc]{
     [void][Win]::GetWindowText($h, $sb, 512)
     $t = $sb.ToString()
     if ($t) {
-      $pid = 0
-      [void][Win]::GetWindowThreadProcessId($h, [ref]$pid)
-      $pname = (Get-Process -Id $pid -ErrorAction SilentlyContinue).ProcessName
+      # Не `$pid`: в PowerShell это автоматическая read-only переменная (PID
+      # хоста), присвоение в неё падает — и все окна резолвились бы в сам хост.
+      $procId = 0
+      [void][Win]::GetWindowThreadProcessId($h, [ref]$procId)
+      $pname = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName
       [void]$lines.Add("$pname | $t")
     }
   }
