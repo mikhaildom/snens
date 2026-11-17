@@ -75,8 +75,14 @@ pub fn run_with(l: &mut crate::Live, args: &Args) -> Result<(), String> {
 fn activate(l: &mut crate::Live) -> Result<(), String> {
     let ws = l.ep.browser_ws()?;
     let mut b = crate::cdp::Cdp::connect(&ws, 15.0)?;
-    let _ = b.call("Target.activateTarget", json!({"targetId": l.tab}));
-    let _ = l.cdp.call("Page.bringToFront", Value::Null);
+    // Ошибку активации не глотаем: иначе ввод уходит в другую вкладку, а батч
+    // отчитывается успехом.
+    if let Err(e) = b.call("Target.activateTarget", json!({"targetId": l.tab})) {
+        eprintln!("внимание: не удалось активировать вкладку: {e}");
+    }
+    if let Err(e) = l.cdp.call("Page.bringToFront", Value::Null) {
+        eprintln!("внимание: вкладка не выведена вперёд: {e}");
+    }
     if let Ok(v) = l.cdp.eval("document.visibilityState") {
         if v.as_str() == Some("hidden") {
             eprintln!(
@@ -275,7 +281,9 @@ fn click_at(cdp: &mut crate::cdp::Cdp, x: f64, y: f64) -> Result<(), String> {
     )?;
     cdp.call(
         "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}),
+        // buttons=1 (левая кнопка нажата): из битовой маски Chrome выводит
+        // event.buttons, и canvas/drag-обработчики без неё видят 0.
+        json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1}),
     )?;
     cdp.call(
         "Input.dispatchMouseEvent",
@@ -340,17 +348,15 @@ fn press(cdp: &mut crate::cdp::Cdp, combo: &str) -> Result<(), String> {
     // Одиночная буква/цифра в комбинации (Control+a): код берём из ASCII вверх
     // регистром — Chrome ждёт windowsVirtualKeyCode заглавной буквы.
     let (name, code, ch) = match key_for(key) {
-        Some(t) => t,
+        Some((n, c, ch)) => (n.to_string(), c, ch),
         None => {
             let mut cs = key.chars();
             match (cs.next(), cs.next()) {
                 (Some(c), None) if c.is_ascii_alphanumeric() => {
                     let up = c.to_ascii_uppercase();
-                    (
-                        Box::leak(up.to_string().into_boxed_str()) as &'static str,
-                        up as u32,
-                        Some(c),
-                    )
+                    // Без Box::leak: имя клавиши живёт в этой функции, а утечка
+                    // росла с каждым нажатием в батче.
+                    (String::from(up), up as u32, Some(c))
                 }
                 _ => return Err(format!("press: неизвестная клавиша {key}")),
             }
@@ -364,7 +370,9 @@ fn press(cdp: &mut crate::cdp::Cdp, combo: &str) -> Result<(), String> {
         "modifiers": mods,
     });
     let mut down = base.clone();
-    down["type"] = json!("rawKeyDown");
+    // keyDown, а не rawKeyDown: rawKeyDown определён без текста, и вставка символа
+    // не происходит — `press("a")` не набирал букву в поле.
+    down["type"] = json!("keyDown");
     if let Some(c) = ch {
         down["text"] = json!(c.to_string());
         down["unmodifiedText"] = json!(c.to_string());
