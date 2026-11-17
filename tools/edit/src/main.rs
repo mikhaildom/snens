@@ -14,7 +14,7 @@
 // на ОРИГИНАЛ по карте смещений: иначе запись нормализованной копии переписала
 // бы весь файл — чужой diff на весь файл вместо одной строки.
 use serde_json::Value;
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::exit;
@@ -90,6 +90,9 @@ fn hint(text: &str, old: &str) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or_else(|| old.trim());
     let lines: Vec<&str> = text.lines().collect();
+    // Регистр снимаем один раз: иначе на большом файле это O(строк) аллокаций
+    // только чтобы построить подсказку об ошибке.
+    let first_lower = first.to_lowercase();
     let nothing = || "похожего фрагмента нет — прочитай файл заново (read)".to_string();
     if first.is_empty() {
         return nothing();
@@ -108,7 +111,7 @@ fn hint(text: &str, old: &str) -> String {
         .enumerate()
         .map(|(i, l)| {
             (
-                ratio(&first.to_lowercase(), &l.trim().to_lowercase()),
+                ratio(&first_lower, &l.trim().to_lowercase()),
                 i + 1,
                 l.trim(),
             )
@@ -381,6 +384,18 @@ fn escape_raw_controls(src: &str) -> String {
     out
 }
 
+/// Конечная цель симлинка, иначе путь как есть. Битая ссылка — остаётся как есть:
+/// дальше её отсечёт `metadata`.
+fn resolve_symlink(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(p)
+            .map(|c| c.display().to_string())
+            .unwrap_or_else(|_| path.to_string()),
+        _ => path.to_string(),
+    }
+}
+
 fn abs(p: &str) -> String {
     let path = std::path::Path::new(p);
     if path.is_absolute() {
@@ -402,10 +417,19 @@ fn mode_of(_meta: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
+/// Права — до данных и без проглатывания ошибки: файл с секретами не должен
+/// ни секунды лежать с дефолтными 0644. `m & 0o7777` отсекает биты типа файла.
 #[cfg(unix)]
 fn set_mode(p: &std::path::Path, mode: Option<u32>) {
     if let Some(m) = mode {
-        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        let m = m & 0o7777;
+        if let Err(e) = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)) {
+            die(format!(
+                "edit: {}: не удалось сохранить права {:o}: {e}",
+                p.display(),
+                m
+            ));
+        }
     }
 }
 
@@ -423,11 +447,32 @@ fn atomic_write(path: &str, data: &[u8], mode: Option<u32>) {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let tmp = dir.join(format!(".snens-edit-{}-{nanos}", std::process::id()));
-    std::fs::write(&tmp, data).unwrap_or_else(|e| die(format!("edit: {}: {e}", tmp.display())));
+    // create_new: имя предсказуемо, а `fs::write` (create+truncate) по симлинку,
+    // заранее положенному в каталог, писал бы в чужой файл.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(m) = mode {
+        // Права при создании: окно «данные уже на диске, а режим ещё 0644» исчезает.
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, m & 0o7777);
+    }
+    let mut f = opts
+        .open(&tmp)
+        .unwrap_or_else(|e| die(format!("edit: {}: {e}", tmp.display())));
+    if let Err(e) = f.write_all(data).and_then(|_| f.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        die(format!("edit: {}: {e}", tmp.display()));
+    }
+    drop(f);
     set_mode(&tmp, mode);
     if let Err(e) = std::fs::rename(&tmp, p) {
         let _ = std::fs::remove_file(&tmp);
         die(format!("edit: {path}: {e}"));
+    }
+    // fsync каталога: без него после сбоя rename может быть виден без данных.
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
 }
 
@@ -648,6 +693,18 @@ fn locate(orig: &str, norm: &mut Option<Norm>, e: &Edit, path: &str) -> Result<V
         if spots.is_empty() {
             return Err(not_found(orig, e, path));
         }
+        // Совпадение в нормализованном тексте, которое не отображается назад
+        // в оригинал (граница внутри лигатуры), — не «единственное место»,
+        // а неоднозначность: молча править одно из двух нельзя.
+        if spots.len() != hits.len() {
+            return Err(format!(
+                "edit: в нормализованном тексте {} совпадений, а в исходном отображается только {} — \
+                 место неоднозначно, уточни old_string{}",
+                hits.len(),
+                spots.len(),
+                where_n(e.n)
+            ));
+        }
         spots
     };
     if spots.len() > 1 && !e.all {
@@ -697,7 +754,7 @@ fn apply_all(orig: &str, edits: &[Edit], path: &str) -> Result<(String, Vec<Appl
     for (e, spots) in edits.iter().zip(&per) {
         for s in spots.as_ref().expect("ошибки уже отсеяны выше") {
             let mut new = e.new.clone();
-            if s.fuzzy && crlf && !new.contains("\r\n") && new.contains('\n') {
+            if crlf && !new.contains("\r\n") && new.contains('\n') {
                 new = new.replace('\n', "\r\n");
             }
             plan.push(Applied {
@@ -738,7 +795,15 @@ fn apply_all(orig: &str, edits: &[Edit], path: &str) -> Result<(String, Vec<Appl
 }
 
 fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // args_os: путь на Linux не обязан быть UTF-8, а args() на таком паникует
+    // вместо понятного отказа.
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| {
+            a.into_string()
+                .unwrap_or_else(|bad| die(format!("edit: аргумент не UTF-8: {bad:?}")))
+        })
+        .collect();
     if argv.is_empty() || argv[0] == "-h" || argv[0] == "--help" {
         println!("{HELP}");
         exit(if argv.is_empty() { 1 } else { 0 });
@@ -783,6 +848,9 @@ fn main() {
     // её части носят номер: по нему видно, какая не совпала.
     let edits = parse_edits(&j).unwrap_or_else(|e| die(e));
 
+    // Симлинк разрешаем до цели: `rename` в atomic_write заменил бы саму ссылку
+    // обычным файлом. Для слинкованных дотфайлов правка иначе уходит не туда.
+    let path = resolve_symlink(&path);
     let meta = std::fs::metadata(&path).unwrap_or_else(|e| match e.kind() {
         std::io::ErrorKind::NotFound => die(format!("edit: файл не найден: {path}")),
         _ => die(format!("edit: {path}: {e}")),
@@ -797,7 +865,16 @@ fn main() {
             data.len()
         ));
     }
-    let text = String::from_utf8_lossy(&data).into_owned();
+    // Не UTF-8 — отказ, а не lossy-декод: `from_utf8_lossy` заменил бы каждый
+    // нелегальный байт на U+FFFD, и запись целиком переписала бы файл в CP1251
+    // или Latin-1, пообещав «остальной файл не трогаю».
+    let text = match std::str::from_utf8(&data) {
+        Ok(t) => t.to_string(),
+        Err(e) => die(format!(
+            "edit: {path} — не UTF-8 (сбой на байте {}), правка текстом испортила бы файл",
+            e.valid_up_to()
+        )),
+    };
 
     // Все правки считаются против ИСХОДНОГО текста и применяются разом. Файл
     // пишется один раз — только если сошлись все фрагменты и не пересеклись.
@@ -849,6 +926,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crlf_file_gets_crlf_even_on_exact_match() {
+        // Точное совпадение на CRLF-файле, а new_string — с голыми \n: иначе в
+        // середину файла попадали LF-строки и получались смешанные концы.
+        let orig = "alpha\r\nbeta\r\n";
+        let (t, _plan) = apply(orig, &[e(0, "beta", "gamma\ndelta")]);
+        assert_eq!(t, "alpha\r\ngamma\r\ndelta\r\n", "концы строк смешались");
+    }
 
     #[test]
     fn hint_finds_line_with_different_indent() {
