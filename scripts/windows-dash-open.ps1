@@ -8,7 +8,10 @@
 # (заголовок ставит Tauri, а классы у окна и у webview разные) — проверено.
 $out = Join-Path $env:USERPROFILE "dash-click.txt"
 $png = Join-Path $env:USERPROFILE "dash-open.png"
-
+# Глобальный тип PowerShell создаётся один раз на сессию: повторный Add-Type с
+# тем же именем падает, если скрипт запускают дважды из одного хоста
+# (например, из одной сессии планировщика).
+if (-not ("W" -as [type])) {
 Add-Type @"
 using System;
 using System.Collections.Generic;
@@ -40,6 +43,7 @@ public class W {
   }
 }
 "@
+}
 
 $lines = New-Object System.Collections.ArrayList
 $proc = Get-Process snens-desktop -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -71,8 +75,21 @@ $r = New-Object W+RECT
 [void]$lines.Add("rect=$($r.L),$($r.T),$($r.Rr),$($r.B)")
 
 # Кнопка дашборда в шапке списка сессий: рельса ~248 px, строка «sessions N [▤][+]».
-$x = $r.L + 232
-$y = $r.T + 97
+# Координаты МАГИЧЕСКИЕ: они верны только при 100% масштабировании экрана и на
+# нынешней вёрстке шапки. При другом DPI или после правки клиента поправь их
+# (или сними дашборд через CDP — tools/cdp — там координаты не нужны).
+$scale = 1.0
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  $scale = [System.Windows.Forms.SystemInformation]::PrimaryMonitorSize.Width /
+           ([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width)
+} catch { $scale = 1.0 }
+if ([math]::Abs($scale - 1.0) -gt 0.01) {
+  # Смещение считается в DIP: при масштабе != 100% пиксельный клик уедет мимо.
+  [void]$lines.Add("scale=$scale — координаты клика верны только при 100%, проверь результат глазами")
+}
+$x = $r.L + [int](232 * $scale)
+$y = $r.T + [int](97 * $scale)
 
 # Клик синтезируется глобально: если окно snens не оказалось поверх, клик уедет
 # в чужой интерфейс. `SetForegroundWindow` отказывает регулярно (таймаут

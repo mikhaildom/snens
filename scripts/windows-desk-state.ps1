@@ -15,6 +15,10 @@ param(
 $out = $Out
 $png = $Png
 
+# Глобальный тип PowerShell создаётся один раз на сессию: повторный Add-Type с
+# тем же именем падает, если скрипт запускают дважды из одного хоста
+# (например, из одной сессии планировщика).
+if (-not ("Win" -as [type])) {
 Add-Type @"
 using System;
 using System.Text;
@@ -27,6 +31,7 @@ public class Win {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 }
 "@
+}
 
 $lines = New-Object System.Collections.ArrayList
 $cb = [Win+EnumWindowsProc]{
