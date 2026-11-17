@@ -16,14 +16,26 @@
 # Прогресс tauri пишет в stderr, поэтому `*>` и мягкий режим ошибок: иначе
 # PowerShell валит сборку на первой же строке "Info …".
 param(
-  [string]$Repo = (Join-Path $env:USERPROFILE "snens-release\snens"),
+  # Репозиторий обязателен: раньше дефолт смотрел в `snens-release\snens`
+  # (дерево 0.2.x), и запуск без аргументов собирал старую версию молча.
+  [Parameter(Mandatory = $true)][string]$Repo,
   [string]$Key  = (Join-Path $env:USERPROFILE "snens-updater.key"),
   [string]$ClientDist = (Join-Path $env:USERPROFILE "snens-web-dist"),
-  [string]$BinDir = (Join-Path $env:USERPROFILE "snens-release\snens\target\release"),
+  [string]$BinDir = "",
   [switch]$NoBuild
 )
 
 $log = Join-Path $Repo "tauri-signed.log"
+
+# BinDir не задан — берём target-каталог самого репозитория, а не чужой путь.
+if ([string]::IsNullOrWhiteSpace($BinDir)) {
+  $BinDir = Join-Path $Repo "target\release"
+}
+if (-not (Test-Path (Join-Path $Repo "desktop\tauri.conf.json"))) {
+  Write-Output "EXIT=1 (Repo=$Repo — это не корень репозитория snens)"
+  exit 1
+}
+Write-Output ("repo: " + $Repo)
 
 Write-Output "=== 1/3 сборка ядра и тулов"
 if (-not $NoBuild) {
