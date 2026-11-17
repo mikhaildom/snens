@@ -228,18 +228,22 @@ async fn run_loop<L: Llm>(
     let out_dir = sess.path().with_extension("out");
     let mail_dir = cfg.mail_path();
     let mut mirror = crate::context::Mirror::open(sess, cfg)?;
-    let mut pressure_next = cfg.context_budget();
-    // Persist reminder hysteresis across resume; successful edits can re-arm it below target.
-    for rec in sess.read()? {
-        if let Rec::User { source, .. } = rec {
-            if let Some(n) = source
-                .strip_prefix("context-cleanup:")
-                .and_then(|n| n.parse::<u64>().ok())
-            {
-                pressure_next = n;
+    // Ступени давления: 50% и 75% бюджета по умолчанию. Гистерезис переживает
+    // resume — на нём держится `Rec::User { source: "context-cleanup:<порог>" }`.
+    let mut pressure = {
+        let mut persisted = None;
+        for rec in sess.read()? {
+            if let Rec::User { source, .. } = rec {
+                if let Some(n) = source
+                    .strip_prefix("context-cleanup:")
+                    .and_then(|n| n.parse::<u64>().ok())
+                {
+                    persisted = Some(n);
+                }
             }
         }
-    }
+        crate::context::Pressure::resumed(cfg.context_pressure_tiers(), persisted)
+    };
     let mut turn = 0u32;
     // Пустой ответ — не конец работы, а сбой (обрыв стрима, непарсимый формат
     // вызова). Считаем подряд: первый повторяем запросом, второй — выходим явной
@@ -309,21 +313,18 @@ async fn run_loop<L: Llm>(
         // из последних usage этой сессии (см. project::calibration).
         let est_raw = project::estimate_tokens(&msgs) + schema_tokens;
         let approx = (est_raw as f64 * project::calibration(&raw)).round() as u64;
-        if approx < cfg.context_target() {
-            pressure_next = cfg.context_budget();
-        }
+        // Порог мог смениться из файла (бюджет, профиль модели, ступени) —
+        // пересчитываем точки взвода, уже пройденное не откатываем.
+        pressure.retune(cfg.context_pressure_tiers());
         // Абзац про управление зеркалом — только когда уборка запрошена:
         // постоянное напоминание на каждом ходу отвлекало модель на размышления
         // о контексте вместо задачи.
         let mut cleanup_requested = false;
-        if approx >= pressure_next {
+        if let Some(next) = pressure.observe(approx, cfg.context_budget()) {
             // Даже без `ctx` в схеме автоэлизия уже сработала выше — часть
             // давления снята. Требование правки зеркала шлём только когда
             // применить её действительно чем: иначе это приглашение в тупик.
             cleanup_requested = ctx_tool;
-            pressure_next = approx
-                .saturating_add(cfg.context_budget() / 4)
-                .max(approx.saturating_add(1));
             let text = if ctx_tool {
                 format!("[Уборка рабочего контекста] Сейчас ~{approx} токенов, экономический бюджет {}. Перед продолжением задачи отредактируй {} и вызови ctx commit. Ориентир после уборки — {} токенов. Удали переваренные выводы и законченные ветки, сохрани полезные точные фрагменты и обнови записку для продолжения: цель, ограничения, решения, точные данные, открытые проверки, следующие действия. Не пересказывай историю ради пересказа. Стратегию и объём правок выбираешь ты.", cfg.context_budget(), mirror.path().display(), cfg.context_target())
             } else {
@@ -338,7 +339,7 @@ async fn run_loop<L: Llm>(
             });
             sess.append(Rec::User {
                 ts: log::now(),
-                source: format!("context-cleanup:{pressure_next}"),
+                source: format!("context-cleanup:{next}"),
                 text,
                 parts: Vec::new(),
                 ask: None,
@@ -354,8 +355,8 @@ async fn run_loop<L: Llm>(
         // Едет только когда запрошена уборка: постоянное напоминание отвлекало
         // модель на размышления о контексте.
         if cleanup_requested {
-        msgs.insert(1, serde_json::json!({"role":"system", "content": format!(
-            "Ты управляешь своим рабочим контекстом. Зеркало следующего ввода: {} (также SNENS_CONTEXT_PATH в окружении инструментов). Читай его окнами и редактируй обычными read/edit/write/run, затем ctx commit. JSON blocks содержат messages; вызовы и ответы инструмента связаны одним блоком: нельзя оставлять сироты. Можно сокращать аргументы (валидный JSON), ответы, удалять целые пары/блоки, добавлять текстовые user notes с id new-*. Системные сообщения вне зеркала. Правка действует после результатов шага; исходный журнал не меняется. Держи рабочую записку и proactively удаляй ненужное. Бюджет {} токенов, цель уборки {}. Успешные прямые read/edit/write зеркала и ctx commit не остаются в рабочей истории; shell-команды остаются. Не дублируй всё зеркало в ответе.", mirror.path().display(), cfg.context_budget(), cfg.context_target())}));
+            msgs.insert(1, serde_json::json!({"role":"system", "content": format!(
+            "Ты управляешь своим рабочим контекстом. Зеркало следующего ввода: {} (также SNENS_CONTEXT_PATH в окружении инструментов). Читай его окнами, правь обычными read/edit/write/run и примени правку одним вызовом ctx commit. Защищены первый и последний запрос человека; всё остальное — ответы модели, середина диалога, результаты тулов — можно сокращать, удалять и переставлять. Одна батчевая запись за ход. Сохраняй порядок и структуру диалога: устаревший анализ заменяй локальным саммари на том же месте. Сохраняй решения, ограничения, открытые вопросы, пути, команды, результаты проверок и следующий шаг. Снимай в первую очередь крупные результаты тулов и отработанные ветки. Вызов и результат тула — пара: правка с сиротой не пройдёт. Заметки — блоки с id new-*; системные сообщения вне зеркала. Правка проверяется на сжатие: если снято мало, придёт отказ с числами и списком крупнейших блоков. Бюджет {} токенов, цель уборки {}. Успешные прямые read/edit/write зеркала и ctx commit не остаются в рабочей истории; shell-команды остаются. Не печатай зеркало целиком.", mirror.path().display(), cfg.context_budget(), cfg.context_target())}));
         }
 
         let physical_limit = cfg
@@ -604,11 +605,10 @@ async fn run_loop<L: Llm>(
                     })
         });
         let outcome = if committing {
-            Some(
-                mirror
-                    .apply(sess, cfg)?
-                    .unwrap_or_else(|| crate::context::Mirror::noop_outcome(sess)),
-            )
+            match mirror.apply(sess, cfg)? {
+                Some(outcome) => Some(outcome),
+                None => Some(crate::context::Mirror::noop_outcome(sess)?),
+            }
         } else {
             None
         };
@@ -643,9 +643,7 @@ async fn supervisor(
     cfg: &Config,
     ui: &crate::render::Ui,
     queued: Option<
-        &std::sync::Arc<
-            tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<QueuedInput>>,
-        >,
+        &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<QueuedInput>>>,
     >,
 ) -> bool {
     let parent = sess.id();
@@ -804,7 +802,6 @@ fn usage_rec(reply: &Reply, est_tok: u64, model: &str) -> Rec {
         est_tok,
     }
 }
-
 
 /// Сколько строк результата показывать человеку в терминале.
 const PREVIEW_LINES: usize = 15;

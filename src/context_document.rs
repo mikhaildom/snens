@@ -1,4 +1,9 @@
 //! Editable JSON view. Systems are protected; non-text content parts are opaque references.
+//!
+//! Политика правки — CLM: контекст принадлежит модели. Неизменяемы ровно два
+//! блока — *первый* и *последний* user-блок (исходная задача и текущая
+//! инструкция человека). Всё остальное — assistant-текст, user-сообщения из
+//! середины, результаты тулов — можно сокращать, удалять и переставлять.
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -29,11 +34,65 @@ pub(crate) fn hash(bytes: &[u8]) -> String {
     format!("fnv64:{h:016x}")
 }
 
+/// Текстовая форма `content`: строка и массив текстовых parts дают одно и то же.
+/// Защита сравнивает содержимое, а не сериализацию — иначе одна и та же запись,
+/// пришедшая массивом `parts`, выглядела бы другой и «незащищённой».
+fn text_of(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            for part in parts {
+                if part["type"] != "text" {
+                    return None;
+                }
+                text.push_str(part["text"].as_str()?);
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+/// Сообщение в сравнимой форме: форма `content` (строка или `parts`) не влияет
+/// на решение о защите. Нетекстовые части остаются как есть.
+fn canonical(message: &Value) -> Value {
+    let mut out = message.clone();
+    if let Some(text) = message.get("content").and_then(text_of) {
+        if let Some(object) = out.as_object_mut() {
+            object.insert("content".into(), Value::String(text));
+        }
+    }
+    out
+}
+
+fn canonical_block(messages: &[Value]) -> Vec<Value> {
+    messages.iter().map(canonical).collect()
+}
+
+/// Короткое описание блока для отказа: id, роль, размер одной строкой. Модель
+/// должна понять, о каком блоке речь, не перечитывая зеркало целиком.
+fn describe(block: &Block) -> String {
+    let role = block
+        .messages
+        .first()
+        .and_then(|m| m["role"].as_str())
+        .unwrap_or("?");
+    let chars: usize = block
+        .messages
+        .iter()
+        .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+        .sum();
+    format!("{} ({role}, {chars} chars)", block.id)
+}
+
 pub(crate) struct View {
     pub document: Document,
     attachments: BTreeMap<String, Value>,
     // Protected system messages precede the next original block, or the end.
     systems: Vec<(usize, Value)>,
+    // Индексы блоков первого и последнего user-блока: только они неприкосновенны.
+    protected: Vec<usize>,
 }
 
 impl View {
@@ -80,87 +139,176 @@ impl View {
                 }
             }
         }
+        let users: Vec<usize> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.messages.iter().any(|m| m["role"] == "user"))
+            .map(|(index, _)| index)
+            .collect();
+        let protected = match (users.first(), users.last()) {
+            (Some(first), Some(last)) if first == last => vec![*first],
+            (Some(first), Some(last)) => vec![*first, *last],
+            _ => Vec::new(),
+        };
         Ok(Self {
             document: Document { revision, blocks },
             attachments,
             systems,
+            protected,
         })
+    }
+
+    /// Как называется защищённый блок в отказе: у сессии из одного user-блока он
+    /// сразу и первый, и последний.
+    fn label(&self, index: usize) -> &'static str {
+        match (self.protected.len(), self.protected.first() == Some(&index)) {
+            (1, _) => "first and last",
+            (_, true) => "first",
+            _ => "last",
+        }
+    }
+
+    /// Развернуть непрозрачные ссылки вложений обратно в части. Отдельной
+    /// функцией — её же использует счётчик размеров блоков для подсказки.
+    fn resolve(&self, messages: &[Value]) -> R<Vec<Value>> {
+        let mut messages = messages.to_vec();
+        for m in &mut messages {
+            if let Some(parts) = m["content"].as_array_mut() {
+                for part in parts {
+                    if let Some(key) = part.get("$context_attachment") {
+                        if part.as_object().map(|o| o.len()) != Some(1) {
+                            return Err("attachment reference must be opaque".into());
+                        }
+                        *part = self
+                            .attachments
+                            .get(key.as_str().ok_or("invalid attachment reference")?)
+                            .ok_or("unknown attachment reference")?
+                            .clone();
+                    } else if part["type"] != "text" {
+                        return Err("new attachments are not allowed in context drafts".into());
+                    }
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Крупнейшие блоки текущей проекции: id, роль, оценка токенов. Нужно для
+    /// отказа по сжатию — модель получает механический ответ «что снимать», а не
+    /// «правка не понравилась».
+    pub fn block_sizes(&self) -> Vec<(String, String, u64)> {
+        let mut sizes: Vec<(String, String, u64)> = self
+            .document
+            .blocks
+            .iter()
+            .map(|block| {
+                let role = block
+                    .messages
+                    .first()
+                    .and_then(|m| m["role"].as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let messages = self
+                    .resolve(&block.messages)
+                    .unwrap_or_else(|_| block.messages.clone());
+                (
+                    block.id.clone(),
+                    role,
+                    crate::project::estimate_tokens(&messages),
+                )
+            })
+            .collect();
+        sizes.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        sizes
     }
 
     pub fn restore(&self, edited: &Document) -> R<Vec<Value>> {
         if edited.revision != self.document.revision {
-            return Err("stale revision; reread LIVE_CONTEXT.json".into());
+            return Err(format!(
+                "stale revision {} (current {}); reread LIVE_CONTEXT.json and edit the fresh copy",
+                edited.revision, self.document.revision
+            )
+            .into());
         }
         let originals: HashSet<&str> = self.document.blocks.iter().map(|b| b.id.as_str()).collect();
-        // Жёсткий запрет на амнезию: запрос пользователя и текст ответа модели —
-        // самая ценная часть контекста, и уборка их не трогает. Правкой зеркала
-        // можно снять результаты инструментов и аргументы вызовов, но не ходы
-        // диалога. Тела скиллов и длинные вставки — отдельный механизм (в файл).
-        let protected = |messages: &[Value]| -> Vec<Value> {
-            messages
-                .iter()
-                .filter(|m| {
-                    m["role"] == "user"
-                        || (m["role"] == "assistant"
-                            && m["content"].as_str().is_some_and(|s| !s.is_empty()))
-                })
-                .cloned()
-                .collect()
-        };
-        let mut ids = HashSet::new();
-        let mut restored = Vec::new();
-        for original in &self.document.blocks {
-            match edited.blocks.iter().find(|b| b.id == original.id) {
-                None if !protected(&original.messages).is_empty() => {
-                    return Err(
-                        "cannot delete blocks containing user messages or assistant text".into(),
+        // Политика защиты: первый и последний user-блок неприкосновенны. Всё
+        // остальное — assistant-текст, середина диалога, результаты тулов —
+        // модель вправе сократить, удалить или переставить.
+        let mut seen = HashSet::new();
+        let mut positions = BTreeMap::<&str, usize>::new();
+        for (index, block) in edited.blocks.iter().enumerate() {
+            if !seen.insert(block.id.as_str()) {
+                return Err(format!(
+                    "duplicate block id {}; keep one copy and delete the other",
+                    describe(block)
+                )
+                .into());
+            }
+            positions.insert(block.id.as_str(), index);
+        }
+        let mut previous: Option<usize> = None;
+        for &index in &self.protected {
+            let original = &self.document.blocks[index];
+            let label = self.label(index);
+            let Some(&at) = positions.get(original.id.as_str()) else {
+                return Err(format!(
+                    "block {} is protected: it is the {label} human request and cannot be removed; \
+                     edit or remove other blocks instead",
+                    describe(original)
+                )
+                .into());
+            };
+            if let Some(previous) = previous {
+                if at < previous {
+                    return Err(format!(
+                        "block {} is protected and was moved: the first human request must stay \
+                         before the last one; reorder other blocks instead",
+                        describe(original)
                     )
+                    .into());
                 }
-                Some(block) if protected(&block.messages) != protected(&original.messages) => {
-                    return Err(
-                        "cannot edit or reorder user messages and assistant text; clear tool results instead"
-                            .into(),
-                    )
-                }
-                _ => {}
+            }
+            previous = Some(at);
+            let block = &edited.blocks[at];
+            if canonical_block(&block.messages) != canonical_block(&original.messages) {
+                return Err(format!(
+                    "block {} is protected: it is the {label} human request and cannot be edited; \
+                     change other blocks, or add a new-* note with what you need to remember",
+                    describe(original)
+                )
+                .into());
             }
         }
+        let mut restored = Vec::new();
         for block in &edited.blocks {
-            if !ids.insert(block.id.as_str()) {
-                return Err("duplicate block id".into());
-            }
             if !originals.contains(block.id.as_str()) && !block.id.starts_with("new-") {
-                return Err("unknown block id (new notes require new- prefix)".into());
+                return Err(format!(
+                    "unknown block id {}; use ids from the current mirror headers, or prefix a new \
+                     block's id with new-",
+                    describe(block)
+                )
+                .into());
             }
             if block.messages.is_empty() {
-                return Err("empty block; delete it instead".into());
+                return Err(format!(
+                    "block {} is empty; delete the block instead of emptying it",
+                    block.id
+                )
+                .into());
             }
-            let mut messages = block.messages.clone();
-            for m in &mut messages {
-                if let Some(parts) = m["content"].as_array_mut() {
-                    for part in parts {
-                        if let Some(key) = part.get("$context_attachment") {
-                            if part.as_object().map(|o| o.len()) != Some(1) {
-                                return Err("attachment reference must be opaque".into());
-                            }
-                            *part = self
-                                .attachments
-                                .get(key.as_str().ok_or("invalid attachment reference")?)
-                                .ok_or("unknown attachment reference")?
-                                .clone();
-                        } else if part["type"] != "text" {
-                            return Err("new attachments are not allowed in context drafts".into());
-                        }
-                    }
-                }
-            }
-            validate(&messages, false)?;
+            let messages = self.resolve(&block.messages)?;
+            validate(&messages, false).map_err(|error| format!("block {}: {error}", block.id))?;
             if block.id.starts_with("new-") && messages.iter().any(|m| m["role"] != "user") {
-                return Err("new blocks must contain user notes".into());
+                return Err(format!(
+                    "block {} is a new note and must contain user messages only; \
+                     notes carry text, not tool calls",
+                    block.id
+                )
+                .into());
             }
             restored.push(messages);
         }
-        let mut protected: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
+        let mut systems: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
         for (at, message) in &self.systems {
             // Initial system stays first. Other systems stay ahead of the next
             // surviving original block, even when their immediate neighbour was deleted.
@@ -172,15 +320,15 @@ impl View {
                     .find_map(|original| edited.blocks.iter().position(|b| b.id == original.id))
                     .unwrap_or(edited.blocks.len())
             };
-            protected.entry(position).or_default().push(message.clone());
+            systems.entry(position).or_default().push(message.clone());
         }
         let mut out = Vec::new();
         for (i, messages) in restored.into_iter().enumerate() {
-            out.extend(protected.remove(&i).unwrap_or_default());
+            out.extend(systems.remove(&i).unwrap_or_default());
             out.extend(messages);
         }
-        out.extend(protected.remove(&edited.blocks.len()).unwrap_or_default());
-        validate(&out, true)?;
+        out.extend(systems.remove(&edited.blocks.len()).unwrap_or_default());
+        validate(&out, true).map_err(|error| format!("restored projection: {error}"))?;
         Ok(out)
     }
 }

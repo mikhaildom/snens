@@ -63,6 +63,16 @@ pub struct Config {
     /// Цель после уборки в токенах; 0 — 70% эффективного бюджета.
     #[serde(default)]
     pub context_target: u64,
+    /// Ступени давления в процентах бюджета: 50 и 75 — уборка просится дважды,
+    /// раньше и мягче, чем по единственному порогу. Пусто — одна ступень по
+    /// бюджету (прежнее поведение).
+    #[serde(default = "d_context_pressure_tiers")]
+    pub context_pressure_tiers: Vec<u64>,
+    /// Минимальное сжатие правки зеркала в токенах. Не задано — 1% бюджета, но
+    /// не меньше 2000: правка, которая ничего не сняла, — потерянный ход.
+    /// `0` отключает проверку совсем (принимается любая валидная правка).
+    #[serde(default)]
+    pub context_min_savings: Option<u64>,
     /// Сколько символов одного tool-результата доезжает до модели.
     #[serde(default = "d_max_chars")]
     pub max_result_chars: usize,
@@ -269,6 +279,10 @@ fn d_context_reserve() -> u64 {
 fn d_keep_results() -> usize {
     5
 }
+/// Ступени давления по умолчанию: уборка просится на 50% и на 75% бюджета.
+fn d_context_pressure_tiers() -> Vec<u64> {
+    vec![50, 75]
+}
 fn d_max_chars() -> usize {
     24_000
 }
@@ -462,6 +476,39 @@ impl Config {
             (u128::from(budget) * 7 / 10) as u64
         };
         target.min(budget)
+    }
+
+    /// Точки взвода давления в токенах по возрастанию. Проценты больше 100 или
+    /// нулевые отбрасываются: ступень выше бюджета не сработает никогда, а
+    /// нулевая требовала бы уборку на каждом ходу. Пустой список — одна ступень
+    /// по бюджету, как было до ступеней.
+    pub fn context_pressure_tiers(&self) -> Vec<u64> {
+        let budget = self.context_budget();
+        let mut tiers: Vec<u64> = self
+            .context_pressure_tiers
+            .iter()
+            .filter(|percent| **percent > 0 && **percent <= 100)
+            .map(|percent| (u128::from(budget) * u128::from(*percent) / 100) as u64)
+            .filter(|tier| *tier > 0)
+            .collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+        if tiers.is_empty() {
+            tiers.push(budget);
+        }
+        tiers
+    }
+
+    /// Минимальное сжатие правки зеркала. Ключа нет — 1% бюджета, но не меньше
+    /// 2000 токенов (на синтетических мелких бюджетах процент дал бы единицы
+    /// токенов и проверка выродилась бы в шум). `0` — проверку выключить:
+    /// принимается любая валидная правка.
+    pub fn context_min_savings(&self) -> u64 {
+        match self.context_min_savings {
+            Some(0) => 0,
+            Some(tokens) => tokens,
+            None => (u128::from(self.context_budget()) / 100).max(2000) as u64,
+        }
     }
 
     /// Активный профиль, если он есть и пригоден к работе. Непригодный профиль
@@ -698,11 +745,7 @@ impl Config {
                     check.active_provider.trim()
                 )
             };
-            return Err(format!(
-                "модель не применилась: в конфиге {}{hint}",
-                check.model
-            )
-            .into());
+            return Err(format!("модель не применилась: в конфиге {}{hint}", check.model).into());
         }
         Ok(path)
     }
@@ -715,7 +758,11 @@ impl Config {
     /// Правка одного ключа секции: `value` — готовая TOML-строка значения,
     /// разбираемая в документ (например `"always"` или `true`).
     pub fn set_section_key(&self, section: &str, key: &str, value: &str) -> R<PathBuf> {
-        self.set_keys(&[(Some(section.to_string()), key.to_string(), value.to_string())])
+        self.set_keys(&[(
+            Some(section.to_string()),
+            key.to_string(),
+            value.to_string(),
+        )])
     }
 
     /// Пачка правок: одна запись файла, поэтому пачка либо применяется целиком,
@@ -756,7 +803,9 @@ impl Config {
     /// действовал бы до перезапуска сервиса. Файла нет или он сломан — снимок
     /// старта: правка конфига под руками не должна ронять ход.
     pub fn memory_now(&self) -> Memory {
-        self.fresh().map(|f| f.memory).unwrap_or_else(|| self.memory.clone())
+        self.fresh()
+            .map(|f| f.memory)
+            .unwrap_or_else(|| self.memory.clone())
     }
 
     /// Конфиг на следующий ход: перечитанный из файла, но с моделями снимка
@@ -814,7 +863,9 @@ impl Config {
         if self.model_pinned {
             return self.model.clone();
         }
-        self.fresh().map(|f| f.model).unwrap_or_else(|| self.model.clone())
+        self.fresh()
+            .map(|f| f.model)
+            .unwrap_or_else(|| self.model.clone())
     }
 
     /// Сменить модель в файле и сразу применить её в этом процессе: без второго
@@ -873,12 +924,7 @@ impl Config {
     /// секрет берётся из /tmp/x/.env, а не из глобального каталога
     /// пользователя (иначе инстансы обмениваются чужими ключами).
     pub fn env_path(&self) -> PathBuf {
-        env_file::path_near(
-            &self
-                .source_path
-                .clone()
-                .unwrap_or_else(config_path),
-        )
+        env_file::path_near(&self.source_path.clone().unwrap_or_else(config_path))
     }
 }
 
@@ -904,10 +950,9 @@ mod tests {
         assert!(cfg.memory.retain);
 
         // Мастер-выключатель гасит канал даже с заданным cmd.
-        let cfg: Config = toml::from_str(
-            "[memory]\ncmd = \"memory\"\nenabled = false\nrecall = \"always\"\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            toml::from_str("[memory]\ncmd = \"memory\"\nenabled = false\nrecall = \"always\"\n")
+                .unwrap();
         assert_eq!(cfg.memory.recall, RecallMode::Always);
         assert!(cfg.memory_bin_for(&cfg.memory).is_none());
     }
@@ -1136,7 +1181,10 @@ mod tests {
         let err = cfg.set_model("other/model", None).unwrap_err().to_string();
         assert!(err.contains("nous"), "{err}");
         assert_eq!(
-            std::fs::read_to_string(&p).unwrap().matches("model = \"top\"").count(),
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .matches("model = \"top\"")
+                .count(),
             1,
             "файл всё-таки поправлен"
         );

@@ -22,6 +22,13 @@ pub struct Mirror {
     digest: String,
 }
 
+/// Отказ применения проверяется тестом на сбой записи журнала: ревизия не
+/// должна оставаться активной, если её не удалось дописать. Сбой привязан к id
+/// сессии, а не к глобальному флагу: иначе параллельные тесты перехватывали бы
+/// его друг у друга.
+#[cfg(test)]
+pub(crate) const FAIL_APPEND_SESSION: &str = "context-append-fails";
+
 /// FNV-1a64 of serialized *raw records*, not provider messages. Covers all
 /// records, including prior revisions. Format: `fnv64:0123456789abcdef`.
 fn digest(raw: &[Rec]) -> R<String> {
@@ -62,7 +69,65 @@ fn revision(raw: &[Rec]) -> R<Option<(Vec<Value>, usize)>> {
     Ok(None)
 }
 
+/// Ступени давления контекста. Пороги — в токенах по возрастанию; ступень
+/// взводится заново, когда потребление упало ниже самой низкой из них.
+pub struct Pressure {
+    tiers: Vec<u64>,
+    next: u64,
+}
 
+impl Pressure {
+    pub fn armed(tiers: Vec<u64>) -> Self {
+        let next = tiers.first().copied().unwrap_or_default();
+        Self { tiers, next }
+    }
+
+    /// После resume: сохранённый порог продолжает гистерезис, а не начинает
+    /// его заново — иначе напоминание повторялось бы на каждом ходу.
+    pub fn resumed(tiers: Vec<u64>, persisted: Option<u64>) -> Self {
+        let mut this = Self::armed(tiers);
+        if let Some(next) = persisted {
+            this.next = next;
+        }
+        this
+    }
+
+    /// Пересчёт ступеней от нового бюджета: взведённая точка едет за бюджетом,
+    /// уже пройденное не откатывается.
+    pub fn retune(&mut self, tiers: Vec<u64>) {
+        let was_armed = self.tiers.first() == Some(&self.next);
+        self.tiers = tiers;
+        if was_armed {
+            self.next = self.tiers.first().copied().unwrap_or_default();
+        }
+    }
+
+    /// Наблюдение за потреблением. `Some(порог)` — уборку просим, и вот какой
+    /// порог станет следующим; `None` — тишина.
+    pub fn observe(&mut self, approx: u64, budget: u64) -> Option<u64> {
+        let lowest = self.tiers.first().copied().unwrap_or(budget);
+        if approx < lowest {
+            // Потребление упало ниже нижней ступени — все ступени снова
+            // взведены: следующий рост опять получит требование.
+            self.next = lowest;
+            return None;
+        }
+        if approx < self.next {
+            return None;
+        }
+        // Следующая точка — ближайшая ступень выше текущего потребления, а когда
+        // ступени кончились — прирост на четверть бюджета: без этого модель
+        // получала бы требование каждый ход.
+        let growth = approx.saturating_add((budget / 4).max(1));
+        self.next = self
+            .tiers
+            .iter()
+            .copied()
+            .find(|tier| *tier > approx)
+            .unwrap_or(growth);
+        Some(self.next)
+    }
+}
 
 // Project the suffix WITH its raw prefix: preserves the original system,
 // replay framing and tail repair. A non-projecting revision is ignored by
@@ -164,23 +229,31 @@ impl Mirror {
     /// (тикет `context-commit-confirmation-loop`: до 7 лишних `ctx commit`
     /// подряд). Если в журнале уже есть принятая ревизия — говорим об этом
     /// прямо и с номером: подтверждать нечего, повтор ничего не изменит.
-    pub fn noop_outcome(sess: &Session) -> String {
-        let applied = sess.read().ok().and_then(|raw| {
-            raw.into_iter().rev().find_map(|r| match r {
-                Rec::ContextRevision { anchor, digest, .. } => Some(format!("{anchor}:{digest}")),
-                _ => None,
-            })
+    ///
+    /// Нечитаемый журнал — не «нечего применять», а сбой хода: тихое «unchanged»
+    /// скрыло бы от модели потерю состояния.
+    pub fn noop_outcome(sess: &Session) -> R<String> {
+        let raw = sess.read().map_err(|error| {
+            format!("context status unknown: журнал сессии не читается: {error}")
+        })?;
+        let applied = raw.into_iter().rev().find_map(|r| match r {
+            Rec::ContextRevision { anchor, digest, .. } => Some(format!("{anchor}:{digest}")),
+            _ => None,
         });
-        match applied {
+        Ok(match applied {
             Some(marker) => format!(
                 "context already applied: revision {marker} (принята, повторять commit не нужно)"
             ),
             None => "context unchanged: no edit to apply".to_string(),
-        }
+        })
     }
 
     /// Called only after all results of a turn. Rejections reset the mirror;
     /// persistence errors propagate and never activate an unpersisted revision.
+    ///
+    /// Порядок: подготовить и провалидировать правку, установить зеркало,
+    /// дописать ревизию. Сбой записи журнала откатывает зеркало к каноническому,
+    /// поэтому активная ревизия и зеркало не расходятся.
     pub fn apply(&mut self, sess: &Session, cfg: &Config) -> R<Option<String>> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -210,20 +283,68 @@ impl Mirror {
             Ok(messages) => messages,
             Err(error) => return self.reject(sess, cfg, &error.to_string()),
         };
-        // Anchor includes all current turn records. Their ordinary messages are
-        // already in messages; editor service pairs have deliberately vanished.
-        let before = project::estimate_tokens(&effective(&current, cfg)?);
-        let after = project::estimate_tokens(&messages);
+        // Тот же оценщик, что и у порога: иначе модель получала бы «сжатие» по
+        // наивной эвристике, а порог считался бы по токенам провайдера.
+        let before = project::calibrated_tokens(&current, &effective(&current, cfg)?);
+        let after = project::calibrated_tokens(&current, &messages);
+        let target = cfg.context_target();
+        let savings = before.saturating_sub(after);
+        let min = cfg.context_min_savings();
+        if savings < min {
+            let reason = format!(
+                "{}. нужно снять не меньше {min} токенов; до цели {target} не хватает {} токенов. \
+                 Крупнейшие блоки: {}. Сокращай или удаляй их в той же правке; вызов и результат \
+                 тула удаляй парой",
+                if after > before {
+                    format!("правка увеличила проекцию: было ~{before}, стало ~{after} токенов")
+                } else {
+                    format!(
+                        "правка сжала проекцию на {savings} токенов (было ~{before}, стало ~{after})"
+                    )
+                },
+                after.saturating_sub(target),
+                top_blocks(view, project::calibration(&current)),
+            );
+            return self.reject(sess, cfg, &reason);
+        }
         let marker = format!("{}:{}", current.len(), digest(&current)?);
-        sess.append(Rec::ContextRevision {
+        let revision = Rec::ContextRevision {
             ts: log::now(),
             anchor: current.len(),
             digest: digest(&current)?,
             messages,
-        })?;
+        };
+        // Зеркало ставим до записи журнала: если процесс упадёт между ними,
+        // каноническое зеркало просто переустановится на следующем ходу, а
+        // ревизии, которой не видно в зеркале, не возникнет. Сбой записи
+        // журнала откатывает зеркало к каноническому — ревизия и зеркало не
+        // расходятся.
+        self.install(&current, cfg, false)?;
+        #[cfg(test)]
+        let append_failed = sess.id() == FAIL_APPEND_SESSION;
+        #[cfg(not(test))]
+        let append_failed = false;
+        let appended = if append_failed {
+            Err("context revision append failed (test)".into())
+        } else {
+            sess.append(revision)
+        };
+        if let Err(error) = appended {
+            let rollback = self.install(&sess.read()?, cfg, false);
+            return match rollback {
+                Ok(_) => Err(error),
+                Err(nested) => Err(format!("{error}; зеркало не откатилось: {nested}").into()),
+            };
+        }
         self.install(&sess.read()?, cfg, false)?;
+        let remaining = after.saturating_sub(target);
         Ok(Some(format!(
-            "context applied: revision {marker}; tokens ~{before} -> ~{after}"
+            "context applied: revision {marker}; tokens ~{before} -> ~{after} (снято {savings}, цель {target}){}",
+            if remaining > 0 {
+                format!("; до цели осталось {remaining} токенов")
+            } else {
+                String::new()
+            }
         )))
     }
 
@@ -231,6 +352,25 @@ impl Mirror {
         self.install(&sess.read()?, cfg, false)?;
         Ok(Some(format!("context rejected: {reason}")))
     }
+}
+
+/// Топ-5 крупнейших блоков зеркала: механический ответ «что снимать» вместо
+/// «правка не понравилась». Размеры пересчитаны тем же множителем калибровки,
+/// что и `before`/`after`, иначе числа в отказе не сходились бы.
+fn top_blocks(view: &View, calibration: f64) -> String {
+    let mut sizes = view.block_sizes();
+    sizes.truncate(5);
+    if sizes.is_empty() {
+        return "нет блоков".to_string();
+    }
+    sizes
+        .into_iter()
+        .map(|(id, role, tokens)| {
+            let tokens = (tokens as f64 * calibration).round() as u64;
+            format!("{id} ({role}, ~{tokens} токенов)")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // A clean mirror from an older prefix is refreshed on resume; an edited
