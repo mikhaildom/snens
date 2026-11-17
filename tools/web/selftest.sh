@@ -21,10 +21,21 @@ has() {
 }
 
 BIN=$HERE/web
+# Запасной путь — бинарь из cargo target (target-dir может быть вынесен).
+if [ ! -x "$BIN" ]; then
+  REPO=$(cd "$HERE/../.." && pwd)
+  TD=${CARGO_TARGET_DIR:-}
+  [ -n "$TD" ] || TD=$(cd "$REPO" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | tr ',' '\n' | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$TD" ] && [ -x "$TD/debug/web" ] && BIN=$TD/debug/web
+fi
 [ -x "$BIN" ] || { echo "FAIL: нет бинарника $BIN — собери: snens build web"; exit 1; }
 [ -f "$HERE/schema.json" ] && ok "web: schema.json рядом с бинарником" || bad "web: нет schema.json"
-has '"x-snens"' "$(cat "$HERE/schema.json")" "web: в схеме есть ключ x-snens"
-has '"command"' "$(cat "$HERE/schema.json")" "web: схема объявляет command"
+# Читаем файл один раз: двойной cat в командной подстановке при пропавшем
+# schema.json давал два невнятных FAIL вместо одной причины.
+schema=$(cat "$HERE/schema.json" 2>/dev/null || true)
+has '"x-snens"' "$schema" "web: в схеме есть ключ x-snens"
+has '"command"' "$schema" "web: схема объявляет command"
 
 # t [args...] → $out, $err, $rc
 t() {
@@ -84,7 +95,13 @@ if [ -z "$CHROME" ]; then
   done
 fi
 if [ -z "$CHROME" ]; then
-  echo "skip: живые проверки — Chrome не найден (нет SNENS_CHROME и ~/.cache/ms-playwright)"
+  # Живые проверки — почти весь контракт (connect/open/snap/act/eval/text/shot).
+  # Зелёный прогон без них был бы ложью, поэтому пропуск только явный.
+  if [ "${WEB_SELFTEST_SKIP_LIVE:-0}" = 1 ]; then
+    echo "skip: живые проверки пропущены (WEB_SELFTEST_SKIP_LIVE=1)"
+  else
+    bad "web: Chrome не найден (нет SNENS_CHROME и ~/.cache/ms-playwright) — живые проверки не выполнены; пропустить явно: WEB_SELFTEST_SKIP_LIVE=1"
+  fi
 else
   PORT=$((9200 + $$ % 400))
   "$CHROME" --headless=new --remote-debugging-port=$PORT \
