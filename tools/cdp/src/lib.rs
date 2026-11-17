@@ -299,9 +299,18 @@ impl Cdp {
             .map_err(|e| format!("CDP send: {e}"))
     }
 
-    fn read_json(&mut self) -> Result<Value, String> {
+    /// Прочитать одно сообщение. `cap` — верхняя граница ожидания: бюджет
+    /// вызывающего (`wait_event`) должен соблюдаться, а не размываться глобальным
+    /// дедлайном запуска. Иначе ожидание события в 500 мс висело десятки секунд.
+    fn read_json_within(&mut self, cap: Option<Duration>) -> Result<Value, String> {
         loop {
-            let left = self.left()?;
+            let mut left = self.left()?;
+            if let Some(cap) = cap {
+                left = left.min(cap);
+            }
+            // Ноль не годится: сокет с нулевым таймаутом ведёт себя как неблокирующий
+            // и читает «нет данных» как ошибку.
+            left = left.max(Duration::from_millis(1));
             if let MaybeTlsStream::Plain(s) = self.ws.get_mut() {
                 let _ = s.set_read_timeout(Some(left));
             }
@@ -319,13 +328,21 @@ impl Cdp {
                 Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
                 Ok(Message::Close(_)) => return Err("CDP: Chrome закрыл соединение".into()),
                 Err(e) if is_timeout(&e) => {
-                    return Err(self.left().err().unwrap_or_else(|| {
-                        "CDP: Chrome не ответил (страница держит открытый поток?)".into()
-                    }))
+                    return Err(match (cap, self.left()) {
+                        // Свой бюджет истёк, а общий дедлайн ещё жив: это не сбой.
+                        (Some(_), Ok(_)) => "таймаут ожидания события".to_string(),
+                        (_, Err(e)) => e,
+                        _ => "CDP: Chrome не ответил (страница держит открытый поток?)".into(),
+                    })
                 }
                 Err(e) => return Err(format!("CDP: {e}")),
             }
         }
+    }
+
+    /// Прочитать одно сообщение в пределах общего дедлайна запуска.
+    fn read_json(&mut self) -> Result<Value, String> {
+        self.read_json_within(None)
     }
 
     /// Вызов метода. События по пути складываются в очередь, а не выбрасываются.
@@ -379,7 +396,13 @@ impl Cdp {
             if Instant::now() >= until {
                 return Ok(None);
             }
-            match self.read_json() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            // Ждём не дольше своего бюджета: иначе ответ на чужой запрос
+            // блокировал бы вызывающего на весь дедлайн запуска.
+            match self.read_json_within(Some(left)) {
                 Ok(v) if v.get("method").is_some() => {
                     let hit = method.is_empty()
                         || v.get("method").and_then(Value::as_str) == Some(method);
