@@ -80,8 +80,10 @@ fn fingerprint(s: &Snap) -> u64 {
 /// Снимок с ожиданием стабилизации. AX-дерево обновляется асинхронно: сразу
 /// после навигации Chrome ещё отдаёт дерево предыдущего документа при том, что
 /// `location.href` уже новый (наблюдали: после логина снимок показывал форму
-/// входа на странице товаров). Поэтому снимаем до трёх раз, пока не совпадут
-/// размер и набор ролей.
+/// входа на странице товаров). Поэтому снимаем до четырёх раз, пока не совпадут
+/// счётчики, URL и отпечаток дерева. Если стабилизация не наступила, отдаём
+/// последний снимок и говорим об этом в stderr: молча отдавать нестабильное
+/// дерево — значит подсунуть `act` чужие адреса.
 pub fn take_stable(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
     let mut prev: Option<(usize, usize, String, u64)> = None;
     let mut last: Option<Snap> = None;
@@ -102,27 +104,35 @@ pub fn take_stable(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
         prev = Some(sig);
         last = Some(s);
     }
+    eprintln!(
+        "внимание: дерево не стабилизировалось за 4 снимка — адреса могут быть от предыдущего рендера"
+    );
     Ok(last.unwrap_or_default())
 }
 
 pub fn take(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
-    let _ = cdp.call("Accessibility.enable", Value::Null);
+    // Отказ Accessibility.enable раньше давал пустое дерево, неотличимое от
+    // пустой страницы. Теперь это ошибка с причиной.
+    cdp.call("Accessibility.enable", Value::Null)
+        .map_err(|e| format!("CDP: Accessibility.enable не прошёл: {e}"))?;
     let r = cdp.call("Accessibility.getFullAXTree", Value::Null)?;
-    let nodes = r
+    // Ссылка на массив, без глубокой копии: nodes — это 500–600 КБ на снимок,
+    // и копия делалась до четырёх раз за `take_stable`.
+    let nodes: &[Value] = r
         .get("nodes")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
 
     let mut by_id: HashMap<String, &Value> = HashMap::new();
-    for n in &nodes {
+    for n in nodes {
         if let Some(id) = n.get("nodeId").and_then(Value::as_str) {
             by_id.insert(id.to_string(), n);
         }
     }
     // Корни — узлы, на которые никто не ссылается как на ребёнка.
     let mut claimed: HashMap<&str, ()> = HashMap::new();
-    for n in &nodes {
+    for n in nodes {
         for c in n
             .get("childIds")
             .and_then(Value::as_array)
@@ -150,7 +160,7 @@ pub fn take(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
         .unwrap_or_default();
 
     let mut counter = 0usize;
-    for n in &nodes {
+    for n in nodes {
         let id = n.get("nodeId").and_then(Value::as_str).unwrap_or("");
         if claimed.contains_key(id) || id.is_empty() {
             continue;

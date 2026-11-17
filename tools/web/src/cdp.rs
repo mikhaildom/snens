@@ -103,6 +103,16 @@ pub fn http_get_host(
         }
     }
     let h = head_end.ok_or_else(|| format!("{addr}{path}: не HTTP-ответ"))?;
+    // Оборванное тело не выдаём за целое: обрезанный `/json/list` давал либо
+    // «не JSON», либо, хуже, неполный список вкладок под видом полного.
+    if let Some(w) = want {
+        if buf.len() < h + w {
+            return Err(format!(
+                "{addr}{path}: тело оборвано ({} из {w} Б)",
+                buf.len() - h
+            ));
+        }
+    }
     Ok(String::from_utf8_lossy(&buf[h..]).to_string())
 }
 
@@ -250,7 +260,14 @@ impl Cdp {
         timeout_s: f64,
         host_header: Option<&str>,
     ) -> Result<Self, String> {
-        let budget = Duration::from_secs_f64(timeout_s.max(1.0));
+        // from_secs_f64 паникует на NaN/inf, а Instant + Duration — на переполнении:
+        // `--timeout inf` из CLI не должен ронять процесс.
+        let secs = if timeout_s.is_finite() {
+            timeout_s.clamp(1.0, 3600.0)
+        } else {
+            1.0
+        };
+        let budget = Duration::from_secs_f64(secs);
         let deadline = Instant::now() + budget;
         // Таймаут ставим ДО рукопожатия: `tungstenite::connect` делает TCP-connect
         // и WebSocket-handshake без таймаута вовсе, и мёртвый (blackhole) туннель
@@ -410,9 +427,12 @@ impl Cdp {
     pub fn wait_ready(&mut self, budget: Duration) -> Result<(), String> {
         let until = Instant::now() + budget;
         loop {
-            let state = self
-                .eval("document.readyState")
-                .unwrap_or(Value::String(String::new()));
+            let state = match self.eval("document.readyState") {
+                Ok(v) => v,
+                // Мёртвое соединение/закрытая вкладка — не «страница ещё грузится»:
+                // иначе вызывающий узнает об этом позже и не там.
+                Err(e) => return Err(format!("CDP: страница не отвечает: {e}")),
+            };
             if state.as_str() == Some("complete") {
                 return Ok(());
             }

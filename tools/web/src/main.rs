@@ -187,7 +187,7 @@ fn endpoint(args: &Args) -> Endpoint {
         match tunnel::start(host, port_from(args)) {
             Ok(t) => {
                 let mut ep = t.endpoint();
-                ep.browser_path = tunnel::remote_browser_path(host, ep.port);
+                ep.browser_path = tunnel::remote_browser_path(host, ep.port, ep.remote_port);
                 return ep;
             }
             Err(e) => {
@@ -222,7 +222,7 @@ fn endpoint(args: &Args) -> Endpoint {
         // с тем Chrome.
         if !explicit_port || t.remote_port == port_from(args) {
             let mut ep = t.endpoint();
-            ep.browser_path = tunnel::remote_browser_path(&t.host, ep.port);
+            ep.browser_path = tunnel::remote_browser_path(&t.host, ep.port, ep.remote_port);
             return ep;
         }
     }

@@ -102,6 +102,11 @@ pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
     // Отвязать от терминала: туннель должен переживать наш процесс, иначе
     // следующий вызов останется без соединения.
     #[cfg(unix)]
+    // SAFETY: pre_exec исполняется в форкнутом ребёнке до exec, где допустимы
+    // только async-signal-safe операции. `setsid(2)` такая и есть (ни аллокаций,
+    // ни блокировок, ни логирования — не добавлять!). Возврат игнорируем
+    // осознанно: своя сессия нужна лишь для живучести туннеля, а при EPERM
+    // процесс всё равно запускается.
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
@@ -142,16 +147,40 @@ pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
         remote_port,
         pid,
     };
-    state::save_tunnel(&t)?;
+    // Если состояние не сохранилось, туннель остался бы сиротой без pid-файла:
+    // следующий `start` поднял бы второй. Гасим и забираем ребёнка.
+    if let Err(e) = state::save_tunnel(&t) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
     Ok(t)
 }
 
 pub fn stop(t: &Tunnel) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill").arg(t.pid.to_string()).status();
+        // PID мог быть переиспользован: перед сигналом убеждаемся, что это наш ssh.
+        if owns(t.pid, &t.host) {
+            let _ = Command::new("kill").arg(t.pid.to_string()).status();
+        }
     }
     state::clear_tunnel();
+}
+
+/// Наш ли это ssh-процесс: командная строка должна содержать и порт-форвард
+/// (`-L`), и адрес машины. На Linux читаем /proc, иначе доверяем pid.
+#[cfg(unix)]
+fn owns(pid: u32, host: &str) -> bool {
+    let path = format!("/proc/{pid}/cmdline");
+    match std::fs::read(&path) {
+        Ok(raw) => {
+            let cmd = String::from_utf8_lossy(&raw).replace('\0', " ");
+            cmd.contains("ssh") && cmd.contains(host) && cmd.contains("-L")
+        }
+        // /proc нет (macOS): проверить нечем, ведём себя как раньше.
+        Err(_) => true,
+    }
 }
 
 /// Порт локального конца отвечает? Именно «порт открыт», без запроса к CDP:
@@ -169,11 +198,17 @@ fn is_open(port: u16) -> bool {
 /// Что сказал Chrome на той стороне: порт отладки и ws-путь браузера.
 /// В режиме одобрения (Chrome 144+) HTTP-эндпоинтов `/json/*` нет, но файл
 /// `DevToolsActivePort` в каталоге профиля есть всегда — из него и берём путь.
-pub fn remote_browser_path(host: &str, local_port: u16) -> Option<String> {
+pub fn remote_browser_path(host: &str, local_port: u16, remote_port: u16) -> Option<String> {
     // Сначала обычный путь: /json/version (старые сборки и отдельные профили).
-    if let Ok(raw) =
-        crate::cdp::http_get_host("127.0.0.1", local_port, "127.0.0.1", "/json/version")
-    {
+    // Host — с портом той стороны: Chrome сверяет его со своим и на чужой
+    // отвечает 403, из-за чего быстрый путь молча не работал.
+    let host_header = format!("127.0.0.1:{remote_port}");
+    if let Ok(raw) = crate::cdp::http_get_host(
+        "127.0.0.1",
+        local_port,
+        &host_header,
+        "/json/version",
+    ) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(u) = v.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
                 if let Some(i) = u.find("/devtools/") {
