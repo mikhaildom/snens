@@ -5,10 +5,15 @@ use crate::die;
 pub const USAGE: &str =
     "fetch <url> [--raw] [--fallback auto|never|always] [--save путь] [--max-chars N] [--timeout S]";
 
-pub const HELP: &str = "\
-fetch — прочитать веб-страницу как markdown.
-fetch <url> [--raw] [--fallback auto|never|always] [--save путь] [--max-chars N] [--timeout S]
+/// Хелп собирается из `USAGE`, а не повторяет его: два списка флагов в одном
+/// файле всегда расходятся, и `--help` начинает врать о контракте.
+pub fn help() -> String {
+    format!("{HEAD}\n{USAGE}\n\n{BODY}")
+}
 
+const HEAD: &str = "fetch — прочитать веб-страницу как markdown.";
+
+const BODY: &str = "\
 Свой путь: GET с браузерным User-Agent, очистка DOM (script/nav/header/footer/…),
 <main>/<article> в приоритете, затем markdown. Не-html (pdf и бинарь) сливается в файл.
 

@@ -8,7 +8,7 @@ mod net;
 use std::io::Read;
 use std::process::exit;
 
-use cli::{Args, HELP, USAGE};
+use cli::{Args, USAGE};
 
 /// Лимит тела для текста: страница длиннее — уже не для контекста, а бомба по памяти.
 const MAX_BODY: u64 = 2 * 1024 * 1024;
@@ -27,7 +27,7 @@ fn die(msg: &str, code: i32) -> ! {
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if !argv.is_empty() && (argv[0] == "-h" || argv[0] == "--help") {
-        println!("{HELP}");
+        println!("{}", cli::help());
         exit(0);
     }
     if argv.is_empty() {

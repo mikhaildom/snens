@@ -102,18 +102,26 @@ fn squeeze_table_padding(md: &str) -> String {
     // Внутри фенса — код как есть: ASCII-таблица в примере не таблица markdown,
     // и выравнивание там трогать нельзя.
     let mut fenced = false;
+    // Разделитель шапки — только вторая строка таблицы (сразу за строкой ячеек):
+    // иначе `| - | - |` в данных молча превратилось бы в выравнивание.
+    let mut prev_is_row = false;
     md.lines()
         .map(|line| {
             if line.trim_start().starts_with("```") {
                 fenced = !fenced;
+                prev_is_row = false;
                 return line.to_string();
             }
             if fenced || !line.starts_with('|') {
+                prev_is_row = false;
                 return line.to_string();
             }
+            let was_row = prev_is_row;
+            prev_is_row = !(line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+                && line.contains('-'));
             // Строка-разделитель шапки состоит из „|“, „-“, „:“ и пробелов: длину
             // дефисов markdown не значит, а в инфобоксе она растянута на весь текст.
-            if line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) && line.contains('-') {
+            if was_row && !prev_is_row {
                 return line
                     .split('|')
                     .map(|cell| {
@@ -226,6 +234,15 @@ mod tests {
         );
         assert!(out.contains("| --- | ---: |"), "разделитель не сжат: {out}");
         assert!(out.contains("абзац  с  двойным"), "абзац тронут: {out}");
+    }
+
+    #[test]
+    fn data_row_of_dashes_is_not_a_separator() {
+        // `| - | - |` в данных — это данные, а не выравнивание: разделитель бывает
+        // только второй строкой таблицы.
+        let md = "| a | b |\n| - | - |\n| - | - |";
+        let out = squeeze_table_padding(md);
+        assert!(out.ends_with("| - | - |"), "строка данных переписана: {out}");
     }
 
     #[test]
