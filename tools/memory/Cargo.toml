@@ -6,6 +6,9 @@ description = "Долгая память агента: один бинарь, о
 license = "MIT"
 repository = "https://git.svuvi.ch/svuvich/snens-memory"
 readme = "README.md"
+# Копия отдельного репозитория snens-memory: публикация отсюда не должна
+# уезжать под тем же именем в crates.io.
+publish = false
 
 [[bin]]
 name = "memory"

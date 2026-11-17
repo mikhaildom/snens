@@ -54,7 +54,13 @@ fn main() {
     let path = path.unwrap_or_else(|| die("audit: не указан лог".into()));
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| die(format!("audit: {path}: {e}")));
-    print!("{}", render(&analyze(&path, &text), huge));
+    let out = render(&analyze(&path, &text), huge);
+    // print! паникует на EPIPE (`audit log | head`) и на полном диске: нужен
+    // штатный отказ, как у остальных ошибок тула.
+    use std::io::Write;
+    if let Err(e) = std::io::stdout().lock().write_all(out.as_bytes()) {
+        die(format!("audit: запись в stdout: {e}"));
+    }
 }
 
 struct Row {
@@ -64,8 +70,9 @@ struct Row {
     cmd: String,
     /// ключ повтора: полное содержимое вызова, без обрезки
     key: String,
-    exit: i32,
-    bytes: usize,
+    /// `None` — в записи нет поля exit (не «провал»): формат лога не типизирован.
+    exit: Option<i32>,
+    bytes: u64,
     ms: u64,
 }
 
@@ -81,6 +88,8 @@ struct Report {
     cost_micro: u64,
     elided: usize,
     freed_bytes: usize,
+    /// Вызовы без результата (лог оборван или процесс снят).
+    unpaired: usize,
 }
 
 /// Разбор сырой строки аргументов от модели в пару (человекочитаемый `cmd`,
@@ -129,6 +138,9 @@ fn cmd_of(raw: &str) -> (String, String) {
                 let t = format!("  ⇐ {} Б на stdin", stdin.len());
                 full.push_str(&t);
                 shown.push_str(&t);
+                // Размер — не ключ: два разных скрипта одной длины иначе
+                // схлопывались бы в ложный duplicate. Берём сами байты.
+                full.push_str(stdin);
             }
         }
     }
@@ -156,6 +168,7 @@ fn analyze(path: &str, text: &str) -> Report {
         cost_micro: 0,
         elided: 0,
         freed_bytes: 0,
+        unpaired: 0,
     };
     // Вызовы текущего хода: результат приходит отдельной записью и знает только call_id.
     let mut pending: Vec<(String, String, String, String)> = Vec::new();
@@ -220,8 +233,10 @@ fn analyze(path: &str, text: &str) -> Report {
                     tool,
                     cmd,
                     key,
-                    exit: v.get("exit").and_then(Value::as_i64).unwrap_or(-1) as i32,
-                    bytes: v.get("bytes").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    exit: v.get("exit").and_then(Value::as_i64).map(|e| e as i32),
+                    // u64 как есть: `as usize` на 32-битной цели обрезал бы размер,
+                    // и гигабайтная выдача не попала бы в «huge».
+                    bytes: v.get("bytes").and_then(Value::as_u64).unwrap_or(0),
                     ms: v.get("ms").and_then(Value::as_u64).unwrap_or(0),
                 });
             }
@@ -238,6 +253,20 @@ fn analyze(path: &str, text: &str) -> Report {
             _ => {}
         }
     }
+    // Вызовы без результата не выбрасываем: обрыв лога (падение, kill) иначе
+    // выглядел бы как «всё хорошо» — ровно то, от чего предупреждает шапка файла.
+    for (_, name, cmd, _) in pending {
+        r.rows.push(Row {
+            turn: r.turns,
+            tool: name,
+            cmd,
+            key: String::new(),
+            exit: None,
+            bytes: 0,
+            ms: 0,
+        });
+        r.unpaired += 1;
+    }
     r
 }
 
@@ -245,19 +274,24 @@ fn analyze(path: &str, text: &str) -> Report {
 /// и не было повторено. Всё выводится из лога — никакой модели здесь нет.
 fn suspects(rows: &[Row], huge: usize) -> Vec<String> {
     let mut out = Vec::new();
-    // ponytail: линейный поиск по ключу, лог на тысячи строк ещё не тот случай
-    let mut groups: Vec<((&str, &str), Vec<usize>)> = Vec::new();
+    // Группировка по ключу — через HashMap и один проход: линейный поиск на
+    // каждом ряду давал квадрат на логах в тысячи строк.
+    let mut by_key: std::collections::HashMap<(&str, &str), Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut order: Vec<(&str, &str)> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         // Ключ повтора — полное содержимое вызова (r.key), а не обрезанное для
         // печати r.cmd: иначе две разные правки с общим префиксом old_string
         // дают ложный duplicate.
         let key = (r.tool.as_str(), r.key.as_str());
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, list)) => list.push(i),
-            None => groups.push((key, vec![i])),
+        if !by_key.contains_key(&key) {
+            order.push(key);
         }
+        by_key.entry(key).or_default().push(i);
     }
-    for ((tool, cmd), idx) in &groups {
+    for key in &order {
+        let idx = &by_key[key];
+        let (tool, cmd) = *key;
         if idx.len() >= 2 {
             let turns: Vec<String> = idx.iter().map(|i| rows[*i].turn.to_string()).collect();
             let what = format!("{tool}  {}", clip(cmd, CMD_WIDTH));
@@ -276,7 +310,8 @@ fn suspects(rows: &[Row], huge: usize) -> Vec<String> {
             }
         }
     }
-    for r in rows.iter().filter(|r| r.bytes > huge) {
+    let huge64 = huge as u64;
+    for r in rows.iter().filter(|r| r.bytes > huge64) {
         out.push(format!(
             "huge             {} Б (> {huge})  ход {}  {}  {}",
             r.bytes,
@@ -286,17 +321,19 @@ fn suspects(rows: &[Row], huge: usize) -> Vec<String> {
         ));
     }
     for (i, r) in rows.iter().enumerate() {
-        if r.exit == 0 {
+        // Только явный провал: отсутствие поля exit — не «упало».
+        let Some(code) = r.exit else { continue };
+        if code == 0 {
             continue;
         }
         let retried_ok = rows
             .iter()
             .skip(i + 1)
-            .any(|n| n.exit == 0 && n.tool == r.tool && n.key == r.key);
+            .any(|n| n.exit == Some(0) && n.tool == r.tool && n.key == r.key);
         if !retried_ok {
             out.push(format!(
                 "failed-abandoned exit={:<4} ход {}  {}  {}",
-                r.exit,
+                code,
                 r.turn,
                 r.tool,
                 clip(&r.cmd, CMD_WIDTH)
@@ -308,7 +345,11 @@ fn suspects(rows: &[Row], huge: usize) -> Vec<String> {
 
 fn render(r: &Report, huge: usize) -> String {
     let mut s = String::new();
-    let error_rows = r.rows.iter().filter(|x| x.exit != 0).count();
+    let error_rows = r
+        .rows
+        .iter()
+        .filter(|x| matches!(x.exit, Some(c) if c != 0))
+        .count();
     s.push_str(&format!(
         "лог: {} — записей {}, ходов {}, вызовов {}, с ошибкой {}",
         r.path,
@@ -317,6 +358,13 @@ fn render(r: &Report, huge: usize) -> String {
         r.rows.len(),
         error_rows
     ));
+    if r.unpaired > 0 {
+        // Вызовы без результата: лог оборван или процесс снят — молчать нельзя.
+        s.push_str(&format!(
+            ", без результата {} (лог оборван?)",
+            r.unpaired
+        ));
+    }
     if r.broken > 0 {
         s.push_str(&format!(", битых строк {}", r.broken));
     }
@@ -348,14 +396,23 @@ fn render(r: &Report, huge: usize) -> String {
         .max()
         .unwrap_or(0);
     for (n, row) in r.rows.iter().enumerate() {
-        let flag = if row.exit != 0 { "!" } else { " " };
+        // Без поля exit — не провал: помечаем отдельным знаком.
+        let flag = match row.exit {
+            None => "?",
+            Some(0) => " ",
+            Some(_) => "!",
+        };
+        let exit = match row.exit {
+            None => "—".to_string(),
+            Some(c) => c.to_string(),
+        };
         s.push_str(&format!(
             "{:>3}.{flag} ход {:<3} {:<8} {:<w$}  exit={:<4} {:>8} Б {:>6} мс\n",
             n + 1,
             row.turn,
             row.tool,
             clip(&row.cmd, CMD_WIDTH),
-            row.exit,
+            exit,
             row.bytes,
             row.ms
         ));
