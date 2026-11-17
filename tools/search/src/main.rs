@@ -65,9 +65,11 @@ fn parse(argv: &[String]) -> Args {
     while i < argv.len() {
         let a = argv[i].as_str();
         let value = |what: &str| -> String {
-            argv.get(i + 1)
-                .cloned()
-                .unwrap_or_else(|| die(2, format!("search: {what} без значения\n{USAGE}")))
+            match argv.get(i + 1) {
+                // Следующий флаг — не значение: `--lang --json` иначе съедал --json.
+                Some(v) if !v.starts_with("--") => v.clone(),
+                _ => die(2, format!("search: {what} без значения\n{USAGE}")),
+            }
         };
         match a {
             "--n" => {
@@ -159,17 +161,43 @@ struct File {
 
 /// env → файл → дефолт. Раскладка та же, что у конфига харнесса и memory.
 fn base_url() -> String {
+    // Значение из env нормализуем: пробелы по краям давали URL с пробелом внутри,
+    // а reqwest такой отвергает с непонятной ошибкой.
     let env = std::env::var("SEARXNG_URL")
         .ok()
-        .filter(|v| !v.trim().is_empty());
-    let file: File = std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|t| toml::from_str(&t).ok())
-        .unwrap_or_default();
-    env.or(file.url)
-        .unwrap_or_else(|| "http://127.0.0.1:8888".into())
-        .trim_end_matches('/')
-        .to_string()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let file = read_file();
+    // Пустой `url = ""` в конфиге — не адрес: иначе запрос шёл бы на `/search`.
+    let pick = env
+        .or(file.url.map(|u| u.trim().to_string()))
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8888".into());
+    pick.trim_end_matches('/').to_string()
+}
+
+/// Разбор `search.toml`. Ошибку не глотаем: опечатка в конфиге иначе неотличима
+/// от отсутствия файла, и запрос молча уходил бы на дефолтный инстанс.
+fn read_file() -> File {
+    let path = config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return File::default(),
+        Err(e) => {
+            eprintln!("search: {}: {e} — беру адрес по умолчанию", path.display());
+            return File::default();
+        }
+    };
+    match toml::from_str(&text) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "search: {} не разобран: {e} — беру адрес по умолчанию",
+                path.display()
+            );
+            File::default()
+        }
+    }
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -186,8 +214,14 @@ fn config_path() -> std::path::PathBuf {
 }
 
 /// Обрезка сниппета по символам, а не байтам — иначе рвётся внутри UTF-8.
+/// Управляющие символы и ESC-последовательности выкидываем: заголовок страницы
+/// приходит из интернета и может перекрасить терминал или подделать строку вывода.
 fn clip(s: &str, max: usize) -> String {
-    let s = s.trim();
+    let clean: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let s = clean.trim();
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -217,11 +251,13 @@ struct Answer {
     results: Vec<Hit>,
     // Движки, которые отвалились (429/CAPTCHA/timeout). Без этого поля «ничего
     // не найдено» не отличить от «движки как раз упали» — а они падают регулярно.
+    // Форма поля в разных версиях SearXNG разная: пары [engine, reason] или просто
+    // имена. Строгий тип валил весь разбор и превращал рабочий ответ в «не JSON».
     #[serde(default)]
-    unresponsive_engines: Vec<(String, String)>,
+    unresponsive_engines: Vec<Value>,
 }
 
-type SearchResults = (usize, Vec<Value>, Vec<(String, String)>);
+type SearchResults = (usize, Vec<Value>, Vec<String>);
 
 fn fetch(base: &str, a: &Args) -> Result<SearchResults, String> {
     let mut q = a.query.clone();
@@ -276,7 +312,20 @@ fn fetch(base: &str, a: &Args) -> Result<SearchResults, String> {
             })
         })
         .collect();
-    Ok((total, results, ans.unresponsive_engines))
+    // Приводим обе формы к строке «engine (reason)».
+    let dead: Vec<String> = ans
+        .unresponsive_engines
+        .iter()
+        .map(|v| match v {
+            Value::Array(a) => {
+                let name = a.first().and_then(Value::as_str).unwrap_or("?");
+                let why = a.get(1).and_then(Value::as_str).unwrap_or("причина не сказана");
+                format!("{name} ({why})")
+            }
+            other => other.as_str().unwrap_or("?").to_string(),
+        })
+        .collect();
+    Ok((total, results, dead))
 }
 
 fn main() {
@@ -295,10 +344,7 @@ fn main() {
         Ok(v) => v,
         Err(e) => die(1, e),
     };
-    let dead: Vec<String> = unresponsive
-        .iter()
-        .map(|(e, w)| format!("{e} ({w})"))
-        .collect();
+    let dead: Vec<String> = unresponsive;
 
     if a.json {
         println!(
@@ -405,6 +451,16 @@ mod tests {
         let ans: Answer = serde_json::from_str(raw).unwrap();
         assert!(ans.results.is_empty());
         assert_eq!(ans.unresponsive_engines.len(), 2);
-        assert_eq!(ans.unresponsive_engines[0].0, "brave");
+        assert_eq!(ans.unresponsive_engines[0][0].as_str(), Some("brave"));
+    }
+
+    #[test]
+    fn flat_unresponsive_engines_do_not_break_the_parse() {
+        // Старые версии отдают просто имена: раньше это был «не JSON» и пустой ответ.
+        let raw = r#"{"query":"x","results":[{"title":"t","url":"u","content":"c"}],
+            "unresponsive_engines":["brave"]}"#;
+        let ans: Answer = serde_json::from_str(raw).unwrap();
+        assert_eq!(ans.results.len(), 1);
+        assert_eq!(ans.unresponsive_engines.len(), 1);
     }
 }
