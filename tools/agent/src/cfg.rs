@@ -22,32 +22,58 @@ struct File {
     sessions_dir: String,
 }
 
+/// Домашний каталог. Пустой `HOME` (бывает в systemd-юнитах и контейнерах) раньше
+/// схлопывался в `""`, и умолчания превращались в пути от корня файловой
+/// системы: `/.local/share/snens/mail`.
+fn home_dir() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// Развернуть `~` только в начале пути.
+///
+/// `str::replace('~', …)` менял **каждый** тильду: `/srv/~backup/mail` становился
+/// `/srv//home/user/backup/mail`, а при пустом `HOME` — относительным путём.
+fn expand(configured: &str, home: &str, fallback: &str) -> String {
+    if configured.is_empty() {
+        return fallback.replace("{home}", home);
+    }
+    match configured.strip_prefix('~') {
+        Some("") => home.to_string(),
+        Some(rest) if rest.starts_with('/') || rest.starts_with('\\') => {
+            format!("{home}{rest}")
+        }
+        _ => configured.to_string(),
+    }
+}
+
 impl Cfg {
     pub fn load() -> Cfg {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_default();
-        let f: File = std::env::var("SNENS_CONFIG")
+        let home = home_dir();
+        let config_path = std::env::var("SNENS_CONFIG")
             .ok()
-            .or_else(|| Some(format!("{home}/.config/snens/config.toml")))
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default();
-        let mail = std::env::var("SNENS_MAIL_DIR").unwrap_or_else(|_| {
-            if f.mail_dir.is_empty() {
-                format!("{home}/.local/share/snens/mail")
-            } else {
-                f.mail_dir.replace('~', &home)
-            }
-        });
+            .unwrap_or_else(|| format!("{home}/.config/snens/config.toml"));
+        let f: File = match std::fs::read_to_string(&config_path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(file) => file,
+                // Молчаливые дефолты уводили ящик в чужой каталог: опечатка в
+                // ключе или битый TOML выглядели как «всё настроено по-старому».
+                Err(error) => {
+                    eprintln!("agent: {config_path} не разобран ({error}) — беру умолчания");
+                    File::default()
+                }
+            },
+            Err(_) => File::default(),
+        };
+        let mail = std::env::var("SNENS_MAIL_DIR")
+            .unwrap_or_else(|_| expand(&f.mail_dir, &home, "{home}/.local/share/snens/mail"));
         // SNENS_SESSIONS_DIR — чтобы status/wait можно было проверять на копии логов
         // и смотреть чужие инстансы, не трогая свой config.toml.
         let sessions = std::env::var("SNENS_SESSIONS_DIR").unwrap_or_else(|_| {
-            if f.sessions_dir.is_empty() {
-                format!("{home}/.local/share/snens/sessions")
-            } else {
-                f.sessions_dir.replace('~', &home)
-            }
+            expand(&f.sessions_dir, &home, "{home}/.local/share/snens/sessions")
         });
         Cfg {
             mail_dir: PathBuf::from(mail),

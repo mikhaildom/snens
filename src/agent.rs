@@ -105,6 +105,11 @@ pub struct SurfaceRunOptions<'a> {
     pub surface: Option<&'a str>,
     pub surface_tools: Vec<Value>,
     pub tool_tx: Option<tokio::sync::mpsc::UnboundedSender<SurfaceToolRequest>>,
+    /// Кто-то разбудит сессию по входящему (ящик, фоновое задание): поверхность
+    /// или TUI. Тогда цикл не держится живым ради детей — он заканчивается, а
+    /// итог ребёнка поднимает новый ход. Без будильника (одноразовый `snens run`)
+    /// ждём детей сами, иначе их итог было бы некому прочитать.
+    pub wake: bool,
 }
 
 pub struct SurfaceToolRequest {
@@ -148,6 +153,7 @@ impl Default for SurfaceRunOptions<'static> {
             surface: None,
             surface_tools: Vec::new(),
             tool_tx: None,
+            wake: false,
         }
     }
 }
@@ -194,6 +200,7 @@ async fn run_loop<L: Llm>(
         surface,
         surface_tools,
         tool_tx,
+        wake,
     } = options;
     // Промпт сессии фиксируется в логе один раз и дальше читается оттуда: файлы
     // инстанса (soul/user/memory, скиллы) правятся по ходу, и пересборка на каждом
@@ -450,9 +457,11 @@ async fn run_loop<L: Llm>(
         if reply.calls.is_empty() {
             memory::retain_turn(sess, cfg, &path, &reply.text).await;
             // Подагенты: пока есть живые дети, не выходим — ждём их вопросы и
-            // итоги. Иначе вопрос ребёнка родителю никто не прочитает и он уедет
-            // в таймаут. Это supervisor вокруг цикла, а не вызов инструмента.
-            if supervisor(sess, cfg, ui, queued.as_ref()).await {
+            // итоги. Но только там, где нет будильника: если сессию разбудит
+            // входящее (поверхность, TUI), ход заканчивается сразу, а итог
+            // ребёнка поднимет новый. Иначе выход держится лишние минуты, и слово
+            // человека стоит в очереди.
+            if !wake && supervisor(sess, cfg, ui, queued.as_ref()).await {
                 continue;
             }
             if let Some(rx) = queued.as_ref() {

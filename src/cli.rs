@@ -33,6 +33,8 @@ mod selftest;
 mod sesscwd;
 mod settings;
 mod subagent;
+mod jobs;
+mod wake;
 mod sweep;
 mod surface_artifact;
 mod surface_client;
@@ -106,6 +108,9 @@ async fn legacy_main() -> R<()> {
         // Внутренние подкоманды, которые сам себя спавнит харнесс (run --detach
         // и agent start). Человеку звать их не нужно — только через `run`/`agent`.
         Some("run-child") => cmd_run_child(&flags).await,
+        // Исполнитель фонового задания: отдельный процесс, чей результат вернётся
+        // в сессию уведомлением (`run --background`). Человеку звать не нужно.
+        Some("job-run") => cmd_job_run(&flags).await,
         Some("steer") => cmd_steer(&flags, positional),
         Some("agents") => cmd_agents(&flags),
         Some("result") => cmd_result(&flags, positional),
@@ -277,6 +282,22 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
     // раньше запроса, и карточка висела «работает» до перезагрузки окна.
     reporter.finish().await;
     res
+}
+
+/// Исполнитель фонового задания (`run --background`). Задание приходит файлом:
+/// команда, рабочий каталог, таймаут. Результат — файлы `done` рядом с логом,
+/// заберёт будильник сессии (`surface_wake`). Родитель этот процесс не ждёт.
+async fn cmd_job_run(flags: &BTreeMap<String, String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let path = flags
+        .get("job")
+        .ok_or("job-run: нужен --job <файл>")?;
+    let job: jobs::Job = serde_json::from_slice(&std::fs::read(path)?)?;
+    let done = jobs::run_job(&job, &cfg.shell, cfg.max_process_chars).await?;
+    // `done` кладётся рядом с записью задания: будильник ищет его там (`jobs::done`).
+    let done_path = std::path::Path::new(path).with_extension("done");
+    std::fs::write(&done_path, serde_json::to_vec(&done)?)?;
+    Ok(())
 }
 
 /// Текст со stdin, если не задан позиционно.

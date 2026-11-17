@@ -261,6 +261,7 @@ pub(super) async fn launch(
                 surface: Some(&surface),
                 surface_tools,
                 tool_tx: Some(tool_tx),
+                wake: true,
             },
         )
         .await;

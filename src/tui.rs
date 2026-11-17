@@ -56,7 +56,27 @@ pub async fn cmd(flags: &BTreeMap<String, String>) -> R<()> {
     ui.line("не знаешь, умеет ли он то, что надо, — спроси его самого");
 
     loop {
-        let Some(msg) = rx.recv().await else { break };
+        // Ввод не единственный источник хода: пока человек молчит, в ящик может
+        // лечь результат подагента или фонового задания (`run --background`).
+        // Тогда ход запускается сам — ждать чужого слова незачем.
+        let msg = match idle_input(&mut rx, &cfg, &id).await {
+            Input::Wake(text) => {
+                sess.append(log::Rec::User {
+                    ts: log::now(),
+                    text,
+                    source: "wake".into(),
+                    parts: Vec::new(),
+                    ask: None,
+                })?;
+                ui.line("вернулась работа: ход без вопроса");
+                match run_turn(&sess, &cfg, &llm, &ui, &mut rx, &id).await? {
+                    Flow::Next => continue,
+                    Flow::Quit => break,
+                }
+            }
+            Input::Msg(msg) => msg,
+        };
+        let Some(msg) = msg else { break };
         let line = match msg {
             In::Eof => break,
             In::Interrupt => {
@@ -144,6 +164,38 @@ enum Flow {
     Quit,
 }
 
+/// Что пришло, пока ход спал.
+enum Input {
+    Msg(Option<In>),
+    /// Результат подагента или фонового задания: ход без вопроса.
+    Wake(String),
+}
+
+/// Ждать ввода человека и одновременно следить за ящиком и заданиями: долгая
+/// работа не держит цикл, её результат приходит сюда.
+async fn idle_input(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<In>,
+    cfg: &Config,
+    id: &str,
+) -> Input {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(2000));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            msg = rx.recv() => return Input::Msg(msg),
+            _ = tick.tick() => {
+                if !crate::wake::has_pending(cfg, id) {
+                    continue;
+                }
+                let inbox = crate::wake::collect(cfg, id);
+                if !inbox.is_empty() {
+                    return Input::Wake(inbox.as_turn());
+                }
+            }
+        }
+    }
+}
+
 /// Ход агента с живым вводом. Пока future цикла выполняется, канал ввода не
 /// простаивает: каждая строка становится steer'ом в ящике сессии. Инжект делает
 /// сам цикл на ближайшей границе хода (после текущего шага).
@@ -155,7 +207,13 @@ async fn run_turn(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<In>,
     id: &str,
 ) -> R<Flow> {
-    let mut turn = Box::pin(agent::run_agent(sess, cfg, llm, ui));
+    // TUI сам следит за ящиком (`idle_input`), поэтому цикл не держится живым
+    // ради детей: итог ребёнка запустит следующий ход отсюда же.
+    let options = agent::SurfaceRunOptions {
+        wake: true,
+        ..Default::default()
+    };
+    let mut turn = Box::pin(agent::run_agent_surface(sess, cfg, llm, ui, options));
     loop {
         tokio::select! {
             r = &mut turn => {
