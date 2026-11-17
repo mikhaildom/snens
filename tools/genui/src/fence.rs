@@ -128,27 +128,101 @@ pub fn parse(text: &str) -> Vec<Artifact> {
 /// контракта (`docs/artifact.md`) и дублируется в клиенте намеренно: клиент
 /// обязан отказать, даже если проверку обошли.
 pub fn is_private_host(host: &str) -> bool {
-    let h = host.trim().to_ascii_lowercase();
+    // Порт в `net=` не должен влиять на проверку: `localhost:8080` — тот же
+    // localhost, и одним двоеточием документированный запрет не обойти.
+    let h = strip_port(host.trim()).to_ascii_lowercase();
+    // Финальная точка — каноничное DNS-имя: `localhost.` — тот же localhost.
+    let h = h.trim_end_matches('.');
     if h.is_empty() {
         return true;
     }
-    if h == "localhost" || h == "::1" || h == "[::1]" {
+    if h == "localhost" || h.ends_with(".local") || h.ends_with(".localhost") {
         return true;
     }
-    if h.ends_with(".local") || h.ends_with(".localhost") {
-        return true;
+    // Браузер разворачивает сокращённые/целочисленные IPv4 (`127.1`,
+    // `2130706433`, `0x7f.0.0.1`) в обычный адрес — значит, и мы обязаны.
+    if let Some(n) = ipv4_loose(h) {
+        return private_v4(n);
     }
-    let parts: Vec<&str> = h.split('.').collect();
-    if parts.len() != 4 {
-        return false;
+    // IPv6-литерал: `::1`, ULA `fc00::/7`, link-local `fe80::/10`,
+    // IPv4-mapped `::ffff:10.0.0.1` — всё это локальная сеть того же браузера.
+    if let Some(v6) = ipv6_literal(h) {
+        return private_v6(v6);
     }
-    let mut n = [0u32; 4];
-    for (i, p) in parts.iter().enumerate() {
-        match p.parse::<u32>() {
-            Ok(v) if v <= 255 => n[i] = v,
-            _ => return false,
+    false
+}
+
+/// Снять порт и обрамляющие скобки у IPv6-литерала.
+fn strip_port(host: &str) -> String {
+    if let Some(rest) = host.strip_prefix('[') {
+        // `[::1]:8080` и `[::1]`
+        return match rest.split_once(']') {
+            Some((addr, _)) => format!("[{addr}]"),
+            None => host.to_string(),
+        };
+    }
+    match host.rsplit_once(':') {
+        // Больше одного двоеточия — это IPv6 без скобок, порта там нет.
+        Some((head, port)) if !head.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
+            head.to_string()
+        }
+        _ => host.to_string(),
+    }
+}
+
+/// IPv4 в любой из форм, которые понимает `inet_aton`: 1–4 части, десятичные,
+/// восьмеричные (`0177`) и шестнадцатеричные (`0x7f`) числа.
+fn ipv4_loose(s: &str) -> Option<[u8; 4]> {
+    if let Ok(v4) = s.parse::<std::net::Ipv4Addr>() {
+        return Some(v4.octets());
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut nums = Vec::with_capacity(parts.len());
+    for p in &parts {
+        if p.is_empty() {
+            return None;
+        }
+        nums.push(parse_int_part(p)?);
+    }
+    let last = *nums.last()?;
+    let lead = &nums[..nums.len() - 1];
+    for n in lead {
+        if *n > 255 {
+            return None;
         }
     }
+    // Хвост занимает все оставшиеся байты: `127.1` = 127.0.0.1.
+    let rest = 4 - lead.len() as u32;
+    if last >= 1u64 << (8 * rest) {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    for (i, n) in lead.iter().enumerate() {
+        out[i] = *n as u8;
+    }
+    for i in 0..rest {
+        out[lead.len() + i as usize] = ((last >> (8 * (rest - 1 - i))) & 0xff) as u8;
+    }
+    Some(out)
+}
+
+/// Число в форме inet_aton: `0x..` — hex, ведущий `0` — восьмеричное, иначе десятичное.
+fn parse_int_part(p: &str) -> Option<u64> {
+    let (radix, digits) = match p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+        Some(d) => (16, d),
+        None if p.len() > 1 && p.starts_with('0') => (8, &p[1..]),
+        None => (10, p),
+    };
+    if digits.is_empty() {
+        return Some(0);
+    }
+    u64::from_str_radix(digits, radix).ok()
+}
+
+fn private_v4(n: [u8; 4]) -> bool {
     let (a, b) = (n[0], n[1]);
     a == 127
         || a == 10
@@ -156,6 +230,28 @@ pub fn is_private_host(host: &str) -> bool {
         || (a == 192 && b == 168)
         || (a == 172 && (16..=31).contains(&b))
         || (a == 169 && b == 254)
+        // CGNAT 100.64.0.0/10 — тоже «внутренняя» сеть, браузер в неё попадает.
+        || (a == 100 && (64..=127).contains(&b))
+}
+
+fn ipv6_literal(h: &str) -> Option<std::net::Ipv6Addr> {
+    let s = h.strip_prefix('[').unwrap_or(h).strip_suffix(']').unwrap_or(h);
+    s.parse::<std::net::Ipv6Addr>().ok()
+}
+
+fn private_v6(v6: std::net::Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    if v6.is_loopback() || v6.is_unspecified() {
+        return true;
+    }
+    // IPv4-mapped `::ffff:a.b.c.d` — это адрес той же машины в другой нотации.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return private_v4(v4.octets());
+    }
+    // ULA fc00::/7, link-local fe80::/10, site-local (устаревший) fec0::/10.
+    (seg[0] & 0xfe00) == 0xfc00
+        || (seg[0] & 0xffc0) == 0xfe80
+        || (seg[0] & 0xffc0) == 0xfec0
 }
 
 #[cfg(test)]
@@ -221,6 +317,56 @@ mod tests {
         }
         assert!(!is_private_host("api.example.com"));
         assert!(!is_private_host("172.32.0.1"));
+    }
+
+    #[test]
+    fn private_host_with_port_is_still_private() {
+        for h in [
+            "localhost:8080",
+            "127.0.0.1:80",
+            "10.0.0.1:443",
+            "[::1]:8080",
+            "192.168.1.1:3000",
+        ] {
+            assert!(is_private_host(h), "{h}");
+        }
+        assert!(!is_private_host("api.example.com:443"));
+    }
+
+    #[test]
+    fn non_canonical_ipv4_forms_are_private() {
+        for h in [
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "127.0.0.1.",
+            "localhost.",
+            "0.0.0.0",
+            "100.64.1.1",
+        ] {
+            assert!(is_private_host(h), "{h}");
+        }
+        assert!(!is_private_host("8.8.8.8"));
+        assert!(!is_private_host("example.com."));
+    }
+
+    #[test]
+    fn ipv6_local_ranges_are_private() {
+        for h in [
+            "::1",
+            "[::1]",
+            "fd00::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "::ffff:127.0.0.1",
+            "[::ffff:10.0.0.1]",
+            "::",
+        ] {
+            assert!(is_private_host(h), "{h}");
+        }
+        assert!(!is_private_host("2001:4860:4860::8888"));
     }
 
     #[test]

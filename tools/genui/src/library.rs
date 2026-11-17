@@ -110,12 +110,13 @@ pub fn hash(files: &[File]) -> String {
 }
 
 /// Скелет компонента: то, с чего начинается новый файл в `components/`.
+/// Тег и класс выводятся из того же slug, что и имя файла: `my-Poll Card` —
+/// невалидное имя кастомного элемента, а `class 3dCard` — синтаксическая ошибка.
 pub fn skeleton(name: &str) -> String {
-    let tag = if name.starts_with("my-") {
-        name.to_string()
-    } else {
-        format!("my-{name}")
-    };
+    let slug = file_name(name);
+    let slug = slug.trim_end_matches(".js");
+    let tag = format!("my-{slug}");
+    let cls = pascal(slug);
     format!(
         r#"// <{tag}> — что это и когда использовать.
 //
@@ -143,8 +144,7 @@ class {cls} extends HTMLElement {{
   }}
 }}
 customElements.define("{tag}", {cls});
-"#,
-        cls = pascal(name)
+"#
     )
 }
 
@@ -156,6 +156,10 @@ fn pascal(name: &str) -> String {
             out.push(first.to_ascii_uppercase());
             out.extend(chars);
         }
+    }
+    // Имя класса не может начинаться с цифры: `3d-card` → `C3dCard`.
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, 'C');
     }
     if out.is_empty() {
         "Component".into()
@@ -222,6 +226,20 @@ mod tests {
         let src = skeleton("quiz");
         assert!(src.contains("customElements.define(\"my-quiz\""));
         assert!(src.contains("class Quiz extends HTMLElement"));
+    }
+
+    #[test]
+    fn skeleton_tag_and_class_follow_the_file_slug() {
+        // Имя человеческое: файл — poll-card.js, тег — my-poll-card, класс —
+        // PollCard. Раньше тег получался «my-Poll Card» (невалидное имя).
+        let src = skeleton("Poll Card");
+        assert!(src.contains("customElements.define(\"my-poll-card\""), "{src}");
+        assert!(src.contains("class PollCard extends HTMLElement"), "{src}");
+        assert_eq!(file_name("Poll Card"), "poll-card.js");
+        // Ведущая цифра: класс не может начинаться с неё.
+        let src = skeleton("3d-card");
+        assert!(src.contains("class C3dCard extends HTMLElement"), "{src}");
+        assert!(src.contains("customElements.define(\"my-3d-card\""), "{src}");
     }
 
     #[test]

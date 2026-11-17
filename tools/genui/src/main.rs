@@ -84,7 +84,9 @@ fn parse(argv: &[String]) -> Args {
                         a.timeout = v.parse().unwrap_or_else(|_| {
                             die(&format!("genui: --timeout ждёт число, получено {v}"), 2)
                         });
-                        if a.timeout <= 0.0 || a.timeout > 600.0 {
+                        // is_finite: `"NaN".parse::<f64>()` успешен, оба сравнения
+                        // для NaN ложны, а Duration::from_secs_f64 на NaN паникует.
+                        if !a.timeout.is_finite() || a.timeout <= 0.0 || a.timeout > 600.0 {
                             die(&format!("genui: --timeout вне 0..600 с: {v}"), 2);
                         }
                     }
@@ -361,9 +363,23 @@ fn cmd_check(a: &Args) -> Result<i32, String> {
 
     let mut degraded = false;
     if !a.no_browser {
+        // --data объявлен в справке и схеме: молча его игнорировать — врать о
+        // контракте. Читаем и разбираем здесь, ошибку показываем как есть.
+        let data = match &a.data {
+            Some(p) => {
+                let text = std::fs::read_to_string(p)
+                    .map_err(|e| format!("--data {}: {e}", p.display()))?;
+                Some(
+                    serde_json::from_str::<serde_json::Value>(&text)
+                        .map_err(|e| format!("--data {}: не JSON: {e}", p.display()))?,
+                )
+            }
+            None => None,
+        };
         match check::check_in_browser(
             &art,
             &files,
+            data.as_ref(),
             a.chrome.as_deref(),
             a.out_dir.as_deref(),
             a.timeout,

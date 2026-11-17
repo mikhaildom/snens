@@ -442,7 +442,13 @@ fn inject(doc: &str, what: &str, html: &str) -> String {
 }
 
 /// Документ целиком — как его собирает клиент (`composeDocument`).
-pub fn compose(art: &Artifact, lib: &[library::File]) -> String {
+/// Собрать документ проверки. `data` уезжает в `snens.data` артефакта:
+/// `--data файл.json` иначе молча игнорировался.
+pub fn compose_with(
+    art: &Artifact,
+    lib: &[library::File],
+    data: Option<&serde_json::Value>,
+) -> String {
     let meta = format!(
         r#"<meta http-equiv="Content-Security-Policy" content="{}">"#,
         csp(art)
@@ -465,7 +471,20 @@ font-size:13px;line-height:1.45}body{padding:10px 12px;overflow:hidden}</style>"
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let boot = format!("{SHIM}{scripts}");
+    // Данные кладём отдельным скриптом после шима: шим объявляет `data:null`,
+    // и присваивание обязано идти после него. JSON-строка экранирует кавычки,
+    // но не `</` — закрывающий тег внутри значений сломал бы документ.
+    let data_script = match data {
+        Some(v) => {
+            let json = serde_json::to_string(v).unwrap_or_else(|_| "null".into());
+            format!(
+                "<script>window.snens.data=JSON.parse({});</script>",
+                serde_json::to_string(&json).unwrap_or_else(|_| "\"null\"".into())
+            )
+        }
+        None => String::new(),
+    };
+    let boot = format!("{SHIM}{data_script}{scripts}");
     if art.body.to_ascii_lowercase().contains("<html") {
         let doc = inject(&art.body, "head", &format!("{meta}{theme}"));
         return inject(&doc, "start", &boot);
@@ -477,8 +496,22 @@ font-size:13px;line-height:1.45}body{padding:10px 12px;overflow:hidden}</style>"
     )
 }
 
+/// Экранировать закрывающий тег скрипта, в том числе в верхнем регистре и с
+/// пробелом/табом после имени: HTML закрывает тег без учёта регистра и допускает
+/// `</script >`. Иначе содержимое библиотеки обрывает наш `<script data-genui>`
+/// и всё после него становится разметкой документа.
 fn escape_close(s: &str) -> String {
-    s.replace("</script", "<\\/script")
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find("</script") {
+        let at = i + pos;
+        out.push_str(&s[i..at + 1]);
+        out.push_str("\\/script");
+        i = at + "</script".len();
+    }
+    out.push_str(&s[i..]);
+    out
 }
 
 /// Страница-хост: артефакт живёт в iframe, как у клиента — только так проверка
@@ -520,12 +553,13 @@ document.body.appendChild(f);\
 pub fn check_in_browser(
     art: &Artifact,
     lib: &[library::File],
+    data: Option<&serde_json::Value>,
     chrome: Option<&str>,
     out_dir: Option<&Path>,
     timeout_s: f64,
 ) -> Result<Report, String> {
     let mut report = Report::default();
-    let doc = compose(art, lib);
+    let doc = compose_with(art, lib, data);
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_s);
     let mut br = cdp::open(chrome, deadline, timeout_s, out_dir, "genui")?;
     br.set_viewport(1000, 900)?;
