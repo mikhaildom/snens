@@ -17,6 +17,7 @@ use super::{
     pairing,
     commands::{message, stop, tool_result},
     events::{events, history, ingest, session_updates},
+    fork::fork,
     files::{session_file, upload_attachment},
     http::{AuthCtx, auth},
     query::{context_breakdown, search},
@@ -50,6 +51,8 @@ pub(super) fn app(state: Arc<Runtime>, token: String) -> Router {
         .route("/v1/sessions", get(list).post(create))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/sessions/{id}/messages", post(message))
+        // Ответвление: новая сессия с журналом этой до выбранного ответа.
+        .route("/v1/sessions/{id}/fork", post(fork))
         .route(
             "/v1/sessions/{id}/tools",
             axum::routing::put(register_tools),
