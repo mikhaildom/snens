@@ -80,22 +80,83 @@ pub fn read() -> Result<Vec<File>, String> {
 pub fn tags(files: &[File]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for f in files {
-        let mut rest = f.source.as_str();
+        // Комментарии и строки не должны давать фантомных тегов: пример вызова
+        // `customElements.define(...)` в документации — не регистрация.
+        let code = strip_comments(&f.source);
+        let mut rest = code.as_str();
         while let Some(pos) = rest.find("customElements.define(") {
             let after = &rest[pos + "customElements.define(".len()..];
             let after = after.trim_start();
-            let (quote, after) = match after.chars().next() {
-                Some(c @ ('"' | '\'')) => (Some(c), &after[1..]),
-                _ => (None, after),
+            // Кавычка обязательна: `define(myVar, …)` — не строковый тег.
+            let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                rest = after;
+                continue;
             };
-            let _ = quote;
-            let end = after.find(['"', '\'', ')', ',']).unwrap_or(after.len());
-            let tag = after[..end].trim().to_ascii_lowercase();
-            if !tag.is_empty() && !out.contains(&tag) {
+            let body = &after[1..];
+            let end = body.find(quote).unwrap_or(body.len());
+            let tag = body[..end].trim().to_ascii_lowercase();
+            if !tag.is_empty() && valid_tag(&tag) && !out.contains(&tag) {
                 out.push(tag);
             }
-            rest = &after[end..];
+            rest = &body[end..];
         }
+    }
+    out
+}
+
+fn valid_tag(t: &str) -> bool {
+    t.contains('-')
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Исходник без комментариев: пример вызова в документации — не регистрация тега.
+/// Строки не трогаем: имя тега само живёт в строковом литерале.
+fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        // Строчный комментарий.
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Блочный комментарий.
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            out.push(' ');
+            continue;
+        }
+        // Строка или шаблон: копируем целиком, чтобы не спутать `//` внутри неё
+        // с комментарием.
+        if c == b'"' || c == b'\'' || c == b'`' {
+            let quote = c;
+            out.push(quote as char);
+            i += 1;
+            while i < b.len() && b[i] != quote {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    out.push(b[i] as char);
+                    i += 1;
+                }
+                out.push(b[i] as char);
+                i += 1;
+            }
+            if i < b.len() {
+                out.push(quote as char);
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
     }
     out
 }
@@ -237,6 +298,18 @@ mod tests {
             source: "customElements.define('my-quiz', class extends HTMLElement{});".into(),
         }];
         assert_eq!(tags(&files), vec!["my-quiz".to_string()]);
+    }
+
+    #[test]
+    fn commented_define_is_not_a_tag() {
+        let files = vec![File {
+            name: "components/doc.js".into(),
+            source: "// customElements.define('my-ghost', class {});\n\
+                     /* customElements.define('my-ghost2', class {}); */\n\
+                     customElements.define(\"my-real\", class extends HTMLElement{});"
+                .into(),
+        }];
+        assert_eq!(tags(&files), vec!["my-real".to_string()]);
     }
 
     #[test]
