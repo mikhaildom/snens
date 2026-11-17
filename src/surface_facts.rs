@@ -121,12 +121,19 @@ pub fn progress_uncached(path: &Path) -> Progress {
     }
 }
 
-/// Ключ кэша: путь, mtime (сек) и размер файла.
-type FactsKey = (PathBuf, u64, u64);
+/// Ключ кэша: путь, mtime (наносекунды) и размер файла.
+///
+/// Секундной точности не хватало: правка в ту же секунду с тем же размером
+/// (или ФС с гранулярностью 1 с — FAT, сетевые монтирования) оставляла в кэше
+/// устаревшие факты навсегда.
+type FactsKey = (PathBuf, u128, u64);
+
+/// Потолок записей кэша: при переполнении кэш чистится целиком (факты
+/// пересчитываются лениво, а память важнее).
+const CACHE_LIMIT: usize = 4096;
 
 fn cache() -> &'static Mutex<HashMap<FactsKey, Facts>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<FactsKey, Facts>>> =
-        std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<FactsKey, Facts>>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -138,7 +145,7 @@ pub fn facts(path: &Path, want_progress: bool) -> Facts {
         .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let key = (path.to_path_buf(), mtime, size);
@@ -152,11 +159,18 @@ pub fn facts(path: &Path, want_progress: bool) -> Facts {
     }
     let mut value = read_facts(path, want_progress);
     if let Ok(mut guard) = cache().lock() {
+        // Прогресс прошлой версии забираем ДО чистки: `retain` убирает и сам
+        // `key`, поэтому поиск после него всегда давал `None`, и «перенести
+        // посчитанные ходы» было мёртвым кодом.
+        let prev = guard.get(&key).and_then(|hit| hit.progress.clone());
         // Старые версии того же пути не нужны: под одним путём живёт один файл,
         // и держать его историю по mtime — значит копить копии фактов.
         guard.retain(|(p, _, _), _| p != path);
-        if let Some(prev) = guard.get(&key) {
-            value.progress = value.progress.or(prev.progress.clone());
+        value.progress = value.progress.or(prev);
+        // Удалённые сессии иначе остаются в кэше навсегда: у кэша нет другого
+        // вытеснения. Потолок грубый, но память перестаёт расти бесконечно.
+        if guard.len() >= CACHE_LIMIT {
+            guard.clear();
         }
         guard.insert(key, value.clone());
     }
@@ -165,7 +179,16 @@ pub fn facts(path: &Path, want_progress: bool) -> Facts {
 
 fn read_facts(path: &Path, want_progress: bool) -> Facts {
     let mut out = Facts::default();
-    let head = crate::log::read_head_bytes(path, HEAD_BYTES).unwrap_or_default();
+    // Ошибку чтения головы не глотаем в «пустые факты»: иначе транзиентный сбой
+    // (или файл, которого ещё нет) кэшировался бы под валидным ключом, и сессия
+    // висела бы пустой в списке до следующей правки журнала.
+    let head = crate::log::read_head_bytes(path, HEAD_BYTES).unwrap_or_else(|error| {
+        eprintln!(
+            "[snens] факты сессии {}: голова не прочитана: {error}",
+            path.display()
+        );
+        Vec::new()
+    });
     for rec in &head {
         match rec {
             crate::log::Rec::Meta {
@@ -181,11 +204,13 @@ fn read_facts(path: &Path, want_progress: bool) -> Facts {
                 if let Some(s) = surface.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     out.surface.get_or_insert_with(|| s.to_string());
                 }
-                if let Some(p) = Some(parent.trim()).filter(|p| !p.is_empty()) {
-                    out.parent.get_or_insert_with(|| p.to_string());
+                let parent = parent.trim();
+                if !parent.is_empty() {
+                    out.parent.get_or_insert_with(|| parent.to_string());
                 }
-                if let Some(m) = Some(model.trim()).filter(|m| !m.is_empty()) {
-                    out.model.get_or_insert_with(|| m.to_string());
+                let model = model.trim();
+                if !model.is_empty() {
+                    out.model.get_or_insert_with(|| model.to_string());
                 }
             }
             crate::log::Rec::User { .. } | crate::log::Rec::Steer { .. } => {
@@ -220,6 +245,10 @@ fn head_has_dialogue(path: &Path) -> bool {
         return false;
     };
     let mut buf = vec![0u8; 64 * 1024];
+    // Совпадение ищем только в начале строки: иначе текст ассистента или
+    // `tool_result`, где журнальный формат просто упомянут (фикстуры, тесты,
+    // примеры в чате), делал бы из огрызка «сессию с диалогом».
+    let mut at_line_start = true;
     loop {
         let Ok(n) = file.read(&mut buf) else {
             return false;
@@ -228,12 +257,37 @@ fn head_has_dialogue(path: &Path) -> bool {
             return false;
         }
         let chunk = &buf[..n];
-        if PREFIXES.iter().any(|p| {
-            chunk
-                .windows(p.len())
-                .any(|window| window == *p)
-        }) {
-            return true;
+        for (i, byte) in chunk.iter().enumerate() {
+            if !at_line_start {
+                // Переходы строки внутри куска тоже считаются началом строки.
+                if *byte == b'\n' {
+                    at_line_start = true;
+                }
+                continue;
+            }
+            // Начало строки: проверяем каждый префикс по месту. Хвост, который
+            // не влез в кусок, досматривает следующий проход по этому же
+            // смещению — поэтому позиция начала строки переживает границу.
+            for prefix in PREFIXES {
+                let end = i + prefix.len();
+                if end <= chunk.len() {
+                    if &chunk[i..end] == prefix {
+                        return true;
+                    }
+                } else if prefix.starts_with(&chunk[i..]) {
+                    // Префикс разрезан границей куска: читаем следующий кусок
+                    // с этого же места, не теряя совпадение.
+                    let rest = prefix.len() - (chunk.len() - i);
+                    let mut tail = vec![0u8; rest];
+                    let read = file.read(&mut tail).unwrap_or(0);
+                    if read == rest && tail == prefix[(prefix.len() - rest)..] {
+                        return true;
+                    }
+                    // Не совпало — продолжаем с того, что прочли.
+                    return false;
+                }
+            }
+            at_line_start = false;
         }
     }
 }
@@ -308,14 +362,60 @@ mod tests {
         let filler = "x".repeat(200);
         let mut body = String::new();
         for i in 0..2000 {
-            body.push_str(&format!("{{\"kind\":\"assistant\",\"ts\":{i},\"text\":\"{filler}\"}}\n"));
+            body.push_str(&format!(
+                "{{\"kind\":\"assistant\",\"ts\":{i},\"text\":\"{filler}\"}}\n"
+            ));
         }
         body.push_str("{\"kind\":\"user\",\"ts\":9999,\"text\":\"далеко\"}\n");
-        body.push_str("{\"kind\":\"usage\",\"ts\":10000,\"model\":\"m/late\",\"in_tok\":1,\"out_tok\":1}\n");
+        body.push_str(
+            "{\"kind\":\"usage\",\"ts\":10000,\"model\":\"m/late\",\"in_tok\":1,\"out_tok\":1}\n",
+        );
         std::fs::write(&path, body).unwrap();
         let f = facts(&path, false);
         assert!(f.has_dialogue, "реплика дальше головы не найдена");
-        assert_eq!(f.model.as_deref(), Some("m/late"), "модель из хвоста не найдена");
+        assert_eq!(
+            f.model.as_deref(),
+            Some("m/late"),
+            "модель из хвоста не найдена"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dialogue_prefix_is_matched_only_at_line_start_and_across_chunks() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.jsonl");
+        // Формат журнала упомянут внутри JSON-строки ассистента: это не реплика
+        // человека, и сессия-огрызок не должна попадать в список.
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"kind\":\"meta\",\"ts\":1,\"model\":\"\"}\n",
+                "{\"kind\":\"assistant\",\"ts\":2,\"text\":\"пример записи: {\\\"kind\\\":\\\"user\\\"}\"}\n"
+            ),
+        )
+        .unwrap();
+        assert!(
+            !head_has_dialogue(&path),
+            "упоминание в тексте — не реплика"
+        );
+
+        // Та же реплика ровно на стыке 64-килобайтных кусков: префикс разрезан
+        // границей, но должен быть найден.
+        let mut text = String::new();
+        while text.len() + 44 < 64 * 1024 {
+            text.push_str("{\"kind\":\"system\",\"ts\":1,\"text\":\"шум\"}\n");
+        }
+        // Добиваем до стыка пустыми строками (каждая — начало строки), чтобы
+        // префикс реплики лёг ровно на границу куска.
+        let target = 64 * 1024 - 6;
+        while text.len() < target {
+            text.push('\n');
+        }
+        text.push_str("{\"kind\":\"user\",\"ts\":2,\"text\":\"привет\"}\n");
+        std::fs::write(&path, &text).unwrap();
+        assert!(head_has_dialogue(&path), "префикс на стыке кусков потерян");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -326,7 +426,17 @@ mod tests {
         let path = dir.join("c.jsonl");
         std::fs::write(&path, "{\"kind\":\"user\",\"ts\":1,\"text\":\"a\"}\n").unwrap();
         assert!(facts(&path, false).has_dialogue);
-        std::fs::write(&path, "{\"kind\":\"assistant\",\"ts\":1,\"text\":\"b\"}\n").unwrap();
+        // Одинаковая длина — ключ изменится только по mtime, и на ФС с секундной
+        // гранулярностью две записи подряд дали бы тот же ключ. Отодвигаем mtime
+        // явно, чтобы тест проверял инвалидацию, а не удачу таймера.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::write(&path, "{\"kind\":\"assistant\",\"text\":\"b\"}").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
         // Файл изменился — кэш обязан пересчитать, а не отдать прежний ответ.
         assert!(!facts(&path, false).has_dialogue);
         std::fs::remove_dir_all(&dir).ok();

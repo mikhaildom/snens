@@ -11,9 +11,9 @@
 // библиотеку всегда), а формат — три каталога и два расширения.
 
 use crate::surface_runtime::Runtime;
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use crate::surface_server::http::err;
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use std::sync::Arc;
-
 
 /// Каталог библиотеки: `SNENS_GENUI_DIR`, иначе `<данные>/genui`.
 fn dir() -> std::path::PathBuf {
@@ -32,8 +32,17 @@ fn dir() -> std::path::PathBuf {
 }
 
 fn read_file(path: &std::path::Path, name: &str) -> Option<serde_json::Value> {
-    let source = std::fs::read_to_string(path).ok()?;
-    Some(serde_json::json!({"name": name, "source": source}))
+    // Отсутствие файла — норма (библиотеку могли не наполнять), а ошибка чтения —
+    // нет: раньше и то и другое давало `None`, и клиент кэшировал библиотеку
+    // с молча пропавшим компонентом (хеш переставал меняться).
+    match std::fs::read_to_string(path) {
+        Ok(source) => Some(serde_json::json!({"name": name, "source": source})),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            eprintln!("[snens] genui: {} не прочитан: {error}", path.display());
+            None
+        }
+    }
 }
 
 /// Содержимое библиотеки: `lib.js`, потом компоненты по алфавиту. Порядок важен:
@@ -84,9 +93,16 @@ fn hash(files: &[serde_json::Value]) -> String {
 }
 
 pub(super) async fn get(State(_s): State<Arc<Runtime>>) -> impl IntoResponse {
-    // Ошибки не отдаём: пустая библиотека — нормальное состояние (её ещё не
-    // наполняли), и клиент просто нарисует артефакты без компонентов.
-    let files = files();
+    // Чтение библиотеки — блокирующее (`read_dir` + чтение всех компонентов): не
+    // на async-воркере, иначе весь рантайм стоит на время обхода.
+    let collected = tokio::task::spawn_blocking(files).await;
+    let files = match collected {
+        Ok(files) => files,
+        Err(e) => {
+            return err("storage", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response();
+        }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -114,9 +130,29 @@ mod tests {
     fn missing_dir_gives_empty_list() {
         // Каталога нет — пустой список, а не ошибка: клиент рисует артефакты
         // без компонентов.
+        //
+        // Переменная общая для процесса: ставим под мьютексом (чтобы не
+        // пересечься с другими тестами) и возвращаем прежнее значение на любом
+        // выходе — `Drop` отработает и при панике в `assert`.
+        struct EnvGuard {
+            prev: Option<String>,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.prev.take() {
+                    Some(prev) => std::env::set_var("SNENS_GENUI_DIR", prev),
+                    None => std::env::remove_var("SNENS_GENUI_DIR"),
+                }
+            }
+        }
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = EnvGuard {
+            prev: std::env::var("SNENS_GENUI_DIR").ok(),
+            _lock: lock,
+        };
         std::env::set_var("SNENS_GENUI_DIR", "/nonexistent-genui-dir");
         assert!(files().is_empty());
-        // Переменную убираем: она общая для процесса и портит соседние тесты.
-        std::env::remove_var("SNENS_GENUI_DIR");
     }
 }
