@@ -10,6 +10,10 @@
     "depth": {"type": "integer", "description": "Для snap: максимальная глубина дерева (дефолт 30)"},
     "out": {"type": "string", "description": "Для shot: путь к PNG (дефолт — канал вложений или каталог состояния)"},
     "port": {"type": "integer", "description": "Порт CDP (дефолт 9222 или порт из состояния connect)"},
+    "visible": {"type": "boolean", "description": "Для launch: поднять Chrome в сессии пользователя, с видимым окном"},
+    "full": {"type": "boolean", "description": "Для snap: дерево без ограничения глубины (весь документ)"},
+    "new": {"type": "boolean", "description": "Для open: открыть в новой вкладке"},
+    "all": {"type": "boolean", "description": "Для tabs: показать и чужие вкладки, не только наши"},
     "host": {"type": "string", "description": "Машина пользователя для ssh: та же команда выполняется там (там тоже должен стоять web). Пример: user@machine"},
     "profile": {"type": "string", "description": "Для launch: каталог профиля Chrome на той машине (по умолчанию ~/.snens-chrome). Отдельный профиль = отладка без подтверждений"},
     "tunnel": {"type": "string", "description": "Машина пользователя для ssh-туннеля к её Chrome: на той стороне web ставить не нужно, только Chrome с включённым тумблером в chrome://inspect/#remote-debugging. Пример: user@machine. Дальше все команды идут через туннель"}
@@ -29,7 +33,11 @@
       {"flag": "--limit", "field": "limit"},
       {"flag": "--depth", "field": "depth"},
       {"flag": "--out", "field": "out"},
-      {"flag": "--port", "field": "port"}
+      {"flag": "--port", "field": "port"},
+      {"flag": "--visible", "when_field": "visible"},
+      {"flag": "--full", "when_field": "full"},
+      {"flag": "--new", "when_field": "new"},
+      {"flag": "--all", "when_field": "all"}
     ],
     "stdin": {"mode": "none"}
   }

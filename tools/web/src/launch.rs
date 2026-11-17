@@ -148,7 +148,7 @@ pub fn ours_on_port(host: &str, port: u16) -> Result<bool, String> {
         let out = ssh(
             host,
             format!(
-                "sh -c 'for p in $(pgrep -f \"remote-debugging-port={port}\"); do tr \"\\0\" \" \" < /proc/$p/cmdline | grep -q snens-chrome && echo ours && exit; done; echo no'"
+                "sh -c 'for p in $(pgrep -f \"remote-debugging-port={port}( |$)\"); do tr \"\\0\" \" \" < /proc/$p/cmdline | grep -q snens-chrome && echo ours && exit; done; echo no'"
             ),
         )?;
         Ok(out.contains("ours"))
@@ -392,6 +392,9 @@ pub fn start_agent_chrome(host: &str, port: u16, profile: Option<&str>) -> Resul
 fn wait_port(host: &str, port: u16, budget: Duration) -> Result<(), String> {
     let os = remote_os(host)?;
     let until = Instant::now() + budget;
+    // Последняя ошибка пробы: недоступный хост/сломанный ssh иначе выглядит как
+    // «Chrome не поднялся», и диагностика уводит не туда.
+    let mut last_err: Option<String> = None;
     loop {
         let probe = match os {
             "windows" => powershell(
@@ -399,13 +402,18 @@ fn wait_port(host: &str, port: u16, budget: Duration) -> Result<(), String> {
                 &format!(
                     "try {{ (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:{port}/json/version -TimeoutSec 3).StatusCode }} catch {{ 0 }}"
                 ),
-            )
-            .unwrap_or_default(),
+            ),
             _ => ssh(
                 host,
                 format!("curl -s -o /dev/null -w '%{{http_code}}' --max-time 3 http://127.0.0.1:{port}/json/version"),
-            )
-            .unwrap_or_default(),
+            ),
+        };
+        let probe = match probe {
+            Ok(p) => p,
+            Err(e) => {
+                last_err = Some(e);
+                String::new()
+            }
         };
         if probe.trim().trim_matches('"') == "200" {
             return Ok(());
@@ -416,8 +424,12 @@ fn wait_port(host: &str, port: u16, budget: Duration) -> Result<(), String> {
                 "cmd /c type C:\\Users\\%USERNAME%\\snens-chrome-visible.out 2>nul",
             )
             .unwrap_or_default();
+            let cause = match &last_err {
+                Some(e) => format!("\nпоследняя ошибка пробы: {e}"),
+                None => String::new(),
+            };
             return Err(format!(
-                "Chrome на {host} не поднял отладку на порту {port} за {} с.{}\n\
+                "Chrome на {host} не поднял отладку на порту {port} за {} с.{cause}{}\n\
                  Частые причины: порт занят другим Chrome (тогда профиль агента не свой), \
                  chrome.exe не найден в стандартном месте, на unix не установлен google-chrome.\n\
                  Уже запущенные агентские Chrome: `web launch` без --port переиспользует свой.",

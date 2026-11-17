@@ -143,7 +143,16 @@ impl Args {
 }
 
 /// Флаги-переключатели: значения не принимают.
-const BOOL_FLAGS: [&str; 6] = ["new", "visible", "headless", "full", "no-wait", "fresh"];
+const BOOL_FLAGS: [&str; 8] = [
+    "new",
+    "visible",
+    "headless",
+    "full",
+    "all",
+    "no-snap",
+    "no-wait",
+    "fresh",
+];
 
 fn is_command(s: &str) -> bool {
     matches!(
@@ -168,27 +177,35 @@ fn is_command(s: &str) -> bool {
 
 // ---------------------------------------------------------------- соединение
 
-fn port_from(args: &Args) -> u16 {
-    args.flag("port")
-        .and_then(|p| p.parse().ok())
-        .or_else(|| {
-            std::env::var("SNENS_CDP_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-        })
-        .unwrap_or(9222)
+/// Порт CDP. Явно заданный и кривой — это ошибка аргументов, а не тихий откат
+/// на дефолт: иначе `--port 92a22` подключается «куда-то» и падает позже.
+fn port_from(args: &Args) -> Result<u16, String> {
+    if let Some(p) = args.flag("port") {
+        return p
+            .parse::<u16>()
+            .map_err(|e| format!("web: --port ждёт число 1..65535, получено {p} ({e})"));
+    }
+    if let Ok(p) = std::env::var("SNENS_CDP_PORT") {
+        if !p.trim().is_empty() {
+            return p
+                .trim()
+                .parse::<u16>()
+                .map_err(|e| format!("web: SNENS_CDP_PORT={p}: {e}"));
+        }
+    }
+    Ok(9222)
 }
 
 /// Куда стучаться: живой ssh-туннель (если поднят) или прямой порт.
 /// `--tunnel user@host` поднимает туннель немедленно и дальше всё идёт через него.
-fn endpoint(args: &Args) -> Endpoint {
+fn endpoint(args: &Args) -> Result<Endpoint, String> {
     if let Some(host) = args.flag("tunnel") {
         // Порт на той стороне: --port (по умолчанию 9222).
-        match tunnel::start(host, port_from(args)) {
+        match tunnel::start(host, port_from(args)?) {
             Ok(t) => {
                 let mut ep = t.endpoint();
                 ep.browser_path = tunnel::remote_browser_path(host, ep.port, ep.remote_port);
-                return ep;
+                return Ok(ep);
             }
             Err(e) => {
                 eprintln!("{e}");
@@ -202,17 +219,17 @@ fn endpoint(args: &Args) -> Endpoint {
     let explicit_port = args.flag("port").is_some() || std::env::var("SNENS_CDP_PORT").is_ok();
     if !explicit_port {
         if let Some((target, _)) = state::load_target() {
-            return Endpoint {
+            return Ok(Endpoint {
                 host: "127.0.0.1".into(),
                 port: target.port,
                 remote_port: target.remote_port,
                 browser_path: target.browser_path.clone(),
-            };
+            });
         }
     } else {
         // Порт задан руками — туннель к нему тоже надо поднять заново.
         if let Some(t) = tunnel::load() {
-            if t.remote_port != port_from(args) {
+            if t.remote_port != port_from(args)? {
                 tunnel::stop(&t);
             }
         }
@@ -220,13 +237,13 @@ fn endpoint(args: &Args) -> Endpoint {
     if let Some(t) = tunnel::load() {
         // Порт туннеля должен совпадать с запрошенным: иначе молча работаем не
         // с тем Chrome.
-        if !explicit_port || t.remote_port == port_from(args) {
+        if !explicit_port || t.remote_port == port_from(args)? {
             let mut ep = t.endpoint();
             ep.browser_path = tunnel::remote_browser_path(&t.host, ep.port, ep.remote_port);
-            return ep;
+            return Ok(ep);
         }
     }
-    Endpoint::direct(port_from(args))
+    Ok(Endpoint::direct(port_from(args)?))
 }
 
 pub struct Live {
@@ -249,7 +266,7 @@ pub fn live(args: &Args) -> Result<Live, String> {
         }
     };
     let ep = if args.flag("tunnel").is_some() {
-        endpoint(args)
+        endpoint(args)?
     } else {
         Endpoint {
             host: "127.0.0.1".into(),
@@ -299,10 +316,13 @@ pub fn live(args: &Args) -> Result<Live, String> {
 fn page_targets(ep: &Endpoint) -> Result<Vec<Value>, String> {
     if let Ok(raw) = ep.get("/json/list") {
         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-            let out: Vec<Value> = v
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
+            // Не-массив — это не «вкладок нет»: пробуем путь через ws, а не
+            // рапортуем «в этом Chrome нет вкладок».
+            let Some(list) = v.as_array() else {
+                return targets_via_ws(ep);
+            };
+            let out: Vec<Value> = list
+                .clone()
                 .into_iter()
                 .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
                 .collect();
@@ -365,7 +385,7 @@ pub fn trunc(s: &str, n: usize) -> String {
 // ---------------------------------------------------------------- команды
 
 fn cmd_connect(args: &Args) -> Result<(), String> {
-    let ep = endpoint(args);
+    let ep = endpoint(args)?;
     let port = ep.port;
     // Проверяем не порт, а живой CDP: без согласия порт открыт, а /json/list пуст
     // или отдаёт 403 — тул должен сказать об этом прямо, а не падать на WS.
@@ -416,7 +436,7 @@ fn cmd_connect(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_status(args: &Args) -> Result<(), String> {
-    let ep = endpoint(args);
+    let ep = endpoint(args)?;
     match state::load_target() {
         Some((t, tab)) => {
             println!("привязка: 127.0.0.1:{}, вкладка {}", t.port, trunc(&tab, 8));
@@ -438,10 +458,29 @@ fn cmd_status(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_tabs(args: &Args) -> Result<(), String> {
-    let ep = endpoint(args);
+    let ep = endpoint(args)?;
     let targets = page_targets(&ep)?;
+    // По умолчанию — только вкладки нашего профиля: чужие (личный Chrome
+    // пользователя) в списке сбивают `web use` по номеру.
+    let ours = state::load_target();
     for (i, t) in targets.iter().enumerate() {
+        let id = t.get("id").and_then(Value::as_str).unwrap_or("");
+        let mine = ours
+            .as_ref()
+            .map(|(_, tab)| tab == id)
+            .unwrap_or(true);
+        if !mine && !args.on("all") {
+            continue;
+        }
         println!("{}", tab_line(i, t));
+    }
+    if !args.on("all") {
+        let hidden = targets.len();
+        if hidden > 0 && ours.is_some() {
+            println!(
+                "(показаны вкладки текущей привязки; все — `web tabs --all`)"
+            );
+        }
     }
     Ok(())
 }
@@ -451,7 +490,7 @@ fn cmd_use(args: &Args) -> Result<(), String> {
         .positional
         .first()
         .ok_or("web use: нужен id вкладки или её номер из `web tabs`")?;
-    let ep = endpoint(args);
+    let ep = endpoint(args)?;
     if state::load_target().is_none() {
         return Err("не подключено: сначала `web connect`".into());
     }
@@ -552,14 +591,15 @@ fn report_page(cdp: &mut cdp::Cdp, verb: &str) -> Result<(), String> {
 
 fn cmd_snap(args: &Args) -> Result<(), String> {
     let mut l = live(args)?;
+    // --full: дерево без ограничения глубины. Иначе флаг из справки ничего не делал.
     let depth = args.num("depth", 30.0) as usize;
-    let s = snap::take_stable(&mut l.cdp, depth)?;
-    let full = if args.on("full") {
-        s.text.clone()
+    let depth = if args.on("full") {
+        usize::MAX
     } else {
-        s.text
+        depth
     };
-    let path = state::save_page(&l.tab, &full)?;
+    let s = snap::take_stable(&mut l.cdp, depth)?;
+    let path = state::save_page(&l.tab, &s.text)?;
     state::save_url(&l.tab, &s.url);
     let refs_path = state::save_refs(&l.tab, &s.refs)?;
     println!("{} — {}", trunc(&s.url, 120), trunc(&s.title, 80));
@@ -571,13 +611,13 @@ fn cmd_snap(args: &Args) -> Result<(), String> {
     );
     println!("адреса → {}", refs_path.display());
     // 12 строк примера: чтобы модель поняла форму, но не платила за весь экран.
-    for line in full.lines().take(12) {
+    for line in s.text.lines().take(12) {
         println!("{line}");
     }
-    if full.lines().count() > 12 {
+    if s.text.lines().count() > 12 {
         println!(
             "… ещё {} строк, читать: grep -n <слово> {}",
-            full.lines().count() - 12,
+            s.text.lines().count() - 12,
             path.display()
         );
     }
@@ -691,7 +731,7 @@ fn cmd_launch(args: &Args) -> Result<(), String> {
         .to_string();
     // Порт подбираем сами: занятый порт означал бы, что Chrome прилип к уже
     // запущенному процессу с чужим профилем.
-    let want = port_from(args);
+    let want = port_from(args)?;
     let port = if args.flag("port").is_some() {
         if !launch::port_free(&host, want)? {
             return Err(format!(
