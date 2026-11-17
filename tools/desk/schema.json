@@ -11,8 +11,8 @@
       "description": "Выбор окна: индекс из apps (0,1,2…), подстрока заголовка, или пусто — окно в фокусе"
     },
     "json": {
-      "type": "string",
-      "description": "Для act: JSON-массив действий по адресам, напр. [{\"click\":\"e3\"},{\"set\":{\"ref\":\"e1\",\"text\":\"hi\"}}]"
+      "type": ["string", "array"],
+      "description": "Для act: действия по адресам — массив объектов, напр. [{\"click\":\"e3\"},{\"set\":{\"ref\":\"e1\",\"text\":\"hi\"}}]"
     },
     "tunnel": {
       "type": "string",

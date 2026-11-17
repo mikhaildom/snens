@@ -24,12 +24,33 @@ pub fn host(args: &Args) -> Result<String, String> {
     Err("desk: нужен --tunnel user@machine (где живёт агент)".into())
 }
 
+/// Хост из `--tunnel`/`SNENS_DESK_HOST` уходит в argv ssh/scp, поэтому
+/// проверяется по форме: значение, начинающееся с `-`, OpenSSH разберёт как свою
+/// опцию (`-oProxyCommand=…` — это уже выполнение локальной команды).
+fn check_host(host: &str) -> Result<(), String> {
+    let bad = host.is_empty()
+        || host.starts_with('-')
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']'));
+    if bad {
+        return Err(format!(
+            "desk: недопустимый адрес машины `{host}` — нужен вид user@host"
+        ));
+    }
+    Ok(())
+}
+
 fn ssh(host: &str, cmd: &str) -> Result<String, String> {
+    check_host(host)?;
     let out = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
+        // `--` закрывает разбор опций: адрес не может стать ключом ssh.
+        .arg("--")
         .arg(host)
         .arg(cmd)
         .output()
@@ -91,6 +112,7 @@ fn free_port() -> Result<u16, String> {
 
 /// Поднять (или переиспользовать) туннель к порту агента. Возвращает локальный порт.
 pub fn ensure(host: &str, remote_port: u16) -> Result<u16, String> {
+    check_host(host)?;
     if let Some((h, local, rem, pid)) = load_tunnel() {
         if h == host && rem == remote_port && alive(pid) && port_open(local) {
             return Ok(local);
@@ -110,11 +132,17 @@ pub fn ensure(host: &str, remote_port: u16) -> Result<u16, String> {
         .arg("ServerAliveInterval=20")
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{remote_port}"))
+        .arg("--")
         .arg(host)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(unix)]
+    // SAFETY: замыкание исполняется в форкнутом ребёнке до exec — только
+    // async-signal-safe вызовы. `setsid(2)` такой и есть: ни аллокаций, ни
+    // блокировок. Возврат игнорируем осознанно: если сессия уже своя (или
+    // EPERM), процесс всё равно запустится — отдельная сессия нужна лишь для
+    // того, чтобы туннель пережил наш терминал.
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
@@ -154,10 +182,35 @@ fn port_open(port: u16) -> bool {
     TcpStream::connect_timeout(&sa, Duration::from_millis(400)).is_ok()
 }
 
+/// Живой ли процесс. `kill(pid, 0)`: 0 — жив, EPERM — жив, но чужой (не наш
+/// случай, но «мёртв» было бы враньём), ESRCH — мёртв. `/proc` не используем:
+/// его нет на macOS, и там `alive` всегда давал false — `ensure` убивал pid и
+/// поднимал второй туннель поверх первого.
+///
+/// Зомби считаем мёртвым: `waitpid(pid, WNOHANG)` забирает статус, если процесс
+/// уже кончился. Без этого `ensure` не замечал мгновенно упавший ssh и ждал
+/// полные 12 секунд.
 fn alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: kill(2) с сигналом 0 ничего не делает, только проверяет
+        // существование; waitpid с WNOHANG не блокируется.
+        unsafe {
+            let mut status: libc::c_int = 0;
+            let reaped = libc::waitpid(pid, &mut status, libc::WNOHANG);
+            if reaped == pid {
+                // Ребёнок наш и уже завершился (в том числе зомби).
+                return false;
+            }
+            let r = libc::kill(pid, 0);
+            r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
     }
     #[cfg(not(unix))]
     {
@@ -166,20 +219,73 @@ fn alive(pid: u32) -> bool {
     }
 }
 
+/// Токен агента: генерируется при первом обращении и живёт в каталоге состояния.
+/// Агент без токена не работает вовсе: иначе любой локальный процесс в сессии
+/// пользователя мог бы кликать от его имени.
+pub fn token() -> Result<String, String> {
+    let path = state_dir().join("token");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim().to_string();
+        if t.len() >= 16 {
+            return Ok(t);
+        }
+    }
+    let d = state_dir();
+    std::fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+    let mut raw = [0u8; 16];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut raw))
+        .is_ok();
+    if !filled {
+        // Запасной источник — время и pid: слабее, но токен всё равно секретом
+        // внутри каталога состояния пользователя.
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        raw[..8].copy_from_slice(&n.to_le_bytes()[..8]);
+        raw[8..].copy_from_slice(&(std::process::id() as u128).to_le_bytes());
+    }
+    let t: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(&path, &t).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Права: файл с токеном не должен читаться другими пользователями.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(t)
+}
+
 fn state_dir() -> std::path::PathBuf {
-    std::env::var("SNENS_DESK_STATE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
-                .join(".local/state/snens/desk")
-        })
+    if let Ok(d) = std::env::var("SNENS_DESK_STATE") {
+        if !d.trim().is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    // Без HOME состояние уезжало в /tmp/.local/… — общий каталог, где чужой
+    // пользователь мог подложить tunnel.json с произвольным pid (а `ensure`
+    // его убивает). Отказ лучше тихой записи в мировую помойку.
+    let home = std::env::var("HOME").unwrap_or_else(|_| {
+        eprintln!("desk: HOME не задан — состояние туннеля некуда положить");
+        String::new()
+    });
+    if home.is_empty() {
+        return std::env::temp_dir().join(format!("snens-desk-{}", std::process::id()));
+    }
+    std::path::PathBuf::from(home).join(".local/state/snens/desk")
 }
 
 fn save_tunnel(host: &str, local: u16, remote: u16, pid: u32) {
     let d = state_dir();
     let _ = std::fs::create_dir_all(&d);
     let v = serde_json::json!({"host": host, "local": local, "remote": remote, "pid": pid});
-    let _ = std::fs::write(d.join("tunnel.json"), v.to_string());
+    // Атомарно: читатель не должен увидеть половину файла, а конкурентный desk —
+    // чужой недописанный pid.
+    let tmp = d.join(format!("tunnel.json.{pid}"));
+    if std::fs::write(&tmp, v.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, d.join("tunnel.json"));
+    }
 }
 
 fn load_tunnel() -> Option<(String, u16, u16, u32)> {
@@ -196,6 +302,8 @@ fn load_tunnel() -> Option<(String, u16, u16, u32)> {
 /// Запустить агента на той стороне. Windows — через schtasks /IT (сессия
 /// пользователя), unix — systemd --user или nohup внутри своей сессии.
 pub fn start_agent(host: &str, port: u16) -> Result<(), String> {
+    check_host(host)?;
+    let token = token()?;
     let os = remote_os(host)?;
     match os {
         "windows" => {
@@ -207,7 +315,12 @@ pub fn start_agent(host: &str, port: u16) -> Result<(), String> {
             // LISTENING: `netstat | findstr :9227` ловит и TIME_WAIT от прошлых
             // соединений, и тогда мы решали «уже слушает», не запустив агента.
             let until = Instant::now() + Duration::from_secs(10);
-            while listening(host, port).unwrap_or(false) {
+            // Ошибку проверки не превращаем в «порт свободен»: иначе перезапись
+            // скрипта и schtasks шли бы поверх работающего старого агента.
+            loop {
+                if !listening(host, port)? {
+                    break;
+                }
                 if Instant::now() >= until {
                     return Err(format!(
                         "порт {port} на {host} занят другим процессом: освободи его или возьми --port"
@@ -222,8 +335,11 @@ pub fn start_agent(host: &str, port: u16) -> Result<(), String> {
                 include_str!("../agent/desk-agent.ps1"),
             )?;
             let task = "snens-desk-agent";
+            // Токен уезжает в командной строке задачи: другого канала в schtasks
+            // нет. Остаточный риск в том, что он виден в списке процессов этой же
+            // машины — там и так работает сам агент от того же пользователя.
             let tr = format!(
-                r"powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\%USERNAME%\snens-desk-agent.ps1 -Port {port}"
+                r"powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\%USERNAME%\snens-desk-agent.ps1 -Port {port} -Token {token}"
             );
             let _ = ssh(host, &format!("schtasks /Delete /TN {task} /F"));
             ssh(
@@ -288,10 +404,14 @@ fn put_file(host: &str, name: &str, content: &str) -> Result<(), String> {
     } else {
         format!("{}/{name}", home.replace('\\', "/"))
     };
+    check_host(host)?;
     let out = Command::new("scp")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-q")
+        // `--` тоже нужен: цель идёт как `host:path`, но разбор опций должен
+        // закончиться до неё.
+        .arg("--")
         .arg(&local)
         .arg(format!("{host}:{target}"))
         .output()

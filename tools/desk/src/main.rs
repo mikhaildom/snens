@@ -52,8 +52,17 @@ fn die(msg: &str, code: i32) -> ! {
 pub struct Args {
     pub positional: Vec<String>,
     pub flags: BTreeMap<String, String>,
+    /// Все значения повторяющегося флага: `--json` может прийти несколько раз
+    /// (ядро разворачивает массив из схемы в повторение флага).
+    pub multi: BTreeMap<String, Vec<String>>,
     pub has: Vec<String>,
 }
+
+/// Флаги, которые команда вообще понимает: опечатка (`--windw`) должна стать
+/// ошибкой аргументов, а не тихо проигнорированным флагом.
+const FLAGS: [&str; 8] = [
+    "tunnel", "port", "window", "full", "json", "out", "timeout", "progress",
+];
 
 impl Args {
     fn parse(argv: &[String]) -> Result<Self, String> {
@@ -65,11 +74,19 @@ impl Args {
                     Some((k, v)) => (k.to_string(), Some(v.to_string())),
                     None => (name.to_string(), None),
                 };
+                if !FLAGS.contains(&k.as_str()) {
+                    return Err(format!(
+                        "desk: неизвестный флаг --{k} (есть: {})",
+                        FLAGS.join(", ")
+                    ));
+                }
                 if let Some(v) = v {
+                    a.multi.entry(k.clone()).or_default().push(v.clone());
                     a.flags.insert(k, v);
                 } else if let Some(next) = it.peek() {
                     if !next.starts_with("--") {
                         let v = it.next().unwrap().clone();
+                        a.multi.entry(k.clone()).or_default().push(v.clone());
                         a.flags.insert(k, v);
                     } else {
                         a.has.push(k);
@@ -88,12 +105,27 @@ impl Args {
         self.flags.get(name).map(String::as_str)
     }
 
+    /// Все значения повторяющегося флага (например `--json`).
+    pub fn values(&self, name: &str) -> Vec<&str> {
+        self.multi
+            .get(name)
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
     pub fn on(&self, name: &str) -> bool {
         self.has.iter().any(|h| h == name) || self.flags.contains_key(name)
     }
 
-    fn num(&self, name: &str, def: f64) -> f64 {
-        self.flag(name).and_then(|v| v.parse().ok()).unwrap_or(def)
+    /// Порт: строгий разбор без тихого отката на дефолт и без насыщения
+    /// (`--port 70000` раньше молча становился 65535).
+    pub fn port(&self) -> Result<u16, String> {
+        match self.flag("port") {
+            None => Ok(9227),
+            Some(v) => v.parse::<u16>().map_err(|e| {
+                format!("desk: --port ждёт число 1..65535, получено {v} ({e})")
+            }),
+        }
     }
 }
 
@@ -146,7 +178,12 @@ fn main() {
 /// Запрос к агенту на той стороне: одна JSON-строка туда, одна обратно.
 fn call(args: &Args, req: Value) -> Result<Value, String> {
     let host = tunnel::host(args)?;
-    let port = tunnel::ensure(&host, args.num("port", 9227.0) as u16)?;
+    // Агент без токена не отвечает: токен лежит в каталоге состояния рядом с
+    // туннелем и уезжает в каждом запросе.
+    let token = tunnel::token()?;
+    let mut req = req;
+    req["token"] = Value::String(token);
+    let port = tunnel::ensure(&host, args.port()?)?;
     let addr = format!("127.0.0.1:{port}");
     let sa = addr
         .to_socket_addrs()
@@ -156,8 +193,12 @@ fn call(args: &Args, req: Value) -> Result<Value, String> {
     let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(10))
         .map_err(|e| format!("агент не отвечает на {addr} ({e}): подними его `desk launch`"))?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
-    s.write_all(format!("{}\n", serde_json::to_string(&req).unwrap_or_default()).as_bytes())
-        .map_err(|e| format!("{addr}: {e}"))?;
+    // Сериализация может отказать: пустая строка вместо запроса давала бы
+    // «ответ не пришёл»/«не JSON» вместо настоящей причины.
+    let body = serde_json::to_string(&req)
+        .map_err(|e| format!("запрос не сериализуется: {e}"))?;
+    s.write_all(format!("{body}\n").as_bytes())
+        .map_err(|e| format!("{addr}: запрос не отправлен: {e}"))?;
     let mut reader = BufReader::new(s);
     let mut line = String::new();
     reader
@@ -192,12 +233,11 @@ fn window_flag(args: &Args) -> Value {
 
 fn cmd_launch(args: &Args) -> Result<(), String> {
     let host = tunnel::host(args)?;
-    let port = args.num("port", 9227.0) as u16;
+    let port = args.port()?;
     tunnel::start_agent(&host, port)?;
     println!("агент запущен на {host}, порт {port} (в сессии пользователя)");
-    // Проверяем, что он действительно отвечает, а не просто «команда прошла».
-    let up = tunnel::ensure(&host, port)?;
-    let _ = up;
+    // Проверяем, что он действительно отвечает, а не просто «команда прошла»:
+    // call сам поднимет туннель и спросит ping.
     let v = call(args, json!({"cmd": "ping"}))?;
     println!(
         "готов: сессия {}, pid {}",
@@ -216,7 +256,7 @@ fn cmd_stop(args: &Args) -> Result<(), String> {
 
 fn cmd_status(args: &Args) -> Result<(), String> {
     let host = tunnel::host(args)?;
-    let port = args.num("port", 9227.0) as u16;
+    let port = args.port()?;
     match tunnel::ensure(&host, port) {
         Ok(_) => {
             let v = call(args, json!({"cmd": "ping"}))?;
@@ -226,7 +266,8 @@ fn cmd_status(args: &Args) -> Result<(), String> {
                 v.get("pid").map(|x| x.to_string()).unwrap_or_default()
             );
         }
-        Err(e) => println!("агент на {host} недоступен: {e}"),
+        // Недоступный агент — это провал: по коду 0 скрипты считали бы, что он живёт.
+        Err(e) => return Err(format!("агент на {host} недоступен: {e}")),
     }
     Ok(())
 }
@@ -280,7 +321,10 @@ fn refs_path(host: &str) -> std::path::PathBuf {
 
 fn cmd_snap(args: &Args) -> Result<(), String> {
     let host = tunnel::host(args)?;
-    let v = call(args, json!({"cmd": "snap", "window": window_flag(args)}))?;
+    let v = call(
+        args,
+        json!({"cmd": "snap", "window": window_flag(args), "full": args.on("full")}),
+    )?;
     let tree = v.get("tree").and_then(Value::as_str).unwrap_or("");
     let refs = v.get("refs").cloned().unwrap_or(Value::Array(vec![]));
     let dir = refs_path(&host);
@@ -315,23 +359,63 @@ fn cmd_snap(args: &Args) -> Result<(), String> {
 
 fn cmd_act(args: &Args) -> Result<(), String> {
     let host = tunnel::host(args)?;
-    let raw = args
-        .flag("json")
-        .map(str::to_string)
-        .or_else(|| args.positional.get(1).cloned())
-        .ok_or("desk act: нужен --json '<массив действий>'")?;
-    let actions: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("desk act: не JSON: {e}"))?;
-    if !actions.is_array() {
+    // Ядро собирает argv по схеме: массив из поля `json` превращается в
+    // повторение флага, поэтому значений может быть несколько. Все части —
+    // одна логическая пачка действий.
+    let mut raws: Vec<String> = args.values("json").into_iter().map(str::to_string).collect();
+    if raws.is_empty() {
+        // Позиционные разбираются из argv[1..]: первый из них — это [0], а не [1].
+        if let Some(p) = args.positional.first() {
+            raws.push(p.clone());
+        }
+    }
+    if raws.is_empty() {
+        return Err("desk act: нужен --json '<массив действий>'".into());
+    }
+    let parsed: Vec<Value> = raws
+        .iter()
+        .map(|raw| serde_json::from_str(raw).map_err(|e| format!("desk act: не JSON: {e}")))
+        .collect::<Result<_, _>>()?;
+    let acts: Vec<Value> = match parsed.as_slice() {
+        // Один аргумент-массив — обычная форма `--json '[{...}]'`.
+        [Value::Array(items)] => items.clone(),
+        // Один не-массив — ошибка формы: одиночное действие путает с пустым набором.
+        [other] => {
+            return Err(format!(
+                "desk act: ожидается массив действий, напр. [{{\"click\":\"e3\"}}], получено {other}"
+            ))
+        }
+        // Несколько аргументов (ядро развернуло массив схемы в повторение
+        // флага) — каждый обязан быть объектом-действием.
+        many => {
+            if let Some(bad) = many.iter().find(|v| !v.is_object()) {
+                return Err(format!(
+                    "desk act: ожидается массив действий, напр. [{{\"click\":\"e3\"}}], получено {bad}"
+                ));
+            }
+            many.to_vec()
+        }
+    };
+    let actions = Value::Array(acts);
+    if actions.as_array().map(|a| a.is_empty()).unwrap_or(true) {
         return Err("desk act: ожидается массив действий, напр. [{\"click\":\"e3\"}]".into());
     }
     // Пути элементов берём из последнего снимка: AutomationElement между
     // запросами не сохранить, а путь «индексы детей от окна» стабилен.
     let rf = refs_path(&host).join("refs.json");
-    let refs: Value = std::fs::read_to_string(&rf)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or(Value::Array(vec![]));
+    // Пустая таблица адресов = все действия упадут в агенте с невнятной ошибкой.
+    // Поэтому «снимка нет» и «снимок битый» различаем и говорим, что делать.
+    let refs: Value = match std::fs::read_to_string(&rf) {
+        Ok(t) => serde_json::from_str(&t)
+            .map_err(|e| format!("desk act: {} испорчен ({e}) — сделай `desk snap` заново", rf.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "desk act: нет снимка {} — сначала `desk snap`, иначе адреса некуда сопоставить",
+                rf.display()
+            ))
+        }
+        Err(e) => return Err(format!("desk act: {} не читается: {e}", rf.display())),
+    };
     let v = call(
         args,
         json!({
@@ -400,22 +484,40 @@ fn cmd_focus(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Base64 с проверкой формы: `=` только в хвосте, длина кратна 4, остаточные
+/// биты нулевые. Иначе искажённый ответ агента декодировался бы в мусорный PNG,
+/// а не в ошибку.
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     const NL: u8 = 10;
     const CR: u8 = 13;
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let bad = || "агент: не base64 в картинке".to_string();
+    let body: Vec<u8> = s.bytes().filter(|c| *c != NL && *c != CR).collect();
+    if body.is_empty() || !body.len().is_multiple_of(4) {
+        return Err(bad());
+    }
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut bits = 0;
-    for c in s.bytes() {
+    let mut pad_seen = false;
+    for (i, c) in body.iter().copied().enumerate() {
+        if c == b'=' {
+            // Допустимы только два последних байта, и после них — ничего.
+            if i < body.len() - 2 {
+                return Err(bad());
+            }
+            pad_seen = true;
+            continue;
+        }
+        if pad_seen {
+            return Err(bad());
+        }
         let v = match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
-            b'=' => continue,
-            NL | CR => continue,
-            _ => return Err("агент: не base64 в картинке".into()),
+            _ => return Err(bad()),
         } as u32;
         acc = (acc << 6) | v;
         bits += 6;
@@ -424,5 +526,24 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
             out.push((acc >> bits) as u8);
         }
     }
+    // Мусорные младшие биты в хвосте — признак неполного/искажённого base64.
+    if bits > 0 && (acc & ((1 << bits) - 1)) != 0 {
+        return Err(bad());
+    }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64_decode;
+
+    #[test]
+    fn base64_rejects_malformed_input() {
+        assert_eq!(base64_decode("aGk=").unwrap(), b"hi");
+        assert!(base64_decode("aGk").is_err(), "длина не кратна 4");
+        assert!(base64_decode("aG=k").is_err(), "символ после паддинга");
+        assert!(base64_decode("a=lk").is_err(), "паддинг не в хвосте");
+        assert!(base64_decode("aGl*").is_err(), "посторонний символ");
+        assert!(base64_decode("aGk=aGk=").is_err(), "две группы с паддингом");
+    }
 }

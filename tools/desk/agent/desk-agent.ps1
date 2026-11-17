@@ -180,7 +180,7 @@ function Resolve-ByPath($winEl, [string]$path) {
   foreach ($seg in $path.Split('/')) {
     $idx = [int]$seg
     $kids = $cur.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
-    if ($idx -ge $kids.Count) { return $null }
+    if ($idx -lt 0 -or $idx -ge $kids.Count) { return $null }
     $cur = $kids[$idx]
   }
   return $cur
@@ -345,9 +345,10 @@ function Cmd-Act($req) {
   if (-not $win) { return @{ ok = $false; error = "окно не найдено: $($req.window)" } }
   $winEl = Get-WindowElement $win
   if ($req.focus_window) {
-    [void][SnensW.U]::ShowWindow([IntPtr][int]$win.handle, 9)
-    [void][SnensW.U]::BringWindowToTop([IntPtr][int]$win.handle)
-    [void][SnensW.U]::SetForegroundWindow([IntPtr][int]$win.handle)
+    # handle — Int64 из EnumWindows; [int] падал на значениях выше Int32.MaxValue.
+    [void][SnensW.U]::ShowWindow([IntPtr]$win.handle, 9)
+    [void][SnensW.U]::BringWindowToTop([IntPtr]$win.handle)
+    [void][SnensW.U]::SetForegroundWindow([IntPtr]$win.handle)
   }
   $script:__winEl = $winEl
   $done = @()
@@ -356,7 +357,15 @@ function Cmd-Act($req) {
     # считая их от левого верхнего угла окна.
     foreach ($a in $req.actions) {
       $kind = $null
-      foreach ($k in @('click_at','keys')) { if ($a.PSObject.Properties.Name -contains $k) { $kind = $k; break } }
+      foreach ($k in @('click_at','keys','wait')) { if ($a.PSObject.Properties.Name -contains $k) { $kind = $k; break } }
+      # Значение действия раньше вообще не присваивалось: wait получал $null,
+      # wait_sel/click_sel/set_sel были недостижимы.
+      $arg = if ($kind) { $a.$kind } else { $null }
+      if ($kind -eq 'wait_sel' -or $kind -eq 'click_sel' -or $kind -eq 'set_sel') {
+        # В окне без UIA элементы не находятся: честный отказ, а не молчаливый пропуск.
+        $done += "ошибка: $kind недоступен в окне без UIA (есть click_at/keys/wait)"
+        continue
+      }
       if ($kind -eq 'wait') {
         # Пауза: после клика страница/диалог ещё не готовы.
         $ms = [int]$arg
@@ -480,7 +489,8 @@ function Cmd-Act($req) {
       # объект {"ref":"e13","text":"..."} — текст берём из text.
       $value = $arg
       if ($arg -is [string]) { $value = '' }
-      elseif ($arg.text -ne $null) { $value = $arg.text }
+      elseif ($null -ne $arg.text) { $value = $arg.text }
+      elseif ($kind -eq 'set') { $done += "ошибка: в действии set нет text"; continue }
       $how = Invoke-OnElement $el $kind $value
       $done += "$kind $addr → $how"
     } catch {
@@ -546,6 +556,9 @@ while ($true) {
   $client = $listener.AcceptTcpClient()
   Log "client connected"
   $client.NoDelay = $true
+  # Без таймаута один молчащий клиент (повисший туннель, упавший вызывающий)
+  # блокировал сервер навсегда: он однопоточный.
+  $client.ReceiveTimeout = 60000
   $stream = $client.GetStream()
   $bytes = New-Object System.Collections.Generic.List[byte]
   $buffer = New-Object byte[] 8192
@@ -569,7 +582,9 @@ while ($true) {
           Write-Reply $stream (@{ ok = $false; error = 'не JSON' })
           continue
         }
-        if ($Token -and $req.token -ne $Token) {
+        # -cne: сравнение с учётом регистра, иначе энтропия токена меньше, чем
+        # кажется. Пустой токен больше не «режим без пароля».
+        if (-not $Token -or $req.token -isnot [string] -or $req.token -cne $Token) {
           Write-Reply $stream (@{ ok = $false; error = 'неверный токен' })
           continue
         }
