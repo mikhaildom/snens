@@ -51,15 +51,16 @@ pub fn die(msg: String) -> ! {
 
 /// Rust игнорирует SIGPIPE, поэтому `agent list | head` падал бы паникой
 /// «failed printing to stdout». Возвращаем дефолтное поведение обычного CLI.
+///
+/// Через `libc`, а не своей `extern`-декларацией: прежняя модель обработчика
+/// была голым `usize`, а `SIGPIPE = 13` захардкожен — верно по случайности, и
+/// на необычной платформе молча ставила бы не тот сигнал.
 #[cfg(unix)]
 fn restore_sigpipe() {
-    extern "C" {
-        fn signal(sig: i32, handler: usize) -> usize;
-    }
-    const SIGPIPE: i32 = 13;
-    const SIG_DFL: usize = 0;
+    // SAFETY: `signal(2)` с `SIG_DFL` — стандартная установка обработчика;
+    // глобального состояния, кроме таблицы сигналов процесса, не трогаем.
     unsafe {
-        signal(SIGPIPE, SIG_DFL);
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
@@ -143,13 +144,30 @@ fn parse_args(args: &[String]) -> Args {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--timeout" => out.timeout = it.next().and_then(|v| v.parse().ok()),
-            "--progress" => out.progress = it.next().and_then(|v| v.parse().ok()),
+            // Без значения флаг молча давал `None`, и вызывающий ждал дефолтные
+            // 3600 с вместо ошибки; `--timeout --progress 5` съедал следующий
+            // флаг как значение. Оба случая — отказ, а не догадка.
+            "--timeout" => out.timeout = Some(number(it.next(), "--timeout")),
+            "--progress" => out.progress = Some(number(it.next(), "--progress")),
             "--parent" => out.parent_flag = true,
             _ => out.pos.push(a.clone()),
         }
     }
     out
+}
+
+/// Числовое значение флага: отсутствие, флаг вместо значения и мусор — ошибка.
+fn number(value: Option<&String>, flag: &str) -> u64 {
+    let Some(raw) = value else {
+        die(format!("agent: {flag} без значения"));
+    };
+    if raw.starts_with("--") {
+        die(format!("agent: {flag} без значения (дальше идёт {raw})"));
+    }
+    match raw.parse::<u64>() {
+        Ok(n) => n,
+        Err(_) => die(format!("agent: {flag} ждёт число секунд, а не {raw:?}")),
+    }
 }
 
 /// Текст: позиционные строки, а если их нет — stdin.
@@ -163,10 +181,20 @@ fn take_text(rest: &[String]) -> String {
     s.trim().to_string()
 }
 
+/// id подагента: он склеивается в путь к журналу и ящику, поэтому проверяется
+/// тем же правилом, что и в ядре. `agent status ../../etc/passwd` читал файл за
+/// пределами каталога сессий.
 fn need_id(pos: &[String], what: &str) -> String {
-    pos.first()
+    let id = pos
+        .first()
         .cloned()
-        .unwrap_or_else(|| die(format!("agent {what}: нужен id подагента")))
+        .unwrap_or_else(|| die(format!("agent {what}: нужен id подагента")));
+    if !log::valid_id(&id) {
+        die(format!(
+            "agent {what}: {id:?} не похож на id сессии (ожидается <секунды>-<pid> или uuid)"
+        ));
+    }
+    id
 }
 
 // --- команды ---
@@ -181,7 +209,9 @@ fn cmd_start(cfg: &Cfg, args: &[String]) {
     if !cfg.me.is_empty() {
         cmd.arg("--parent").arg(&cfg.me);
     }
-    cmd.arg(&task);
+    // `--` завершает разбор флагов: задача, начинающаяся с `-`, иначе уезжала в
+    // `snens` как его собственный флаг.
+    cmd.arg("--").arg(&task);
     let out = cmd
         .output()
         .unwrap_or_else(|e| die(format!("agent start: {e}")));
@@ -193,8 +223,8 @@ fn cmd_start(cfg: &Cfg, args: &[String]) {
         ));
     }
     let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if id.is_empty() {
-        die("agent start: snens не вернул id подагента".into());
+    if !log::valid_id(&id) {
+        die(format!("agent start: snens вернул не id: {id:?}"));
     }
     println!("{id}");
 }
@@ -248,10 +278,23 @@ fn cmd_wait(cfg: &Cfg, args: &[String]) {
             }
         }
         // Нет Done, а процесс мёртв — его сняли (OOM/SIGKILL), а не «ещё думает».
-        if !log::is_alive(cfg, &id) {
-            die(format!(
-                "agent wait: процесс подагента {id} мёртв, а Done в логе нет — он был снят"
-            ));
+        // Между чтением Done и проверкой pid ребёнок мог успеть дописать Done и
+        // выйти: тогда честный финал выглядел бы убийством. Перечитываем Done
+        // после отрицательного ответа и только потом говорим «снят».
+        if log::liveness(cfg, &id) == log::Live::No {
+            let text = log::final_text(cfg, &id).unwrap_or_default();
+            match log::done_status(cfg, &id) {
+                Some(status) => {
+                    println!("подагент {id}: {status}");
+                    if !text.trim().is_empty() {
+                        println!("{text}");
+                    }
+                    return;
+                }
+                None => die(format!(
+                    "agent wait: процесс подагента {id} мёртв, а Done в логе нет — он был снят"
+                )),
+            }
         }
         if last_report.elapsed() >= Duration::from_secs(every) {
             eprintln!("{}", log::snapshot(cfg, &id));
@@ -333,10 +376,12 @@ fn cmd_ask(cfg: &Cfg, raw: &[String]) {
         // а старое слово того же адресата — не ответ на этот вопрос. Именно
         // поэтому здесь фильтр, а не «забрать всё и вернуть обратное»: возврат
         // переупорядочивал сообщения и мог ходить по кругу.
-        let got = mail::drain_filter(&cfg.mail_dir, &me, |m| {
+        // Ровно одно сообщение: `drain_filter` забирал все совпадения, а печаталось
+        // только первое — остальные оседали в `read/` и до хода не доезжали.
+        let got = mail::take_one(&cfg.mail_dir, &me, |m| {
             m.kind == "steer" && m.from == target && m.ts >= asked_at
         });
-        if let Some(m) = got.into_iter().next() {
+        if let Some(m) = got {
             println!("{}", m.text);
             return;
         }
@@ -429,11 +474,12 @@ fn cmd_broadcast(cfg: &Cfg, args: &[String]) {
     println!("отправлено {}: {}", sent.len(), sent.join(" "));
 }
 
-fn ago_human(secs: u64) -> String {
+fn ago_human(secs: Option<u64>) -> String {
     match secs {
-        0..=59 => format!("{secs} с назад"),
-        60..=3599 => format!("{} мин назад", secs / 60),
-        _ => format!("{} ч назад", secs / 3600),
+        None => "время неизвестно".into(),
+        Some(s) if s <= 59 => format!("{s} с назад"),
+        Some(s) if s <= 3599 => format!("{} мин назад", s / 60),
+        Some(s) => format!("{} ч назад", s / 3600),
     }
 }
 
