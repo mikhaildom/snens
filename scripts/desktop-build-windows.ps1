@@ -95,8 +95,13 @@ try {
     Write-Output "EXIT=1 (ключ подписи пуст: $Key)"
     exit 1
   }
-  # Ключ без пароля; пустая строка — это «пароля нет», а не «не задан».
-  $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+  # Ключ без пароля — и это значит «переменной НЕТ», а не «пустая строка».
+  # tauri читает её через `env::var`: пустое значение — это Ok(""), и тогда он
+  # идёт расшифровывать ключ и падает на «incorrect updater private key
+  # password». Когда переменной нет — пишет «No updater private key password
+  # provided, assuming an empty password» и подписывает. Так собирались 0.2.2 и
+  # 0.3.0; на пустой строке сборка стоит.
+  Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
   # `npm ci` обязателен: он ставит CLI ровно из закоммиченного
   # package-lock.json. Голый `npx` скачал бы тот 2.x, который редит реестр
   # сегодня, — а этим CLI подписывается инсталлятор.
