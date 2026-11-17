@@ -306,6 +306,10 @@ fn flush(cfg: &Cfg, store: &Store) -> Result<i32, String> {
             .unwrap_or_default();
         match api::distill(cfg, &user, &assistant) {
             Ok(facts) => {
+                // Сначала набираем, что писать, и только потом одним куском в БД:
+                // сбой посреди хода не оставит полузаписанных фактов, а ход
+                // останется `new` — его переработают, а не задвоят.
+                let mut items: Vec<(store::NewFact, Option<String>)> = Vec::new();
                 for fact in facts {
                     let emb = api::embed(cfg, &fact.text);
                     let quant = emb.as_ref().map(|e| api::quantize(e));
@@ -324,26 +328,32 @@ fn flush(cfg: &Cfg, store: &Store) -> Result<i32, String> {
                     if dup {
                         continue;
                     }
-                    let uid = store.insert(&store::NewFact::auto(
-                        &fact.text,
-                        &fact.kind,
-                        &fact.subject,
-                        quant,
-                        cfg.embed_dim,
-                    ))?;
                     // Перекрытие старым: модель уже видела список known; если
                     // текст нового факта прямо отрицает старый — гасим старый.
-                    for (old_uid, old_text) in &known {
-                        if contradicts(old_text, &fact.text) {
-                            if store.supersede(old_uid, &uid)? {
-                                superseded += 1;
-                            }
-                            break;
-                        }
-                    }
-                    added += 1;
+                    // Тип и subject обязаны совпасть: «проект использует tokio»
+                    // и «проект использует axum» — разные факты, не противоречие.
+                    let over = known
+                        .iter()
+                        .find(|old| {
+                            old.kind == fact.kind
+                                && old.subject == fact.subject
+                                && contradicts(&old.text, &fact.text)
+                        })
+                        .map(|old| old.uid.clone());
+                    items.push((
+                        store::NewFact::auto(
+                            &fact.text,
+                            &fact.kind,
+                            &fact.subject,
+                            quant,
+                            cfg.embed_dim,
+                        ),
+                        over,
+                    ));
                 }
-                store.finish(id, "done")?;
+                let (n, s) = store.finish_turn(id, &items)?;
+                added += n;
+                superseded += s;
             }
             Err(e) => {
                 eprintln!("memory: flush {id}: {e}");
@@ -393,14 +403,9 @@ fn import(cfg: &Cfg, store: &mut Store, args: &[String]) -> Result<i32, String> 
     if units.is_empty() {
         return Err("import: пустой units".into());
     }
-    if args.iter().any(|a| a == "--replace") {
-        let closed = store.close_source("import")?;
-        if closed > 0 {
-            eprintln!("закрыто прошлых импортов: {closed}");
-        }
-    }
+    let replace = args.iter().any(|a| a == "--replace");
     let already = store.count_source("import")?;
-    if already > 0 {
+    if already > 0 && !replace {
         return Err(format!(
             "import: уже импортировано {already} фактов; повторить — `import --replace`"
         ));
@@ -434,6 +439,15 @@ fn import(cfg: &Cfg, store: &mut Store, args: &[String]) -> Result<i32, String> 
                 dim: cfg.embed_dim,
                 created: u["created"].as_i64().or_else(|| u["ts"].as_i64()),
             });
+        }
+    }
+    // Закрытие прошлого импорта — только теперь, когда всё, что могло упасть
+    // (сеть, провайдер, размерность вектора), уже позади. Иначе неудачный
+    // `--replace` вычистил бы банк и не вернул ничего.
+    if replace {
+        let closed = store.close_source("import")?;
+        if closed > 0 {
+            eprintln!("закрыто прошлых импортов: {closed}");
         }
     }
     let total = facts.len();

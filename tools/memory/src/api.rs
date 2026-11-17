@@ -69,11 +69,26 @@ pub fn embed_batch(cfg: &Cfg, texts: &[String]) -> Option<Vec<Vec<f32>>> {
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let vec = item["embedding"].as_array()?;
-        out.push(
-            vec.iter()
-                .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                .collect(),
-        );
+        // Размерность и числа проверяем так же строго, как в `embed`: вызывающие
+        // пишут вектор в базу с `cfg.embed_dim`, и молчаливое дополнение нулями
+        // дало бы порченые строки.
+        if vec.len() != cfg.embed_dim {
+            eprintln!(
+                "memory: embeddings: размерность {} вместо {}",
+                vec.len(),
+                cfg.embed_dim
+            );
+            return None;
+        }
+        let mut row = Vec::with_capacity(vec.len());
+        for x in vec {
+            let f = x.as_f64()? as f32;
+            if !f.is_finite() {
+                return None;
+            }
+            row.push(f);
+        }
+        out.push(row);
     }
     (out.len() == texts.len()).then_some(out)
 }

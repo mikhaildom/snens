@@ -18,6 +18,15 @@ pub struct Hit {
     pub rerank: Option<f32>,
 }
 
+/// Живой факт для промпта дистилляции: модель должна видеть тип и subject,
+/// чтобы «перекрывает» решалось в тех же координатах, а не по одному тексту.
+pub struct PromptFact {
+    pub uid: String,
+    pub text: String,
+    pub kind: String,
+    pub subject: String,
+}
+
 /// Что положить в базу: факт с метаданными и, если есть, вектором.
 pub struct NewFact {
     pub text: String,
@@ -115,6 +124,19 @@ impl Store {
         self.db.execute_batch(&sql).map_err(|e| e.to_string())
     }
 
+    /// Есть ли уже таблица векторов: она создаётся лениво, при первом факте с
+    /// эмбеддингом, и запрос к ней на свежей базе падает.
+    fn has_vec_table(&self) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "select count(*) from sqlite_master where type = 'table' and name = 'facts_vec'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .map_err(|e| e.to_string())
+    }
+
     /// Ближайшие живые факты по вектору. `k` — кандидатов в фузию.
     pub fn vector_search(
         &self,
@@ -196,41 +218,52 @@ impl Store {
     }
 
     /// Вставить факт. Возвращает uid записи.
+    /// `facts`, `facts_fts` и `facts_vec` пишутся одной транзакцией: иначе сбой
+    /// на FTS/векторе оставил бы факт, невидимый для поиска.
+    /// Одиночных вставок в рабочем коде нет (ход и импорт идут пачками) — метод
+    /// остаётся точкой входа для тестов и будущих вызывающих.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert(&self, f: &NewFact) -> Result<String, String> {
-        let (text, kind, subject, source, session, emb) = (
-            f.text.as_str(),
-            f.kind.as_str(),
-            f.subject.as_str(),
-            f.source.as_str(),
-            f.session.as_str(),
-            f.emb.as_deref(),
-        );
-        let now = f.created.unwrap_or_else(crate::now);
-        let uid = crate::uid();
-        self.db
-            .execute(
-                "insert into facts(uid, text, kind, subject, created, valid_from, source, session) \
-                 values (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
-                params![uid, text, kind, subject, now, source, session],
-            )
-            .map_err(|e| e.to_string())?;
-        let id = self.db.last_insert_rowid();
-        self.db
-            .execute(
-                "insert into facts_fts(rowid, text, uid) values (?1, ?2, ?3)",
-                params![id, text, uid],
-            )
-            .map_err(|e| e.to_string())?;
-        if let Some(emb) = emb {
+        // Виртуальная таблица векторов — до транзакции: DDL внутри неё только
+        // добавляет риск, а `ensure_vec` идемпотентна.
+        if f.emb.is_some() {
             self.ensure_vec(f.dim)?;
-            self.db
-                .execute(
-                    "insert into facts_vec(rowid, emb) values (?1, vec_int8(?2))",
-                    params![id, emb.to_vec()],
-                )
-                .map_err(|e| e.to_string())?;
         }
+        let tx = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let uid = insert_row(&tx, f)?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(uid)
+    }
+
+    /// Записать всё, что дал один ход, одной транзакцией: новые факты, закрытие
+    /// перекрытых старых и отметку `done`. Сбой на любом шаге не оставляет
+    /// полузаписанного хода, который следующий `flush` переработал бы в дубли.
+    pub fn finish_turn(
+        &self,
+        turn: i64,
+        items: &[(NewFact, Option<String>)],
+    ) -> Result<(usize, usize), String> {
+        if let Some(dim) = items.iter().find_map(|(f, _)| f.emb.as_ref().map(|_| f.dim)) {
+            self.ensure_vec(dim)?;
+        }
+        let tx = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let (mut added, mut superseded) = (0usize, 0usize);
+        for (f, over) in items {
+            let uid = insert_row(&tx, f)?;
+            if let Some(old) = over {
+                if supersede_row(&tx, old, &uid)? {
+                    superseded += 1;
+                }
+            }
+            added += 1;
+        }
+        tx.execute(
+            "update turns set state = 'done' where id = ?1",
+            params![turn],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((added, superseded))
     }
 
     /// Вставить пачку фактов одной транзакцией. Возвращает число добавленных.
@@ -244,9 +277,11 @@ impl Store {
         }
         // Дедуп — в Rust, а не SQL: `lower()` и `COLLATE NOCASE` в SQLite
         // работают только с ASCII, и кириллица в них не складывается.
+        // Только живые факты: закрытые прошлым импортом должны вставиться заново,
+        // иначе `import --replace` вычистил бы банк и не вернул ничего.
         let mut seen: std::collections::HashSet<String> = self
             .db
-            .prepare("select text from facts")
+            .prepare("select text from facts where valid_to is null")
             .map_err(|e| e.to_string())?
             .query_map([], |r| r.get::<_, String>(0))
             .map_err(|e| e.to_string())?
@@ -259,39 +294,20 @@ impl Store {
             if !seen.insert(norm(&f.text)) {
                 continue;
             }
-            let now = f.created.unwrap_or_else(crate::now);
-            let uid = crate::uid();
-            tx.execute(
-                "insert into facts(uid, text, kind, subject, created, valid_from, source, session) \
-                 values (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
-                params![uid, f.text, f.kind, f.subject, now, f.source, f.session],
-            )
-            .map_err(|e| e.to_string())?;
-            let id = tx.last_insert_rowid();
-            tx.execute(
-                "insert into facts_fts(rowid, text, uid) values (?1, ?2, ?3)",
-                params![id, f.text, uid],
-            )
-            .map_err(|e| e.to_string())?;
-            if let Some(emb) = &f.emb {
-                tx.execute(
-                    "insert into facts_vec(rowid, emb) values (?1, vec_int8(?2))",
-                    params![id, emb.clone()],
-                )
-                .map_err(|e| e.to_string())?;
-            }
+            insert_row(&tx, f)?;
             added += 1;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(added)
     }
 
-    /// Сколько фактов пришло из конкретного источника: повторный `import`
-    /// не должен удваивать банк.
+    /// Сколько живых фактов пришло из конкретного источника: повторный `import`
+    /// не должен удваивать банк. Закрытые не считаем — иначе `--replace`
+    /// не смог бы пройти второй раз.
     pub fn count_source(&self, source: &str) -> Result<i64, String> {
         self.db
             .query_row(
-                "select count(*) from facts where source = ?1",
+                "select count(*) from facts where source = ?1 and valid_to is null",
                 params![source],
                 |r| r.get(0),
             )
@@ -310,7 +326,10 @@ impl Store {
     }
 
     /// Закрыть факт: `valid_to = now`. Запись остаётся в истории (таймлайн),
-    /// в выдачу больше не попадает.
+    /// в выдачу больше не попадает. Рабочие пути (`flush`) гасят старый факт той
+    /// же транзакцией через `finish_turn`; публичная форма нужна тестам и ручным
+    /// вызовам.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn supersede(&self, old_uid: &str, new_uid: &str) -> Result<bool, String> {
         let now = crate::now();
         let n = self
@@ -350,20 +369,30 @@ impl Store {
         emb: Option<&[u8]>,
         dim: usize,
         k: usize,
-    ) -> Result<Vec<(String, String)>, String> {
+    ) -> Result<Vec<PromptFact>, String> {
         let Some(emb) = emb else {
             return Ok(Vec::new());
         };
-        let ids: Vec<i64> = self
-            .vector_search(emb, dim, k)?
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        Ok(self
-            .load(&ids)?
-            .into_iter()
-            .map(|h| (h.uid, h.text))
-            .collect())
+        let mut st = self
+            .db
+            .prepare(
+                "select uid, text, kind, subject from facts where id = ?1 and valid_to is null",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for (id, _) in self.vector_search(emb, dim, k)? {
+            if let Ok(p) = st.query_row(params![id], |r| {
+                Ok(PromptFact {
+                    uid: r.get::<_, String>(0)?,
+                    text: r.get::<_, String>(1)?,
+                    kind: r.get::<_, String>(2)?,
+                    subject: r.get::<_, String>(3)?,
+                })
+            }) {
+                out.push(p);
+            }
+        }
+        Ok(out)
     }
 
     pub fn enqueue(&self, user: &str, assistant: &str, context: &str) -> Result<i64, String> {
@@ -426,7 +455,21 @@ impl Store {
     }
 
     /// Факты без вектора (записаны, когда провайдер эмбеддингов лежал).
+    /// `facts_vec` создаётся лениво, поэтому на свежей базе её может не быть —
+    /// тогда векторов нет ни у кого, а не «ошибка запроса».
     pub fn missing_vectors(&self, limit: usize) -> Result<Vec<(i64, String)>, String> {
+        if !self.has_vec_table()? {
+            let mut st = self
+                .db
+                .prepare("select id, text from facts where valid_to is null limit ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map(params![limit as i64], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            return Ok(rows.filter_map(|r| r.ok()).collect());
+        }
         let mut st = self
             .db
             .prepare(
@@ -454,11 +497,56 @@ impl Store {
     }
 }
 
+/// Тело `insert`/`insert_batch`/`finish_turn`: три таблицы одной транзакцией.
+/// Отдельная функция, чтобы вызывающие не повторяли один и тот же SQL.
+fn insert_row(tx: &rusqlite::Transaction<'_>, f: &NewFact) -> Result<String, String> {
+    let now = f.created.unwrap_or_else(crate::now);
+    let uid = crate::uid();
+    tx.execute(
+        "insert into facts(uid, text, kind, subject, created, valid_from, source, session) \
+         values (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
+        params![uid, f.text, f.kind, f.subject, now, f.source, f.session],
+    )
+    .map_err(|e| e.to_string())?;
+    let id = tx.last_insert_rowid();
+    tx.execute(
+        "insert into facts_fts(rowid, text, uid) values (?1, ?2, ?3)",
+        params![id, f.text, uid],
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(emb) = &f.emb {
+        tx.execute(
+            "insert into facts_vec(rowid, emb) values (?1, vec_int8(?2))",
+            params![id, emb.clone()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(uid)
+}
+
+/// Закрыть старый факт в пользу нового в уже открытой транзакции.
+fn supersede_row(tx: &rusqlite::Transaction<'_>, old_uid: &str, new_uid: &str) -> Result<bool, String> {
+    let now = crate::now();
+    let n = tx
+        .execute(
+            "update facts set valid_to = ?1, supersedes = null where uid = ?2 and valid_to is null",
+            params![now, old_uid],
+        )
+        .map_err(|e| e.to_string())?;
+    if n > 0 {
+        tx.execute(
+            "update facts set supersedes = ?1 where uid = ?2",
+            params![old_uid, new_uid],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(n > 0)
+}
+
 /// Ключ дедупа: без регистра (в том числе кириллицы) и крайних пробелов.
 pub fn norm(text: &str) -> String {
     text.trim().to_lowercase()
 }
-
 /// FTS5-выражение из свободного запроса: слова длиной ≥ 3 через OR.
 /// Стемминга нет — русский unicode61 режет по буквам, дальше решает фузия.
 pub fn fts_query(query: &str) -> String {
