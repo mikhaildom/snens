@@ -74,11 +74,7 @@ pub(super) async fn upload_attachment(
         if !d.sessions.contains_key(&id) {
             return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
         }
-        if let Some(existing) = d
-            .attachments
-            .get(&id)
-            .and_then(|m| m.values().find(|a| a.command_id == q.command_id))
-        {
+        if let Some(existing) = by_command(&d, &id, &q.command_id) {
             if existing.filename == q.filename && existing.sha256 == digest {
                 let p = &existing.part;
                 return (
@@ -214,11 +210,7 @@ pub(super) async fn upload_attachment(
         // чтобы два одновременных upload'а с одним `command_id` не затёрли друг
         // друга. Проигравший убирает за собой и файл, и строку в базе.
         let mut d = s.data.lock().await;
-        if let Some(existing) = d
-            .attachments
-            .get(&id)
-            .and_then(|m| m.values().find(|a| a.command_id == attachment.command_id))
-        {
+        if let Some(existing) = by_command(&d, &id, &attachment.command_id) {
             if existing.sha256 == attachment.sha256 && existing.filename == attachment.filename {
                 let p = &existing.part;
                 return (
@@ -253,6 +245,18 @@ pub(super) async fn upload_attachment(
         )),
     )
         .into_response()
+}
+
+/// Вложение по `command_id` (ключ идемпотентности загрузки).
+///
+/// Поиск линейный: у сессии десятки вложений, а отдельный индекс пришлось бы
+/// поддерживать в трёх местах (загрузка, удаление, загрузка store). Цена
+/// линейного прохода по десяткам записей ниже цены рассинхронизации индекса —
+/// но O(n) остаётся, поэтому в комментарии это записано явно.
+fn by_command<'a>(d: &'a rt::Store, sid: &str, command_id: &str) -> Option<&'a rt::Attachment> {
+    d.attachments
+        .get(sid)
+        .and_then(|m| m.values().find(|a| a.command_id == command_id))
 }
 
 #[derive(Deserialize)]

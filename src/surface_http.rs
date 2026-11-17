@@ -80,7 +80,8 @@ pub(super) async fn auth(
 
 /// Потоки, где токен в query допустим: `EventSource` не умеет заголовков.
 fn is_stream_path(path: &str) -> bool {
-    path.ends_with("/events") || path == "/v1/events"
+    // `/v1/events` уже попадает под `ends_with`, второй операнд был мёртвым.
+    path.ends_with("/events")
 }
 
 fn unauthorized() -> axum::response::Response {

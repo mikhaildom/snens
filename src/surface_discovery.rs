@@ -54,9 +54,20 @@ pub fn title(path: &Path) -> Option<String> {
 /// Локальные сессии (`tui`, `tui-local`, `run-child`) — не «legacy»: метку они
 /// не пишут, и это шум, а не признак устаревания.
 pub fn surface(path: &Path) -> String {
-    crate::surface_facts::facts(path, false)
-        .surface
-        .unwrap_or_else(|| "local".into())
+    normalize_surface(crate::surface_facts::facts(path, false).surface)
+}
+
+/// Метка поверхности в том виде, в каком её видит клиент.
+///
+/// `legacy` больше никто не пишет (только тестовые фикстуры как ярлык), но
+/// старые журналы его содержат. Нормализация живёт в одном месте: раньше её
+/// знал только список, и `GET /v1/sessions/{id}` отдавал `legacy` там, где
+/// список уже говорил `local`.
+pub fn normalize_surface(surface: Option<String>) -> String {
+    match surface.as_deref() {
+        None | Some("") | Some("legacy") => "local".into(),
+        Some(other) => other.into(),
+    }
 }
 
 /// Merge durable delivery sessions with JSONL transcripts. JSONL-only sessions
@@ -89,7 +100,7 @@ pub fn sessions(cfg: &Config, store: &rt::Store) -> crate::R<Vec<Session>> {
         } else {
             facts_light
         };
-        let mut session = build_session(cfg, &id, &path, &facts);
+        let mut session = build_session(&id, &path, &facts);
         session.state = child_state_or_idle(cfg, &session, &facts);
         sessions.insert(id, session);
     }
@@ -104,7 +115,7 @@ pub fn sessions(cfg: &Config, store: &rt::Store) -> crate::R<Vec<Session>> {
         // и (для подагента) ходы приходят из одного кэшированного набора фактов.
         let need_progress = session.parent.is_some() || facts_parent(&path).is_some();
         let facts = crate::surface_facts::facts(&path, need_progress);
-        let fresh = build_session(cfg, &session.id, &path, &facts);
+        let fresh = build_session(&session.id, &path, &facts);
         session.surface = fresh.surface;
         session.title = session.title.take().or(fresh.title);
         session.parent = fresh.parent.or(session.parent.take());
@@ -141,17 +152,9 @@ fn facts_parent(path: &Path) -> Option<String> {
     crate::surface_facts::facts(path, false).parent
 }
 
-fn build_session(
-    cfg: &Config,
-    id: &str,
-    path: &Path,
-    facts: &crate::surface_facts::Facts,
-) -> Session {
+fn build_session(id: &str, path: &Path, facts: &crate::surface_facts::Facts) -> Session {
     let mut session = Session::new(id.to_string(), "local".to_string());
-    session.surface = facts.surface.clone().unwrap_or_else(|| "local".into());
-    if session.surface == "legacy" {
-        session.surface = "local".into();
-    }
+    session.surface = normalize_surface(facts.surface.clone());
     session.title = facts.title.clone();
     session.parent = facts.parent.clone();
     session.model = facts.model.clone();
@@ -162,7 +165,6 @@ fn build_session(
         session.done_at = p.done_at;
         session.done = p.done.clone();
     }
-    let _ = cfg;
     session
 }
 
@@ -258,7 +260,7 @@ pub fn session_by_id(cfg: &Config, id: &str) -> Option<Session> {
     // `parent`/`model` и прогресс читаются одним проходом, а состояние
     // подагента считается по его признакам, а не по второму `state_of`.
     let facts = crate::surface_facts::facts(&path, true);
-    let mut session = build_session(cfg, id, &path, &facts);
+    let mut session = build_session(id, &path, &facts);
     if session.parent.is_some() {
         session.state = child_state_or_idle(cfg, &session, &facts);
     }

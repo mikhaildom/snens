@@ -88,13 +88,23 @@ pub(super) async fn launch(
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
     let queue_rx = Arc::new(tokio::sync::Mutex::new(queue_rx));
-    s.controls.lock().await.insert(
-        id.clone(),
-        rt::Control {
-            cancel: cancel_tx,
-            queued: queue_tx,
-        },
-    );
+    // Второй `launch` на ту же сессию не должен затирать живой контроль: иначе
+    // прежний ход теряет канал отмены, а его завершение снимет control нового —
+    // и новый ход останется неостанавливаемым. Останавливаем прежний и
+    // занимаем место сами.
+    {
+        let mut controls = s.controls.lock().await;
+        if let Some(prev) = controls.get(&id) {
+            let _ = prev.cancel.send(true);
+        }
+        controls.insert(
+            id.clone(),
+            rt::Control {
+                cancel: cancel_tx,
+                queued: queue_tx,
+            },
+        );
+    }
     // Новое поколение работы: отложенный таймер авторевью, если ждал, увидит
     // изменение и не запустится посреди этого хода.
     *s.review_gen.lock().await.entry(id.clone()).or_insert(0) += 1;
@@ -127,9 +137,25 @@ pub(super) async fn launch(
                 let payload =
                     serde_json::json!({"status":"pending","name":req.name,"args":req.args});
                 d.tool_requests.insert(key.clone(), payload.clone());
-                if broker_s.save_tool_request(&key, &payload).is_err() {
+                if let Err(error) = broker_s.save_tool_request(&key, &payload) {
                     d.tool_requests.remove(&key);
-                    return;
+                    drop(d);
+                    // Раньше `return` убивал брокера до конца хода: все
+                    // последующие вызовы инструментов просто не доезжали.
+                    // Ошибку записи сообщаем в сессию и живём дальше.
+                    let _ = broker_s
+                        .emit(
+                            &broker_id,
+                            Some(broker_run.clone()),
+                            "notice",
+                            serde_json::json!({"text":format!(
+                                "запрос инструмента не записан: {error}"
+                            )}),
+                        )
+                        .await;
+                    // Waiter закрываем отказом, чтобы агент не ждал вечно.
+                    drop(req.result);
+                    continue;
                 }
             }
             broker_s
@@ -259,21 +285,35 @@ pub(super) async fn launch(
         let _ = s
             .emit(&id, Some(run.clone()), "run.started", serde_json::json!({}))
             .await;
-        let result = crate::agent::run_agent_surface(
-            &sess,
-            &cfg,
-            &*llm,
-            &crate::render::Ui::plain(),
-            crate::agent::SurfaceRunOptions {
-                observe: &observe,
-                cancel: Some(cancel_rx),
-                queued: Some(queue_rx.clone()),
-                surface: Some(&surface),
-                surface_tools,
-                tool_tx: Some(tool_tx),
-            },
-        )
-        .await;
+        // Страховка от паники в агенте: без неё `run.finished` не уезжает,
+        // control не снимается, и сессия висит `running` до перезапуска — все
+        // последующие сообщения уходят в очередь, которую никто не читает.
+        let agent_fut = async {
+            crate::agent::run_agent_surface(
+                &sess,
+                &cfg,
+                &*llm,
+                &crate::render::Ui::plain(),
+                crate::agent::SurfaceRunOptions {
+                    observe: &observe,
+                    cancel: Some(cancel_rx),
+                    queued: Some(queue_rx.clone()),
+                    surface: Some(&surface),
+                    surface_tools,
+                    tool_tx: Some(tool_tx),
+                },
+            )
+            .await
+        };
+        // `AssertUnwindSafe`: состояние сессии живёт в файле и в store, а не в
+        // этих футурах; после паники мы всё равно финализируем ход как ошибку.
+        let result =
+            match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(agent_fut))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("агент упал с паникой".into()),
+            };
         // Drop the callback's sender before joining: every accepted signal is drained
         // before completion events, including on cancellation.
         drop(observe);
