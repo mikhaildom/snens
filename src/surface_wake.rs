@@ -14,7 +14,7 @@ use tokio::time::Duration;
 const TICK: Duration = Duration::from_millis(2000);
 
 /// Наблюдатель поверхности: будит простаивающие сессии, когда пришёл результат.
-pub(super) fn spawn(s: Arc<Runtime>) {
+pub(super) fn spawn(s: Arc<Runtime>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(TICK).await;
@@ -42,7 +42,7 @@ pub(super) fn spawn(s: Arc<Runtime>) {
                 drop(guard);
             }
         }
-    });
+    })
 }
 
 /// Разбудить сессию одним ходом с тем, что накопилось. Если будить нечего или

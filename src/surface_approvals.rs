@@ -20,17 +20,20 @@ use super::http::err;
 /// Поднять сокет одобрений. Шим `sudo` в headless-сессии подключается к нему,
 /// шлёт заявку (session/cwd/argv) и ждёт решение. Ядро эмитит `approval.requested`
 /// в сессию владельца, а решение приходит POST'ом и закрывает канал ответа.
-pub(super) fn spawn_approval_server(s: Arc<Runtime>) {
+/// Поднять сокет заявок. Возвращается ручка: без неё задача переживает shutdown,
+/// `accept()` держит сокет и соединения, а ошибка `bind` видна только в stderr.
+pub(super) fn spawn_approval_server(s: Arc<Runtime>) -> Option<tokio::task::JoinHandle<()>> {
     let timeout = s.cfg.approval_timeout_seconds;
     if timeout == 0 {
-        return;
+        return None;
     }
     #[cfg(not(unix))]
     {
         let _ = (s, timeout);
+        None
     }
     #[cfg(unix)]
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let path = crate::approval::sock_path(&s.cfg.sessions_path());
         let _ = std::fs::remove_file(&path);
         let Ok(listener) = tokio::net::UnixListener::bind(&path) else {
@@ -50,7 +53,7 @@ pub(super) fn spawn_approval_server(s: Arc<Runtime>) {
                 let _ = handle_approval_conn(s, stream, timeout).await;
             });
         }
-    });
+    }))
 }
 
 #[cfg(unix)]

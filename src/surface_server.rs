@@ -53,6 +53,19 @@ pub mod discovery;
 /// `SNENS_READY_FILE` с ФАКТИЧЕСКИМ адресом (порт мог быть выбран ядром при
 /// `--listen 127.0.0.1:0`) и путём к токену. Иначе оболочка держала бы вторую
 /// копию правил «где данные и какой порт» — и расходилась бы с ядром.
+/// Курсор событий сессии. Один литерал на файл: он нужен и на старте (импорт
+/// старого store), и на остановке, а две копии расходятся при первой правке
+/// схемы. `surface_runtime` держит свой такой же — там он под транзакцией
+/// события, здесь под общей транзакцией остановки.
+fn upsert_cursor(c: &rusqlite::Connection, session: &str, seq: u64) -> crate::R<()> {
+    c.execute(
+        "INSERT INTO event_sequences(session_id,seq) VALUES(?1,?2)
+             ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq",
+        rusqlite::params![session, seq as i64],
+    )?;
+    Ok(())
+}
+
 pub async fn serve_with_ready(
     cfg: Config,
     addr: SocketAddr,
@@ -121,12 +134,19 @@ async fn serve_inner(
         .values()
         .any(|s| s.state == "running" || s.state == "stopping");
     rt::interrupt_running(&mut store, &mut discovered_ids);
-    if had_running {
-        // Persist restart recovery before accepting requests.
-        rt::persist_store(&db, &store)?;
-        for (id, seq) in &discovered_ids {
-            db.execute("INSERT INTO event_sequences(session_id,seq) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq", rusqlite::params![id, *seq as i64])?;
+    // Курсоры пишем не только при восстановлении после падения: сразу после
+    // импорта старого `store.json` события уже есть, а таблица курсоров пуста, и
+    // без запущенных сессий она отставала бы до graceful shutdown.
+    {
+        let tx = db.unchecked_transaction()?;
+        if had_running {
+            // Persist restart recovery before accepting requests.
+            rt::persist_store(&tx, &store)?;
         }
+        for (id, seq) in &discovered_ids {
+            upsert_cursor(&tx, id, *seq)?;
+        }
+        tx.commit()?;
     }
     // Реестр спаренных устройств читается один раз при старте: проверка токена
     // на каждом запросе идёт по памяти, а `DELETE /v1/clients/{id}` правит и
@@ -152,47 +172,71 @@ async fn serve_inner(
     });
     // Канал одобрений привилегированных действий: headless-сессия не может спросить
     // пароль, поэтому `sudo`-шим спрашивает согласие владельца кнопкой в чате.
-    approvals::spawn_approval_server(state.clone());
+    let approvals = approvals::spawn_approval_server(state.clone());
     // Будильник сессий: пока ход спит, ящик может получить итог подагента или
     // фонового задания. Без него результат лежал бы до следующего слова человека.
-    wake::spawn(state.clone());
+    let wake_task = wake::spawn(state.clone());
     let app = router::app(state.clone(), token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // Сокет занят — теперь адрес настоящий. Пишем ready-файл ДО того, как
     // начнём принимать запросы: оболочка читает его и идёт по этому адресу.
     let actual = listener.local_addr()?;
-    if let (Some(path), Ok(ready_path)) = (
-        token_path,
-        std::env::var("SNENS_READY_FILE").map_err(|_| "нет SNENS_READY_FILE"),
-    ) {
-        if !ready_path.trim().is_empty() {
-            let ready = serde_json::json!({
-                "url": format!("http://{actual}"),
-                "token_file": path.display().to_string(),
-                "data_dir": data_dir_display,
-                "pid": std::process::id(),
-            });
-            std::fs::write(&ready_path, ready.to_string())?;
-        }
-    }
-    tokio::select! {
-        r=axum::serve(listener,app)=>{r?;},
-        _=async {
-            #[cfg(unix)] {
-                // Без обработчика SIGTERM сервис всё равно должен подниматься:
-                // падать на старте из-за сигнала — хуже, чем остановиться только
-                // по SIGINT (systemd дошлёт SIGKILL).
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(mut term) => tokio::select! { _ = tokio::signal::ctrl_c()=>{}, _ = term.recv()=>{} },
-                    Err(_) => { let _ = tokio::signal::ctrl_c().await; }
+    if let Some(path) = token_path {
+        match std::env::var("SNENS_READY_FILE") {
+            Ok(ready_path) if !ready_path.trim().is_empty() => {
+                let ready = serde_json::json!({
+                    "url": format!("http://{actual}"),
+                    "token_file": path.display().to_string(),
+                    "data_dir": data_dir_display,
+                    "pid": std::process::id(),
+                });
+                // Сервер уже слушает: падать из-за ready-файла значит отобрать
+                // у человека стартовавший инстанс. Оболочка тогда не дождётся
+                // адреса — это видно в логе, а не тишиной.
+                if let Err(error) = std::fs::write(&ready_path, ready.to_string()) {
+                    eprintln!("[snens] ready-файл {ready_path} не записан: {error}");
                 }
             }
-            #[cfg(not(unix))] { let _ = tokio::signal::ctrl_c().await; }
-        } => {}
+            // Переменной нет: оболочка нас не ждёт (ручной запуск). Молчим.
+            Ok(_) => {}
+            Err(_) => eprintln!(
+                "[snens] SNENS_READY_FILE не задан: адрес {actual} знает только этот вывод"
+            ),
+        }
     }
-    shutdown(&state).await?;
-    Ok(())
+    let served = tokio::select! {
+        r = axum::serve(listener, app) => r.map_err(|e| e.to_string()),
+        _ = termination_signal() => Ok(()),
+    };
+    // Остановка обязательна на обоих путях: ошибка serve без неё оставила бы в
+    // журнале висящее «running», недописанные events и курсоры в памяти.
+    if let Some(task) = approvals {
+        task.abort();
+    }
+    wake_task.abort();
+    let stopped = shutdown(&state).await;
+    served?;
+    stopped
 }
+
+#[cfg(unix)]
+async fn termination_signal() {
+    // Без обработчика SIGTERM сервис всё равно должен подниматься: падать на
+    // старте из-за сигнала — хуже, чем остановиться только по SIGINT
+    // (systemd дошлёт SIGKILL).
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut term) => tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} },
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn termination_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 async fn shutdown(s: &Arc<Runtime>) -> crate::R<()> {
     {
         let controls = s.controls.lock().await;
@@ -203,16 +247,21 @@ async fn shutdown(s: &Arc<Runtime>) -> crate::R<()> {
     let mut d = s.data.lock().await;
     let mut sequences = s.event_seq.lock().await;
     rt::interrupt_running(&mut d, &mut sequences);
-    // `db` — обычный `std::sync::Mutex`, и это осознанно: критическая секция —
-    // синхронные вызовы rusqlite, ни одного `await` под замком нет, так что
-    // async-воркер на ней не стоит. `unwrap` здесь оставлен намеренно: отравленный
-    // замок значит, что в другом потоке паника уже случилась посреди записи в
-    // store, и продолжать запись на диск — хуже, чем упасть.
-    let db = s.db.lock().unwrap();
+    // Отравленный замок не повод терять graceful stop: `Runtime::db()` везде
+    // восстанавливает его именно ради этого, и здесь — последняя запись на
+    // диск, которая важнее строгости. Значения пишутся одной транзакцией:
+    // построчный `execute` даёт fsync на сессию и растягивает остановку.
+    let db = s
+        .db
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tx = db.unchecked_transaction()?;
     for (id, seq) in sequences.iter() {
-        db.execute("INSERT INTO event_sequences(session_id,seq) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET seq=excluded.seq", rusqlite::params![id, *seq as i64])?;
+        upsert_cursor(&tx, id, *seq)?;
     }
-    rt::persist_store(&db, &d)
+    rt::persist_store(&tx, &d)?;
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
