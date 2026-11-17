@@ -51,7 +51,11 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Сравнение постоянного времени — для секретов, где `==` выдаёт префикс.
+///
+/// `pub(crate)`: этим же помощником проверяется токен инстанса в
+/// `surface_http`, иначе главный секрет проверялся бы слабее остальных.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -60,6 +64,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Проверка токена инстанса: хеш с двух сторон и сравнение постоянного времени.
+///
+/// Хеш убирает и утечку длины: у пары разной длины диграды разной длины, и
+/// `constant_time_eq` на них отвечает `false` без побайтового прохода.
+pub(crate) fn token_eq(given: &[u8], expected: &[u8]) -> bool {
+    let a = Sha256::digest(given);
+    let b = Sha256::digest(expected);
+    constant_time_eq(&a, &b)
 }
 
 /// Каталог реестра: `<data>/clients`, по файлу на устройство.
@@ -173,10 +187,7 @@ impl Registry {
     }
 
     pub fn snapshot(&self) -> Vec<Client> {
-        self.clients
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.clients.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 

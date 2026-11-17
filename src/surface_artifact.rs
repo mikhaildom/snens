@@ -26,7 +26,18 @@ pub struct ArtifactRef {
     pub id: String,
 }
 
-/// Имя артефакта из открывающей строки фенса. `None` — это не фенс артефакта.
+/// Имя артефакта из открывающей строки фенса.
+///
+/// Три исхода, и их нельзя смешивать:
+///
+/// * `None` — это вообще не фенс артефакта;
+/// * `Some(None)` — фенс без `id=`: анонимный артефакт (клиент зовёт его `#1`);
+/// * `Some(Some(id))` — имя из заголовка.
+///
+/// Невалидное значение `id=` (пустое, `id=quiz 1`, `id=цвиз`) — это ошибка
+/// заголовка по `docs/artifact.md`, а не «анонимный артефакт»: раньше такой фенс
+/// выдавался за `#1`, и ссылка в журнале указывала на другой артефакт, чем тот,
+/// на который ответил человек.
 fn artifact_id(line: &str) -> Option<Option<String>> {
     let rest = line.trim_start().strip_prefix("```")?;
     let rest = rest.trim_start_matches('`');
@@ -40,12 +51,11 @@ fn artifact_id(line: &str) -> Option<Option<String>> {
                 && id
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-            if ok {
-                return Some(Some(id.to_string()));
-            }
+            // `id=` был — значит фенс претендует на имя. Кривое имя — не
+            // «анонимный», а невалидный фенс.
+            return ok.then(|| Some(id.to_string()));
         }
     }
-    // Фенс без `id` — анонимный артефакт; клиент зовёт его `#1`.
     Some(None)
 }
 
@@ -181,6 +191,24 @@ mod tests {
                 id: "#1".into()
             })
         );
+    }
+
+    #[test]
+    fn invalid_id_header_is_not_an_anonymous_artifact() {
+        // По `docs/artifact.md` кривое значение — ошибка фенса. Выдавать его за
+        // `#1` нельзя: ссылка в журнале указывала бы на другой артефакт.
+        for bad in [
+            "```artifact id=",
+            "```artifact id=цвиз",
+            "```artifact id=a/b",
+        ] {
+            let log = vec![assistant(bad)];
+            assert_eq!(find(&log, 1), None, "{bad}");
+        }
+        // А `id=quiz 1` после `split_whitespace` — это валидный `id=quiz`
+        // плюс лишний токен: такой фенс остаётся артефактом `quiz`.
+        let log = vec![assistant("```artifact id=quiz 1")];
+        assert_eq!(find(&log, 1).map(|a| a.id), Some("quiz".into()));
     }
 
     #[test]

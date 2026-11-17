@@ -62,16 +62,20 @@ pub fn surface(path: &Path) -> String {
 /// Merge durable delivery sessions with JSONL transcripts. JSONL-only sessions
 /// never get rewritten as a side effect of discovery.
 pub fn sessions(cfg: &Config, store: &rt::Store) -> crate::R<Vec<Session>> {
-    let data_dir = cfg.data_path();
+    // Каталог журналов — ровно `sessions_path()`, а не `data_path().join("sessions")`:
+    // `data_path()` — это его родитель, и равенство держалось бы только при
+    // `sessions_dir`, названном буквально `sessions`. При своём имени (`.../logs`)
+    // перечисление смотрело бы в несуществующий каталог и список был бы пуст.
+    let dir = cfg.sessions_path();
     let mut sessions = store.sessions.clone();
     // Перечисление журналов — одно на всё ядро (`log::list`): второй такой же
     // обход (`read_dir` + расширение + stem) был в этом файле и в `subagent`,
     // и они уже расходились (тут проверялся `is_file`, там — нет).
-    for id in crate::log::list(&data_dir.join("sessions"))? {
+    for id in crate::log::list(&dir)? {
         if !rt::valid_id(&id) || sessions.contains_key(&id) {
             continue;
         }
-        let Some(path) = path_from(&data_dir, &id) else {
+        let Some(path) = path_from(&dir, &id) else {
             continue;
         };
         // Родитель нужен до фактов: он решает, считать ли ходы.
@@ -91,9 +95,9 @@ pub fn sessions(cfg: &Config, store: &rt::Store) -> crate::R<Vec<Session>> {
     }
     // Сессии из store тоже фильтруются: там могли остаться огрызки, созданные
     // до того, как discovery научился их отбрасывать.
-    sessions.retain(|id, _| path_from(&data_dir, id).is_some_and(|p| has_dialogue(&p)));
+    sessions.retain(|id, _| path_from(&dir, id).is_some_and(|p| has_dialogue(&p)));
     for session in sessions.values_mut() {
-        let Some(path) = path_from(&data_dir, &session.id) else {
+        let Some(path) = path_from(&dir, &session.id) else {
             continue;
         };
         // Один проход по журналу на сессию: метка, заголовок, родитель, модель
@@ -220,12 +224,20 @@ pub fn mtime(path: &Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-fn path_from(data_dir: &Path, id: &str) -> Option<std::path::PathBuf> {
-    let p = data_dir.join("sessions").join(format!("{id}.jsonl"));
+/// Журнал сессии в каталоге сессий. Принимает именно каталог сессий
+/// (`cfg.sessions_path()`), а не каталог данных: иначе при `sessions_dir` с
+/// другим именем каждый поиск уезжал бы мимо файла и живые сессии выпадали бы
+/// из списка.
+fn path_from(sessions_dir: &Path, id: &str) -> Option<std::path::PathBuf> {
+    if !rt::valid_id(id) {
+        return None;
+    }
+    let p = sessions_dir.join(format!("{id}.jsonl"));
     p.is_file().then_some(p)
 }
 
-/// Resolve only canonical UUID JSONL paths; caller still checks file existence.
+/// Resolve a session journal path. `rt::valid_id` принимает и канонические
+/// UUID, и legacy-номера вида `1790000000-123` — оба формата живые.
 pub fn path(cfg: &Config, id: &str) -> Option<std::path::PathBuf> {
     if !rt::valid_id(id) {
         return None;
@@ -241,7 +253,7 @@ pub fn load_meta_surface(path: &Path) -> Option<String> {
 /// позже старта поверхности (подагент пишет свой лог другим процессом), а
 /// `discovery::sessions` наполняет store только целиком и только при старте.
 pub fn session_by_id(cfg: &Config, id: &str) -> Option<Session> {
-    let path = path_from(&cfg.data_path(), id).filter(|p| has_dialogue(p))?;
+    let path = path_from(&cfg.sessions_path(), id).filter(|p| has_dialogue(p))?;
     // Все факты — из одного набора (он же кэшированный): `surface`/`title`/
     // `parent`/`model` и прогресс читаются одним проходом, а состояние
     // подагента считается по его признакам, а не по второму `state_of`.

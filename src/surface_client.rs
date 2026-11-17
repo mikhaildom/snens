@@ -88,10 +88,15 @@ struct ErrorBody {
 
 impl Client {
     pub fn new(endpoint: String, token: String) -> Result<Self, String> {
+        // Долгоживущий поток без `timeout`: ход идёт минутами. Но без
+        // `connect_timeout` зависший TCP/TLS-handshake держал бы `stream.next().await`
+        // вечно, и логика переподключения не запускалась бы вовсе.
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| e.to_string())?;
         let commands = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .build()
             .map_err(|e| e.to_string())?;
@@ -128,6 +133,16 @@ impl Client {
             .map_err(|e| format!("HTTP body: {e}"))?;
         if !status.is_success() {
             if let Ok(err) = serde_json::from_slice::<ApiError>(&bytes) {
+                // Кодом в префиксе помечаем только транзиентные ответы сервера:
+                // по нему `post_retry` решает, повторять ли запрос. Без него
+                // 5xx/429 возвращался клиенту сразу, хотя повтор безопасен
+                // (идемпотентность по `command_id`).
+                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(format!(
+                        "HTTP {status}: {}: {}",
+                        err.error.code, err.error.message
+                    ));
+                }
                 return Err(format!("{}: {}", err.error.code, err.error.message));
             }
             return Err(format!(
@@ -186,8 +201,12 @@ impl Client {
     /// Открыть приглашение пейринга на ядре (docs/pairing.md). Требует уже
     /// действующего токена: открыть пейринг может только тот, кто уже внутри.
     pub async fn pair_open(&self) -> Result<Value, String> {
-        self.json(reqwest::Method::POST, "/v1/pair/start", Some(serde_json::json!({})))
-            .await
+        self.json(
+            reqwest::Method::POST,
+            "/v1/pair/start",
+            Some(serde_json::json!({})),
+        )
+        .await
     }
 
     /// Подключённые устройства: id, имя, когда создан и когда последний раз видели.
@@ -199,7 +218,7 @@ impl Client {
     pub async fn revoke_client(&self, id: &str) -> Result<Value, String> {
         self.json(
             reqwest::Method::DELETE,
-            &format!("/v1/clients/{id}"),
+            &format!("/v1/clients/{}", segment(id)),
             None,
         )
         .await
@@ -265,7 +284,13 @@ impl Client {
                 .await
             {
                 Ok(value) => return Ok(value),
-                Err(error) if error.starts_with("HTTP:") || error.starts_with("HTTP body:") => {
+                Err(error)
+                    if error.starts_with("HTTP:")
+                        || error.starts_with("HTTP body:")
+                        || error.starts_with("HTTP 5")
+                        || error.starts_with("HTTP 429")
+                        || error.starts_with("HTTP 408") =>
+                {
                     last = error
                 }
                 Err(error) => return Err(error),
@@ -302,17 +327,27 @@ impl Client {
         let mut first_line = true;
         let mut data = Vec::<String>::new();
         let mut event_id: Option<u64> = None;
+        // Потолок на одну строку SSE: без него битый/враждебный сервер,
+        // льющий одну строку без `\n`, растил бы память без границы.
+        const MAX_LINE: usize = 8 * 1024 * 1024;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("SSE read: {e}"))?;
             buffer.extend_from_slice(&chunk);
-            while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
-                let mut line: Vec<u8> = buffer.drain(..=pos).collect();
-                line.pop();
+            if buffer.len() > MAX_LINE {
+                return Err(format!("SSE line exceeds {MAX_LINE} bytes"));
+            }
+            // Режем по индексу, а не `drain(..=pos)` на каждую строку: `drain`
+            // сдвигает остаток и даёт O(n·строк) на кусок.
+            let mut consumed = 0usize;
+            while let Some(rel) = buffer[consumed..].iter().position(|b| *b == b'\n') {
+                let pos = consumed + rel;
+                consumed = pos + 1;
+                let mut line = &buffer[consumed - rel - 1..pos];
                 if line.last() == Some(&b'\r') {
-                    line.pop();
+                    line = &line[..line.len() - 1];
                 }
                 let line =
-                    std::str::from_utf8(&line).map_err(|e| format!("SSE invalid UTF-8: {e}"))?;
+                    std::str::from_utf8(line).map_err(|e| format!("SSE invalid UTF-8: {e}"))?;
                 let line = if first_line {
                     first_line = false;
                     line.strip_prefix('\u{feff}').unwrap_or(line)
@@ -346,26 +381,14 @@ impl Client {
                     }
                 }
             }
-        }
-        // Process a final unterminated line/frame too; UTF-8 was only decoded once complete.
-        if !buffer.is_empty() {
-            if buffer.last() == Some(&b'\r') {
-                buffer.pop();
-            }
-            let line =
-                std::str::from_utf8(&buffer).map_err(|e| format!("SSE invalid UTF-8: {e}"))?;
-            if let Some(value) = line.strip_prefix("data:") {
-                data.push(value.strip_prefix(' ').unwrap_or(value).to_owned());
-            } else if let Some(value) = line.strip_prefix("id:") {
-                event_id = value.trim().parse().ok();
+            if consumed > 0 {
+                buffer.drain(..consumed);
             }
         }
-        if !data.is_empty() {
-            let parsed: Event = serde_json::from_str(&data.join("\n"))
-                .map_err(|e| format!("SSE invalid event: {e}"))?;
-            let seq = event_id.unwrap_or(parsed.seq);
-            event(parsed, seq);
-        }
+        // Хвост без перевода строки и без пустой строки после него — не событие:
+        // SSE закрывает кадр пустой строкой. Раньше такой огрызок уезжал в
+        // `serde_json` и возвращал `Err` вместо штатного «переподключись с
+        // последнего id». Поэтому недособранный кадр здесь просто отбрасывается.
         Ok(())
     }
 }
