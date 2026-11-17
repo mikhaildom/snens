@@ -1,6 +1,6 @@
 [package]
 name = "snens-desktop"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Окно snens: веб-клиент и своё ядро (или подключение к удалённому)"
 license = "MIT"
