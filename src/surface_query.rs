@@ -169,8 +169,15 @@ pub(super) fn search_sessions(
             continue;
         }
         let Ok(rows) = history::read_with(&path, cfg, false) else {
+            // Ошибка чтения отдельного файла не должна выглядеть как «нет
+            // совпадений»: без строки в stderr проблема прав/диска невидима.
+            eprintln!("[snens] search: журнал {} не прочитан", path.display());
             continue;
         };
+        // Совпадение в тексте ищем в том же поле `lower`, в котором его нашёл
+        // `file_contains`. Исходный текст с ним не совпадает по смещению: ищем
+        // подстроку напрямую в исходнике (без учёта регистра — через `lower`,
+        // когда длины совпадают).
         let mut matched = Vec::new();
         for row in &rows {
             if row.role != "user" && row.role != "assistant" {
@@ -179,17 +186,13 @@ pub(super) fn search_sessions(
             let Some(text) = row.content.as_deref() else {
                 continue;
             };
-            let lower = text.to_lowercase();
-            let Some(pos) = lower.find(needle) else {
+            // Окно вокруг совпадения: символы, а не байты — иначе кириллицу
+            // разрежет посреди буквы. Смещение ищем в исходном тексте: `pos` из
+            // `lower` не переводится в `text` (у 'İ' lowercase длиннее),
+            // а срез за длину `chars` паниковал прямо с `/search`.
+            let Some(snippet) = snippet_window(text, needle) else {
                 continue;
             };
-            // Окно вокруг совпадения: символы, а не байты — иначе кириллицу
-            // разрежет посреди буквы.
-            let chars: Vec<char> = text.chars().collect();
-            let byte_pos = lower[..pos].chars().count();
-            let start = byte_pos.saturating_sub(40);
-            let end = (byte_pos + needle.chars().count() + 60).min(chars.len());
-            let snippet: String = chars[start..end].iter().collect();
             matched.push(serde_json::json!({
                 "seq": row.seq,
                 "role": row.role,
@@ -218,18 +221,67 @@ pub(super) fn search_sessions(
     Ok(hits)
 }
 
-/// Есть ли подстрока в файле (без учёта регистра, потоками по 256 КБ).
-/// Регистр складываем в нижний на лету: ASCII-поиск дешевле полного разбора.
+/// Сниппет вокруг первого совпадения (до 40 символов до и 60 после).
+///
+/// Совпадение ищется без учёта регистра, но `to_lowercase` иногда меняет число
+/// символов ('İ' → два), поэтому перевести смещение из `lower` в `text` нечем.
+/// Ищем в обоих вариантах и режем тот, в котором смещение настоящее:
+///
+/// 1. исходный текст содержит `needle` как есть (регистр совпал);
+/// 2. иначе — `lower`, и сниппет строится тоже по `lower`.
+///
+/// Границы всегда зажаты в длину выбранного текста, так что срез не паникует ни
+/// на кириллице, ни на символах, разворачивающихся при смене регистра.
+fn snippet_window(text: &str, needle: &str) -> Option<String> {
+    const BEFORE: usize = 40;
+    const AFTER: usize = 60;
+    let lower = text.to_lowercase();
+    let (hay, pos) = match text.find(needle) {
+        Some(pos) => (text, pos),
+        None => {
+            let pos = lower.find(needle)?;
+            (lower.as_str(), pos)
+        }
+    };
+    // Байтовое смещение → счётчик символов в том же тексте (по определению
+    // границы символа это безопасно: `pos` пришёл из `find`).
+    let at = hay[..pos].chars().count();
+    let len = hay.chars().count();
+    let start = at.saturating_sub(BEFORE);
+    let end = (at + needle.chars().count() + AFTER).min(len).max(start);
+    Some(hay.chars().skip(start).take(end - start).collect())
+}
+/// Есть ли подстрока в файле (без учёта регистра, кусками по 256 КБ).
+///
+/// Два ограничения честно заложены в форме цикла:
+///
+/// 1. Регистр складываем на уже собранном тексте, а не на байтах куска: для
+///    кириллицы `to_lowercase` меняет длину (и иногда число символов).
+/// 2. Граница куска не должна разрезать совпадение — поэтому в `carry` держим
+///    `needle.len() - 1` байт, а не фиксированные 8: у длинного `needle` голова
+///    совпадения иначе оставалась в предыдущем куске и терялась.
+///
+/// Остаточный край: если подстрока сама короче двух байт или `to_lowercase`
+/// удлиняет символ на границе, окно в `needle.len() - 1` байт теоретически
+/// может не вместить развёрнутый символ. Для поиска по журналам (запросы
+/// человека, обычно десятки байт) это не встречается; полное решение —
+/// скользящее окно в символах, цена которого выше пользы.
 pub(super) fn file_contains(path: &std::path::Path, needle: &str) -> bool {
     use std::io::Read;
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    // Кириллица в UTF-8 при смене регистра меняет длину байтов, поэтому для
-    // не-ASCII ищем как есть и в нижнем регистре по декодированному куску.
     let ascii = needle.is_ascii();
+    // Нижний регистр `needle` — один раз на файл, а не на кусок.
+    let needle_lower = if ascii {
+        needle.to_ascii_lowercase()
+    } else {
+        needle.to_lowercase()
+    };
+    // Держим столько байт хвоста, сколько может понадобиться совпадению на стыке.
+    let keep_bytes = needle.len().saturating_sub(1).max(1);
+    let mut carry: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 256 * 1024];
-    let mut carry = String::new();
     loop {
         let Ok(n) = file.read(&mut buf) else {
             return false;
@@ -237,26 +289,66 @@ pub(super) fn file_contains(path: &std::path::Path, needle: &str) -> bool {
         if n == 0 {
             return false;
         }
-        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-        let combined = format!("{carry}{chunk}");
+        let mut combined = std::mem::take(&mut carry);
+        combined.extend_from_slice(&buf[..n]);
+        // `from_utf8_lossy` здесь безопасен для поиска в ASCII (байты как есть)
+        // и теряет только разрезанный на стыке символ, который остаётся в хвосте
+        // сырых байт ниже.
+        let text = String::from_utf8_lossy(&combined);
         let found = if ascii {
-            combined.to_ascii_lowercase().contains(needle)
+            text.to_ascii_lowercase().contains(&needle_lower)
         } else {
-            combined.to_lowercase().contains(needle)
+            text.to_lowercase().contains(&needle_lower)
         };
         if found {
             return true;
         }
-        // Хвост может разрезать многобайтный символ: переносим последние байты.
-        let keep = combined.len().saturating_sub(8);
-        carry = combined[keep..].to_string();
+        // Хвост переносим СЫРЫМИ байтами: `combined` уже прошёл через lossy, и
+        // копия из него тащила бы в следующий кусок U+FFFD вместо разрезанного
+        // символа.
+        let keep = combined.len().saturating_sub(keep_bytes);
+        carry = combined[keep..].to_vec();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::window_limit;
+    use super::{file_contains, snippet_window, window_limit};
     use crate::{cfg::Config, surface_runtime::Session};
+
+    #[test]
+    fn snippet_window_never_slices_past_the_text() {
+        // Кириллица: смещение совпадения в середине текста.
+        let text = "предисловие ".repeat(20) + "искомое" + &" хвост".repeat(20);
+        let snippet = snippet_window(&text, "искомое").unwrap();
+        assert!(snippet.contains("искомое"), "{snippet}");
+    }
+
+    #[test]
+    fn snippet_window_survives_case_expanding_characters() {
+        // 'İ' в нижнем регистре — два символа: смещение из `lower` в `text` не
+        // переводится, и старый код резал `chars` за длиной (паника с /search).
+        let text = format!("{}ИСКОМОЕ{}", "İ".repeat(200), "x".repeat(200));
+        let snippet = snippet_window(&text, "искомое").unwrap();
+        assert!(snippet.contains("искомое"), "{snippet}");
+    }
+
+    #[test]
+    fn file_contains_keeps_a_carry_as_long_as_the_needle() {
+        let dir = std::env::temp_dir().join(format!("surface-query-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.jsonl");
+        // Строка ставит совпадение ровно на стык 256-килобайтных кусков: старая
+        // версия держала 8 байт хвоста и теряла голову длинного `needle`.
+        let needle = "пограничное совпадение";
+        let mut text = "а".repeat(256 * 1024 - 10);
+        text.push_str(needle);
+        text.push_str(&"б".repeat(100));
+        std::fs::write(&path, &text).unwrap();
+        assert!(file_contains(&path, needle));
+        assert!(!file_contains(&path, "такого в журнале нет"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn window_limit_is_the_cleanup_budget_not_the_target() {
