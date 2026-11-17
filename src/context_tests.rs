@@ -9,13 +9,17 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::named("test")
+    }
+
+    fn named(session: &str) -> Self {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "snens-context-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let sess = Session::open(&dir, "test").unwrap();
+        let sess = Session::open(&dir, session).unwrap();
         sess.append(Rec::System {
             ts: 1,
             text: "original system".into(),
@@ -442,21 +446,17 @@ fn new_note_block_is_accepted() {
 /// (ж) Сбой записи журнала не оставляет активной ревизии и откатывает зеркало.
 #[test]
 fn failed_revision_append_leaves_no_active_revision() {
-    let f = Fixture::new();
+    // Сессия со специальным id: сбой append привязан к ней, а не к глобальному
+    // флагу — параллельные тесты не перехватывают его друг у друга.
+    let f = Fixture::named(FAIL_APPEND_SESSION);
     f.user("start");
     bulk(&f, 40_000);
     f.user("finish");
     let mut m = Mirror::open(&f.sess, &f.cfg).unwrap();
     let mut d = document(&m);
-    let at = d
-        .blocks
-        .iter()
-        .position(|b| b.messages.iter().any(|m| m["role"] == "tool"))
-        .unwrap();
-    d.blocks[at].messages[1]["content"] = json!("short");
+    assert!(shrink_bulk(&mut d));
     save(&m, &d);
     let canonical = effective(&f.sess.read().unwrap(), &f.cfg).unwrap();
-    FAIL_APPEND.store(true, Ordering::Relaxed);
     m.prepare(&f.sess.read().unwrap(), &f.cfg).unwrap();
     let error = m.apply(&f.sess, &f.cfg).unwrap_err().to_string();
     assert!(error.contains("append failed"), "{error}");

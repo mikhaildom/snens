@@ -23,10 +23,11 @@ pub struct Mirror {
 }
 
 /// Отказ применения проверяется тестом на сбой записи журнала: ревизия не
-/// должна оставаться активной, если её не удалось дописать.
+/// должна оставаться активной, если её не удалось дописать. Сбой привязан к id
+/// сессии, а не к глобальному флагу: иначе параллельные тесты перехватывали бы
+/// его друг у друга.
 #[cfg(test)]
-pub(crate) static FAIL_APPEND: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub(crate) const FAIL_APPEND_SESSION: &str = "context-append-fails";
 
 /// FNV-1a64 of serialized *raw records*, not provider messages. Covers all
 /// records, including prior revisions. Format: `fnv64:0123456789abcdef`.
@@ -302,7 +303,7 @@ impl Mirror {
                     )
                 },
                 after.saturating_sub(target),
-                top_blocks(view),
+                top_blocks(view, project::calibration(&current)),
             );
             return self.reject(sess, cfg, &reason);
         }
@@ -320,7 +321,7 @@ impl Mirror {
         // расходятся.
         self.install(&current, cfg, false)?;
         #[cfg(test)]
-        let append_failed = FAIL_APPEND.swap(false, Ordering::Relaxed);
+        let append_failed = sess.id() == FAIL_APPEND_SESSION;
         #[cfg(not(test))]
         let append_failed = false;
         let appended = if append_failed {
@@ -354,8 +355,9 @@ impl Mirror {
 }
 
 /// Топ-5 крупнейших блоков зеркала: механический ответ «что снимать» вместо
-/// «правка не понравилась».
-fn top_blocks(view: &View) -> String {
+/// «правка не понравилась». Размеры пересчитаны тем же множителем калибровки,
+/// что и `before`/`after`, иначе числа в отказе не сходились бы.
+fn top_blocks(view: &View, calibration: f64) -> String {
     let mut sizes = view.block_sizes();
     sizes.truncate(5);
     if sizes.is_empty() {
@@ -363,7 +365,10 @@ fn top_blocks(view: &View) -> String {
     }
     sizes
         .into_iter()
-        .map(|(id, role, tokens)| format!("{id} ({role}, ~{tokens} токенов)"))
+        .map(|(id, role, tokens)| {
+            let tokens = (tokens as f64 * calibration).round() as u64;
+            format!("{id} ({role}, ~{tokens} токенов)")
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
