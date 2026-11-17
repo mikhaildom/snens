@@ -55,12 +55,34 @@ fn powershell(host: &str, script: &str) -> Result<String, String> {
     )
 }
 
+/// Путь профиля уезжает в удалённую команду на обеих платформах: разрешаем
+/// только то, что не может изменить смысл строки.
+fn check_profile(profile: Option<&str>) -> Result<(), String> {
+    let Some(p) = profile else { return Ok(()) };
+    let bad = p.is_empty()
+        || p.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '\'' | '"' | '&' | '|' | '>' | '<' | '$' | ';' | '\n' | '\r' | '`'
+                )
+        });
+    if bad {
+        return Err(format!(
+            "web: недопустимый путь профиля `{p}` — кавычки, пробелы и метасимволы запрещены"
+        ));
+    }
+    Ok(())
+}
+
 fn ssh<A: AsRef<str>>(host: &str, cmd: A) -> Result<String, String> {
+    crate::tunnel::check_host(host)?;
     let out = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(host)
         .arg(cmd.as_ref())
         .output()
@@ -146,11 +168,30 @@ pub fn port_free(host: &str, port: u16) -> Result<bool, String> {
         )?;
         Ok(out.contains("free"))
     } else {
+        // `A && B || C` отдавал «free» при любом сбое (нет ss, grep ошибся) —
+        // именно тогда Chrome и прилипал к чужому профилю. Теперь три исхода,
+        // и «не знаю» — ошибка, а не «свободно».
         let out = ssh(
             host,
-            format!("sh -c 'command -v ss >/dev/null && ss -ltn | grep -q \":{port} \" && echo busy || echo free'"),
+            format!(
+                "sh -c 'if command -v ss >/dev/null 2>&1; then \
+                   if ss -ltn 2>/dev/null | grep -q \":{port} \"; then echo busy; else echo free; fi; \
+                 elif command -v netstat >/dev/null 2>&1; then \
+                   if netstat -ltn 2>/dev/null | grep -q \":{port} \"; then echo busy; else echo free; fi; \
+                 elif command -v lsof >/dev/null 2>&1; then \
+                   if lsof -nP -iTCP:{port} -sTCP:LISTEN 2>/dev/null | grep -q .; then echo busy; else echo free; fi; \
+                 else echo unknown; fi'"
+            ),
         )?;
-        Ok(out.contains("free"))
+        if out.contains("busy") {
+            Ok(false)
+        } else if out.contains("free") {
+            Ok(true)
+        } else {
+            Err(format!(
+                "на {host} нечем проверить порт {port} (нет ss/netstat/lsof):                  запуск вслепую прилип бы к чужому профилю — поставь --port или утилиту"
+            ))
+        }
     }
 }
 
@@ -178,6 +219,9 @@ pub fn start_visible(host: &str, port: u16, profile: Option<&str>) -> Result<(),
                 .into(),
         );
     }
+    // Путь профиля подставляется в удалённую команду: кавычка, пробел или
+    // метасимвол ломают её (а `'` в PowerShell-литерале — это уже исполнение).
+    check_profile(profile)?;
     let prof = match profile {
         Some(p) => p.to_string(),
         None => r"C:\Users\%USERNAME%\.snens-chrome".to_string(),
@@ -215,11 +259,24 @@ $log = Join-Path $env:USERPROFILE 'snens-chrome-visible.out'
 fn write_remote_file(host: &str, name: &str, content: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::Stdio;
+    // Имя уходит в удалённую команду без кавычек: пробел, `&`, `>` или кавычка
+    // меняли бы её смысл. Сегодня передаются только литералы, но проверка
+    // стоит одну строку и снимает грабли на будущее.
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(format!("web: недопустимое имя файла `{name}`"));
+    }
     let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg(host)
-        .arg(format!(r"cmd /c more > C:\Users\%USERNAME%\{}", name))
+        .arg(format!(
+            r#"cmd /c more > "C:\Users\%USERNAME%\{}""#,
+            name
+        ))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -228,9 +285,13 @@ fn write_remote_file(host: &str, name: &str, content: &str) -> Result<(), String
     if let Some(mut stdin) = child.stdin.take() {
         // Windows-переводы строк: powershell их ждёт.
         let crlf = content.replace("\r\n", "\n").replace('\n', "\r\n");
-        stdin
-            .write_all(crlf.as_bytes())
-            .map_err(|e| format!("stdin ssh: {e}"))?;
+        if let Err(e) = stdin.write_all(crlf.as_bytes()) {
+            // Ребёнок остался бы писать на ту сторону без нас: гасим и забираем.
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("stdin ssh: {e}"));
+        }
     }
     let out = child
         .wait_with_output()
@@ -299,6 +360,7 @@ pub fn start_agent_chrome(host: &str, port: u16, profile: Option<&str>) -> Resul
             // Склейка через конкатенацию, без интерполяции в строке: PowerShell
             // не подставляет переменные внутрь одинарных кавычек, и `$prof`
             // уезжал в командную строку Chrome буквально.
+            check_profile(profile)?;
             let prof_expr = match profile {
                 Some(p) => format!("'{}'", p),
                 None => "(Join-Path $env:USERPROFILE '.snens-chrome')".to_string(),
@@ -309,6 +371,7 @@ pub fn start_agent_chrome(host: &str, port: u16, profile: Option<&str>) -> Resul
             powershell(host, &script)?;
         }
         _ => {
+            check_profile(profile)?;
             let prof = profile.unwrap_or("$HOME/.snens-chrome");
             let cmd = format!(
                 "sh -c 'nohup setsid \"$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)\" \

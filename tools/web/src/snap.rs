@@ -57,17 +57,40 @@ pub struct Snap {
     pub url: String,
 }
 
+/// FNV-1a по адресам, ролям и тексту дерева: дешёвый детерминированный
+/// отпечаток, не зависящий от версии компилятора (в отличие от DefaultHasher).
+fn fingerprint(s: &Snap) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    eat(b"addr");
+    for r in &s.refs {
+        eat(r.addr.as_bytes());
+        eat(b"\0");
+    }
+    eat(b"tree");
+    eat(s.text.as_bytes());
+    h
+}
+
 /// Снимок с ожиданием стабилизации. AX-дерево обновляется асинхронно: сразу
 /// после навигации Chrome ещё отдаёт дерево предыдущего документа при том, что
 /// `location.href` уже новый (наблюдали: после логина снимок показывал форму
 /// входа на странице товаров). Поэтому снимаем до трёх раз, пока не совпадут
 /// размер и набор ролей.
 pub fn take_stable(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
-    let mut prev: Option<(usize, usize, String)> = None;
+    let mut prev: Option<(usize, usize, String, u64)> = None;
     let mut last: Option<Snap> = None;
     for attempt in 0..4 {
         let s = take(cdp, depth_cap)?;
-        let sig = (s.total, s.refs.len(), s.url.clone());
+        // Отпечаток самого дерева, а не только счётчиков: две разные страницы с
+        // одинаковым числом узлов и тем же URL считались «стабильными», и в act
+        // уезжали адреса предыдущего рендера.
+        let sig = (s.total, s.refs.len(), s.url.clone(), fingerprint(&s));
         if let Some(p) = &prev {
             if *p == sig {
                 return Ok(s);
@@ -245,7 +268,9 @@ fn walk(
             .flatten()
         {
             if let Some(child) = c.as_str().and_then(|cid| by_id.get(cid)) {
-                walk(child, by_id, depth, depth_cap, counter, snap);
+                // Шаг глубины на pass-through узле: иначе цепочка ignored-обёрток
+                // не продвигалась и depth_cap не ограничивал рекурсию вовсе.
+                walk(child, by_id, depth + 1, depth_cap, counter, snap);
             }
         }
         return;

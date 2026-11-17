@@ -32,11 +32,30 @@ pub fn run_with(l: &mut crate::Live, args: &Args) -> Result<(), String> {
         return Err("web act: пустой список действий".into());
     }
     activate(l)?;
-    let refs = state::load_refs(&l.tab).unwrap_or_default();
+    // Адреса перезагружаем после каждого действия, способного сменить документ:
+    // `navigate`/`eval`/клик с переходом оставляют остальные адреса батча
+    // указывающими на старые backendNodeId.
+    let mut refs = state::load_refs(&l.tab).unwrap_or_default();
     let mut done: Vec<String> = Vec::new();
-    for a in &list {
-        let d = apply(&mut l.cdp, &refs, a)?;
-        done.push(d);
+    for (i, a) in list.iter().enumerate() {
+        match apply(&mut l.cdp, &refs, a) {
+            Ok(d) => done.push(d),
+            Err(e) => {
+                // Уже выполненные действия печатаем: иначе вызывающий не знает,
+                // случился ли клик, и повторяет весь батч — с двойными кликами.
+                for d in &done {
+                    println!("✓ {d}");
+                }
+                return Err(format!(
+                    "действие #{} ({a}) не выполнено: {e}; до него выполнено {} — не повторяй весь батч",
+                    i + 1,
+                    done.len()
+                ));
+            }
+        }
+        if invalidates_refs(a) {
+            refs = state::load_refs(&l.tab).unwrap_or_default();
+        }
     }
     for d in &done {
         println!("✓ {d}");
@@ -68,6 +87,22 @@ fn activate(l: &mut crate::Live) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Меняет ли действие документ так, что адреса снимка могли устареть. Клик и
+/// нажатие включаем намеренно: они часто ведут к навигации/перерисовке, а
+/// лишняя перезагрузка адресов стоит одного чтения файла.
+fn invalidates_refs(a: &Value) -> bool {
+    let obj = match a {
+        Value::Object(o) => o,
+        _ => return false,
+    };
+    obj.contains_key("navigate")
+        || obj.contains_key("eval")
+        || obj.contains_key("click")
+        || obj.contains_key("press")
+        || obj.contains_key("set")
+        || obj.contains_key("clear")
 }
 
 fn node_of(refs: &[crate::snap::Ref], addr: &str) -> Result<i64, String> {

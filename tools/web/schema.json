@@ -1,7 +1,7 @@
 {
   "type": "object",
   "properties": {
-    "command": {"type": "string", "enum": ["connect", "status", "tabs", "use", "open", "snap", "act", "shot", "eval", "text", "probe", "disconnect", "launch", "close"], "description": "Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется"},
+    "command": {"type": "string", "enum": ["connect", "status", "tabs", "use", "open", "snap", "act", "shot", "eval", "text", "probe", "disconnect", "launch", "show", "close"], "description": "Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется; show — вывести окно агентского Chrome на экран"},
     "url": {"type": "string", "description": "Адрес для open (только http/https/file)"},
     "tab": {"type": "string", "description": "Вкладка для use: id (или его начало) либо номер из tabs"},
     "json": {"type": "string", "description": "Для act: JSON-массив действий, напр. [{\"click\":\"e3\"},{\"type\":{\"ref\":\"e1\",\"text\":\"hi\"}},{\"press\":\"Enter\"}]. Действия: click/hover (адрес или [x,y]), type {ref,text}, clear, press, scroll, navigate, wait, upload {ref,file}, eval"},

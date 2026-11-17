@@ -6,13 +6,17 @@
 // Тунель живёт между вызовами (каждый вызов — свой процесс, адреса в состоянии),
 // поэтому процесс отвязан от терминала и записан pid: иначе после `web connect`
 // туннель умирал бы вместе с ним.
-use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::cdp::Endpoint;
 use crate::state;
+
+/// Куда ssh туннеля пишет stderr: файл в каталоге состояния рядом с tunnel.json.
+fn stderr_path() -> std::path::PathBuf {
+    state::dir().join("tunnel.err")
+}
 
 /// Свободный порт на локальной стороне: просим ОС выдать и закрываем.
 fn free_port() -> Result<u16, String> {
@@ -44,7 +48,26 @@ pub fn load() -> Option<Tunnel> {
 }
 
 /// Поднять туннель: `user@machine` и порт CDP на той стороне (по умолчанию 9222).
+/// Адрес машины уходит в argv ssh: значение, начинающееся с `-`, OpenSSH
+/// разберёт как свою опцию (`-oProxyCommand=…` — это выполнение локальной
+/// команды). Проверяем форму и ставим `--` перед адресом.
+pub fn check_host(host: &str) -> Result<(), String> {
+    let bad = host.is_empty()
+        || host.starts_with('-')
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+        || !host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']')
+        });
+    if bad {
+        return Err(format!(
+            "web: недопустимый адрес машины `{host}` — нужен вид user@host"
+        ));
+    }
+    Ok(())
+}
+
 pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
+    check_host(host)?;
     // Уже поднят к тому же адресу — переиспользуем, а не плодим процессы.
     if let Some(t) = load() {
         if t.host == host && t.remote_port == remote_port && is_open(t.local_port) {
@@ -66,10 +89,16 @@ pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
         .arg("ServerAliveInterval=20")
         .arg("-L")
         .arg(&spec)
+        .arg("--")
         .arg(host)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        // stderr в файл, а не в пайп: невычитанный пайп заполняется и вешает ssh
+        // на write(2), а закрытие read-конца после нашего выхода убивает туннель
+        // SIGPIPE'ом. Файл читаем только в ветке отказа.
+        .stderr(Stdio::from(
+            std::fs::File::create(stderr_path()).map_err(|e| format!("stderr туннеля: {e}"))?,
+        ));
     // Отвязать от терминала: туннель должен переживать наш процесс, иначе
     // следующий вызов останется без соединения.
     #[cfg(unix)]
@@ -91,10 +120,7 @@ pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
             break;
         }
         if let Ok(Some(status)) = child.try_wait() {
-            let mut msg = String::new();
-            if let Some(mut e) = child.stderr.take() {
-                let _ = e.read_to_string(&mut msg);
-            }
+            let msg = std::fs::read_to_string(stderr_path()).unwrap_or_default();
             return Err(format!(
                 "ssh-туннель не поднялся (код {:?}): {}",
                 status.code(),
@@ -156,12 +182,14 @@ pub fn remote_browser_path(host: &str, local_port: u16) -> Option<String> {
             }
         }
     }
+    check_host(host).ok()?;
     for cmd in remote_candidates() {
         let out = Command::new("ssh")
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg("ConnectTimeout=10")
+            .arg("--")
             .arg(host)
             .arg(cmd)
             .output()

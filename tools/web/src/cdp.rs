@@ -217,6 +217,26 @@ impl Endpoint {
     }
 }
 
+/// `ws://host:port/path` → адрес для TCP-connect. `wss://` отвергаем явно:
+/// сборка tungstenite без TLS, и раньше такая попытка падала непонятной ошибкой.
+fn tcp_addr(url: &str) -> Result<std::net::SocketAddr, String> {
+    let rest = url
+        .strip_prefix("ws://")
+        .ok_or_else(|| format!("CDP: только ws:// (без TLS): {url}"))?;
+    let hostport = rest.split(['/', '?']).next().unwrap_or(rest);
+    let hostport = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{hostport}:80")
+    };
+    use std::net::ToSocketAddrs;
+    hostport
+        .to_socket_addrs()
+        .map_err(|e| format!("CDP: {hostport}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("CDP: {hostport} не разрешился"))
+}
+
 impl Cdp {
     pub fn connect(url: &str, timeout_s: f64) -> Result<Self, String> {
         Self::connect_with_host(url, timeout_s, None)
@@ -230,7 +250,17 @@ impl Cdp {
         timeout_s: f64,
         host_header: Option<&str>,
     ) -> Result<Self, String> {
-        let deadline = Instant::now() + Duration::from_secs_f64(timeout_s.max(1.0));
+        let budget = Duration::from_secs_f64(timeout_s.max(1.0));
+        let deadline = Instant::now() + budget;
+        // Таймаут ставим ДО рукопожатия: `tungstenite::connect` делает TCP-connect
+        // и WebSocket-handshake без таймаута вовсе, и мёртвый (blackhole) туннель
+        // висел бы минутами, обещая «жёсткий дедлайн».
+        let stream = TcpStream::connect_timeout(&tcp_addr(url)?, budget)
+            .map_err(|e| format!("CDP: {url}: {e}"))?;
+        let _ = stream.set_read_timeout(Some(budget));
+        let _ = stream.set_write_timeout(Some(budget));
+        // Тот же тип, что у `tungstenite::connect`: структура держит MaybeTlsStream.
+        let stream = MaybeTlsStream::Plain(stream);
         let (mut ws, _res) = match host_header {
             Some(h) => {
                 use tungstenite::client::IntoClientRequest;
@@ -241,9 +271,15 @@ impl Cdp {
                     "Host",
                     h.parse().map_err(|e| format!("CDP: Host {h}: {e}"))?,
                 );
-                tungstenite::connect(req).map_err(|e| format!("CDP: {e}"))?
+                tungstenite::client(req, stream).map_err(|e| format!("CDP: {e}"))?
             }
-            None => tungstenite::connect(url).map_err(|e| format!("CDP: {e}"))?,
+            None => {
+                use tungstenite::client::IntoClientRequest;
+                let req = url
+                    .into_client_request()
+                    .map_err(|e| format!("CDP: адрес {url}: {e}"))?;
+                tungstenite::client(req, stream).map_err(|e| format!("CDP: {e}"))?
+            }
         };
         if let MaybeTlsStream::Plain(s) = ws.get_mut() {
             let left = deadline.saturating_duration_since(Instant::now());

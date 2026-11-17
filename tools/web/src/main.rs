@@ -108,8 +108,11 @@ impl Args {
                     // аргументы, а не подкоманда) или «слово не команда».
                     // Проверка на `--` общая: значение самого флага флагом быть
                     // не может.
-                    let takes_value =
-                        !next.starts_with("--") && (!a.positional.is_empty() || !is_command(next));
+                    // У булевых флагов значения не бывает: иначе `web open --new
+                    // https://…` съедал URL как значение --new.
+                    let takes_value = !next.starts_with("--")
+                        && !BOOL_FLAGS.contains(&k.as_str())
+                        && (!a.positional.is_empty() || !is_command(next));
                     if takes_value {
                         let v = it.next().unwrap().clone();
                         a.flags.insert(k, v);
@@ -138,6 +141,9 @@ impl Args {
         self.flag(name).and_then(|v| v.parse().ok()).unwrap_or(def)
     }
 }
+
+/// Флаги-переключатели: значения не принимают.
+const BOOL_FLAGS: [&str; 6] = ["new", "visible", "headless", "full", "no-wait", "fresh"];
 
 fn is_command(s: &str) -> bool {
     matches!(
@@ -190,18 +196,35 @@ fn endpoint(args: &Args) -> Endpoint {
             }
         }
     }
-    if let Some((target, _)) = state::load_target() {
-        return Endpoint {
-            host: "127.0.0.1".into(),
-            port: target.port,
-            remote_port: target.remote_port,
-            browser_path: target.browser_path.clone(),
-        };
+    // Явный --port/SNENS_CDP_PORT сильнее сохранённой привязки: иначе после
+    // первого `connect` переключиться на другой Chrome без удаления состояния
+    // невозможно, и флаг молча игнорируется.
+    let explicit_port = args.flag("port").is_some() || std::env::var("SNENS_CDP_PORT").is_ok();
+    if !explicit_port {
+        if let Some((target, _)) = state::load_target() {
+            return Endpoint {
+                host: "127.0.0.1".into(),
+                port: target.port,
+                remote_port: target.remote_port,
+                browser_path: target.browser_path.clone(),
+            };
+        }
+    } else {
+        // Порт задан руками — туннель к нему тоже надо поднять заново.
+        if let Some(t) = tunnel::load() {
+            if t.remote_port != port_from(args) {
+                tunnel::stop(&t);
+            }
+        }
     }
     if let Some(t) = tunnel::load() {
-        let mut ep = t.endpoint();
-        ep.browser_path = tunnel::remote_browser_path(&t.host, ep.port);
-        return ep;
+        // Порт туннеля должен совпадать с запрошенным: иначе молча работаем не
+        // с тем Chrome.
+        if !explicit_port || t.remote_port == port_from(args) {
+            let mut ep = t.endpoint();
+            ep.browser_path = tunnel::remote_browser_path(&t.host, ep.port);
+            return ep;
+        }
     }
     Endpoint::direct(port_from(args))
 }
@@ -866,11 +889,17 @@ fn run_remote(host: &str, argv: &[String]) -> i32 {
         cmd.push_str(&a.replace('\'', "'\\''"));
         cmd.push('\'');
     }
+    // Тот же адрес, что у туннеля: `-` в начале разбирался бы как опция ssh.
+    if let Err(e) = tunnel::check_host(host) {
+        eprintln!("{e}");
+        return 2;
+    }
     let status = std::process::Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(host)
         .arg(&cmd)
         .status();
