@@ -46,9 +46,12 @@ pub enum Own {
     Binary(String),
     /// Ответ пришёл, но не тот: HTTP-код и сообщение для stderr.
     Http(u16, String),
-    /// Ответа нет вовсе: сеть, таймаут, локальная запись файла. Ноль как код
-    /// HTTP смешивал бы это с «сайт ответил 0» и врал в решении о фолбэке.
+    /// Ответа нет вовсе: сеть, таймаут, обрыв тела. Ноль как код HTTP смешивал
+    /// бы это с «сайт ответил 0» и врал в решении о фолбэке.
     Offline(String),
+    /// Локальная проблема (некуда сохранить, нет прав). Фолбэк тут не поможет:
+    /// он сходит в сеть и вернёт то же самое другими словами.
+    Local(String),
 }
 
 /// Байты тела → строка по charset из content-type. Неизвестная кодировка — UTF-8
@@ -124,7 +127,7 @@ pub fn own(a: &Args) -> Own {
     let name = filename(a, &ctype, disposition.as_deref());
     match save_binary(a, resp, name.as_deref(), &ctype) {
         Ok(line) => Own::Binary(line),
-        Err(e) => Own::Offline(format!("{}: {e}", a.url)),
+        Err(e) => Own::Local(format!("{}: {e}", a.url)),
     }
 }
 
@@ -372,6 +375,8 @@ pub fn fetch(a: &Args) -> String {
                 }
             }
             Own::Binary(path_line) => path_line,
+            // Локальная ошибка: сайт ни при чём, фолбэк не лечит.
+            Own::Local(msg) => crate::die(&format!("fetch: {msg}"), 1),
             Own::Offline(msg) => {
                 // Ответа нет вовсе — фолбэк по режиму: сайт не отказал, до него не дошли.
                 if a.fallback == Fallback::Auto {
