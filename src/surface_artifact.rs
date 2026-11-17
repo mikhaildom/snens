@@ -249,7 +249,7 @@ mod tests {
         assert!(set.contains(&(7, "quiz".into(), "q1".into())));
         assert!(set.contains(&(7, "quiz".into(), "q2".into())));
         // Склейка через ':' склеила бы эти два в один ключ.
-        let tricky = answered(&vec![ask(7, "quiz:q", ""), ask(7, "quiz", "q")]);
+        let tricky = answered(&[ask(7, "quiz:q", ""), ask(7, "quiz", "q")]);
         assert_eq!(tricky.len(), 2);
     }
 

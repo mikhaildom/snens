@@ -10,7 +10,7 @@ use super::{
     events::{session_event_stream, snapshot_and_subscribe},
     launch::{drain_surface_signals, finalize_launch_error},
     review::{review_due, session_cleanup_limits, session_turns},
-    test_support::{add_event, add_events, event, runtime},
+    test_support::{add_event, add_events, event, runtime, BROADCAST_CAPACITY},
 };
 use crate::{
     cfg::Config,
@@ -95,12 +95,11 @@ fn review_marker_neither_counts_as_a_turn_nor_moves_the_boundary() {
     // Запись без полей (ручная/будущая правка формата) не роняет чтение.
     std::fs::write(&path, "{\"kind\":\"review\"}\n").unwrap();
     assert_eq!(session_turns(&cfg, "s"), Some(0));
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn failed_launch_clears_running_state_and_cancels_queued_messages() {
-    let (runtime, dir) = runtime().await;
+    let (runtime, _dir) = runtime().await;
     {
         let mut data = runtime.data.lock().await;
         let session = data.sessions.get_mut("a").unwrap();
@@ -129,7 +128,6 @@ async fn failed_launch_clears_running_state_and_cancels_queued_messages() {
         .any(|event| event.kind == "run.finished"));
     drop(data);
     drop(runtime);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
@@ -145,7 +143,10 @@ async fn signal_relay_preserves_fifo_and_final_waits_for_drain() {
         drain_surface_signals(rx, move |kind, _| {
             let seen = seen.clone();
             let is_blocked = kind == "assistant.delta";
-            let started = started_tx.take();
+            // Сигнал «дошёл до обработчика» — именно у блокирующего сигнала:
+            // раньше его забирал первый (`notice`), и тест доказывал только то,
+            // что релей запустился.
+            let started = if is_blocked { started_tx.take() } else { None };
             let release = if is_blocked { release_rx.take() } else { None };
             async move {
                 if let Some(started) = started {
@@ -178,30 +179,32 @@ async fn signal_relay_preserves_fifo_and_final_waits_for_drain() {
     );
     release_tx.send(()).unwrap();
     relay.await.unwrap().unwrap();
-    emitted.lock().await.push("assistant.completed".into());
-    emitted.lock().await.push("run.finished".into());
+    // `drain_surface_signals` финальные события не эмитит — их шлёт вызывающий
+    // после дренажа. Добавлять их сюда руками значило бы сверять список с самим
+    // собой; проверяем ровно то, что делает дрейн: порядок принятых сигналов.
     assert_eq!(
         *emitted.lock().await,
-        [
-            "notice",
-            "assistant.delta",
-            "notice",
-            "assistant.completed",
-            "run.finished"
-        ]
+        ["notice", "assistant.delta", "notice"],
+        "порядок сигналов сохранён, дрейн дождался заблокированного"
     );
 }
 
 #[tokio::test]
 async fn snapshot_boundary_filters_sessions_and_suppresses_overlap() {
-    let (runtime, dir) = runtime().await;
+    let (runtime, _dir) = runtime().await;
     add_event(&runtime, "a", 1).await;
     add_event(&runtime, "b", 1).await;
     // Snapshot captures A:1; its already-broadcast copy and B:2 must not leak live.
     let (rx, (initial, cursor)) = snapshot_and_subscribe(&runtime, "a", 0).await.unwrap();
     // Inject the overlap explicitly: A:1 was included in the snapshot and
     // can also be present in the receiver queue at the boundary.
-    let _ = runtime.tx.send(event("a", 1));
+    // Проверяем результат: если у канала нет живого приёмника, дубль не
+    // вставится, а тест всё равно «пройдёт» — и граница снимка останется
+    // непроверенной.
+    assert!(
+        runtime.tx.send(event("a", 1)).is_ok(),
+        "дубль не вставился: проверять нечего"
+    );
     add_event(&runtime, "a", 2).await;
     add_event(&runtime, "b", 2).await;
     let mut stream = Box::pin(session_event_stream(
@@ -217,12 +220,11 @@ async fn snapshot_boundary_filters_sessions_and_suppresses_overlap() {
     assert_eq!((second.session_id.as_str(), second.seq), ("a", 2));
     drop(stream);
     drop(runtime);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
 async fn after_cursor_and_lag_replay_are_session_scoped_and_gapless() {
-    let (runtime, dir) = runtime().await;
+    let (runtime, _dir) = runtime().await;
     // Different sessions have independent sequences; A resumes strictly after 3.
     for n in 1..=3 {
         add_event(&runtime, "a", n).await;
@@ -238,23 +240,26 @@ async fn after_cursor_and_lag_replay_are_session_scoped_and_gapless() {
         cursor,
         initial,
     ));
-    // New A events overflow the 1024-entry broadcast buffer; B makes global traffic
-    // exceed the limit too, without sharing A's per-session cursor.
+    // Новые события A переполняют буфер broadcast (ёмкость берём из хелпера, а
+    // не магическим числом: при её изменении тест должен переполнять, а не
+    // молча проходить мимо ветки replay). B создаёт общий трафик и не делит
+    // курсор A.
+    let last = 3 + BROADCAST_CAPACITY as u64 + 70;
     let mut overflow = Vec::new();
-    for n in 4..=1100 {
+    for n in 4..=last {
         overflow.push(event("a", n));
         overflow.push(event("b", n + 12));
     }
     add_events(&runtime, overflow).await;
     let mut got = Vec::new();
-    for _ in 4..=1100 {
+    for _ in 4..=last {
         let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
             .await
             .unwrap()
             .unwrap();
         got.push((event.session_id, event.seq));
     }
-    assert_eq!(got.len(), 1097);
+    assert_eq!(got.len(), (last - 3) as usize);
     assert!(got
         .iter()
         .enumerate()
@@ -262,19 +267,22 @@ async fn after_cursor_and_lag_replay_are_session_scoped_and_gapless() {
 
     // Replay drained the gap; the same subscription must continue live,
     // including while traffic from the other session keeps arriving.
-    add_events(&runtime, vec![event("b", 1200), event("a", 1101)]).await;
+    add_events(&runtime, vec![event("b", last + 100), event("a", last + 1)]).await;
     let next = tokio::time::timeout(Duration::from_secs(3), stream.next())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!((next.session_id.as_str(), next.seq), ("a", 1101));
-    add_event(&runtime, "b", 1201).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), stream.next())
-            .await
-            .is_err()
-    );
+    assert_eq!((next.session_id.as_str(), next.seq), ("a", last + 1));
+    add_event(&runtime, "b", last + 101).await;
+    // Вместо «30 мс тишины» (флейкует под нагрузкой): событие другой сессии
+    // пришло, но в поток A не попало — дальше ждём следующее A и проверяем,
+    // что чужих номеров в потоке нет.
+    add_event(&runtime, "a", last + 2).await;
+    let after = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((after.session_id.as_str(), after.seq), ("a", last + 2));
     drop(stream);
     drop(runtime);
-    std::fs::remove_dir_all(dir).unwrap();
 }

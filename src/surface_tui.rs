@@ -15,7 +15,8 @@ use std::{
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-const HELP: &str = "команды: /new — новая сессия · /sessions — какие есть · /resume ID — открыть · \
+const HELP: &str =
+    "команды: /new — новая сессия · /sessions — какие есть · /resume ID — открыть · \
 /stop — остановить ход · /model [slug] — модель · /reasoning — рассуждение · \
 /memory [on|off] — долгая память · /compact [указание] — сжать контекст · /help · /quit (Ctrl+D)\n\
 Ctrl+C — остановить текущий ход. Пароль sudo здесь не спрашивается.";
@@ -104,7 +105,16 @@ async fn app_loop(
             }
             Err(e) => ui.line(&format!("ошибка открытия: {e}")),
         }
-    } else if let Ok(sessions) = client.sessions().await {
+    } else {
+        let sessions = match client.sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                // Без этой строки при недоступном сервере человек видел пустой
+                // экран без единого объяснения, почему нет сессий.
+                ui.line(&format!("список сессий недоступен: {error}"));
+                Vec::new()
+            }
+        };
         if let Some(s) = choose_default_session(&sessions) {
             match open_session(&client, &s.id, &ui).await {
                 Ok((opened, c)) => {
@@ -151,7 +161,12 @@ async fn app_loop(
                         if should_quit { break; }
                         // A selected-session transition must close old event stream.
                         if current_session_id(session.as_ref()) != subscription_session_id.as_deref() {
-                            stream = None;
+                            // Стрим копит недосказанную строку и начатую таблицу:
+                            // голый `drop` терял уже полученный вывод, у которого
+                            // не было завершающего перевода строки.
+                            if let Some(mut current) = stream.take() {
+                                current.finish();
+                            }
                             received_text.clear();
                             if let Some(task) = subscription.take() { task.abort(); }
                             subscription_session_id = session.as_ref().map(|s| s.id.clone());
@@ -188,7 +203,12 @@ async fn app_loop(
                                         ui.line(&format!("Ответ восстановлен целиком:\n{text}"));
                                     }
                                 }
-                                current.finish();
+                                // `CompletionAction::Finish` уже завершил стрим
+                                // внутри `match`: второй `finish()` — двойной
+                                // флаш того, что в него добавят позже.
+                                if !matches!(action, CompletionAction::Finish) {
+                                    current.finish();
+                                }
                                 stream = None;
                                 received_text.clear();
                             } else {
@@ -259,6 +279,7 @@ fn subscribe(
     let tx = tx.clone();
     *handle = Some(tokio::spawn(async move {
         let delivered = Arc::new(AtomicU64::new(after));
+        let mut failures: u32 = 0;
         loop {
             let tx_events = tx.clone();
             let last = Arc::clone(&delivered);
@@ -271,10 +292,22 @@ fn subscribe(
                 })
                 .await;
             match result {
-                Ok(()) => tokio::time::sleep(Duration::from_millis(300)).await,
+                Ok(()) => {
+                    // Чистое переподключение — сбрасываем повторы, чтобы
+                    // следующий обрыв снова сообщился.
+                    failures = 0;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
                 Err(e) => {
-                    let _ = tx.send(Notice::Error(e));
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    // Экспоненциальная пауза с потолком: при лежащем сервере
+                    // фиксированная секунда давала строку ошибки в TUI каждую
+                    // секунду без конца.
+                    failures += 1;
+                    if failures == 1 {
+                        let _ = tx.send(Notice::Error(e));
+                    }
+                    let backoff = std::cmp::min(1u64 << failures.saturating_sub(1).min(5), 30);
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
             }
         }
@@ -377,9 +410,20 @@ async fn command(
         match client.memory().await {
             Ok(v) => ui.line(&format!(
                 "память: {} · справка {} · запись хода {} · cmd {}",
-                if v["enabled"] == true { "вкл" } else { "выкл" },
+                // `== true` на `Value` даёт `false` и для отсутствующего поля, и
+                // для `"true"`, и для `1` — кривой ответ сервера выдавался за
+                // «выкл» молча. Нераспознанное печатаем как «?».
+                match v["enabled"].as_bool() {
+                    Some(true) => "вкл",
+                    Some(false) => "выкл",
+                    None => "?",
+                },
                 v["recall"].as_str().unwrap_or("?"),
-                if v["retain"] == true { "да" } else { "нет" },
+                match v["retain"].as_bool() {
+                    Some(true) => "да",
+                    Some(false) => "нет",
+                    None => "?",
+                },
                 v["cmd"].as_str().unwrap_or("(нет)"),
             )),
             Err(e) => ui.line(&format!("ошибка памяти: {e}")),
@@ -389,16 +433,17 @@ async fn command(
     }
     if line == "/memory on" || line == "/memory off" {
         let on = line.ends_with("on");
-        match client
-            .set_memory(serde_json::json!({"enabled": on}))
-            .await
-        {
+        match client.set_memory(serde_json::json!({"enabled": on})).await {
             Ok(_) => ui.line(&format!("память: {}", if on { "вкл" } else { "выкл" })),
             Err(e) => ui.line(&format!("ошибка памяти: {e}")),
         }
         return Ok(false);
     }
-    if let Some(instruction) = line.strip_prefix("/compact") {
+    // Только точное `/compact` или `/compact <указание>`: `strip_prefix` без
+    // разделителя ловил `/compacted` и `/compactfoo` и отправлял их модели как
+    // указание сжать контекст вместо ветки «неизвестная команда».
+    if line == "/compact" || line.starts_with("/compact ") {
+        let instruction = line.trim_start_matches("/compact");
         let text = if instruction.trim().is_empty() {
             "Please compact the conversation so far, preserving key decisions and open tasks."
                 .to_owned()
@@ -547,7 +592,6 @@ fn display(event: &Event, ui: &Ui, stream: Option<&mut Stream>) {
         _ => {}
     }
 }
-
 
 #[cfg(test)]
 mod tests {

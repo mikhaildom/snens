@@ -82,31 +82,61 @@ fn resolve_ask_rejects_invalid_header_value_and_repeat() {
         question: "x".into(),
     };
     // Вопрос уже отвечен — ключ структурный, повтор не проходит.
-    let err = resolve_ask(&log, &ask)
-        .err()
-        .expect("ответ не должен пройти");
+    let err = resolve_ask(&log, &ask).expect_err("ответ не должен пройти");
     assert_eq!(err.status(), StatusCode::CONFLICT);
 }
 
 #[test]
 fn surface_tool_definitions_are_validated_and_bounded() {
-    let dir = std::env::temp_dir().join(format!("surface-tools-{}", uuid::Uuid::new_v4()));
-    let cfg = Config::default();
+    // Конфиг смотрит в свой временный каталог: `Config::default()` указывает на
+    // настоящие данные разработчика, и тест читал бы живой `tools/` — результат
+    // зависел бы от машины.
+    let dir = crate::surface_server::test_support::TempDir(
+        std::env::temp_dir().join(format!("surface-tools-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = Config {
+        sessions_dir: dir.join("sessions").display().to_string(),
+        tools_dir: dir.join("tools").display().to_string(),
+        ..Config::default()
+    };
     let valid = serde_json::json!({"type":"function","function":{"name":"send_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}});
     let rt = tokio::runtime::Runtime::new().unwrap();
     assert!(rt
         .block_on(validate_tools(vec![valid.clone()], &cfg))
         .is_ok());
-    assert!(rt.block_on(validate_tools(vec![serde_json::json!({"type":"function","function":{"name":"run","parameters":{"type":"object"}}})],&cfg)).is_err());
+    // Имя ядра занято.
     assert!(rt
-        .block_on(validate_tools(vec![valid.clone(), valid], &cfg))
+        .block_on(validate_tools(
+            vec![serde_json::json!({"type":"function","function":{"name":"run","parameters":{"type":"object"}}})],
+            &cfg
+        ))
         .is_err());
-    let _ = std::fs::remove_dir_all(dir);
+    // Дубль имени в одном запросе.
+    assert!(rt
+        .block_on(validate_tools(vec![valid.clone(), valid.clone()], &cfg))
+        .is_err());
+    // Больше восьми инструментов — отказ по количеству.
+    let many: Vec<serde_json::Value> = (0..9)
+        .map(|i| {
+            serde_json::json!({"type":"function","function":{"name":format!("tool_{i}"),"parameters":{"type":"object"}}})
+        })
+        .collect();
+    assert!(
+        rt.block_on(validate_tools(many, &cfg)).is_err(),
+        "лимит 8 не проверен"
+    );
+    // Определения больше 32 КиБ — отказ по размеру.
+    let huge = serde_json::json!({"type":"function","function":{"name":"big","parameters":{"type":"object","description":"x".repeat(40 * 1024)}}});
+    assert!(
+        rt.block_on(validate_tools(vec![huge], &cfg)).is_err(),
+        "лимит 32 КиБ не проверен"
+    );
 }
 
 #[tokio::test]
 async fn result_after_waiter_timeout_is_rejected_even_when_run_active() {
-    let (runtime, dir) = runtime().await;
+    let (runtime, _dir) = runtime().await;
     {
         let mut d = runtime.data.lock().await;
         let s = d.sessions.get_mut("a").unwrap();
@@ -141,7 +171,6 @@ async fn result_after_waiter_timeout_is_rejected_even_when_run_active() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert!(!runtime.data.lock().await.tool_results.contains_key("a/r/c"));
     drop(runtime);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// Повтор result'а не роняет обработчик и не открывает второй ход.
@@ -152,7 +181,7 @@ async fn result_after_waiter_timeout_is_rejected_even_when_run_active() {
 /// Тест держит то, что проверяемо: повтор с тем же payload — 200, без паники.
 #[tokio::test]
 async fn repeated_tool_result_is_idempotent_and_never_panics() {
-    let (runtime, dir) = runtime().await;
+    let (runtime, _dir) = runtime().await;
     {
         let mut d = runtime.data.lock().await;
         let s = d.sessions.get_mut("a").unwrap();
@@ -188,10 +217,15 @@ async fn repeated_tool_result_is_idempotent_and_never_panics() {
         StatusCode::OK,
         "первый result должен пройти"
     );
-    assert!(rx.await.unwrap().text == "первый");
+    assert_eq!(
+        rx.await.unwrap().text,
+        "первый",
+        "waiter получил не тот текст"
+    );
 
-    // Канал уже изъят и закрыт: повтор (в том числе от второго процесса)
-    // получает конфликт, а не панику и не второй ход инструмента.
+    // Канал уже изъят: повтор с тем же payload идемпотентен (200, ветка
+    // `tool_results`), а не паника и не второй ход инструмента. Другой payload
+    // на тот же key — 409 `result_conflict`.
     let second = tool_result(
         State(runtime.clone()),
         Path(("a".into(), "r".into(), "c".into())),
@@ -208,7 +242,6 @@ async fn repeated_tool_result_is_idempotent_and_never_panics() {
         "тот же payload — идемпотентен"
     );
     drop(runtime);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// Повтор `POST /v1/sessions` не открывает второй журнал и возвращает тот же id.
@@ -218,7 +251,7 @@ async fn repeated_tool_result_is_idempotent_and_never_panics() {
 /// на файле. Проверяем оба захода — до и после открытия журнала.
 #[tokio::test]
 async fn create_is_idempotent_per_command_id() {
-    let (runtime, dir) = runtime().await;
+    let (runtime, _dir) = runtime().await;
     let body = || Create {
         // `command_id` проходит `valid_id`: иначе `create` отвергает запрос.
         command_id: "1792710852-1".into(),
@@ -249,7 +282,7 @@ async fn create_is_idempotent_per_command_id() {
     assert_eq!(
         runtime.data.lock().await.sessions.len(),
         3,
-        "создана вторая сессия"
+        "store стартовал с двумя сессиями: создана ровно одна новая"
     );
 
     // Другой surface под тем же command_id — 409, а не тихая подмена.
@@ -259,7 +292,16 @@ async fn create_is_idempotent_per_command_id() {
         .await
         .into_response();
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
-    let _ = id;
+
+    // Повтор обязан вернуть ТОТ ЖЕ id: раньше он только вычислялся и глушился
+    // `let _ = id`, и регрессия «replay отдаёт другую сессию» проходила бы.
+    let replay = create(State(runtime.clone()), Json(body()))
+        .await
+        .into_response();
+    let bytes = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"].as_str(), Some(id.as_str()), "{body}");
     drop(runtime);
-    std::fs::remove_dir_all(dir).unwrap();
 }
