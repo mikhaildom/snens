@@ -5,8 +5,15 @@
 # создать окно ("Invalid window handle", HRESULT 0x80070578) и CopyFromScreen
 # падает с "handle is invalid" — это ограничение среды, а не приложения.
 # Поэтому скрипт запускается планировщиком с флагом /it в сессии пользователя.
-$out = "C:\Users\Svuvich\desk-state.txt"
-$png = "C:\Users\Svuvich\desk.png"
+#
+# Пути — от профиля текущего пользователя, а не зашитые: на другом аккаунте
+# `C:\Users\Svuvich` не существует.
+param(
+  [string]$Out = (Join-Path $env:USERPROFILE 'desk-state.txt'),
+  [string]$Png = (Join-Path $env:USERPROFILE 'desk.png')
+)
+$out = $Out
+$png = $Png
 
 Add-Type @"
 using System;
@@ -61,4 +68,8 @@ try {
   Add-Content -Encoding UTF8 $out "screenshot=ok"
 } catch {
   Add-Content -Encoding UTF8 $out ("screenshot=ERR " + $_.Exception.Message)
+} finally {
+  # Без Dispose на каждый прогон остаётся битмап размером с экран.
+  if ($g) { $g.Dispose() }
+  if ($bmp) { $bmp.Dispose() }
 }

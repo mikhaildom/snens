@@ -7,8 +7,28 @@
 #
 # Проверяем не «кликнулось ли», а состояние: после крестика окна не видно
 # (IsWindowVisible = false), при этом процесс жив (это «спрятать», не «выйти»).
-$out = "C:\Users\Svuvich\close-test.txt"
+#
+# Пути — от профиля текущего пользователя: на другом аккаунте зашитые
+# `C:\Users\Svuvich` не существуют, и harness логировал бы фальшивый результат.
+param(
+  [string]$Exe = (Join-Path $env:LOCALAPPDATA 'snens\snens-desktop.exe'),
+  [string]$Out = (Join-Path $env:USERPROFILE 'close-test.txt')
+)
+$out = $Out
 $log = New-Object System.Collections.ArrayList
+
+# Стартовое предусловие: окно должно быть запущено человеком. Иначе весь
+# сценарий отрабатывает вхолостую и отчёт выглядит успешным.
+if (-not (Get-Process snens-desktop -ErrorAction SilentlyContinue)) {
+  @("ПРЕДУСЛОВИЕ НЕ ВЫПОЛНЕНО: snens-desktop не запущен") | Set-Content -Encoding UTF8 $out
+  Write-Error "snens-desktop не запущен: запусти приложение и повтори"
+  exit 1
+}
+if (-not (Test-Path -LiteralPath $Exe)) {
+  @("ПРЕДУСЛОВИЕ НЕ ВЫПОЛНЕНО: нет $Exe") | Set-Content -Encoding UTF8 $out
+  Write-Error "не найден $Exe"
+  exit 1
+}
 
 Add-Type @"
 using System;
@@ -66,7 +86,7 @@ if ($h -ne [IntPtr]::Zero) {
 Report "после первого крестика"
 
 # 2) повторный запуск — второй экземпляр просит первый показать окно
-Start-Process -FilePath "C:\Users\Svuvich\AppData\Local\snens\snens-desktop.exe"
+$second = Start-Process -FilePath $Exe -PassThru -ErrorAction Stop
 Start-Sleep -Seconds 4
 Report "после повторного запуска"
 
@@ -80,7 +100,7 @@ if ($h -ne [IntPtr]::Zero) {
 Report "после второго крестика"
 
 # 4) и ещё раз: показать, что цикл не сломался
-Start-Process -FilePath "C:\Users\Svuvich\AppData\Local\snens\snens-desktop.exe"
+$third = Start-Process -FilePath $Exe -PassThru -ErrorAction Stop
 Start-Sleep -Seconds 4
 Report "после третьего запуска"
 $h = MainWindow
