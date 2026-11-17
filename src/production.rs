@@ -281,6 +281,7 @@ pub const CLI_SPEC: FlagSpec = FlagSpec {
         "--session",
         "--config",
         "--parent",
+        "--job",
         "--older-than",
         "--endpoint",
         "--token-file",

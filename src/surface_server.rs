@@ -40,6 +40,8 @@ mod settings;
 mod genui;
 #[path = "surface_pairing.rs"]
 mod pairing;
+#[path = "surface_wake.rs"]
+pub(super) mod wake;
 #[path = "surface_router.rs"]
 mod router;
 #[path = "surface_history.rs"]
@@ -151,6 +153,9 @@ async fn serve_inner(
     // Канал одобрений привилегированных действий: headless-сессия не может спросить
     // пароль, поэтому `sudo`-шим спрашивает согласие владельца кнопкой в чате.
     approvals::spawn_approval_server(state.clone());
+    // Будильник сессий: пока ход спит, ящик может получить итог подагента или
+    // фонового задания. Без него результат лежал бы до следующего слова человека.
+    wake::spawn(state.clone());
     let app = router::app(state.clone(), token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // Сокет занят — теперь адрес настоящий. Пишем ready-файл ДО того, как

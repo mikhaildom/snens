@@ -1,0 +1,92 @@
+// Будильник поверхности: пока сессия спит, в ящик может лечь итог подагента или
+// фонового задания. Ход тогда запускается сам, тем же путём, что и слово
+// человека — иначе результат лежал бы до следующего сообщения клиента.
+//
+// Нейтральная часть (что забирать из ящика и где каталог заданий) — в `wake.rs`:
+// ею пользуется и TUI, у которого своего сервера нет.
+use super::Runtime;
+use std::sync::Arc;
+use tokio::time::Duration;
+
+/// Период опроса. Файловая система не даёт событий без платформенных API, а
+/// ящик маленький: пара stat-ов раз в две секунды дешевле, чем inotify с его
+/// граблями на сетевых ФС и в контейнерах.
+const TICK: Duration = Duration::from_millis(2000);
+
+/// Наблюдатель поверхности: будит простаивающие сессии, когда пришёл результат.
+pub(super) fn spawn(s: Arc<Runtime>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(TICK).await;
+            let live = s.cfg.live();
+            // Будим только простаивающие: идущий ход сам прочитает ящик на
+            // ближайшей границе, а второй параллельный ход — это гонка.
+            let idle: Vec<String> = {
+                let data = s.data.lock().await;
+                data.sessions
+                    .iter()
+                    .filter(|(_, x)| x.state == "idle")
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            for id in crate::wake::mailboxes(&live, idle.into_iter()) {
+                if !crate::wake::has_pending(&live, &id) {
+                    continue;
+                }
+                // Замок сессии: пока его держит кто-то другой, ход уже начался
+                // или начинается — второй не нужен.
+                let Some(guard) = s.session_lock(&id).await.try_lock_owned().ok() else {
+                    continue;
+                };
+                wake(s.clone(), &live, &id).await;
+                drop(guard);
+            }
+        }
+    });
+}
+
+/// Разбудить сессию одним ходом с тем, что накопилось. Если будить нечего или
+/// сессия занята, вход остаётся в ящике и следующий тик попробует снова.
+async fn wake(s: Arc<Runtime>, cfg: &crate::cfg::Config, id: &str) {
+    let (busy, surface) = {
+        let d = s.data.lock().await;
+        match d.sessions.get(id) {
+            Some(x) => (
+                x.state == "running" || x.state == "stopping",
+                x.surface.clone(),
+            ),
+            None => (false, String::new()),
+        }
+    };
+    if busy {
+        return;
+    }
+    let surface = if surface.is_empty() {
+        // Сессии нет в store, а ящик есть: поверхность поднимает её из журнала
+        // так же, как это делает первое сообщение от клиента.
+        match super::discovery::path(&s.cfg, id) {
+            Some(path) if path.is_file() => super::discovery::surface(&path),
+            _ => return,
+        }
+    } else {
+        surface
+    };
+    // Писательский замок журнала: без него `launch` откажется начинать ход.
+    if super::commands::ensure_writer(&s, id).await.is_err() {
+        return;
+    }
+    let inbox = crate::wake::collect(cfg, id);
+    if inbox.is_empty() {
+        return;
+    }
+    super::launch::launch(
+        s,
+        id.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        inbox.as_turn(),
+        surface,
+        Vec::new(),
+        None,
+    )
+    .await;
+}

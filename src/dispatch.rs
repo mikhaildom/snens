@@ -90,13 +90,14 @@ pub fn builtin_defs(shell: &str) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "run",
-                "description": "Выполнить shell-команду ($shell) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]\nКод возврата при `;`-цепочке — от последней команды: хвостовой which/grep может покрасить успешную команду в ошибку.\nДругой диалект — только когда он действительно нужен: `bash -c '...'`.",
+                "description": "Выполнить shell-команду ($shell) и получить вывод: stdout, затем stderr, и код возврата.\nrun <команда> [--cwd каталог]\nКод возврата при `;`-цепочке — от последней команды: хвостовой which/grep может покрасить успешную команду в ошибку.\nДругой диалект — только когда он действительно нужен: `bash -c '...'`.\nФоново — только то, что долго (сборка, тесты, скачивание): поставь background, ход заверши и не жди; результат придёт сообщением и разбудит новый ход.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Команда для $shell"},
                         "cwd": {"type": "string", "description": "Рабочий каталог"},
-                        "timeout_seconds": {"type": "integer", "description": "Таймаут в секундах"}
+                        "timeout_seconds": {"type": "integer", "description": "Таймаут в секундах"},
+                        "background": {"type": "boolean", "description": "Долгая команда: отдать в фон и не ждать; вывод уйдёт в сессию уведомлением, когда закончится"}
                     },
                     "required": ["command"]
                 }
@@ -224,6 +225,38 @@ pub async fn dispatch(
             .map(|c| sesscwd::resolve(Path::new(c), &session_cwd))
             .unwrap_or_else(|| session_cwd.clone());
         let mut sp = exec::Spawn::sh(&cfg.shell, command, t, cfg.max_process_chars);
+        // `background`: не держим ход, пока команда работает. Задание уезжает
+        // отдельным процессом, а результат вернётся в сессию уведомлением и
+        // разбудит следующий ход. Ждать здесь значит блокировать единственный
+        // цикл: человек со своим словом стоит в очереди до таймаута.
+        if a.get("background").and_then(Value::as_bool).unwrap_or(false) {
+            return match crate::jobs::start(
+                cfg,
+                sess.path(),
+                command,
+                &cwd_owned.display().to_string(),
+                t,
+            ) {
+                Ok(job) => {
+                    let text = format!(
+                        "задание {job} пошло в фон (лимит {t}s). Ход свободен: не жди его — \
+                         результат придёт сообщением и разбудит новый ход. Вывод: {}",
+                        crate::jobs::dir(sess.path())
+                            .join(format!("{job}.log"))
+                            .display()
+                    );
+                    exec::Out {
+                        exit: 0,
+                        bytes: text.len(),
+                        text,
+                        ms: 0,
+                        timed_out: false,
+                        parts: Vec::new(),
+                    }
+                }
+                Err(e) => fail(format!("run --background: {e}")),
+            };
+        }
         sp.cwd = cwd_owned.to_str();
         sp.path = Some(path);
         sp.reduce = cfg.reduce_output;

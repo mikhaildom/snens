@@ -450,9 +450,10 @@ async fn run_loop<L: Llm>(
         if reply.calls.is_empty() {
             memory::retain_turn(sess, cfg, &path, &reply.text).await;
             // Подагенты: пока есть живые дети, не выходим — ждём их вопросы и
-            // итоги. Иначе вопрос ребёнка родителю никто не прочитает и он уедет
-            // в таймаут. Это supervisor вокруг цикла, а не вызов инструмента.
-            if supervisor(sess, cfg, ui, queued.as_ref()).await {
+            // итоги. Но только там, где нет будильника: на поверхности (surface
+            // задан) ход заканчивается сразу, а итог ребёнка разбудит сессию сам.
+            // Иначе выход держится лишние минуты, и слово человека стоит в очереди.
+            if surface.is_none() && supervisor(sess, cfg, ui, queued.as_ref()).await {
                 continue;
             }
             if let Some(rx) = queued.as_ref() {
