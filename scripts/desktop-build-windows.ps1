@@ -68,7 +68,9 @@ if (-not $jsFiles) {
   exit 1
 }
 $all = ($jsFiles | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
-foreach ($needle in @("/v1/tickets", "dash__card")) {
+# Маркеры свежести — то, что живёт в JS, а не в CSS: класс вида `dash__card`
+# переехал в 30-shell.css нового дизайна, и проверка врала «клиент устарел».
+foreach ($needle in @("/v1/tickets", "snens-rail-mini")) {
   if ($all -notmatch [regex]::Escape($needle)) {
     Write-Output "EXIT=1 (клиент устарел: нет '$needle' ни в одном js из $assetsDir)"
     exit 1
