@@ -216,14 +216,26 @@ pub fn collect_finished(sess_path: &Path) -> Vec<String> {
     out
 }
 
-/// Есть ли готовое задание — дешёвая проверка без изъятия.
+/// Есть ли что забирать — дешёвая проверка без изъятия. Кроме готового задания
+/// это ещё и снятое (pid мёртв, а `done` нет): иначе о таком сессия узнала бы
+/// только когда её разбудят по другому поводу.
 pub fn has_finished(sess_path: &Path) -> bool {
     let Ok(rd) = std::fs::read_dir(dir(sess_path)) else {
         return false;
     };
     for e in rd.flatten() {
         let path = e.path();
-        if path.extension().and_then(|x| x.to_str()) == Some("done") {
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if done(sess_path, id).is_some() {
+            return true;
+        }
+        let job = serde_json::from_slice::<Job>(&std::fs::read(&path).unwrap_or_default());
+        if job.is_ok_and(|job| !crate::subagent::alive(job.pid)) {
             return true;
         }
     }
@@ -248,10 +260,10 @@ mod tests {
     /// докладывало бы один и тот же результат на каждом тике.
     #[test]
     fn finished_job_is_collected_once() {
-        let dir = std::env::temp_dir().join(format!("snens-jobs-once-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sess_path = dir.join("1-2.jsonl");
+        let root = std::env::temp_dir().join(format!("snens-jobs-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sess_path = root.join("1-2.jsonl");
         let jobs = dir(&sess_path);
         std::fs::create_dir_all(&jobs).unwrap();
         let log = jobs.join("7-1.log");
@@ -259,7 +271,7 @@ mod tests {
         let job = Job {
             id: "7-1".into(),
             command: "make all".into(),
-            cwd: dir.display().to_string(),
+            cwd: root.display().to_string(),
             timeout_s: 60,
             log: log.display().to_string(),
             // pid 0 не существует: задание считается снятым, если нет `done`.
@@ -290,7 +302,7 @@ mod tests {
         assert!(first[0].contains("готово"), "{}", first[0]);
         assert!(!has_finished(&sess_path));
         assert!(collect_finished(&sess_path).is_empty(), "выдано дважды");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

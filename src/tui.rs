@@ -207,7 +207,13 @@ async fn run_turn(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<In>,
     id: &str,
 ) -> R<Flow> {
-    let mut turn = Box::pin(agent::run_agent(sess, cfg, llm, ui));
+    // TUI сам следит за ящиком (`idle_input`), поэтому цикл не держится живым
+    // ради детей: итог ребёнка запустит следующий ход отсюда же.
+    let options = agent::SurfaceRunOptions {
+        wake: true,
+        ..Default::default()
+    };
+    let mut turn = Box::pin(agent::run_agent_surface(sess, cfg, llm, ui, options));
     loop {
         tokio::select! {
             r = &mut turn => {
