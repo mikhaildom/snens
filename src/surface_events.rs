@@ -183,10 +183,9 @@ pub(super) async fn history(
         return err("not_found", "session not found", StatusCode::NOT_FOUND).into_response();
     }
     let with_recall = q.with_recall();
-    let cfg = s.cfg.clone();
     let read_path = path.clone();
     let messages = match tokio::task::spawn_blocking(move || {
-        history::read_with(&read_path, &cfg, with_recall)
+        history::read_with(&read_path, with_recall)
     })
     .await
     {

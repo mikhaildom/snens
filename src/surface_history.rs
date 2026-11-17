@@ -1,4 +1,3 @@
-use crate::cfg::Config;
 use crate::log::{Body, Rec};
 use serde::Serialize;
 use std::{
@@ -71,24 +70,46 @@ pub struct Usage {
 /// только поверхности, которая решила её показать (веб-клиент, галочка в
 /// настройках). По умолчанию выключено: справка — это контекст промпта, а не
 /// транскрипт, и в общей ленте/поиске ей не место.
-pub fn read_with(path: &Path, _cfg: &Config, with_recall: bool) -> crate::R<Vec<HistoryMessage>> {
+pub fn read_with(path: &Path, with_recall: bool) -> crate::R<Vec<HistoryMessage>> {
     if !path.is_file() {
         return Ok(Vec::new());
     }
-    let bytes = std::fs::read(path)?;
+    // Читаем потоком, а не через `std::fs::read` + `BufReader` по срезу: файл
+    // всё равно целиком уезжает в память в виде записей, и вторая копия байтов
+    // на мегабайтном журнале удваивала пик.
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
     let mut rows: Vec<HistoryMessage> = Vec::new();
-    let mut lines = BufReader::new(bytes.as_slice()).lines().peekable();
     let mut seq = 0u64;
-    while let Some(line) = lines.next() {
+    let mut raw = String::new();
+    let mut last_ended_with_newline;
+    loop {
+        raw.clear();
+        let read = reader.read_line(&mut raw)?;
+        if read == 0 {
+            break;
+        }
         seq += 1;
-        let line = line?;
+        last_ended_with_newline = raw.ends_with('\n');
+        let line = raw.trim_end_matches(['\n', '\r']);
         if line.trim().is_empty() {
             continue;
         }
-        let rec = match serde_json::from_str::<Rec>(&line) {
+        let rec = match serde_json::from_str::<Rec>(line) {
             Ok(rec) => rec,
-            Err(error) if lines.peek().is_none() && !bytes.ends_with(b"\n") => {
-                let _ = error;
+            // Недописанный хвост (обрыв записи, процесс убили) — норма журнала,
+            // иначе один оборванный ход ломал бы весь транскрипт. Граница
+            // честная: терпим только `is_eof` или строку без завершающего `\n`
+            // — это и есть признаки обрыва. Битый, но ЗАВЕРШЁННЫЙ переводом
+            // строки последний байт остаётся ошибкой: это порча файла, и её
+            // видно, а не прячем.
+            Err(error) if error.is_eof() || !last_ended_with_newline => {
+                // Не молча: тихая потеря последней записи неотличима от «её не
+                // было», и разбираться с этим потом нечем.
+                eprintln!(
+                    "[snens] журнал {}: хвост не разобран (строка {seq}), запись пропущена: {error}",
+                    path.display()
+                );
                 continue;
             }
             Err(error) => {
@@ -308,7 +329,16 @@ pub fn read_with(path: &Path, _cfg: &Config, with_recall: bool) -> crate::R<Vec<
                 }
                 None
             }
-            _ => None,
+            // Служебные записи журнала, которым в транскрипте места нет.
+            // Перечислены явно, без `_`: новый вариант `Rec` в этом же крейте
+            // тогда даст ошибку компиляции, а не молча исчезнет с поверхности.
+            Rec::Meta { .. }
+            | Rec::System { .. }
+            | Rec::Replay { .. }
+            | Rec::Ctx { .. }
+            | Rec::ContextRevision { .. }
+            | Rec::Started { .. }
+            | Rec::Done { .. } => None,
         };
         if let Some(row) = row {
             rows.push(row);
@@ -339,7 +369,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = read_with(&path, &Config::default(), false).unwrap();
+        let rows = read_with(&path, false).unwrap();
         let json = serde_json::to_string(&rows).unwrap();
         assert!(rows.is_empty());
         assert!(!json.contains("PRIVATE_RECALL_MARKER"));
@@ -347,7 +377,7 @@ mod tests {
 
         // А по запросу поверхности справка памяти отдаётся как шаг `recall`:
         // человек включает её показ галочкой, и тогда он видит, что агент вспомнил.
-        let shown = read_with(&path, &Config::default(), true).unwrap();
+        let shown = read_with(&path, true).unwrap();
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].role, "recall");
         assert!(shown[0]
@@ -381,7 +411,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = read_with(&path, &Config::default(), false).unwrap();
+        let rows = read_with(&path, false).unwrap();
         let roles: Vec<&str> = rows.iter().map(|r| r.role).collect();
         assert_eq!(
             roles,
@@ -414,7 +444,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = read_with(&path, &Config::default(), false).unwrap();
+        let rows = read_with(&path, false).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content.as_deref(), Some("послушай голосовое"));
         let parts = rows[0].parts.as_ref().expect("вложения сохраняются");
@@ -437,7 +467,7 @@ mod tests {
         );
         fs::write(&path, raw).unwrap();
         let before = fs::read(&path).unwrap();
-        let rows = read_with(&path, &Config::default(), false).unwrap();
+        let rows = read_with(&path, false).unwrap();
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [2, 3, 4]);
         assert_eq!(rows[0].role, "user");
         assert_eq!(rows[0].content.as_deref(), Some("hi"));
@@ -449,7 +479,7 @@ mod tests {
             "{\"kind\":\"user\",\"ts\":1,\"text\":\"ok\",\"source\":\"tui\"}\n{broken}\n",
         )
         .unwrap();
-        assert!(read_with(&path, &Config::default(), false)
+        assert!(read_with(&path, false)
             .unwrap_err()
             .to_string()
             .contains("physical line 2"));
@@ -458,10 +488,7 @@ mod tests {
             "{\"kind\":\"user\",\"ts\":1,\"text\":\"ok\",\"source\":\"tui\"}\n{incomplete",
         )
         .unwrap();
-        assert_eq!(
-            read_with(&path, &Config::default(), false).unwrap().len(),
-            1
-        );
+        assert_eq!(read_with(&path, false).unwrap().len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 }

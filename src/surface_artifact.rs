@@ -65,7 +65,10 @@ fn artifact_id(line: &str) -> Option<Option<String>> {
 /// номеру. Берётся первый артефакт записи: ответы на второй и дальше в одном
 /// сообщении — редкость, а порядок совпадает с нумерацией клиента (`#1`, `#2`).
 pub fn find(log: &[Rec], seq: u64) -> Option<ArtifactRef> {
-    let rec = log.get(seq.checked_sub(1)? as usize)?;
+    // `as usize` на 32-битной цели молча обрезал бы большое `seq` до маленького
+    // индекса — ответ ссылался бы на чужую запись вместо `None`.
+    let index = usize::try_from(seq.checked_sub(1)?).ok()?;
+    let rec = log.get(index)?;
     let Rec::Assistant { text, .. } = rec else {
         return None;
     };
@@ -88,9 +91,9 @@ pub fn find(log: &[Rec], seq: u64) -> Option<ArtifactRef> {
 /// JS-парсер в ядре. Вопрос из цикла посчитается один раз — тоже приемлемо:
 /// важно заметить системную проблему, а не сосчитать точно.
 pub fn count_questions(text: &str) -> usize {
-    if !text.contains("artifact") {
-        return 0;
-    }
+    // Гейт по слову `artifact` давал `asked = 0` там, где `answered` считал
+    // ответы (текст без слова, но с вопросами) — и сводка врала «0, без ответа
+    // 0». Считаем по самому вызову: лишний `str::matches` — копейки.
     text.matches("snens.ask").count()
 }
 
@@ -142,7 +145,26 @@ impl AskStats {
             return String::new();
         }
         let pending = self.asked.saturating_sub(self.answered);
-        format!("вопросов артефактов {}, без ответа {pending}", self.asked)
+        format!(
+            "{} артефактов {}, без ответа {pending}",
+            questions_word(self.asked),
+            self.asked
+        )
+    }
+}
+
+/// Слово для числа вопросов: «вопрос / вопроса / вопросов».
+fn questions_word(n: usize) -> &'static str {
+    let tail = n % 100;
+    let last = n % 10;
+    if (11..=14).contains(&tail) {
+        "вопросов"
+    } else if last == 1 {
+        "вопрос"
+    } else if (2..=4).contains(&last) {
+        "вопроса"
+    } else {
+        "вопросов"
     }
 }
 
@@ -273,7 +295,7 @@ mod tests {
         let s = AskStats::of(&log);
         assert_eq!(s.asked, 1);
         assert_eq!(s.answered, 1);
-        assert_eq!(s.line(), "вопросов артефактов 1, без ответа 0");
+        assert_eq!(s.line(), "вопрос артефактов 1, без ответа 0");
         assert_eq!(AskStats::of(&[]).line(), "");
     }
 }

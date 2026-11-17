@@ -83,9 +83,18 @@ pub(super) async fn handle_approval_conn(
     mut stream: tokio::net::UnixStream,
     timeout: u64,
 ) -> crate::R<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    // Потолок на строку и таймаут на её получение: без них клиент, который
+    // подключился и молчит (или льёт строку без `\n`), держал бы задачу и её
+    // буфер вечно, а таймаут одобрения начинался бы только после разбора.
+    const MAX_LINE: u64 = 64 * 1024;
     let mut line = String::new();
-    BufReader::new(&mut stream).read_line(&mut line).await?;
+    {
+        let mut reader = BufReader::new(&mut stream).take(MAX_LINE);
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .map_err(|_| "заявка на одобрение не пришла за 10 с")??;
+    }
     let req: crate::approval::Request = serde_json::from_str(line.trim_end())?;
     // Заявка привязана к сессии: решение ищется по её событиям. Неизвестная
     // сессия — сразу отказ, без карточки (нельзя показать владельцу — нет чата).
@@ -106,7 +115,10 @@ pub(super) async fn handle_approval_conn(
             .map(|a| shell_quote(a))
             .collect::<Vec<_>>()
             .join(" ");
-        let _ = s
+        // Ошибку `emit` не глотаем: если карточка не ушла (диск, сериализация),
+        // шим будет ждать весь `approval_timeout_seconds` и получить
+        // необъяснимый отказ. Честнее ответить «нет» сразу.
+        let card = s
             .emit(
                 &req.session,
                 None,
@@ -118,6 +130,12 @@ pub(super) async fn handle_approval_conn(
                 }),
             )
             .await;
+        if card.is_err() {
+            s.approvals.lock().await.remove(&id);
+            let _ = stream.write_all(b"deny\n").await;
+            let _ = stream.flush().await;
+            return Ok(());
+        }
         let decided = tokio::time::timeout(Duration::from_secs(timeout), rx).await;
         s.approvals.lock().await.remove(&id);
         match decided {

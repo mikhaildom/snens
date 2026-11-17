@@ -68,7 +68,25 @@ pub(super) async fn context_breakdown(
     };
     // Схемы инструментов тоже уезжают в запрос и занимают окно: считаем их
     // оценкой по JSON и приводим тем же коэффициентом, что и остальное.
-    let tools = crate::registry::discover(&s.cfg).await;
+    //
+    // `registry::discover` — `async`-обёртка над полностью блокирующим телом
+    // (`read_dir`, `is_file` и запуск каждого тула с `--help` и таймаутом 5 с).
+    // Прямой вызов здесь стоял бы на async-воркере и сводил на нет
+    // `spawn_blocking` выше; уводим его в блокирующий пул.
+    let cfg = s.cfg.clone();
+    let tools = match tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(crate::registry::discover(&cfg))
+    })
+    .await
+    {
+        Ok(tools) => tools,
+        // Задачи пула не паникуют на ожидаемых путях; если это всё же случилось,
+        // показываем расклад без схемы инструментов, а не 500 на весь /context.
+        Err(error) => {
+            eprintln!("[snens] /context: реестр инструментов не собран: {error}");
+            Vec::new()
+        }
+    };
     let schema: u64 = crate::registry::definitions(&tools)
         .iter()
         .map(|t| crate::project::estimate_message(t) + 8)
@@ -128,9 +146,7 @@ pub(super) async fn search(
     }
     let limit = q.limit.unwrap_or(50).min(200);
     let dir = s.cfg.sessions_path();
-    let cfg = s.cfg.clone();
-    let found =
-        tokio::task::spawn_blocking(move || search_sessions(&dir, &cfg, &needle, limit)).await;
+    let found = tokio::task::spawn_blocking(move || search_sessions(&dir, &needle, limit)).await;
     match found {
         Ok(Ok(hits)) => Json(serde_json::json!({"hits": hits})).into_response(),
         Ok(Err(e)) => err("storage", &e, StatusCode::INTERNAL_SERVER_ERROR).into_response(),
@@ -145,7 +161,6 @@ pub(super) async fn search(
 /// промах из 1.6 с в единицы миллисекунд.
 pub(super) fn search_sessions(
     dir: &std::path::Path,
-    cfg: &Config,
     needle: &str,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -180,7 +195,7 @@ pub(super) fn search_sessions(
         if !file_contains(&path, needle) {
             continue;
         }
-        let Ok(rows) = history::read_with(&path, cfg, false) else {
+        let Ok(rows) = history::read_with(&path, false) else {
             // Ошибка чтения отдельного файла не должна выглядеть как «нет
             // совпадений»: без строки в stderr проблема прав/диска невидима.
             eprintln!("[snens] search: журнал {} не прочитан", path.display());

@@ -36,12 +36,31 @@ pub(super) async fn put_model(
     if slug.is_empty() {
         return err("invalid", "empty model slug", StatusCode::BAD_REQUEST).into_response();
     }
+    // Та же проверка, что у `PUT /v1/config` (`settings::prepare` → `text()`):
+    // slug с переводом строки/табом проходил тут, но отвергался там.
+    if slug.chars().any(char::is_control) {
+        return err(
+            "invalid",
+            "model slug contains control characters",
+            StatusCode::BAD_REQUEST,
+        )
+        .into_response();
+    }
     // Пишем в тот же конфиг, что читает этот процесс (учёт `--config`).
     let mut cfg = s.cfg.clone();
     match cfg.set_model_now(slug) {
         Ok(path) => Json(serde_json::json!({"model": slug, "config": path.display().to_string()}))
             .into_response(),
-        Err(e) => err("config", &e.to_string(), StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+        // `set_model` отказывает и по делу (активный провайдер диктует модель,
+        // пустой slug), и по I/O. Домен — 400, запись — 500.
+        Err(e) => {
+            let message = e.to_string();
+            if provider_error_is_client(&message) {
+                err("invalid", &message, StatusCode::BAD_REQUEST).into_response()
+            } else {
+                err("config", &message, StatusCode::INTERNAL_SERVER_ERROR).into_response()
+            }
+        }
     }
 }
 
@@ -116,7 +135,7 @@ pub(super) async fn post_provider(
     let activate =
         live.providers.is_empty() || body.get("activate").and_then(|v| v.as_bool()) == Some(true);
     if let Err(e) = crate::providers::write_profile(&s.cfg, &name, &draft, None, activate) {
-        return err("invalid", &e.to_string(), StatusCode::BAD_REQUEST).into_response();
+        return provider_error(&e.to_string(), StatusCode::BAD_REQUEST);
     }
     Json(crate::providers::list(&s.cfg)).into_response()
 }
@@ -147,7 +166,7 @@ pub(super) async fn put_provider(
     };
     // Пустое тело — не ошибка: PUT без полей значит «оставь как было».
     if let Err(e) = crate::providers::write_profile(&s.cfg, &name, &draft, Some(&existing), false) {
-        return err("invalid", &e.to_string(), StatusCode::BAD_REQUEST).into_response();
+        return provider_error(&e.to_string(), StatusCode::BAD_REQUEST);
     }
     Json(crate::providers::list(&s.cfg)).into_response()
 }
@@ -173,8 +192,55 @@ pub(super) async fn delete_provider(
     // предметной области — 409, а не 400.
     match crate::providers::remove_profile(&s.cfg, &name) {
         Ok(()) => Json(crate::providers::list(&s.cfg)).into_response(),
-        Err(e) => err("conflict", &e.to_string(), StatusCode::CONFLICT).into_response(),
+        // «Нельзя удалить активный» — 409, сбой записи — 500.
+        Err(e) => provider_error(&e.to_string(), StatusCode::CONFLICT),
     }
+}
+
+/// Доменная ли это ошибка правки профиля (400/409), а не сбой записи (500).
+///
+/// `providers::*` возвращают один `crate::R<()>` и на «имя пустое», и на
+/// «не смог записать файл». Ошибку записи отличаем по форме: она несёт путь
+/// файла или `io::Error`-текст из `env_file`/`cfg_edit`, а доменные сообщения
+/// перечислены явно. Иначе клиент повторял бы валидный запрос вечно, а диск бы
+/// молчал.
+fn provider_error_is_client(message: &str) -> bool {
+    const DOMAIN: [&str; 14] = [
+        "имя профиля",
+        "base_url",
+        "model",
+        "key_env",
+        "профиль «",
+        "нечего применять",
+        "недопустим",
+        "переключись",
+        "неполный",
+        "нужен адрес вида",
+        "str чужой",
+        "дубликат",
+        "должен начинаться",
+        "содержит недопустимые",
+    ];
+    DOMAIN.iter().any(|needle| message.contains(needle))
+}
+
+/// Ответ на ошибку правки профиля: домен — 400, всё остальное — 500 `storage`.
+fn provider_error(message: &str, status: StatusCode) -> axum::response::Response {
+    let status = if provider_error_is_client(message) {
+        status
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    err(
+        if status.is_server_error() {
+            "storage"
+        } else {
+            "invalid"
+        },
+        message,
+        status,
+    )
+    .into_response()
 }
 
 /// Сделать профиль активным. Адрес и модель действуют со следующего хода:
@@ -198,7 +264,7 @@ pub(super) async fn activate_provider(
     }
     match crate::providers::activate(&s.cfg, &name) {
         Ok(()) => Json(crate::providers::list(&s.cfg)).into_response(),
-        Err(e) => err("invalid", &e.to_string(), StatusCode::BAD_REQUEST).into_response(),
+        Err(e) => provider_error(&e.to_string(), StatusCode::BAD_REQUEST),
     }
 }
 
@@ -227,8 +293,15 @@ pub(super) async fn put_config(
 /// Состояние канала долгой памяти: тумблеры читаются перечитанными из конфига,
 /// как модель. Правки — те же ключи `[memory]`, что у `snens memory …`.
 pub(super) async fn get_memory(State(s): State<Arc<Runtime>>) -> impl IntoResponse {
-    let mem = s.cfg.memory_now();
-    Json(serde_json::json!({
+    Json(memory_view(&s.cfg.memory_now())).into_response()
+}
+
+/// Вид состояния канала памяти для обоих хендлеров.
+///
+/// Одна функция, а не две копии: `PUT` раньше не отдавал `cmd`, и клиент,
+/// апсертивший ответ, терял это поле.
+fn memory_view(mem: &crate::cfg::Memory) -> serde_json::Value {
+    serde_json::json!({
         "enabled": mem.enabled,
         "recall": match mem.recall {
             crate::cfg::RecallMode::Always => "always",
@@ -237,8 +310,7 @@ pub(super) async fn get_memory(State(s): State<Arc<Runtime>>) -> impl IntoRespon
         },
         "retain": mem.retain,
         "cmd": mem.cmd,
-    }))
-    .into_response()
+    })
 }
 
 #[derive(Deserialize)]
@@ -299,18 +371,8 @@ pub(super) async fn put_memory(
                 .into_response();
         }
     }
-    // Ответ — новое состояние канала.
-    let mem = s.cfg.memory_now();
-    Json(serde_json::json!({
-        "enabled": mem.enabled,
-        "recall": match mem.recall {
-            crate::cfg::RecallMode::Always => "always",
-            crate::cfg::RecallMode::Session => "session",
-            crate::cfg::RecallMode::Off => "off",
-        },
-        "retain": mem.retain,
-    }))
-    .into_response()
+    // Ответ — новое состояние канала в том же виде, что `GET /v1/memory`.
+    Json(memory_view(&s.cfg.memory_now())).into_response()
 }
 
 #[cfg(test)]
