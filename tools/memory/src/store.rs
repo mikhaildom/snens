@@ -486,19 +486,6 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Отметить состояние хода. В рабочем коде провал хода идёт через `retry`,
-    /// а успех — через `finish_turn`; остаётся точкой для ручных состояний.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn finish(&self, id: i64, state: &str) -> Result<(), String> {
-        self.db
-            .execute(
-                "update turns set state = ?1 where id = ?2",
-                params![state, id],
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
     /// Отметить неудачную попытку: ход вернётся в очередь, пока попыток меньше
     /// пяти. Так транзиентный сбой провайдера не теряет ход навсегда.
     pub fn retry(&self, id: i64) -> Result<(), String> {
