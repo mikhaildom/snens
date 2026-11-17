@@ -5,6 +5,9 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Deserialize, Default)]
+// Опечатка в ключе (`embed_dimm`) иначе молча давала бы дефолт: с этим атрибутом
+// разбор файла падает и мы говорим об этом.
+#[serde(deny_unknown_fields)]
 struct File {
     db: Option<String>,
     api_base: Option<String>,
@@ -41,9 +44,12 @@ fn config_path() -> PathBuf {
 fn key_from_file(env_name: &str) -> Option<String> {
     let path = config_path().with_file_name(".env");
     let text = std::fs::read_to_string(path).ok()?;
+    // Префикс считается один раз, а не на каждой строке файла.
+    let prefix = format!("{env_name}=");
     for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix(&format!("{env_name}=")) else {
+        // `export KEY=…` — обычная форма в .env, и она тоже должна работать.
+        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+        let Some(rest) = line.strip_prefix(&prefix) else {
             continue;
         };
         let v = rest.trim().trim_matches('"').trim_matches('\'').to_string();
@@ -54,34 +60,57 @@ fn key_from_file(env_name: &str) -> Option<String> {
     None
 }
 
-/// Путь к базе без сети и ключа: `retain`/`forget`/`stats` работают локально,
+/// Разбор `memory.toml`. Ошибку не глотаем: опечатка в конфиге иначе молча
+/// оставляла бы пользователя с чужим `api_base`/`db`, и это трудно заметить.
+fn read_file() -> File {
+    let path = config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return File::default(),
+        Err(e) => {
+            eprintln!("memory: {}: {e} — беру настройки по умолчанию", path.display());
+            return File::default();
+        }
+    };
+    match toml::from_str(&text) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "memory: {} не разобран: {e} — беру настройки по умолчанию",
+                path.display()
+            );
+            File::default()
+        }
+    }
+}
+
+/// Путь базы без сети и ключа: `retain`/`forget`/`stats` работают локально,
 /// и падать на отсутствующем ключе им незачем.
 pub fn db_path() -> PathBuf {
-    let f: File = std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|t| toml::from_str(&t).ok())
-        .unwrap_or_default();
+    default_db_path(&read_file())
+}
+
+fn default_db_path(f: &File) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(f.db.unwrap_or_else(|| format!("{home}/.local/share/snens/memory.db")))
+    PathBuf::from(
+        f.db.clone()
+            .unwrap_or_else(|| format!("{home}/.local/share/snens/memory.db")),
+    )
 }
 
 impl Cfg {
     pub fn load() -> Result<Cfg, String> {
-        let f: File = std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default();
-        let key_env = f.api_key_env.unwrap_or_else(|| "SNENS_API_KEY".into());
+        let f = read_file();
+        let key_env = f.api_key_env.clone().unwrap_or_else(|| "SNENS_API_KEY".into());
         let api_key = std::env::var(&key_env)
             .ok()
             .filter(|v| !v.trim().is_empty())
             .or_else(|| key_from_file(&key_env))
             .ok_or_else(|| format!("нет ключа {key_env} (env или ~/.config/snens/.env)"))?;
         Ok(Cfg {
-            db: match f.db {
-                Some(db) => PathBuf::from(db),
-                None => db_path(),
-            },
+            // Путь считаем из уже разобранного файла: повторное чтение могло бы
+            // дать другое значение, если файл поменялся между двумя чтениями.
+            db: default_db_path(&f),
             api_base: f
                 .api_base
                 .unwrap_or_else(|| "https://inference-api.nousresearch.com/v1".into())
@@ -114,5 +143,8 @@ impl Cfg {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .or_else(|| key_from_file("SNENS_OPENROUTER_KEY"))
+            // Последний шанс — ключ основного провайдера: если реранк отдаёт тот же
+            // сервис, отдельная переменная не нужна.
+            .or_else(|| Some(self.api_key.clone()))
     }
 }

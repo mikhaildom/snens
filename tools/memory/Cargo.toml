@@ -6,6 +6,9 @@ description = "Долгая память агента: один бинарь, о
 license = "MIT"
 repository = "https://git.svuvi.ch/svuvich/snens-memory"
 readme = "README.md"
+# Копия отдельного репозитория snens-memory: публикация отсюда не должна
+# уезжать под тем же именем в crates.io.
+publish = false
 
 [[bin]]
 name = "memory"
@@ -13,7 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
-sqlite-vec = "0.1.9"
+# Точный пин: сигнатура sqlite3_vec_init транслируется вручную, и патч-релиз
+# с другой сигнатурой компилировался бы, а падал в рантайме.
+sqlite-vec = "=0.1.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

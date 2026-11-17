@@ -7,6 +7,7 @@
     },
     "old_string": {
       "type": "string",
+      "minLength": 1,
       "description": "Точный фрагмент, который надо заменить. Должен встречаться ровно один раз, если replace_all не задан. Многострочный текст подавай как есть, с реальными переводами строк."
     },
     "new_string": {
@@ -19,11 +20,12 @@
     },
     "edits": {
       "type": "array",
-      "description": "Несколько правок одного файла одним вызовом: применяются по порядку и атомарно. Вместо old_string/new_string.",
+      "description": "Несколько правок одного файла одним вызовом: все old_string матчатся против исходного текста (не последовательно), не должны пересекаться, применяются разом и атомарно. Пустой массив отвергается. Вместо old_string/new_string.",
+      "minItems": 1,
       "items": {
         "type": "object",
         "properties": {
-          "old_string": {"type": "string"},
+          "old_string": {"type": "string", "minLength": 1},
           "new_string": {"type": "string"},
           "replace_all": {"type": "boolean"}
         },

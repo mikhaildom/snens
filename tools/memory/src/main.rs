@@ -23,7 +23,7 @@ use cfg::Cfg;
 use store::{Hit, Store};
 
 const HELP: &str = "memory — долгая память агента (SQLite + FTS5 + sqlite-vec)\n\
-memory recall <запрос> | memory retain | memory flush | memory stats | memory reindex | memory forget <uid>\n\
+memory recall <запрос> | memory retain | memory flush | memory stats | memory reindex | memory forget <uid> | memory import [--replace]\n\
 \n\
 recall  — гибридный поиск: BM25 ∪ вектор → RRF → реранк → порог; по строке на факт.\n\
 retain  — ход (JSON {\"user\",\"assistant\"} на stdin) в очередь на дистилляцию.\n\
@@ -31,6 +31,8 @@ flush   — разобрать очередь: извлечь факты, пог
 stats   — сколько живых фактов, устаревших, что в очереди.\n\
 reindex — посчитать вектора для фактов, записанных без провайдера.\n\
 forget  — закрыть факт по uid (остаётся в таймлайне, но не выдаётся).\n\
+import  — разовый импорт из другой системы: JSON {\"units\":[…]} на stdin;\n\
+          --replace закрывает всё, что пришло прошлыми импортами.\n\
 \n\
 Настройки: ~/.config/snens/memory.toml (db, api_base, embed_model, rerank,\n\
 rerank_model, max_facts, max_tokens), ключ — SNENS_API_KEY в ~/.config/snens/.env.";
@@ -134,15 +136,17 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
     }
     let cand = 30;
     let mut fused: Vec<(i64, f64, Option<f64>, Option<f64>)> = Vec::new();
-    let by_vec = api::embed(cfg, &query)
-        .map(|e| {
+    // Ошибка поиска — не «ничего не помню»: сломанная база (нет vec0, чужая
+    // размерность, битый файл) иначе даёт код 0 и пустой ответ. Отсутствие
+    // провайдера эмбеддингов сюда не относится — это `api::embed` → None.
+    let by_vec = match api::embed(cfg, &query) {
+        Some(e) => {
             let q = api::quantize(&e);
-            store
-                .vector_search(&q, cfg.embed_dim, cand)
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let by_text = store.bm25_search(&query, cand).unwrap_or_default();
+            store.vector_search(&q, cfg.embed_dim, cand)?
+        }
+        None => Vec::new(),
+    };
+    let by_text = store.bm25_search(&query, cand)?;
 
     let rank_of = |list: &[(i64, f64)], id: i64| list.iter().position(|(x, _)| *x == id);
     let mut ids: Vec<i64> = by_vec.iter().map(|(i, _)| *i).collect();
@@ -280,7 +284,9 @@ fn retain(store: &Store) -> Result<i32, String> {
     if user.is_empty() && assistant.is_empty() {
         return Ok(0);
     }
-    if assistant.len() < 80 {
+    // Длина — в символах: для кириллицы 80 байт это ~40 символов, и порог
+    // «короткий ответ» срабатывал вдвое строже, чем задумано.
+    if assistant.chars().count() < 80 {
         // Короткий ответ ничего не добавляет к знанию о мире: экономит вызов.
         return Ok(0);
     }
@@ -304,8 +310,15 @@ fn flush(cfg: &Cfg, store: &Store) -> Result<i32, String> {
         let known = store
             .similar_for_prompt(q.as_deref(), cfg.embed_dim, 5)
             .unwrap_or_default();
-        match api::distill(cfg, &user, &assistant) {
+        // Известное уходит в промпт: модель должна видеть, что уже есть, иначе
+        // инструкция «не дублируй» — пустой звук.
+        let known_texts: Vec<String> = known.iter().map(|k| k.text.clone()).collect();
+        match api::distill(cfg, &user, &assistant, &known_texts) {
             Ok(facts) => {
+                // Сначала набираем, что писать, и только потом одним куском в БД:
+                // сбой посреди хода не оставит полузаписанных фактов, а ход
+                // останется `new` — его переработают, а не задвоят.
+                let mut items: Vec<(store::NewFact, Option<String>)> = Vec::new();
                 for fact in facts {
                     let emb = api::embed(cfg, &fact.text);
                     let quant = emb.as_ref().map(|e| api::quantize(e));
@@ -324,30 +337,38 @@ fn flush(cfg: &Cfg, store: &Store) -> Result<i32, String> {
                     if dup {
                         continue;
                     }
-                    let uid = store.insert(&store::NewFact::auto(
-                        &fact.text,
-                        &fact.kind,
-                        &fact.subject,
-                        quant,
-                        cfg.embed_dim,
-                    ))?;
                     // Перекрытие старым: модель уже видела список known; если
                     // текст нового факта прямо отрицает старый — гасим старый.
-                    for (old_uid, old_text) in &known {
-                        if contradicts(old_text, &fact.text) {
-                            if store.supersede(old_uid, &uid)? {
-                                superseded += 1;
-                            }
-                            break;
-                        }
-                    }
-                    added += 1;
+                    // Тип и subject обязаны совпасть: «проект использует tokio»
+                    // и «проект использует axum» — разные факты, не противоречие.
+                    let over = known
+                        .iter()
+                        .find(|old| {
+                            old.kind == fact.kind
+                                && old.subject == fact.subject
+                                && contradicts(&old.text, &fact.text)
+                        })
+                        .map(|old| old.uid.clone());
+                    items.push((
+                        store::NewFact::auto(
+                            &fact.text,
+                            &fact.kind,
+                            &fact.subject,
+                            quant,
+                            cfg.embed_dim,
+                        ),
+                        over,
+                    ));
                 }
-                store.finish(id, "done")?;
+                let (n, s) = store.finish_turn(id, &items)?;
+                added += n;
+                superseded += s;
             }
             Err(e) => {
-                eprintln!("memory: flush {id}: {e}");
-                store.finish(id, "failed")?;
+                // Транзиентный сбой (таймаут, 429, кривой JSON модели) не должен
+                // съедать ход: возвращаем в очередь с ограничением по попыткам.
+                eprintln!("memory: flush {id}: {e} (попытка отложена)");
+                store.retry(id)?;
             }
         }
     }
@@ -393,14 +414,9 @@ fn import(cfg: &Cfg, store: &mut Store, args: &[String]) -> Result<i32, String> 
     if units.is_empty() {
         return Err("import: пустой units".into());
     }
-    if args.iter().any(|a| a == "--replace") {
-        let closed = store.close_source("import")?;
-        if closed > 0 {
-            eprintln!("закрыто прошлых импортов: {closed}");
-        }
-    }
+    let replace = args.iter().any(|a| a == "--replace");
     let already = store.count_source("import")?;
-    if already > 0 {
+    if already > 0 && !replace {
         return Err(format!(
             "import: уже импортировано {already} фактов; повторить — `import --replace`"
         ));
@@ -434,6 +450,15 @@ fn import(cfg: &Cfg, store: &mut Store, args: &[String]) -> Result<i32, String> 
                 dim: cfg.embed_dim,
                 created: u["created"].as_i64().or_else(|| u["ts"].as_i64()),
             });
+        }
+    }
+    // Закрытие прошлого импорта — только теперь, когда всё, что могло упасть
+    // (сеть, провайдер, размерность вектора), уже позади. Иначе неудачный
+    // `--replace` вычистил бы банк и не вернул ничего.
+    if replace {
+        let closed = store.close_source("import")?;
+        if closed > 0 {
+            eprintln!("закрыто прошлых импортов: {closed}");
         }
     }
     let total = facts.len();
@@ -489,8 +514,9 @@ fn reindex(cfg: &Cfg, store: &Store) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Один и тот же факт в разных формулировках: совпадает начало текста
-/// (первые 60 символов без регистра) или набор длинных слов почти тот же.
+/// Один и тот же факт в разных формулировках: набор длинных слов почти тот же
+/// (порог 60 % по Жаккару). Сравнения по префиксу здесь нет — это единственное
+/// правило, и комментарий не должен обещать второго.
 fn same_fact(a: &str, b: &str) -> bool {
     let key = |s: &str| -> String {
         s.trim()

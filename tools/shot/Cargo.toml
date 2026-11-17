@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 serde_json = "1"
 # Транспорт CDP общий с `genui`: оба обязаны видеть страницу одинаково.
-cdp = { path = "../cdp" }
+cdp = { path = "../cdp", version = "0.1.0" }

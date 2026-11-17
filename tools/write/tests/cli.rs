@@ -11,7 +11,11 @@ fn run(args: &[&str], stdin: &[u8]) -> (i32, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("не запустился write");
-    child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
+    // Дочерний процесс вправе выйти раньше, чем дочитает stdin (ошибка
+    // аргументов, --help): BrokenPipe тут — ожидаемое, а не падение теста.
+    if let Err(e) = child.stdin.as_mut().unwrap().write_all(stdin) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+    }
     let out = child.wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),
@@ -20,10 +24,32 @@ fn run(args: &[&str], stdin: &[u8]) -> (i32, String, String) {
     )
 }
 
-fn tmp(name: &str) -> std::path::PathBuf {
+/// Временный путь, который убирается на Drop — в том числе когда тест упал.
+struct TempPath(std::path::PathBuf);
+
+impl std::ops::Deref for TempPath {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+impl TempPath {
+    fn name(&self) -> &str {
+        self.0.to_str().unwrap()
+    }
+}
+
+fn tmp(name: &str) -> TempPath {
     let p = std::env::temp_dir().join(format!("write-cli-{}-{name}", std::process::id()));
     let _ = std::fs::remove_file(&p);
-    p
+    TempPath(p)
 }
 
 /// 8 КБ кириллицы: файл обязан совпасть побайтово, а ответ — сообщить обе длины.
@@ -36,9 +62,9 @@ fn large_cyrillic_content_is_written_verbatim() {
         ));
     }
     let p = tmp("ok.ts");
-    let (rc, out, err) = run(&[p.to_str().unwrap()], s.as_bytes());
+    let (rc, out, err) = run(&[p.name()], s.as_bytes());
     assert_eq!(rc, 0, "stderr: {err}");
-    let disk = std::fs::read(&p).unwrap();
+    let disk = std::fs::read(&*p).unwrap();
     assert_eq!(disk, s.as_bytes(), "файл не совпал с входом");
     let ev: serde_json::Value = serde_json::from_str(out.trim()).expect("ответ не JSON");
     assert_eq!(ev["bytes"].as_u64().unwrap() as usize, s.len());
@@ -54,7 +80,7 @@ fn large_cyrillic_content_is_written_verbatim() {
 fn corrupt_content_is_refused_and_no_file_written() {
     let p = tmp("bad.ts");
     let bad = "// вып\u{fffd}\u{fffd}лнение\n";
-    let (rc, _out, err) = run(&[p.to_str().unwrap()], bad.as_bytes());
+    let (rc, _out, err) = run(&[p.name()], bad.as_bytes());
     assert_ne!(rc, 0, "битый content принят");
     assert!(err.contains("U+FFFD"), "нет причины отказа: {err}");
     assert!(!p.exists(), "файл записан несмотря на порчу");
@@ -63,15 +89,59 @@ fn corrupt_content_is_refused_and_no_file_written() {
 #[test]
 fn append_separates_lines_and_reports_counts() {
     let p = tmp("append.ts");
-    let (rc, _o, err) = run(&[p.to_str().unwrap()], "первая\n".as_bytes());
+    let (rc, _o, err) = run(&[p.name()], "первая\n".as_bytes());
     assert_eq!(rc, 0, "{err}");
-    let (rc, out, err) = run(&[p.to_str().unwrap(), "--append"], "вторая\n".as_bytes());
+    let (rc, out, err) = run(&[p.name(), "--append"], "вторая\n".as_bytes());
     assert_eq!(rc, 0, "{err}");
-    assert_eq!(std::fs::read_to_string(&p).unwrap(), "первая\nвторая\n");
+    assert_eq!(std::fs::read_to_string(&*p).unwrap(), "первая\nвторая\n");
     let ev: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(ev["appended"], true);
     assert_eq!(
         ev["bytes_on_disk"].as_u64().unwrap(),
         "первая\nвторая\n".len() as u64
     );
+}
+
+/// Хвост без перевода строки: разделитель обязан появиться, иначе строки склеятся.
+#[test]
+fn append_inserts_separator_when_file_has_no_trailing_newline() {
+    let p = tmp("sep.ts");
+    let (rc, _o, err) = run(&[p.name()], "первая".as_bytes());
+    assert_eq!(rc, 0, "{err}");
+    let (rc, out, err) = run(&[p.name(), "--append"], "вторая".as_bytes());
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(std::fs::read_to_string(&*p).unwrap(), "первая\nвторая");
+    let ev: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(ev["separator_added"], true, "{ev}");
+}
+
+/// Пустой вход при --append не меняет файл: раньше дописывался перевод строки.
+#[test]
+fn append_with_empty_stdin_leaves_file_alone() {
+    let p = tmp("empty.ts");
+    let (rc, _o, err) = run(&[p.name()], "первая".as_bytes());
+    assert_eq!(rc, 0, "{err}");
+    let (rc, out, err) = run(&[p.name(), "--append"], b"");
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(std::fs::read_to_string(&*p).unwrap(), "первая");
+    let ev: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(ev["separator_added"], false, "{ev}");
+}
+
+/// Симлинк не должен превращаться в обычный файл: правка идёт в цель.
+#[cfg(unix)]
+#[test]
+fn symlink_target_is_updated_and_link_survives() {
+    let target = tmp("target.ts");
+    let (rc, _o, err) = run(&[target.name()], "старое\n".as_bytes());
+    assert_eq!(rc, 0, "{err}");
+    let link = tmp("link.ts");
+    std::os::unix::fs::symlink(&*target, &*link).unwrap();
+    let (rc, _o, err) = run(&[link.name()], "новое\n".as_bytes());
+    assert_eq!(rc, 0, "{err}");
+    assert!(
+        std::fs::symlink_metadata(&*link).unwrap().file_type().is_symlink(),
+        "симлинк заменён обычным файлом"
+    );
+    assert_eq!(std::fs::read_to_string(&*target).unwrap(), "новое\n");
 }

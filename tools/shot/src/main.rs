@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-const USAGE: &str = "shot <url> [--size WxH[,WxH...]] [--selector CSS] [--crop X,Y,W,H] [--script файл.js] [--wait-ms N] [--timeout S] [--chrome путь] [--out-dir каталог]";
+const USAGE: &str = "shot <url> [--size WxH[,WxH...]] [--selector CSS] [--crop X,Y,W,H] [--script файл.js] [--no-shot] [--wait-ms N] [--timeout S] [--chrome путь] [--out-dir каталог]";
 
 const HELP: &str = "\
 shot — снять скриншот страницы headless-хромом: элемент по селектору, кроп, JS-проба.
@@ -64,16 +64,41 @@ struct Args {
     out_dir: Option<PathBuf>,
 }
 
+/// Флаги, которые принимают значение. Всё остальное считается позиционным:
+/// `--size=1440x900` разворачивается, а значение вида `--x=1.js`, пришедшее
+/// после `--script`, остаётся одним токеном.
+const VALUE_FLAGS: [&str; 8] = [
+    "size",
+    "selector",
+    "crop",
+    "script",
+    "wait-ms",
+    "timeout",
+    "chrome",
+    "out-dir",
+];
+
 /// `--size=1440x900` → `["--size", "1440x900"]`: один разбор вместо двух.
+/// Значения опций не трогаем: иначе путь `--x=1.js` развалился бы на два токена.
 fn expand(argv: &[String]) -> Vec<String> {
     let mut out = Vec::new();
+    let mut expect_value = false;
     for a in argv {
+        if expect_value {
+            out.push(a.clone());
+            expect_value = false;
+            continue;
+        }
         match a.strip_prefix("--").and_then(|r| r.split_once('=')) {
-            Some((k, v)) => {
+            Some((k, v)) if VALUE_FLAGS.contains(&k) => {
                 out.push(format!("--{k}"));
                 out.push(v.to_string());
             }
-            None => out.push(a.clone()),
+            Some((k, _)) => out.push(format!("--{k}")),
+            None => {
+                expect_value = VALUE_FLAGS.contains(&a.trim_start_matches("--"));
+                out.push(a.clone());
+            }
         }
     }
     out
@@ -192,16 +217,39 @@ fn parse(argv: &[String]) -> Args {
                         });
                         a.script = Some(PathBuf::from(v));
                     }
-                    "--wait-ms" => a.wait_ms = num(&argv, i, "--wait-ms"),
+                    "--wait-ms" => {
+                        a.wait_ms = num(&argv, i, "--wait-ms");
+                        // Потолок паузы: она целиком внутри бюджета запуска, и
+                        // абсурдное значение — опечатка, а не намерение.
+                        if a.wait_ms > 600_000 {
+                            die(&format!("shot: --wait-ms вне 0..600000 мс\n{USAGE}"), 2);
+                        }
+                    }
                     "--timeout" => {
                         let t: f64 = num(&argv, i, "--timeout");
-                        if t <= 0.0 || t > 600.0 {
+                        // is_finite обязателен: `"NaN".parse::<f64>()` успешен, а оба
+                        // сравнения для NaN ложны — он доехал бы до
+                        // Duration::from_secs_f64 и уронил процесс паникой.
+                        if !t.is_finite() || t <= 0.0 || t > 600.0 {
                             die(&format!("shot: --timeout вне 0..600 с: {t}\n{USAGE}"), 2);
                         }
                         a.timeout = t;
                     }
-                    "--chrome" => a.chrome = Some(argv[i + 1].clone()),
-                    _ => a.out_dir = Some(PathBuf::from(&argv[i + 1])),
+                    "--chrome" => {
+                        let v = argv.get(i + 1).unwrap_or_else(|| {
+                            die(&format!("shot: --chrome без значения\n{USAGE}"), 2)
+                        });
+                        a.chrome = Some(v.clone());
+                    }
+                    // Явная ветка, а не `_`: иначе любой новый флаг молча становится
+                    // каталогом вывода.
+                    "--out-dir" => {
+                        let v = argv.get(i + 1).unwrap_or_else(|| {
+                            die(&format!("shot: --out-dir без значения\n{USAGE}"), 2)
+                        });
+                        a.out_dir = Some(PathBuf::from(v));
+                    }
+                    _ => unreachable!("ветка только для перечисленных флагов"),
                 }
                 i += 2;
             }
@@ -291,17 +339,31 @@ fn measure(cdp: &mut cdp::Cdp, session: &str, selector: &str) -> Result<Option<R
     if v.get("missing").and_then(Value::as_bool).unwrap_or(false) {
         return Ok(None);
     }
-    let f = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    if !v.is_object() {
+        return Err(format!(
+            "--selector: неожиданный ответ из браузера для `{selector}`: {v}"
+        ));
+    }
+    // Ноль как «поля нет» превратил бы диагностику в бессмысленный Rect 0x0,
+    // из которого потом клепается PNG 1x1.
+    let f = |k: &str| -> Result<f64, String> {
+        v.get(k).and_then(Value::as_f64).ok_or_else(|| {
+            format!(
+                "--selector: в ответе браузера нет поля `{k}` для `{selector}`: {v}"
+            )
+        })
+    };
+    let dpr = f("dpr")?;
     Ok(Some(Rect {
-        x: f("x"),
-        y: f("y"),
-        w: f("w"),
-        h: f("h"),
-        sx: f("sx"),
-        sy: f("sy"),
-        vw: f("vw"),
-        vh: f("vh"),
-        dpr: if f("dpr") > 0.0 { f("dpr") } else { 1.0 },
+        x: f("x")?,
+        y: f("y")?,
+        w: f("w")?,
+        h: f("h")?,
+        sx: f("sx")?,
+        sy: f("sy")?,
+        vw: f("vw")?,
+        vh: f("vh")?,
+        dpr: if dpr > 0.0 { dpr } else { 1.0 },
         tag: v
             .get("tag")
             .and_then(Value::as_str)
@@ -340,7 +402,17 @@ fn shift_to_view(cdp: &mut cdp::Cdp, session: &str, selector: &str) -> Result<Re
         cdp.eval(session, &format!("window.scrollBy({dx:.1}, {dy:.1}); 0"))?;
         cdp::Browser::sleep(60);
     }
-    last.ok_or_else(|| format!("--selector: не удалось измерить `{selector}`"))
+    let r = last.ok_or_else(|| format!("--selector: не удалось измерить `{selector}`"))?;
+    // Кадр за пределами вьюпорта молча обрежется: говорим вслух, а не отдаём
+    // «рамку», по которой ничего не видно.
+    let out_x = r.x < 0.0 || (r.w <= r.vw && r.x + r.w > r.vw);
+    let out_y = r.y < 0.0 || (r.h <= r.vh && r.y + r.h > r.vh);
+    if out_x || out_y {
+        eprintln!(
+            "shot: --selector: `{selector}` не удалось целиком ввести во вьюпорт — кадр может быть обрезан"
+        );
+    }
+    Ok(r)
 }
 
 // ---------------------------------------------------------------- прогон
@@ -367,7 +439,13 @@ fn run(a: &Args) -> Result<(), String> {
     let ready_budget = br.cdp.left()?;
     br.wait_ready(ready_budget)?;
     if a.wait_ms > 0 {
-        cdp::Browser::sleep(a.wait_ms);
+        // Пауза не должна пережить бюджет всего запуска: `--timeout 5 --wait-ms 600000`
+        // иначе висит десять минут вопреки документированному таймауту.
+        let left = br.cdp.left()?;
+        let pause = a.wait_ms.min(left.as_millis() as u64);
+        if pause > 0 {
+            cdp::Browser::sleep(pause);
+        }
     }
     if let Some(script) = &a.script {
         probe(&mut br, script)?;

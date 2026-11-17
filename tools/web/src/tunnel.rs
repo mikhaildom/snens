@@ -6,13 +6,17 @@
 // Тунель живёт между вызовами (каждый вызов — свой процесс, адреса в состоянии),
 // поэтому процесс отвязан от терминала и записан pid: иначе после `web connect`
 // туннель умирал бы вместе с ним.
-use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::cdp::Endpoint;
 use crate::state;
+
+/// Куда ssh туннеля пишет stderr: файл в каталоге состояния рядом с tunnel.json.
+fn stderr_path() -> std::path::PathBuf {
+    state::dir().join("tunnel.err")
+}
 
 /// Свободный порт на локальной стороне: просим ОС выдать и закрываем.
 fn free_port() -> Result<u16, String> {
@@ -44,7 +48,30 @@ pub fn load() -> Option<Tunnel> {
 }
 
 /// Поднять туннель: `user@machine` и порт CDP на той стороне (по умолчанию 9222).
+/// Адрес машины уходит в argv ssh: значение, начинающееся с `-`, OpenSSH
+/// разберёт как свою опцию (`-oProxyCommand=…` — это выполнение локальной
+/// команды). Проверяем форму и ставим `--` перед адресом.
+pub fn check_host(host: &str) -> Result<(), String> {
+    let bad = host.is_empty()
+        || host.starts_with('-')
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+        || !host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']')
+        });
+    if bad {
+        return Err(format!(
+            "web: недопустимый адрес машины `{host}` — нужен вид user@host"
+        ));
+    }
+    Ok(())
+}
+
+/// Поднять туннель. Порт на локальной стороне занимается нашим же листенером и
+/// сразу освобождается, поэтому теоретически его может забрать другой процесс;
+/// тогда `is_open` покажет живой порт, которого мы не поднимали. Это ловится
+/// первым же CDP-запросом, а не молчаливой работой с чужим браузером.
 pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
+    check_host(host)?;
     // Уже поднят к тому же адресу — переиспользуем, а не плодим процессы.
     if let Some(t) = load() {
         if t.host == host && t.remote_port == remote_port && is_open(t.local_port) {
@@ -66,13 +93,24 @@ pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
         .arg("ServerAliveInterval=20")
         .arg("-L")
         .arg(&spec)
+        .arg("--")
         .arg(host)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        // stderr в файл, а не в пайп: невычитанный пайп заполняется и вешает ssh
+        // на write(2), а закрытие read-конца после нашего выхода убивает туннель
+        // SIGPIPE'ом. Файл читаем только в ветке отказа.
+        .stderr(Stdio::from(
+            std::fs::File::create(stderr_path()).map_err(|e| format!("stderr туннеля: {e}"))?,
+        ));
     // Отвязать от терминала: туннель должен переживать наш процесс, иначе
     // следующий вызов останется без соединения.
     #[cfg(unix)]
+    // SAFETY: pre_exec исполняется в форкнутом ребёнке до exec, где допустимы
+    // только async-signal-safe операции. `setsid(2)` такая и есть (ни аллокаций,
+    // ни блокировок, ни логирования — не добавлять!). Возврат игнорируем
+    // осознанно: своя сессия нужна лишь для живучести туннеля, а при EPERM
+    // процесс всё равно запускается.
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
@@ -91,10 +129,7 @@ pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
             break;
         }
         if let Ok(Some(status)) = child.try_wait() {
-            let mut msg = String::new();
-            if let Some(mut e) = child.stderr.take() {
-                let _ = e.read_to_string(&mut msg);
-            }
+            let msg = std::fs::read_to_string(stderr_path()).unwrap_or_default();
             return Err(format!(
                 "ssh-туннель не поднялся (код {:?}): {}",
                 status.code(),
@@ -116,16 +151,40 @@ pub fn start(host: &str, remote_port: u16) -> Result<Tunnel, String> {
         remote_port,
         pid,
     };
-    state::save_tunnel(&t)?;
+    // Если состояние не сохранилось, туннель остался бы сиротой без pid-файла:
+    // следующий `start` поднял бы второй. Гасим и забираем ребёнка.
+    if let Err(e) = state::save_tunnel(&t) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
     Ok(t)
 }
 
 pub fn stop(t: &Tunnel) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill").arg(t.pid.to_string()).status();
+        // PID мог быть переиспользован: перед сигналом убеждаемся, что это наш ssh.
+        if owns(t.pid, &t.host) {
+            let _ = Command::new("kill").arg(t.pid.to_string()).status();
+        }
     }
     state::clear_tunnel();
+}
+
+/// Наш ли это ssh-процесс: командная строка должна содержать и порт-форвард
+/// (`-L`), и адрес машины. На Linux читаем /proc, иначе доверяем pid.
+#[cfg(unix)]
+fn owns(pid: u32, host: &str) -> bool {
+    let path = format!("/proc/{pid}/cmdline");
+    match std::fs::read(&path) {
+        Ok(raw) => {
+            let cmd = String::from_utf8_lossy(&raw).replace('\0', " ");
+            cmd.contains("ssh") && cmd.contains(host) && cmd.contains("-L")
+        }
+        // /proc нет (macOS): проверить нечем, ведём себя как раньше.
+        Err(_) => true,
+    }
 }
 
 /// Порт локального конца отвечает? Именно «порт открыт», без запроса к CDP:
@@ -140,14 +199,22 @@ fn is_open(port: u16) -> bool {
     TcpStream::connect_timeout(&sa, Duration::from_millis(400)).is_ok()
 }
 
-/// Что сказал Chrome на той стороне: порт отладки и ws-путь браузера.
+/// ws-путь браузера с той стороны (только путь, без порта): быстрый способ —
+/// `/json/version`, иначе файл `DevToolsActivePort`. Порт наружу не отдаётся —
+/// у вызывающего он уже есть как `remote_port`.
 /// В режиме одобрения (Chrome 144+) HTTP-эндпоинтов `/json/*` нет, но файл
 /// `DevToolsActivePort` в каталоге профиля есть всегда — из него и берём путь.
-pub fn remote_browser_path(host: &str, local_port: u16) -> Option<String> {
+pub fn remote_browser_path(host: &str, local_port: u16, remote_port: u16) -> Option<String> {
     // Сначала обычный путь: /json/version (старые сборки и отдельные профили).
-    if let Ok(raw) =
-        crate::cdp::http_get_host("127.0.0.1", local_port, "127.0.0.1", "/json/version")
-    {
+    // Host — с портом той стороны: Chrome сверяет его со своим и на чужой
+    // отвечает 403, из-за чего быстрый путь молча не работал.
+    let host_header = format!("127.0.0.1:{remote_port}");
+    if let Ok(raw) = crate::cdp::http_get_host(
+        "127.0.0.1",
+        local_port,
+        &host_header,
+        "/json/version",
+    ) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(u) = v.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
                 if let Some(i) = u.find("/devtools/") {
@@ -156,22 +223,59 @@ pub fn remote_browser_path(host: &str, local_port: u16) -> Option<String> {
             }
         }
     }
+    check_host(host).ok()?;
     for cmd in remote_candidates() {
-        let out = Command::new("ssh")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(host)
-            .arg(cmd)
-            .output()
-            .ok()?;
+        // Не `.ok()?`: сбой первого кандидата (Windows-команда на unix) не должен
+        // прекращать поиск — следующий ещё может сработать. И общий таймаут:
+        // ConnectTimeout покрывает только рукопожатие, а зависшая удалённая
+        // команда держала бы вызывающего бесконечно.
+        let Ok(out) = ssh_with_timeout(host, cmd, Duration::from_secs(10)) else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
         let text = String::from_utf8_lossy(&out.stdout);
         if let Some(p) = parse_devtools_active_port(&text) {
             return Some(p);
         }
     }
     None
+}
+
+/// ssh с общим ограничением времени: ждём не дольше `budget`, иначе гасим.
+fn ssh_with_timeout(
+    host: &str,
+    cmd: &str,
+    budget: Duration,
+) -> Result<std::process::Output, String> {
+    check_host(host)?;
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg("--")
+        .arg(host)
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("ssh {host}: {e}"))?;
+    let until = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Ok(None) => {}
+            Err(e) => return Err(format!("ssh {host}: {e}")),
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("ssh {host}: не ответил за {budget:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Команда для той стороны. ОС той машины наша сборка не знает, поэтому

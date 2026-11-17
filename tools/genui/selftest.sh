@@ -26,11 +26,21 @@ hasnt() {
 }
 
 BIN=$HERE/genui
-[ -x "$BIN" ] || { echo "FAIL: нет бинарника $BIN — собери: cargo build --release -p genui"; exit 1; }
+# Запасной путь — бинарь из cargo target: `snens build` кладёт рядом, но свежий
+# checkout обычно имеет только `cargo build`.
+if [ ! -x "$BIN" ]; then
+  REPO=$(cd "$HERE/../.." && pwd)
+  TD=$(cd "$REPO" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+  [ -n "$TD" ] && [ -x "$TD/debug/genui" ] && BIN=$TD/debug/genui
+fi
+[ -x "$BIN" ] || { echo "FAIL: нет бинарника $BIN — собери: cargo build -p genui"; exit 1; }
 [ -f "$HERE/schema.json" ] && ok "genui: schema.json рядом с бинарником" || bad "genui: нет schema.json"
 has '"x-snens"' "$(cat "$HERE/schema.json")" "genui: в схеме есть ключ x-snens"
 has '"command"' "$(cat "$HERE/schema.json")" "genui: схема объявляет command"
-has '"enum"' "$(cat "$HERE/schema.json")" "genui: подкоманды перечислены enum-ом (модель не выдумает свою)"
+# Проверяем сам список, а не наличие слова "enum" где-то в файле.
+schema_flat=$(tr -d '\n' <"$HERE/schema.json" | sed 's/[[:space:]]\{1,\}/ /g')
+has '"enum": ["list", "new", "check"]' "$schema_flat" "genui: подкоманды перечислены enum-ом (модель не выдумает свою)"
 
 # Библиотека и каталоги — только свои, во временном каталоге.
 export SNENS_GENUI_DIR="$TMP/genui"
@@ -86,7 +96,9 @@ cat >"$TMP/ok.html" <<'EOF'
 <!doctype html><html><body><h3>Квиз</h3><button onclick="snens.answer({id:'q1',value:'2'})">2</button></body></html>
 ```
 EOF
-t check "$TMP/ok.html"
+# Без браузера: иначе прогон зависит от установленного хрома и от того, какие
+# ошибки песочница решит прислать (они становятся ошибками проверки).
+t check "$TMP/ok.html" --no-browser
 want 0 "$rc" "genui: check чистого артефакта — код 0"
 has "чисто" "$out" "genui: check говорит «чисто»"
 
@@ -99,6 +111,16 @@ EOF
 t check "$TMP/bad.html"
 want 1 "$rc" "genui: check чужого тега — код 1"
 has "my-nosuch" "$out" "genui: проверка назвала незарегистрированный тег"
+
+# --- check: тег из библиотеки — не ошибка (положительный контроль) --------
+cat >"$TMP/lib.html" <<'EOF'
+```artifact id=lib
+<div><my-quiz>вопрос</my-quiz></div>
+```
+EOF
+t check "$TMP/lib.html" --no-browser
+want 0 "$rc" "genui: тег из библиотеки принят — код 0"
+hasnt "не зарегистрирован" "$out" "genui: тег из библиотеки не назван чужим"
 
 # --- check: приватная сеть ------------------------------------------------
 cat >"$TMP/net.html" <<'EOF'
@@ -143,9 +165,18 @@ t check "$TMP/ok.html" --chrome /nonexistent/chrome
 want 0 "$rc" "genui: без браузера чистая разметка — не ошибка"
 has "браузер не проверен" "$out" "genui: отсутствие браузера — предупреждение, а не провал"
 
-# --- check: неизвестная подкоманда ---------------------------------------
+# --- коды возврата из --help: 2 — неверные аргументы ----------------------
 t nosuch
-want 1 "$rc" "genui: неизвестная подкоманда — ошибка"
+want 2 "$rc" "genui: неизвестная подкоманда — код 2 (неверные аргументы)"
+
+t check "$TMP/ok.html" --timeout abc
+want 2 "$rc" "genui: --timeout без числа — код 2"
+
+t check
+want 2 "$rc" "genui: check без цели — код 2"
+
+t new
+want 2 "$rc" "genui: new без имени — код 2"
 
 echo
 if [ "$fails" -eq 0 ]; then

@@ -11,8 +11,8 @@
       "description": "Выбор окна: индекс из apps (0,1,2…), подстрока заголовка, или пусто — окно в фокусе"
     },
     "json": {
-      "type": "string",
-      "description": "Для act: JSON-массив действий по адресам, напр. [{\"click\":\"e3\"},{\"set\":{\"ref\":\"e1\",\"text\":\"hi\"}}]"
+      "type": ["string", "array"],
+      "description": "Для act: действия по адресам — массив объектов, напр. [{\"click\":\"e3\"},{\"set\":{\"ref\":\"e1\",\"text\":\"hi\"}}]"
     },
     "tunnel": {
       "type": "string",
@@ -22,12 +22,19 @@
       "type": "string",
       "description": "Для shot: путь к PNG"
     },
+    "full": {"type": "boolean", "description": "Для snap: дерево без ограничения глубины"},
     "port": {
       "type": "integer",
       "description": "Порт агента (дефолт 9227)"
     }
   },
   "required": ["command", "tunnel"],
+  "allOf": [
+    {
+      "if": {"properties": {"command": {"const": "act"}}},
+      "then": {"required": ["json"], "properties": {"json": {"type": "array", "minItems": 1}}}
+    }
+  ],
   "x-snens": {
     "argv": [
       {"field": "command"},
@@ -35,7 +42,8 @@
       {"flag": "--json", "field": "json"},
       {"flag": "--tunnel", "field": "tunnel"},
       {"flag": "--out", "field": "out"},
-      {"flag": "--port", "field": "port"}
+      {"flag": "--port", "field": "port"},
+      {"flag": "--full", "when_field": "full"}
     ],
     "stdin": {"mode": "none"}
   }

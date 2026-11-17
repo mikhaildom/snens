@@ -21,10 +21,21 @@ has() {
 }
 
 BIN=$HERE/web
+# Запасной путь — бинарь из cargo target (target-dir может быть вынесен).
+if [ ! -x "$BIN" ]; then
+  REPO=$(cd "$HERE/../.." && pwd)
+  TD=${CARGO_TARGET_DIR:-}
+  [ -n "$TD" ] || TD=$(cd "$REPO" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | tr ',' '\n' | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$TD" ] && [ -x "$TD/debug/web" ] && BIN=$TD/debug/web
+fi
 [ -x "$BIN" ] || { echo "FAIL: нет бинарника $BIN — собери: snens build web"; exit 1; }
 [ -f "$HERE/schema.json" ] && ok "web: schema.json рядом с бинарником" || bad "web: нет schema.json"
-has '"x-snens"' "$(cat "$HERE/schema.json")" "web: в схеме есть ключ x-snens"
-has '"command"' "$(cat "$HERE/schema.json")" "web: схема объявляет command"
+# Читаем файл один раз: двойной cat в командной подстановке при пропавшем
+# schema.json давал два невнятных FAIL вместо одной причины.
+schema=$(cat "$HERE/schema.json" 2>/dev/null || true)
+has '"x-snens"' "$schema" "web: в схеме есть ключ x-snens"
+has '"command"' "$schema" "web: схема объявляет command"
 
 # t [args...] → $out, $err, $rc
 t() {
@@ -70,7 +81,7 @@ want 1 "$rc" "launch без --tunnel: код 1"
 has "tunnel" "$err" "launch без --tunnel: подсказывает --tunnel"
 
 # --host уходит в ssh одним вызовом; без доступного ssh — ошибка, не паника.
-t --host nosuchhost.invalid status
+t --host 127.0.0.1:1 status
 # ssh отдаёт свой код (255) — пробрасываем как есть, это честнее «своего» 1:
 # человек видит, что упал именно ssh, а не web.
 [ "$rc" -ne 0 ] && ok "--host с недоступной машиной: код $rc ≠ 0" || bad "--host: код 0 на недоступной машине"
@@ -84,7 +95,13 @@ if [ -z "$CHROME" ]; then
   done
 fi
 if [ -z "$CHROME" ]; then
-  echo "skip: живые проверки — Chrome не найден (нет SNENS_CHROME и ~/.cache/ms-playwright)"
+  # Живые проверки — почти весь контракт (connect/open/snap/act/eval/text/shot).
+  # Зелёный прогон без них был бы ложью, поэтому пропуск только явный.
+  if [ "${WEB_SELFTEST_SKIP_LIVE:-0}" = 1 ]; then
+    echo "skip: живые проверки пропущены (WEB_SELFTEST_SKIP_LIVE=1)"
+  else
+    bad "web: Chrome не найден (нет SNENS_CHROME и ~/.cache/ms-playwright) — живые проверки не выполнены; пропустить явно: WEB_SELFTEST_SKIP_LIVE=1"
+  fi
 else
   PORT=$((9200 + $$ % 400))
   "$CHROME" --headless=new --remote-debugging-port=$PORT \
@@ -93,12 +110,28 @@ else
   CH_PID=$!
   i=0
   while [ $i -lt 40 ]; do
-    curl -fsS "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1 && break
+    # --max-time: порт может открыться и не ответить, и тогда прогон висел бы.
+    curl -fsS --max-time 2 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1 && break
     i=$((i + 1)); sleep 0.25
   done
+  if ! curl -fsS --max-time 2 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then
+    bad "web: Chrome не поднял отладку на порту $PORT — живые проверки не выполнены"
+    kill "$CH_PID" 2>/dev/null || true
+    echo "лого: $(tail -3 "$TMP/ch.log" 2>/dev/null)"
+    exit 1
+  fi
 
   printf '<html><head><meta charset="utf-8"><title>Проба</title></head><body><h1>Заголовок</h1><form><input aria-label="Имя"><button>Отправить</button></form><a href="/x">Ссылка</a></body></html>' >"$TMP/p.html"
-  ( cd "$TMP" && python3 -m http.server 8877 >/dev/null 2>&1 ) &
+  # Порт страницы — свободный: захардкоженный 8877 мог достаться чужому серверу.
+  if ! command -v python3 >/dev/null 2>&1; then
+    # «Сеть не нужна» держится на локальном python3: без него живые проверки
+    # не выполнить, и молчаливая зелень тут хуже красного.
+    bad "web: python3 не найден — живые проверки (страница, snap, act) не выполнены"
+    kill "$CH_PID" 2>/dev/null || true
+    exit 1
+  fi
+  PAGE_PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+  ( cd "$TMP" && python3 -m http.server "$PAGE_PORT" >/dev/null 2>&1 ) &
   SRV_PID=$!
   sleep 1
 
@@ -106,7 +139,7 @@ else
   want 0 "$rc" "connect к живому Chrome: код 0"
   has "подключено" "$out" "connect: сказал, что подключился"
 
-  t open "http://127.0.0.1:8877/p.html"
+  t open "http://127.0.0.1:$PAGE_PORT/p.html"
   want 0 "$rc" "open: код 0"
   has "Проба" "$out" "open: показал заголовок страницы"
 

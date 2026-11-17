@@ -36,10 +36,20 @@ fn mode_of(_meta: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
+/// Права ставим до записи данных и не глотаем ошибку: молчаливое «0644 вместо
+/// 0600» на файле с секретами хуже отказа. `m & 0o7777` — потому что `mode()`
+/// несёт ещё и биты типа файла.
 #[cfg(unix)]
 fn set_mode(p: &std::path::Path, mode: Option<u32>) {
     if let Some(m) = mode {
-        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        let m = m & 0o7777;
+        if let Err(e) = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)) {
+            die(format!(
+                "write: {}: не удалось сохранить права {:o}: {e}",
+                p.display(),
+                m
+            ));
+        }
     }
 }
 
@@ -48,24 +58,27 @@ fn set_mode(_p: &std::path::Path, _mode: Option<u32>) {}
 
 /// Последний байт файла — перевод строки? Нечитаемый файл считаем разделённым:
 /// лишняя пустая строка безвредна, склейка — нет.
-fn ends_with_newline(path: &str) -> bool {
-    match std::fs::File::open(path) {
-        Ok(mut f) => {
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len == 0 {
-                return true;
-            }
-            if std::io::Seek::seek(&mut f, std::io::SeekFrom::End(-1)).is_err() {
-                return true;
-            }
-            let mut b = [0u8; 1];
-            match f.read_exact(&mut b) {
-                Ok(()) => b[0] == b'\n',
-                Err(_) => true,
-            }
-        }
-        Err(_) => true,
+/// Последний байт открытого файла — перевод строки? Читаем из того же дескриптора,
+/// куда будем писать: так решение о разделителе не зависит от гонки с другим
+/// писателем.
+fn handle_ends_with_newline(f: &mut std::fs::File) -> bool {
+    use std::io::Seek;
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return true;
     }
+    let Ok(pos) = f.stream_position() else {
+        return true;
+    };
+    if f.seek(std::io::SeekFrom::End(-1)).is_err() {
+        return true;
+    }
+    let mut b = [0u8; 1];
+    let nl = matches!(f.read_exact(&mut b), Ok(()) if b[0] == b'\n');
+    // Возвращаем указатель: файл открыт в режиме append, но позиция нужна
+    // предсказуемая для последующей записи.
+    let _ = f.seek(std::io::SeekFrom::Start(pos));
+    nl
 }
 
 /// temp в том же каталоге + rename: обрыв на середине не оставит обрезанный файл.
@@ -76,11 +89,34 @@ fn atomic_write(path: &str, data: &[u8], mode: Option<u32>) {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let tmp = dir.join(format!(".snens-write-{}-{nanos}", std::process::id()));
-    std::fs::write(&tmp, data).unwrap_or_else(|e| die(format!("write: {}: {e}", tmp.display())));
+    // create_new: имя предсказуемо, и `fs::write` (create+truncate) по симлинку,
+    // заранее положенному в каталог, записал бы содержимое в чужой файл.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .unwrap_or_else(|e| die(format!("write: {}: {e}", tmp.display())));
+    // Права — до данных: иначе секреты успевают полежать с дефолтными 0644.
     set_mode(&tmp, mode);
+    if let Err(e) = f.write_all(data) {
+        let _ = std::fs::remove_file(&tmp);
+        die(format!("write: {}: {e}", tmp.display()));
+    }
+    // sync_all до rename: иначе после сбоя питания rename виден, а данных нет —
+    // ровно тот обрезанный файл, ради отсутствия которого всё и делается.
+    if let Err(e) = f.sync_all() {
+        let _ = std::fs::remove_file(&tmp);
+        die(format!("write: {}: {e}", tmp.display()));
+    }
+    drop(f);
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         die(format!("write: {path}: {e}"));
+    }
+    // И каталог: без fsync самой записи о переименовании на диске может не быть.
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(&dir) {
+        let _ = d.sync_all();
     }
 }
 
@@ -97,14 +133,18 @@ fn check_replacement(data: &[u8]) -> Result<(), String> {
             ))
         }
     };
+    // Считаем все, а держим позиции только первых пяти: вход, целиком
+    // состоящий из U+FFFD, не должен материализовать вектор на весь файл.
+    let total = text.matches('\u{fffd}').count();
+    if total == 0 {
+        return Ok(());
+    }
     let bad: Vec<usize> = text
         .char_indices()
         .filter(|(_, c)| *c == '\u{fffd}')
         .map(|(i, _)| i)
+        .take(5)
         .collect();
-    if bad.is_empty() {
-        return Ok(());
-    }
     let sample: String = text
         .char_indices()
         .filter(|(_, c)| *c == '\u{fffd}')
@@ -126,12 +166,22 @@ fn check_replacement(data: &[u8]) -> Result<(), String> {
         })
         .collect();
     Err(format!(
-        "write: content содержит U+FFFD ({} шт., позиции {:?}) — это след потерянных \
-         байт, файл не записан. Место: {sample}. Пересобери содержимое: при кириллице \
-         такой длины надёжнее `python3 - <<'PY'` в run",
-        bad.len(),
-        bad.iter().take(5).collect::<Vec<_>>()
+        "write: content содержит U+FFFD ({total} шт., позиции {bad:?}) — это след \
+         потерянных байт, файл не записан. Место: {sample}. Пересобери содержимое: при \
+         кириллице такой длины надёжнее `python3 - <<'PY'` в run"
     ))
+}
+
+/// Конечная цель симлинка (цепочка разрешается `canonicalize`), иначе путь как есть.
+/// Несуществующий путь или битая ссылка — остаётся как есть: `write` создаёт файл.
+fn resolve_symlink(path: &str) -> String {
+    let p = Path::new(path);
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(p)
+            .map(|c| c.display().to_string())
+            .unwrap_or_else(|_| path.to_string()),
+        _ => path.to_string(),
+    }
 }
 
 fn main() {
@@ -158,25 +208,48 @@ fn main() {
         die(e);
     }
 
+    // Симлинк разрешаем до конца: `metadata` идёт по ссылке, а `rename` заменил бы
+    // саму ссылку обычным файлом — конфиг из репо, слинкованный в ~, перестал бы
+    // обновляться, а ссылка бы умерла. `--append` пишет сквозь ссылку, и режимы
+    // не должны расходиться.
+    let path = &resolve_symlink(path)[..];
     let meta = std::fs::metadata(path).ok();
     let existed = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
-    let before = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mut before = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mode = meta.as_ref().and_then(mode_of);
 
     if let Some(dir) = parent(path) {
-        let _ = std::fs::create_dir_all(dir);
+        // Ошибку не глотаем: иначе она всплывёт из atomic_write как «write: <temp
+        // путь>», и настоящая причина (нет прав, компонент — файл) потеряется.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            die(format!("write: {}: {e}", dir.display()));
+        }
     }
     let mut separated = false;
     if append {
+        // read тоже нужен: хвост файла проверяем через этот же дескриптор.
         let mut f = std::fs::OpenOptions::new()
+            .read(true)
             .create(true)
             .append(true)
             .open(path)
             .unwrap_or_else(|e| die(format!("write: {path}: {e}")));
+        // Длину и «есть ли перевод строки в хвосте» берём уже из открытого файла:
+        // отдельные вызовы до open оставляли гонку с другим писателем, и проверка
+        // длины после записи падала на чужом байте, уже записав своё.
+        if let Ok(m) = f.metadata() {
+            before = m.len();
+        }
         // Хвост без перевода строки + блок без него = склейка строк
         // (`}/// комментарий`), которую видно только сборкой. Разделитель
         // дописываем сами — вызывающему не надо про него помнить.
-        if before > 0 && !data.starts_with(b"\n") && !ends_with_newline(path) {
+        // Пустой вход ничего не пишет и не должен менять файл: иначе `--append`
+        // без данных дописывал синтетический перевод строки.
+        if !data.is_empty()
+            && before > 0
+            && !data.starts_with(b"\n")
+            && !handle_ends_with_newline(&mut f)
+        {
             f.write_all(b"\n")
                 .unwrap_or_else(|e| die(format!("write: {path}: {e}")));
             separated = true;

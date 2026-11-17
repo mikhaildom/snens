@@ -9,14 +9,26 @@ use std::time::Duration;
 
 use crate::cfg::Cfg;
 
+/// Клиент один на процесс: свой ему таймаут нужен разный (20/25/120 с), поэтому
+/// кэшируем по секундам в маленькой таблице. Новый клиент на каждый вызов
+/// выбрасывал пул соединений — каждый факт `flush` платил TCP+TLS рукопожатием.
 fn client(timeout_s: u64) -> Result<Client, String> {
-    Client::builder()
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Vec<(u64, Client)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cache.lock().map_err(|e| e.to_string())?;
+    if let Some((_, c)) = guard.iter().find(|(t, _)| *t == timeout_s) {
+        return Ok(c.clone());
+    }
+    let c = Client::builder()
         .timeout(Duration::from_secs(timeout_s))
         // Провайдер отвергает запросы без User-Agent (403), а reqwest по
         // умолчанию его не ставит.
         .user_agent("snens-memory/0.1")
         .build()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    guard.push((timeout_s, c.clone()));
+    Ok(c)
 }
 
 /// Эмбеддинг одной строки. `None` — сеть/провайдер отказал: recall продолжается
@@ -69,11 +81,26 @@ pub fn embed_batch(cfg: &Cfg, texts: &[String]) -> Option<Vec<Vec<f32>>> {
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let vec = item["embedding"].as_array()?;
-        out.push(
-            vec.iter()
-                .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                .collect(),
-        );
+        // Размерность и числа проверяем так же строго, как в `embed`: вызывающие
+        // пишут вектор в базу с `cfg.embed_dim`, и молчаливое дополнение нулями
+        // дало бы порченые строки.
+        if vec.len() != cfg.embed_dim {
+            eprintln!(
+                "memory: embeddings: размерность {} вместо {}",
+                vec.len(),
+                cfg.embed_dim
+            );
+            return None;
+        }
+        let mut row = Vec::with_capacity(vec.len());
+        for x in vec {
+            let f = x.as_f64()? as f32;
+            if !f.is_finite() {
+                return None;
+            }
+            row.push(f);
+        }
+        out.push(row);
     }
     (out.len() == texts.len()).then_some(out)
 }
@@ -83,7 +110,12 @@ pub fn embed_batch(cfg: &Cfg, texts: &[String]) -> Option<Vec<Vec<f32>>> {
 pub fn quantize(v: &[f32]) -> Vec<u8> {
     // Масштаб — максимум модуля: у нормализованных эмбеддингов он мал, и
     // фиксированный 127 растянул бы шум.
-    let max = v.iter().fold(0f32, |a, x| a.max(x.abs()));
+    // NaN/inf в компонентах — испорченный вектор: max стал бы NaN или inf,
+    // и весь вектор ушёл бы в нули. Такой факт лучше не векторизовать.
+    let max = v
+        .iter()
+        .filter(|x| x.is_finite())
+        .fold(0f32, |a, x| a.max(x.abs()));
     let k = if max > 0.0 { 127.0 / max } else { 0.0 };
     v.iter()
         .map(|x| ((x * k).round().clamp(-127.0, 127.0) as i8) as u8)
@@ -110,21 +142,40 @@ pub fn rerank(cfg: &Cfg, query: &str, docs: &[&str]) -> Option<Vec<f32>> {
         return None;
     }
     let v: Value = resp.json().ok()?;
-    let mut out = vec![0f32; docs.len()];
+    let mut out = vec![f32::MIN; docs.len()];
+    let mut got = 0usize;
     for item in v["results"].as_array()? {
-        let i = item["index"].as_u64()? as usize;
-        let score = item["relevance_score"].as_f64()? as f32;
+        // Битый элемент не должен обнулять весь реранк: пропускаем его, остальные
+        // оценки остаются. Индекс вне диапазона — тоже просто пропуск.
+        let (Some(i), Some(score)) = (
+            item["index"].as_u64().map(|i| i as usize),
+            item["relevance_score"].as_f64(),
+        ) else {
+            eprintln!("memory: rerank: элемент без index/relevance_score пропущен");
+            continue;
+        };
         if let Some(slot) = out.get_mut(i) {
-            *slot = score;
+            *slot = score as f32;
+            got += 1;
         }
     }
+    if got == 0 {
+        return None;
+    }
+    // Документы, которых провайдер не вернул, — в самый конец, а не «наравне с
+    // нулём»: иначе настоящий нулевой скор неотличим от отсутствия ответа.
     Some(out)
 }
 
 /// Дистилляция хода в отдельные записи. Отдельная модель по той же причине,
 /// что и у эмбеддинга: у записи свой лимит времени, чтение от неё не зависит.
 /// Пустой список — законный ответ: в ходе нечего запоминать.
-pub fn distill(cfg: &Cfg, user: &str, assistant: &str) -> Result<Vec<NewFact>, String> {
+pub fn distill(
+    cfg: &Cfg,
+    user: &str,
+    assistant: &str,
+    known: &[String],
+) -> Result<Vec<NewFact>, String> {
     let prompt = format!(
         "Ты извлекаешь долговременные факты из хода ассистента. Верни строго JSON.\n\
          Схема: {{\"facts\":[{{\"text\":\"...\",\"kind\":\"fact|preference|episode|procedure\",\"subject\":\"user|world|project\"}}]}}\n\
@@ -136,7 +187,15 @@ pub fn distill(cfg: &Cfg, user: &str, assistant: &str) -> Result<Vec<NewFact>, S
          - Мало и точно: 0–5 фактов. Пустой список нормален.\n\n\
          Известное (может быть устаревшим):\n{}\n\n\
          Ход:\nUser: {}\nAssistant: {}",
-        "- (пусто)",
+        if known.is_empty() {
+            "- (пусто)".to_string()
+        } else {
+            known
+                .iter()
+                .map(|k| format!("- {}", cut(k, 200)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
         cut(user, 2000),
         cut(assistant, 4000)
     );
@@ -157,10 +216,12 @@ pub fn distill(cfg: &Cfg, user: &str, assistant: &str) -> Result<Vec<NewFact>, S
         return Err(format!("distill: {}", resp.status()));
     }
     let v: Value = resp.json().map_err(|e| e.to_string())?;
+    // Отсутствие content — не «нечего запоминать»: это сломанный ответ
+    // провайдера, и ход должен остаться в очереди, а не пропасть.
     let text = v["choices"][0]["message"]["content"]
         .as_str()
-        .unwrap_or_default();
-    Ok(parse_facts(text))
+        .ok_or_else(|| "distill: в ответе нет choices[0].message.content".to_string())?;
+    parse_facts(text)
 }
 
 #[derive(Debug, Clone)]
@@ -171,15 +232,28 @@ pub struct NewFact {
 }
 
 /// Разбор ответа модели: JSON где-то в тексте (модели любят ```json).
-fn parse_facts(text: &str) -> Vec<NewFact> {
-    let Some(start) = text.find('{') else {
-        return Vec::new();
-    };
-    let Some(end) = text.rfind('}') else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text[start..=end]) else {
-        return Vec::new();
+fn parse_facts(text: &str) -> Result<Vec<NewFact>, String> {
+    // Перебираем кандидатов от каждой `{`: в преамбуле модели бывает `{схема}`,
+    // и первый сбалансированный объект — не обязательно полезный.
+    let mut parsed: Option<Value> = None;
+    for (pos, _) in text.match_indices('{') {
+        let Some(slice) = balanced_object_at(text, pos) else {
+            continue;
+        };
+        match serde_json::from_str::<Value>(&slice) {
+            Ok(v) if v.get("facts").is_some() => {
+                parsed = Some(v);
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    let Some(v) = parsed else {
+        return Err(format!(
+            "distill: в ответе нет объекта с \"facts\": {}",
+            cut(text.trim(), 200)
+        ));
     };
     let mut out = Vec::new();
     for item in v["facts"].as_array().cloned().unwrap_or_default() {
@@ -205,7 +279,45 @@ fn parse_facts(text: &str) -> Vec<NewFact> {
         });
     }
     out.truncate(5);
-    out
+    Ok(out)
+}
+
+/// Сбалансированный JSON-объект, начинающийся в `start`: скобки внутри строк не
+/// считаем, экранирование учитываем. `find('{')..rfind('}')` ловил преамбулу с
+/// фигурной скобкой и вторым объектом после полезного — и факты молча терялись.
+fn balanced_object_at(text: &str, start: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Обрезка по символам, а не байтам: русский текст иначе рвётся пополам.
@@ -232,10 +344,29 @@ mod tests {
     #[test]
     fn facts_parse_from_fenced_json() {
         let text = "вот:\n```json\n{\"facts\":[{\"text\":\"пользователь живёт в Нидерландах\",\"kind\":\"fact\",\"subject\":\"user\"},{\"text\":\"ок\"}]}\n```";
-        let facts = parse_facts(text);
+        let facts = parse_facts(text).expect("ответ разбирается");
         assert_eq!(facts.len(), 1, "короткий мусор не должен проходить");
         assert_eq!(facts[0].kind, "fact");
         assert_eq!(facts[0].subject, "user");
+    }
+
+    #[test]
+    fn parse_takes_the_first_balanced_object() {
+        // Перед JSON — фигурная скобка в преамбуле, после — второй объект:
+        // прежний срез по первому и последнему `{`/`}` не разбирался вовсе.
+        let text = "схема {a} → вот ответ: {\"facts\":[{\"text\":\"факт про питон и задачи\"}]} конец";
+        let facts = parse_facts(text).expect("первый объект разобран");
+        assert_eq!(facts.len(), 1);
+        // Фигурные скобки внутри строк не должны ломать баланс.
+        let text = "{\"facts\":[{\"text\":\"в тексте есть { и } и это нормально\"}]}";
+        assert_eq!(parse_facts(text).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_object_is_an_error_not_an_empty_list() {
+        // «Нечего запоминать» приходит как {"facts":[]}; текст без JSON — сбой.
+        assert!(parse_facts("я ничего не нашёл").is_err());
+        assert!(parse_facts("{\"facts\":[]}").unwrap().is_empty());
     }
 
     #[test]

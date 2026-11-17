@@ -50,6 +50,10 @@ pub fn http_get_host(
     host_header: &str,
     path: &str,
 ) -> Result<String, String> {
+    // path и Host — публичные входы: `\r\n` дописал бы в запрос лишние заголовки.
+    if path.contains(['\r', '\n', ' ']) || host_header.contains(['\r', '\n', ' ']) {
+        return Err("CDP http: в path/Host недопустимые символы".into());
+    }
     let addr = format!("{host}:{port}");
     let sa = addr
         .to_socket_addrs()
@@ -103,6 +107,16 @@ pub fn http_get_host(
         }
     }
     let h = head_end.ok_or_else(|| format!("{addr}{path}: не HTTP-ответ"))?;
+    // Оборванное тело не выдаём за целое: обрезанный `/json/list` давал либо
+    // «не JSON», либо, хуже, неполный список вкладок под видом полного.
+    if let Some(w) = want {
+        if buf.len() < h + w {
+            return Err(format!(
+                "{addr}{path}: тело оборвано ({} из {w} Б)",
+                buf.len() - h
+            ));
+        }
+    }
     Ok(String::from_utf8_lossy(&buf[h..]).to_string())
 }
 
@@ -155,18 +169,25 @@ impl Endpoint {
 
     /// ws браузера: из `/json/version`, а если его нет (режим одобрения) — из
     /// известного пути `/devtools/browser/<uuid>`.
+    /// Контракт режима одобрения (Chrome 144+): `/json/*` там нет, а прямой
+    /// `/devtools/page/<id>` отвечает 403. Поэтому вызывающий обязан быть готов
+    /// откатиться на `Target.attachToTarget` через ws браузера: `main.rs` делает
+    /// это в `live()`. Здесь возвращается адрес, который может не открыться —
+    /// и это не ошибка этой функции.
     pub fn browser_ws(&self) -> Result<String, String> {
-        if let Ok(ws) = self.ws_url(None) {
-            return Ok(ws);
-        }
+        // Ошибку пробы сохраняем и показываем: иначе причина (отказ соединения,
+        // 403 из-за чужого Host, битый /json/version) прячется за общим текстом.
+        let probe = match self.ws_url(None) {
+            Ok(ws) => return Ok(ws),
+            Err(e) => e,
+        };
         match &self.browser_path {
             Some(p) => Ok(format!("ws://{}:{}{}", self.host, self.port, p)),
-            None => Err(
-                "CDP: браузерный endpoint недоступен. Chrome ≥144 в режиме одобрения не отдаёт \
-                 /json/*; путь берётся из файла DevToolsActivePort — проверь, что `web connect --tunnel` \
-                 видит его на той стороне"
-                    .into(),
-            ),
+            None => Err(format!(
+                "CDP: браузерный endpoint недоступен ({probe}). Chrome ≥144 в режиме одобрения \
+                 не отдаёт /json/*; путь берётся из файла DevToolsActivePort — проверь, что \
+                 `web connect --tunnel` видит его на той стороне"
+            )),
         }
     }
 
@@ -217,6 +238,26 @@ impl Endpoint {
     }
 }
 
+/// `ws://host:port/path` → адрес для TCP-connect. `wss://` отвергаем явно:
+/// сборка tungstenite без TLS, и раньше такая попытка падала непонятной ошибкой.
+fn tcp_addr(url: &str) -> Result<std::net::SocketAddr, String> {
+    let rest = url
+        .strip_prefix("ws://")
+        .ok_or_else(|| format!("CDP: только ws:// (без TLS): {url}"))?;
+    let hostport = rest.split(['/', '?']).next().unwrap_or(rest);
+    let hostport = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{hostport}:80")
+    };
+    use std::net::ToSocketAddrs;
+    hostport
+        .to_socket_addrs()
+        .map_err(|e| format!("CDP: {hostport}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("CDP: {hostport} не разрешился"))
+}
+
 impl Cdp {
     pub fn connect(url: &str, timeout_s: f64) -> Result<Self, String> {
         Self::connect_with_host(url, timeout_s, None)
@@ -230,7 +271,24 @@ impl Cdp {
         timeout_s: f64,
         host_header: Option<&str>,
     ) -> Result<Self, String> {
-        let deadline = Instant::now() + Duration::from_secs_f64(timeout_s.max(1.0));
+        // from_secs_f64 паникует на NaN/inf, а Instant + Duration — на переполнении:
+        // `--timeout inf` из CLI не должен ронять процесс.
+        let secs = if timeout_s.is_finite() {
+            timeout_s.clamp(1.0, 3600.0)
+        } else {
+            1.0
+        };
+        let budget = Duration::from_secs_f64(secs);
+        let deadline = Instant::now() + budget;
+        // Таймаут ставим ДО рукопожатия: `tungstenite::connect` делает TCP-connect
+        // и WebSocket-handshake без таймаута вовсе, и мёртвый (blackhole) туннель
+        // висел бы минутами, обещая «жёсткий дедлайн».
+        let stream = TcpStream::connect_timeout(&tcp_addr(url)?, budget)
+            .map_err(|e| format!("CDP: {url}: {e}"))?;
+        let _ = stream.set_read_timeout(Some(budget));
+        let _ = stream.set_write_timeout(Some(budget));
+        // Тот же тип, что у `tungstenite::connect`: структура держит MaybeTlsStream.
+        let stream = MaybeTlsStream::Plain(stream);
         let (mut ws, _res) = match host_header {
             Some(h) => {
                 use tungstenite::client::IntoClientRequest;
@@ -241,9 +299,15 @@ impl Cdp {
                     "Host",
                     h.parse().map_err(|e| format!("CDP: Host {h}: {e}"))?,
                 );
-                tungstenite::connect(req).map_err(|e| format!("CDP: {e}"))?
+                tungstenite::client(req, stream).map_err(|e| format!("CDP: {e}"))?
             }
-            None => tungstenite::connect(url).map_err(|e| format!("CDP: {e}"))?,
+            None => {
+                use tungstenite::client::IntoClientRequest;
+                let req = url
+                    .into_client_request()
+                    .map_err(|e| format!("CDP: адрес {url}: {e}"))?;
+                tungstenite::client(req, stream).map_err(|e| format!("CDP: {e}"))?
+            }
         };
         if let MaybeTlsStream::Plain(s) = ws.get_mut() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -374,9 +438,12 @@ impl Cdp {
     pub fn wait_ready(&mut self, budget: Duration) -> Result<(), String> {
         let until = Instant::now() + budget;
         loop {
-            let state = self
-                .eval("document.readyState")
-                .unwrap_or(Value::String(String::new()));
+            let state = match self.eval("document.readyState") {
+                Ok(v) => v,
+                // Мёртвое соединение/закрытая вкладка — не «страница ещё грузится»:
+                // иначе вызывающий узнает об этом позже и не там.
+                Err(e) => return Err(format!("CDP: страница не отвечает: {e}")),
+            };
             if state.as_str() == Some("complete") {
                 return Ok(());
             }

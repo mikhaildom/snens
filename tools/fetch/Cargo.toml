@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Без json: контракт — markdown на stdout, не структура.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Без json: контракт — markdown на stdout, не структура. `charset` обязателен:
+# без него тело декодируется как UTF-8, и windows-1251/koi8-r страницы (а в ACCEPT_LANG
+# есть ru) приезжают мусором вместо текста.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "charset"] }
+# Кодировки: charset из content-type, иначе windows-1251/koi8-r приезжают мусором.
+encoding_rs = "0.8"
 scraper = "0.27"
+# htmd 0.5 тянет html5ever 0.38, а scraper 0.27 — 0.39: парсер компилируется
+# дважды, а релизный профиль (lto, strip) оптимизирован по размеру. Апгрейд
+# сдвинет major html5ever и требует проверки поведения конвертации — отдельная
+# задача, не правка ревью.
 htmd = "0.5"

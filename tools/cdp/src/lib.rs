@@ -35,11 +35,15 @@ impl TempDir {
         let base = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
+        // Счётчик в процессе: два TempDir в одну наносекунду (грубые часы)
+        // иначе получили бы один каталог, и Drop первого удалил бы живой второй.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let path = base.join(format!("{tag}-{}-{nanos}", std::process::id()));
+        let path = base.join(format!("{tag}-{}-{nanos}-{seq}", std::process::id()));
         fs::create_dir_all(&path)
             .map_err(|e| format!("временный каталог {}: {e}", path.display()))?;
         Ok(TempDir { path })
@@ -116,7 +120,9 @@ fn playwright_chrome() -> Option<PathBuf> {
     let base = PathBuf::from(home).join(".cache/ms-playwright");
     let mut best: Option<(u64, PathBuf)> = None;
     for e in fs::read_dir(&base).ok()? {
-        let e = e.ok()?;
+        // Одна нечитаемая запись не должна обнулять весь поиск: рабочий Chrome
+        // иначе выглядит как «не найден».
+        let Ok(e) = e else { continue };
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(ver) = name.strip_prefix("chromium-") else {
             continue;
@@ -174,13 +180,40 @@ pub fn chrome_available(explicit: Option<&str>) -> bool {
 }
 
 fn launch_chrome(bin: &Path, profile: &Path) -> Result<ChromeGuard, String> {
-    let child = Command::new(bin)
+    // Сначала с песочницей; если Chrome падает на старте (в контейнере без
+    // user-namespaces это SIGABRT) — повторяем с --no-sandbox, уже осознанно.
+    launch_chrome_once(bin, profile, false)
+}
+
+/// Повторный запуск без песочницы (см. `open`).
+fn launch_chrome_nosandbox(bin: &Path, profile: &Path) -> Result<ChromeGuard, String> {
+    launch_chrome_once(bin, profile, true)
+}
+
+fn launch_chrome_once(bin: &Path, profile: &Path, no_sandbox: bool) -> Result<ChromeGuard, String> {
+    let mut cmd = Command::new(bin);
+    // Песочница Chrome — защита от эксплойта рендерера, а мы грузим произвольные
+    // URL и артефакты. Отключаем только там, где без неё не запуститься: root
+    // (в контейнерах) или явный SNENS_CHROME_NO_SANDBOX=1.
+    // Без libc: euid читается из /proc на Linux, иначе считаем «не root».
+    let uid_root = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+        })
+        .map(|euid| euid == "0")
+        .unwrap_or(false);
+    if no_sandbox || uid_root || std::env::var("SNENS_CHROME_NO_SANDBOX").as_deref() == Ok("1") {
+        cmd.arg("--no-sandbox");
+    }
+    let child = cmd
         .arg("--headless=new")
         .arg("--remote-debugging-port=0")
         .arg(format!("--user-data-dir={}", profile.display()))
         .args([
             "--no-first-run",
-            "--no-sandbox",
             "--disable-gpu",
             "--hide-scrollbars",
             "--disable-extensions",
@@ -248,6 +281,15 @@ pub struct Cdp {
     events: VecDeque<Value>,
 }
 
+/// Таймаут отличаем по префиксу сообщения — договор внутри крейта: `left()`,
+/// `read_json_within` и ожидание события кладут ровно эту строку. Вынесено в
+/// константу, чтобы формулировка не разъезжалась по файлу.
+const TIMEOUT_PREFIX: &str = "таймаут";
+
+/// Потолок очереди событий: события, которые никто не читает, не должны
+/// съедать память.
+const MAX_EVENTS: usize = 512;
+
 fn is_timeout(e: &tungstenite::Error) -> bool {
     match e {
         tungstenite::Error::Io(io) => matches!(
@@ -281,7 +323,7 @@ impl Cdp {
         let now = Instant::now();
         if now >= self.deadline {
             Err(format!(
-                "таймаут {} с: Chrome не довёл работу до конца (страница держит открытый поток?)",
+                "{TIMEOUT_PREFIX} {} с: Chrome не довёл работу до конца (страница держит открытый поток?)",
                 self.timeout_s
             ))
         } else {
@@ -299,9 +341,18 @@ impl Cdp {
             .map_err(|e| format!("CDP send: {e}"))
     }
 
-    fn read_json(&mut self) -> Result<Value, String> {
+    /// Прочитать одно сообщение. `cap` — верхняя граница ожидания: бюджет
+    /// вызывающего (`wait_event`) должен соблюдаться, а не размываться глобальным
+    /// дедлайном запуска. Иначе ожидание события в 500 мс висело десятки секунд.
+    fn read_json_within(&mut self, cap: Option<Duration>) -> Result<Value, String> {
         loop {
-            let left = self.left()?;
+            let mut left = self.left()?;
+            if let Some(cap) = cap {
+                left = left.min(cap);
+            }
+            // Ноль не годится: сокет с нулевым таймаутом ведёт себя как неблокирующий
+            // и читает «нет данных» как ошибку.
+            left = left.max(Duration::from_millis(1));
             if let MaybeTlsStream::Plain(s) = self.ws.get_mut() {
                 let _ = s.set_read_timeout(Some(left));
             }
@@ -319,13 +370,21 @@ impl Cdp {
                 Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
                 Ok(Message::Close(_)) => return Err("CDP: Chrome закрыл соединение".into()),
                 Err(e) if is_timeout(&e) => {
-                    return Err(self.left().err().unwrap_or_else(|| {
-                        "CDP: Chrome не ответил (страница держит открытый поток?)".into()
-                    }))
+                    return Err(match (cap, self.left()) {
+                        // Свой бюджет истёк, а общий дедлайн ещё жив: это не сбой.
+                        (Some(_), Ok(_)) => format!("{TIMEOUT_PREFIX} ожидания события"),
+                        (_, Err(e)) => e,
+                        _ => "CDP: Chrome не ответил (страница держит открытый поток?)".into(),
+                    })
                 }
                 Err(e) => return Err(format!("CDP: {e}")),
             }
         }
+    }
+
+    /// Прочитать одно сообщение в пределах общего дедлайна запуска.
+    fn read_json(&mut self) -> Result<Value, String> {
+        self.read_json_within(None)
     }
 
     /// Вызов метода. События по пути складываются в очередь, а не выбрасываются.
@@ -379,17 +438,28 @@ impl Cdp {
             if Instant::now() >= until {
                 return Ok(None);
             }
-            match self.read_json() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            // Ждём не дольше своего бюджета: иначе ответ на чужой запрос
+            // блокировал бы вызывающего на весь дедлайн запуска.
+            match self.read_json_within(Some(left)) {
                 Ok(v) if v.get("method").is_some() => {
                     let hit = method.is_empty()
                         || v.get("method").and_then(Value::as_str) == Some(method);
                     if hit {
                         return Ok(Some(v));
                     }
+                    // Здесь тоже ограничиваем: ожидание события на болтливой
+                    // странице иначе копило бы очередь без предела.
+                    if self.events.len() >= MAX_EVENTS {
+                        self.events.pop_front();
+                    }
                     self.events.push_back(v);
                 }
                 Ok(_) => {}
-                Err(e) if e.starts_with("таймаут") => return Ok(None),
+                Err(e) if e.starts_with(TIMEOUT_PREFIX) => return Ok(None),
                 // Закрытие страницы посреди ожидания — это конец потока, а не сбой.
                 Err(e) => return Err(e),
             }
@@ -468,11 +538,31 @@ pub fn open(
             d
         }
     };
-    let mut guard = launch_chrome(&bin, &profile)?;
     // Порт ждём отдельным коротким бюджетом: старт хрома — не самая долгая часть,
     // и на нём не нужно съедать весь таймаут страницы.
     let boot_until = (Instant::now() + Duration::from_secs(10)).min(deadline);
-    let (port, path) = wait_devtools(&profile, &mut guard, boot_until)?;
+    let mut guard = launch_chrome(&bin, &profile)?;
+    let boot = wait_devtools(&profile, &mut guard, boot_until);
+    let (guard, port, path) = match boot {
+        Ok((port, path)) => (guard, port, path),
+        // В контейнере без user-namespaces Chrome падает на старте (SIGABRT).
+        // Песочница — защита от эксплойта рендерера, поэтому отключаем её только
+        // после реального падения и говорим об этом вслух.
+        Err(e) if e.contains("на старте") => {
+            eprintln!("внимание: Chrome не стартовал с песочницей ({e}); повторяю с --no-sandbox");
+            drop(guard);
+            // Профиль после падения содержит SingletonLock — второй запуск с ним
+            // тоже упадёт. Чистим: полезных данных там ещё нет.
+            fs::create_dir_all(&profile)
+                .map_err(|e| format!("профиль {}: {e}", profile.display()))?;
+            let _ = fs::remove_dir_all(profile.join("SingletonLock"));
+            let mut guard = launch_chrome_nosandbox(&bin, &profile)?;
+            let boot_until = (Instant::now() + Duration::from_secs(10)).min(deadline);
+            let (port, path) = wait_devtools(&profile, &mut guard, boot_until)?;
+            (guard, port, path)
+        }
+        Err(e) => return Err(e),
+    };
     let ws_url = format!("ws://127.0.0.1:{port}{path}");
     let mut cdp = Cdp::connect(&ws_url, deadline, timeout_s)?;
 
@@ -544,9 +634,19 @@ impl Browser {
                         return Ok(());
                     }
                 }
-                // Контекст исполнения пропадает при навигации — это не ошибка.
-                Err(e) if e.starts_with("таймаут") => return Err(e),
-                Err(e) => last = e,
+                // Контекст исполнения пропадает при навигации — это не ошибка,
+                // ждём дальше. Всё остальное (закрытый сокет, сдохший таргет)
+                // повторять бессмысленно: бюджет кончится, и вызывающий получит
+                // «не догрузилась» вместо настоящей причины.
+                Err(e)
+                    if e.contains("Cannot find context")
+                        || e.contains("Execution context")
+                        || e.contains("context was destroyed") =>
+                {
+                    last = e
+                }
+                Err(e) if e.starts_with(TIMEOUT_PREFIX) => return Err(e),
+                Err(e) => return Err(e),
             }
             if Instant::now() >= until {
                 return Err(format!(
@@ -656,6 +756,9 @@ pub fn shot_name(url: &str, w: u32, h: u32, tag: &str) -> String {
 }
 
 /// Свободное имя в каталоге: одинаковые кадры не должны затирать друг друга.
+/// Уникальное имя в каталоге. Только проверка `exists` — это гонка: два
+/// одновременных прогона выберут одно имя, и `fs::copy` затрёт чужой кадр.
+/// Резервируем имя атомарно (create_new) и отдаём освобождённый путь.
 pub fn unique(dir: &Path, name: &str) -> PathBuf {
     let stem = Path::new(name)
         .file_stem()
@@ -665,13 +768,27 @@ pub fn unique(dir: &Path, name: &str) -> PathBuf {
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("png");
-    let mut p = dir.join(name);
+    let mut cand = dir.join(name);
     let mut i = 1;
-    while p.exists() {
-        p = dir.join(format!("{stem}-{i}.{ext}"));
-        i += 1;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cand)
+        {
+            // Файл зарезервирован нами — дальше в него пишут (copy/rename).
+            Ok(_) => return cand,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                cand = dir.join(format!("{stem}-{i}.{ext}"));
+                i += 1;
+                if i > 10_000 {
+                    return cand;
+                }
+            }
+            // Каталог недоступен — пусть ошибка всплывёт на записи с понятным путём.
+            Err(_) => return cand,
+        }
     }
-    p
 }
 
 /// Канал вложений: модель видит картинку только оттуда. Без переменной файл

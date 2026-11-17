@@ -32,11 +32,30 @@ pub fn run_with(l: &mut crate::Live, args: &Args) -> Result<(), String> {
         return Err("web act: пустой список действий".into());
     }
     activate(l)?;
-    let refs = state::load_refs(&l.tab).unwrap_or_default();
+    // Адреса перезагружаем после каждого действия, способного сменить документ:
+    // `navigate`/`eval`/клик с переходом оставляют остальные адреса батча
+    // указывающими на старые backendNodeId.
+    let mut refs = state::load_refs(&l.tab).unwrap_or_default();
     let mut done: Vec<String> = Vec::new();
-    for a in &list {
-        let d = apply(&mut l.cdp, &refs, a)?;
-        done.push(d);
+    for (i, a) in list.iter().enumerate() {
+        match apply(&mut l.cdp, &refs, a) {
+            Ok(d) => done.push(d),
+            Err(e) => {
+                // Уже выполненные действия печатаем: иначе вызывающий не знает,
+                // случился ли клик, и повторяет весь батч — с двойными кликами.
+                for d in &done {
+                    println!("✓ {d}");
+                }
+                return Err(format!(
+                    "действие #{} ({a}) не выполнено: {e}; до него выполнено {} — не повторяй весь батч",
+                    i + 1,
+                    done.len()
+                ));
+            }
+        }
+        if invalidates_refs(a) {
+            refs = state::load_refs(&l.tab).unwrap_or_default();
+        }
     }
     for d in &done {
         println!("✓ {d}");
@@ -56,18 +75,42 @@ pub fn run_with(l: &mut crate::Live, args: &Args) -> Result<(), String> {
 fn activate(l: &mut crate::Live) -> Result<(), String> {
     let ws = l.ep.browser_ws()?;
     let mut b = crate::cdp::Cdp::connect(&ws, 15.0)?;
-    let _ = b.call("Target.activateTarget", json!({"targetId": l.tab}));
-    let _ = l.cdp.call("Page.bringToFront", Value::Null);
+    // Ошибку активации не глотаем: иначе ввод уходит в другую вкладку, а батч
+    // отчитывается успехом.
+    if let Err(e) = b.call("Target.activateTarget", json!({"targetId": l.tab})) {
+        eprintln!("внимание: не удалось активировать вкладку: {e}");
+    }
+    if let Err(e) = l.cdp.call("Page.bringToFront", Value::Null) {
+        eprintln!("внимание: вкладка не выведена вперёд: {e}");
+    }
     if let Ok(v) = l.cdp.eval("document.visibilityState") {
         if v.as_str() == Some("hidden") {
             eprintln!(
                 "внимание: вкладка {} сообщает hidden — ввод может уйти в другую вкладку. \
                  Держи одну вкладку на сессию или работай в headed-браузере",
-                &l.tab[..8.min(l.tab.len())]
+                // По символам, а не байтам: срез по байту паниковал бы на
+                // многобайтовом id — ровно на пути предупреждения.
+                l.tab.chars().take(8).collect::<String>()
             );
         }
     }
     Ok(())
+}
+
+/// Меняет ли действие документ так, что адреса снимка могли устареть. Клик и
+/// нажатие включаем намеренно: они часто ведут к навигации/перерисовке, а
+/// лишняя перезагрузка адресов стоит одного чтения файла.
+fn invalidates_refs(a: &Value) -> bool {
+    let obj = match a {
+        Value::Object(o) => o,
+        _ => return false,
+    };
+    obj.contains_key("navigate")
+        || obj.contains_key("eval")
+        || obj.contains_key("click")
+        || obj.contains_key("press")
+        || obj.contains_key("set")
+        || obj.contains_key("clear")
 }
 
 fn node_of(refs: &[crate::snap::Ref], addr: &str) -> Result<i64, String> {
@@ -122,15 +165,24 @@ fn apply(
             Ok(format!("клавиша {combo}"))
         }
         "scroll" => {
+            // Кривое значение — ошибка, а не тихие 600 px: иначе вызов выглядит
+            // успешным, хотя прокрутил не туда (или не туда, куда просили).
             let dy = match arg {
-                Value::Number(n) => n.as_f64().unwrap_or(600.0),
+                Value::Number(n) => n
+                    .as_f64()
+                    .ok_or_else(|| format!("act scroll: не число: {arg}"))?,
                 Value::String(s) => match s.as_str() {
                     "up" => -600.0,
                     "down" => 600.0,
-                    other => other.parse().unwrap_or(600.0),
+                    other => other
+                        .parse()
+                        .map_err(|_| format!("act scroll: ждёт up|down|число, получено {other}"))?,
                 },
-                Value::Object(o) => o.get("dy").and_then(Value::as_f64).unwrap_or(600.0),
-                _ => 600.0,
+                Value::Object(o) => o
+                    .get("dy")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| format!("act scroll: нет числового dy: {arg}"))?,
+                _ => return Err(format!("act scroll: непонятное значение {arg}")),
             };
             cdp.call(
                 "Input.dispatchMouseEvent",
@@ -150,7 +202,10 @@ fn apply(
             Ok(format!("переход {url}"))
         }
         "wait" => {
-            let ms = arg.as_u64().unwrap_or(500).min(30_000);
+            let ms = arg
+                .as_u64()
+                .ok_or_else(|| format!("act wait: ждёт целое число миллисекунд, получено {arg}"))?
+                .min(30_000);
             std::thread::sleep(std::time::Duration::from_millis(ms));
             Ok(format!("пауза {ms} мс"))
         }
@@ -240,7 +295,9 @@ fn click_at(cdp: &mut crate::cdp::Cdp, x: f64, y: f64) -> Result<(), String> {
     )?;
     cdp.call(
         "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}),
+        // buttons=1 (левая кнопка нажата): из битовой маски Chrome выводит
+        // event.buttons, и canvas/drag-обработчики без неё видят 0.
+        json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1}),
     )?;
     cdp.call(
         "Input.dispatchMouseEvent",
@@ -305,17 +362,15 @@ fn press(cdp: &mut crate::cdp::Cdp, combo: &str) -> Result<(), String> {
     // Одиночная буква/цифра в комбинации (Control+a): код берём из ASCII вверх
     // регистром — Chrome ждёт windowsVirtualKeyCode заглавной буквы.
     let (name, code, ch) = match key_for(key) {
-        Some(t) => t,
+        Some((n, c, ch)) => (n.to_string(), c, ch),
         None => {
             let mut cs = key.chars();
             match (cs.next(), cs.next()) {
                 (Some(c), None) if c.is_ascii_alphanumeric() => {
                     let up = c.to_ascii_uppercase();
-                    (
-                        Box::leak(up.to_string().into_boxed_str()) as &'static str,
-                        up as u32,
-                        Some(c),
-                    )
+                    // Без Box::leak: имя клавиши живёт в этой функции, а утечка
+                    // росла с каждым нажатием в батче.
+                    (String::from(up), up as u32, Some(c))
                 }
                 _ => return Err(format!("press: неизвестная клавиша {key}")),
             }
@@ -329,7 +384,9 @@ fn press(cdp: &mut crate::cdp::Cdp, combo: &str) -> Result<(), String> {
         "modifiers": mods,
     });
     let mut down = base.clone();
-    down["type"] = json!("rawKeyDown");
+    // keyDown, а не rawKeyDown: rawKeyDown определён без текста, и вставка символа
+    // не происходит — `press("a")` не набирал букву в поле.
+    down["type"] = json!("keyDown");
     if let Some(c) = ch {
         down["text"] = json!(c.to_string());
         down["unmodifiedText"] = json!(c.to_string());
@@ -355,7 +412,8 @@ fn settle(l: &mut crate::Live) {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
-        if url != old && !url.is_empty() {
+        // `old` — None значит «снимка не было»: тогда ждать нечего.
+        if old.as_deref() != Some(url.as_str()) && !url.is_empty() && old.is_some() {
             l.cdp
                 .wait_ready(std::time::Duration::from_millis(3000))
                 .ok();
@@ -379,7 +437,7 @@ fn delta(l: &mut crate::Live) -> Result<(), String> {
     let path = state::save_page(&l.tab, &s.text)?;
     state::save_url(&l.tab, &s.url);
     let refs_path = state::save_refs(&l.tab, &s.refs)?;
-    if prev_url != s.url && !before.is_empty() {
+    if prev_url.as_deref() != Some(s.url.as_str()) && !before.is_empty() && prev_url.is_some() {
         // Ушли на другую страницу: «дельта» между разными документами — шум.
         // Печатаем компактную сводку новой страницы, ссылки уже перезаписаны.
         println!(

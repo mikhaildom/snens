@@ -9,7 +9,6 @@ mod fence;
 mod library;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 const USAGE: &str = "genui <list|new|check> [...]";
 
@@ -39,6 +38,19 @@ lib.js, components/*.js, INDEX.md. Клиент инжектит её в каж�
 fn die(msg: &str, code: i32) -> ! {
     eprintln!("{msg}");
     std::process::exit(code);
+}
+
+/// Чем кончился вызов: неверные аргументы (код 2) или провал по делу (код 1).
+/// Справка обещает ровно эти коды, и скрипты вокруг тула на них смотрят.
+enum Usage {
+    Bad(String),
+    Failed(String),
+}
+
+impl From<String> for Usage {
+    fn from(s: String) -> Self {
+        Usage::Failed(s)
+    }
 }
 
 struct Args {
@@ -84,7 +96,9 @@ fn parse(argv: &[String]) -> Args {
                         a.timeout = v.parse().unwrap_or_else(|_| {
                             die(&format!("genui: --timeout ждёт число, получено {v}"), 2)
                         });
-                        if a.timeout <= 0.0 || a.timeout > 600.0 {
+                        // is_finite: `"NaN".parse::<f64>()` успешен, оба сравнения
+                        // для NaN ложны, а Duration::from_secs_f64 на NaN паникует.
+                        if !a.timeout.is_finite() || a.timeout <= 0.0 || a.timeout > 600.0 {
                             die(&format!("genui: --timeout вне 0..600 с: {v}"), 2);
                         }
                     }
@@ -112,7 +126,7 @@ fn parse(argv: &[String]) -> Args {
 
 // ---------------------------------------------------------------- list
 
-fn cmd_list(a: &Args) -> Result<i32, String> {
+fn cmd_list(a: &Args) -> Result<i32, Usage> {
     let files = library::read()?;
     let tags = library::tags(&files);
     let dir = library::dir();
@@ -177,9 +191,11 @@ fn cmd_list(a: &Args) -> Result<i32, String> {
 
 // ---------------------------------------------------------------- new
 
-fn cmd_new(a: &Args) -> Result<i32, String> {
+fn cmd_new(a: &Args) -> Result<i32, Usage> {
     let Some(name) = a.rest.first() else {
-        return Err("genui new: нужно имя компонента (например `quiz`)".into());
+        return Err(Usage::Bad(
+            "genui new: нужно имя компонента (например `quiz`)".into(),
+        ));
     };
     let dir = library::dir();
     let components = dir.join("components");
@@ -187,10 +203,10 @@ fn cmd_new(a: &Args) -> Result<i32, String> {
     let file = library::file_name(name);
     let path = components.join(&file);
     if path.exists() && !a.force {
-        return Err(format!(
+        return Err(Usage::Failed(format!(
             "{} уже есть — правь его или добавь --force",
             path.display()
-        ));
+        )));
     }
     std::fs::write(&path, library::skeleton(name))
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -205,15 +221,12 @@ fn cmd_new(a: &Args) -> Result<i32, String> {
         )
         .map_err(|e| format!("{}: {e}", lib.display()))?;
     }
-    let files = library::read()?;
     // INDEX.md — то, что читает скилл и `genui list`: регенерируем целиком из
     // файлов, чтобы он не разошёлся с содержимым каталога.
     let _ = write_index(&dir);
-    let tags = library::tags(&files);
-    let tag = tags
-        .first()
-        .cloned()
-        .unwrap_or_else(|| format!("my-{name}"));
+    // Тег — того компонента, который только что создан, а не первый в
+    // библиотеке: подсказка обязана называть свой файл.
+    let tag = format!("my-{}", file.trim_end_matches(".js"));
     println!("{} — скелет <{tag}>", path.display());
     println!("дальше: заполнить, затем `genui check` на артефакте, который его использует");
     println!("библиотека инжектится в артефакты сразу: отдельная регистрация не нужна");
@@ -266,6 +279,17 @@ fn from_session(cfg: &str) -> Result<(fence::Artifact, String), String> {
     if session.is_empty() {
         return Err("пустое имя сессии".into());
     }
+    // Имя сессии приходит из командной строки: `../..` и абсолютный путь увели бы
+    // чтение за пределы каталога сессий.
+    if session.contains(['/', '\\'])
+        || session.contains("..")
+        || std::path::Path::new(session).is_absolute()
+    {
+        return Err(format!("недопустимое имя сессии `{session}`"));
+    }
+    if seq == 0 {
+        return Err("seq нумеруется с 1: 0 — не строка журнала".into());
+    }
     let dir = sessions_dir();
     let path = dir.join(format!("{session}.jsonl"));
     if !path.is_file() {
@@ -317,9 +341,11 @@ fn sessions_dir() -> PathBuf {
     base.join("sessions")
 }
 
-fn cmd_check(a: &Args) -> Result<i32, String> {
+fn cmd_check(a: &Args) -> Result<i32, Usage> {
     let Some(target) = a.rest.first() else {
-        return Err("genui check: нужен файл или <session>:<seq>".into());
+        return Err(Usage::Bad(
+            "genui check: нужен файл или <session>:<seq>".into(),
+        ));
     };
     let files = library::read()?;
     let tags = library::tags(&files);
@@ -361,9 +387,23 @@ fn cmd_check(a: &Args) -> Result<i32, String> {
 
     let mut degraded = false;
     if !a.no_browser {
+        // --data объявлен в справке и схеме: молча его игнорировать — врать о
+        // контракте. Читаем и разбираем здесь, ошибку показываем как есть.
+        let data = match &a.data {
+            Some(p) => {
+                let text = std::fs::read_to_string(p)
+                    .map_err(|e| format!("--data {}: {e}", p.display()))?;
+                Some(
+                    serde_json::from_str::<serde_json::Value>(&text)
+                        .map_err(|e| format!("--data {}: не JSON: {e}", p.display()))?,
+                )
+            }
+            None => None,
+        };
         match check::check_in_browser(
             &art,
             &files,
+            data.as_ref(),
             a.chrome.as_deref(),
             a.out_dir.as_deref(),
             a.timeout,
@@ -438,15 +478,20 @@ fn main() {
         "list" => cmd_list(&a),
         "new" => cmd_new(&a),
         "check" => cmd_check(&a),
-        other => Err(format!("genui: неизвестная подкоманда `{other}`\n{USAGE}")),
+        other => Err(Usage::Bad(format!(
+            "genui: неизвестная подкоманда `{other}`\n{USAGE}"
+        ))),
     };
     match result {
-        Ok(code) => {
-            let _ = Duration::from_secs(0);
-            std::process::exit(code)
+        Ok(code) => std::process::exit(code),
+        // Ошибка разбора аргументов — код 2, провал проверки — 1. `Usage` отличает
+        // их от «артефакт не прошёл»: скрипты вокруг тула на это смотрят.
+        Err(Usage::Bad(msg)) => {
+            eprintln!("genui: {msg}");
+            std::process::exit(2)
         }
-        Err(e) => {
-            eprintln!("genui: {e}");
+        Err(Usage::Failed(msg)) => {
+            eprintln!("genui: {msg}");
             std::process::exit(1)
         }
     }

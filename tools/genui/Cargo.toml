@@ -8,4 +8,4 @@ edition = "2021"
 # «у модели работает, у человека нет».
 [dependencies]
 serde_json = "1"
-cdp = { path = "../cdp" }
+cdp = { path = "../cdp", version = "0.1.0" }

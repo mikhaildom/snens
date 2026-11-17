@@ -52,22 +52,47 @@ pub struct Snap {
     pub text: String,
     pub refs: Vec<Ref>,
     pub total: usize,
-    pub kept: usize,
+
     pub title: String,
     pub url: String,
+}
+
+/// FNV-1a по адресам, ролям и тексту дерева: дешёвый детерминированный
+/// отпечаток, не зависящий от версии компилятора (в отличие от DefaultHasher).
+fn fingerprint(s: &Snap) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    eat(b"addr");
+    for r in &s.refs {
+        eat(r.addr.as_bytes());
+        eat(b"\0");
+    }
+    eat(b"tree");
+    eat(s.text.as_bytes());
+    h
 }
 
 /// Снимок с ожиданием стабилизации. AX-дерево обновляется асинхронно: сразу
 /// после навигации Chrome ещё отдаёт дерево предыдущего документа при том, что
 /// `location.href` уже новый (наблюдали: после логина снимок показывал форму
-/// входа на странице товаров). Поэтому снимаем до трёх раз, пока не совпадут
-/// размер и набор ролей.
+/// входа на странице товаров). Поэтому снимаем до четырёх раз, пока не совпадут
+/// счётчики, URL и отпечаток дерева. Если стабилизация не наступила, отдаём
+/// последний снимок и говорим об этом в stderr: молча отдавать нестабильное
+/// дерево — значит подсунуть `act` чужие адреса.
 pub fn take_stable(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
-    let mut prev: Option<(usize, usize, String)> = None;
+    let mut prev: Option<(usize, usize, String, u64)> = None;
     let mut last: Option<Snap> = None;
     for attempt in 0..4 {
         let s = take(cdp, depth_cap)?;
-        let sig = (s.total, s.refs.len(), s.url.clone());
+        // Отпечаток самого дерева, а не только счётчиков: две разные страницы с
+        // одинаковым числом узлов и тем же URL считались «стабильными», и в act
+        // уезжали адреса предыдущего рендера.
+        let sig = (s.total, s.refs.len(), s.url.clone(), fingerprint(&s));
         if let Some(p) = &prev {
             if *p == sig {
                 return Ok(s);
@@ -79,27 +104,35 @@ pub fn take_stable(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
         prev = Some(sig);
         last = Some(s);
     }
+    eprintln!(
+        "внимание: дерево не стабилизировалось за 4 снимка — адреса могут быть от предыдущего рендера"
+    );
     Ok(last.unwrap_or_default())
 }
 
 pub fn take(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
-    let _ = cdp.call("Accessibility.enable", Value::Null);
+    // Отказ Accessibility.enable раньше давал пустое дерево, неотличимое от
+    // пустой страницы. Теперь это ошибка с причиной.
+    cdp.call("Accessibility.enable", Value::Null)
+        .map_err(|e| format!("CDP: Accessibility.enable не прошёл: {e}"))?;
     let r = cdp.call("Accessibility.getFullAXTree", Value::Null)?;
-    let nodes = r
+    // Ссылка на массив, без глубокой копии: nodes — это 500–600 КБ на снимок,
+    // и копия делалась до четырёх раз за `take_stable`.
+    let nodes: &[Value] = r
         .get("nodes")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
 
     let mut by_id: HashMap<String, &Value> = HashMap::new();
-    for n in &nodes {
+    for n in nodes {
         if let Some(id) = n.get("nodeId").and_then(Value::as_str) {
             by_id.insert(id.to_string(), n);
         }
     }
     // Корни — узлы, на которые никто не ссылается как на ребёнка.
     let mut claimed: HashMap<&str, ()> = HashMap::new();
-    for n in &nodes {
+    for n in nodes {
         for c in n
             .get("childIds")
             .and_then(Value::as_array)
@@ -127,14 +160,14 @@ pub fn take(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
         .unwrap_or_default();
 
     let mut counter = 0usize;
-    for n in &nodes {
+    for n in nodes {
         let id = n.get("nodeId").and_then(Value::as_str).unwrap_or("");
         if claimed.contains_key(id) || id.is_empty() {
             continue;
         }
         walk(n, &by_id, 0, depth_cap, &mut counter, &mut snap);
     }
-    snap.kept = snap.refs.len();
+
     Ok(snap)
 }
 
@@ -245,7 +278,9 @@ fn walk(
             .flatten()
         {
             if let Some(child) = c.as_str().and_then(|cid| by_id.get(cid)) {
-                walk(child, by_id, depth, depth_cap, counter, snap);
+                // Шаг глубины на pass-through узле: иначе цепочка ignored-обёрток
+                // не продвигалась и depth_cap не ограничивал рекурсию вовсе.
+                walk(child, by_id, depth + 1, depth_cap, counter, snap);
             }
         }
         return;

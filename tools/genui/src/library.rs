@@ -48,9 +48,14 @@ pub fn read() -> Result<Vec<File>, String> {
     }
     let comps = dir.join("components");
     if comps.is_dir() {
+        // Ошибку обхода не глотаем: молча неполная библиотека даёт успешный
+        // `check` на части компонентов и нестабильный отпечаток кэша.
         let mut names: Vec<PathBuf> = std::fs::read_dir(&comps)
             .map_err(|e| format!("{}: {e}", comps.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{}: {e}", comps.display()))?
+            .into_iter()
+            .map(|e| e.path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("js"))
             .collect();
         names.sort();
@@ -75,47 +80,110 @@ pub fn read() -> Result<Vec<File>, String> {
 pub fn tags(files: &[File]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for f in files {
-        let mut rest = f.source.as_str();
+        // Комментарии и строки не должны давать фантомных тегов: пример вызова
+        // `customElements.define(...)` в документации — не регистрация.
+        let code = strip_comments(&f.source);
+        let mut rest = code.as_str();
         while let Some(pos) = rest.find("customElements.define(") {
             let after = &rest[pos + "customElements.define(".len()..];
             let after = after.trim_start();
-            let (quote, after) = match after.chars().next() {
-                Some(c @ ('"' | '\'')) => (Some(c), &after[1..]),
-                _ => (None, after),
+            // Кавычка обязательна: `define(myVar, …)` — не строковый тег.
+            let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                rest = after;
+                continue;
             };
-            let _ = quote;
-            let end = after.find(['"', '\'', ')', ',']).unwrap_or(after.len());
-            let tag = after[..end].trim().to_ascii_lowercase();
-            if !tag.is_empty() && !out.contains(&tag) {
+            let body = &after[1..];
+            let end = body.find(quote).unwrap_or(body.len());
+            let tag = body[..end].trim().to_ascii_lowercase();
+            if !tag.is_empty() && valid_tag(&tag) && !out.contains(&tag) {
                 out.push(tag);
             }
-            rest = &after[end..];
+            rest = &body[end..];
         }
     }
     out
 }
 
-/// Отпечаток содержимого: по нему клиент решает, что кэш устарел. Штатный
-/// `DefaultHasher` (SipHash) — не криптография, но для кэша этого хватает, и
-/// лишней зависимости не требует.
-pub fn hash(files: &[File]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    for f in files {
-        f.name.hash(&mut h);
-        f.source.hash(&mut h);
+fn valid_tag(t: &str) -> bool {
+    t.contains('-')
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Исходник без комментариев: пример вызова в документации — не регистрация тега.
+/// Строки не трогаем: имя тега само живёт в строковом литерале.
+fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        // Строчный комментарий.
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Блочный комментарий.
+        if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+            out.push(' ');
+            continue;
+        }
+        // Строка или шаблон: копируем целиком, чтобы не спутать `//` внутри неё
+        // с комментарием.
+        if c == b'"' || c == b'\'' || c == b'`' {
+            let quote = c;
+            out.push(quote as char);
+            i += 1;
+            while i < b.len() && b[i] != quote {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    out.push(b[i] as char);
+                    i += 1;
+                }
+                out.push(b[i] as char);
+                i += 1;
+            }
+            if i < b.len() {
+                out.push(quote as char);
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
     }
-    format!("{:016x}", h.finish())
+    out
+}
+
+/// Отпечаток содержимого: по нему клиент решает, что кэш устарел.
+/// FNV-1a, а не `DefaultHasher`: у того алгоритм не зафиксирован и меняется
+/// между версиями компилятора — отпечаток обязан быть воспроизводимым между
+/// сборками харнесса и клиента.
+pub fn hash(files: &[File]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for f in files {
+        for b in f.name.as_bytes().iter().chain(b"\0").chain(f.source.as_bytes()) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
 }
 
 /// Скелет компонента: то, с чего начинается новый файл в `components/`.
+/// Тег и класс выводятся из того же slug, что и имя файла: `my-Poll Card` —
+/// невалидное имя кастомного элемента, а `class 3dCard` — синтаксическая ошибка.
 pub fn skeleton(name: &str) -> String {
-    let tag = if name.starts_with("my-") {
-        name.to_string()
-    } else {
-        format!("my-{name}")
-    };
+    let slug = file_name(name);
+    let slug = slug.trim_end_matches(".js");
+    let tag = format!("my-{slug}");
+    let cls = pascal(slug);
     format!(
         r#"// <{tag}> — что это и когда использовать.
 //
@@ -143,8 +211,7 @@ class {cls} extends HTMLElement {{
   }}
 }}
 customElements.define("{tag}", {cls});
-"#,
-        cls = pascal(name)
+"#
     )
 }
 
@@ -156,6 +223,10 @@ fn pascal(name: &str) -> String {
             out.push(first.to_ascii_uppercase());
             out.extend(chars);
         }
+    }
+    // Имя класса не может начинаться с цифры: `3d-card` → `C3dCard`.
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, 'C');
     }
     if out.is_empty() {
         "Component".into()
@@ -177,7 +248,12 @@ pub fn file_name(name: &str) -> String {
             }
         })
         .collect();
-    let slug = slug.trim_matches('-').replace("--", "-");
+    // Серии разделителей схлопываем до одного: `replace` делает один проход,
+    // и `a---b` превращалось в `a--b`.
+    let mut slug = slug.trim_matches('-').to_string();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
     if slug.is_empty() {
         "component.js".into()
     } else {
@@ -185,15 +261,22 @@ pub fn file_name(name: &str) -> String {
     }
 }
 
-/// Заголовок компонента для `INDEX.md`: первая строка комментария файла.
+/// Заголовок компонента для `INDEX.md`: первая строка **шапки** файла —
+/// ведущего блока `//`-комментариев. Комментарий выше внутреннего помощника
+/// описанием компонента не является, поэтому на первом же непустом
+/// не-комментарии поиск прекращается.
 pub fn describe(source: &str) -> String {
     for line in source.lines() {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix("//") {
-            let rest = rest.trim();
-            if !rest.is_empty() && !rest.starts_with('-') {
-                return rest.to_string();
-            }
+        if t.is_empty() {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("//") else {
+            return String::new();
+        };
+        let rest = rest.trim();
+        if !rest.is_empty() && !rest.starts_with('-') {
+            return rest.to_string();
         }
     }
     String::new()
@@ -218,10 +301,36 @@ mod tests {
     }
 
     #[test]
+    fn commented_define_is_not_a_tag() {
+        let files = vec![File {
+            name: "components/doc.js".into(),
+            source: "// customElements.define('my-ghost', class {});\n\
+                     /* customElements.define('my-ghost2', class {}); */\n\
+                     customElements.define(\"my-real\", class extends HTMLElement{});"
+                .into(),
+        }];
+        assert_eq!(tags(&files), vec!["my-real".to_string()]);
+    }
+
+    #[test]
     fn skeleton_registers_the_requested_tag() {
         let src = skeleton("quiz");
         assert!(src.contains("customElements.define(\"my-quiz\""));
         assert!(src.contains("class Quiz extends HTMLElement"));
+    }
+
+    #[test]
+    fn skeleton_tag_and_class_follow_the_file_slug() {
+        // Имя человеческое: файл — poll-card.js, тег — my-poll-card, класс —
+        // PollCard. Раньше тег получался «my-Poll Card» (невалидное имя).
+        let src = skeleton("Poll Card");
+        assert!(src.contains("customElements.define(\"my-poll-card\""), "{src}");
+        assert!(src.contains("class PollCard extends HTMLElement"), "{src}");
+        assert_eq!(file_name("Poll Card"), "poll-card.js");
+        // Ведущая цифра: класс не может начинаться с неё.
+        let src = skeleton("3d-card");
+        assert!(src.contains("class C3dCard extends HTMLElement"), "{src}");
+        assert!(src.contains("customElements.define(\"my-3d-card\""), "{src}");
     }
 
     #[test]
@@ -249,5 +358,9 @@ mod tests {
     fn describe_takes_first_comment_line() {
         assert_eq!(describe("// Квиз\n// ещё"), "Квиз");
         assert_eq!(describe("class A {}"), "");
+        // Комментарий глубоко в файле — не описание компонента.
+        assert_eq!(describe("class A {}\n// helper\n"), "");
+        // Шапка с пустой строкой внутри остаётся шапкой.
+        assert_eq!(describe("// Квиз\n\n// ещё\nclass A {}"), "Квиз");
     }
 }

@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # reqwest и toml уже в workspace-локе ядра — новых деревьев зависимостей не тянем.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

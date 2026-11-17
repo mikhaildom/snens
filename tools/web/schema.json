@@ -1,7 +1,7 @@
 {
   "type": "object",
   "properties": {
-    "command": {"type": "string", "enum": ["connect", "status", "tabs", "use", "open", "snap", "act", "shot", "eval", "text", "probe", "disconnect", "launch", "close"], "description": "Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется"},
+    "command": {"type": "string", "enum": ["connect", "status", "tabs", "use", "open", "snap", "act", "shot", "eval", "text", "probe", "disconnect", "launch", "show", "close"], "description": "Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется; show — вывести окно агентского Chrome на экран"},
     "url": {"type": "string", "description": "Адрес для open (только http/https/file)"},
     "tab": {"type": "string", "description": "Вкладка для use: id (или его начало) либо номер из tabs"},
     "json": {"type": "string", "description": "Для act: JSON-массив действий, напр. [{\"click\":\"e3\"},{\"type\":{\"ref\":\"e1\",\"text\":\"hi\"}},{\"press\":\"Enter\"}]. Действия: click/hover (адрес или [x,y]), type {ref,text}, clear, press, scroll, navigate, wait, upload {ref,file}, eval"},
@@ -10,6 +10,10 @@
     "depth": {"type": "integer", "description": "Для snap: максимальная глубина дерева (дефолт 30)"},
     "out": {"type": "string", "description": "Для shot: путь к PNG (дефолт — канал вложений или каталог состояния)"},
     "port": {"type": "integer", "description": "Порт CDP (дефолт 9222 или порт из состояния connect)"},
+    "visible": {"type": "boolean", "description": "Для launch: поднять Chrome в сессии пользователя, с видимым окном"},
+    "full": {"type": "boolean", "description": "Для snap: дерево без ограничения глубины (весь документ)"},
+    "new": {"type": "boolean", "description": "Для open: открыть в новой вкладке"},
+    "all": {"type": "boolean", "description": "Для tabs: показать и чужие вкладки, не только наши"},
     "host": {"type": "string", "description": "Машина пользователя для ssh: та же команда выполняется там (там тоже должен стоять web). Пример: user@machine"},
     "profile": {"type": "string", "description": "Для launch: каталог профиля Chrome на той машине (по умолчанию ~/.snens-chrome). Отдельный профиль = отладка без подтверждений"},
     "tunnel": {"type": "string", "description": "Машина пользователя для ssh-туннеля к её Chrome: на той стороне web ставить не нужно, только Chrome с включённым тумблером в chrome://inspect/#remote-debugging. Пример: user@machine. Дальше все команды идут через туннель"}
@@ -29,7 +33,11 @@
       {"flag": "--limit", "field": "limit"},
       {"flag": "--depth", "field": "depth"},
       {"flag": "--out", "field": "out"},
-      {"flag": "--port", "field": "port"}
+      {"flag": "--port", "field": "port"},
+      {"flag": "--visible", "when_field": "visible"},
+      {"flag": "--full", "when_field": "full"},
+      {"flag": "--new", "when_field": "new"},
+      {"flag": "--all", "when_field": "all"}
     ],
     "stdin": {"mode": "none"}
   }

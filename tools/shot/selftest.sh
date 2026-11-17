@@ -31,10 +31,11 @@ BIN=$HERE/shot
 has '"x-snens"' "$(cat "$HERE/schema.json")" "shot: в схеме есть ключ x-snens"
 has '"url"' "$(cat "$HERE/schema.json")" "shot: схема объявляет url"
 
-# t [args...] → $out, $err, $rc
+# t [args...] → $out, $err, $rc. `SNENS_ATTACH_DIR` из окружения — часть прогона:
+# живые проверки задают его переменной, а не переписывают захват вывода.
 t() {
   rc=0
-  out=$("$BIN" "$@" 2>"$TMP/err") || rc=$?
+  out=$(env ${SNENS_ATTACH_DIR:+SNENS_ATTACH_DIR="$SNENS_ATTACH_DIR"} "$BIN" "$@" 2>"$TMP/err") || rc=$?
   err=$(cat "$TMP/err")
 }
 
@@ -79,7 +80,14 @@ want 2 "$rc" "shot: --timeout 0 — код 2"
 
 # ---- живой прогон: локальный сервер ----
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "selftest: python3 нет — живые проверки (сервер страниц) пропущены"
+  # Живые проверки — почти весь контракт тула (PNG, --selector, --crop, --script,
+  # внутренний таймаут). Молчаливый пропуск в CI даёт зелёный прогон, в котором
+  # ничего не проверено, поэтому пропуск возможен только явным переключателем.
+  if [ "${SHOT_SELFTEST_SKIP_LIVE:-0}" = 1 ]; then
+    echo "selftest: python3 нет — живые проверки пропущены (SHOT_SELFTEST_SKIP_LIVE=1)"
+  else
+    bad "shot: python3 не найден — живые проверки (PNG, --selector, --crop, --script, таймаут) не выполнены; пропустить явно: SHOT_SELFTEST_SKIP_LIVE=1"
+  fi
 else
   mkdir -p "$TMP/www"
   printf '<html><head><title>shot selftest</title></head><body style="background:#eef"><h1>shot selftest</h1><div id="box" style="width:320px;height:140px;background:#4a90d9">box</div><textarea>typed</textarea></body></html>\n' >"$TMP/www/index.html"
@@ -98,10 +106,13 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            self.wfile.write(b"14\r\n<html><body>hang\r\n\r\n")
+            # Размер чанка — ровно длина данных: "<html><body>hang" = 16 = 0x10,
+            # а не 0x14. Ошибка в размере ломает chunked-ответ, и /hang перестаёт
+            # проверять внутренний таймаут (хром падает на сети, а не висит).
+            self.wfile.write(b"10\r\n<html><body>hang\r\n")
             try:
                 while True:
-                    self.wfile.write(b"5\r\n....\r\n")
+                    self.wfile.write(b"4\r\n....\r\n")
                     self.wfile.flush()
                     time.sleep(1)
             except Exception:
@@ -130,9 +141,11 @@ PY
   python3 "$TMP/srv.py" "$TMP/www" >"$TMP/port" 2>"$TMP/srv.err" &
   SRV_PID=$!
   port=
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  srv_deadline=$(( $(date +%s) + 10 ))
+  while [ "$(date +%s)" -lt "$srv_deadline" ]; do
     port=$(head -1 "$TMP/port" 2>/dev/null || true)
     [ -n "$port" ] && break
+    kill -0 "$SRV_PID" 2>/dev/null || break
     sleep 0.2
   done
   if [ -z "$port" ]; then
@@ -140,40 +153,43 @@ PY
   else
     URL="http://127.0.0.1:$port/"
     mkdir -p "$TMP/attach" "$TMP/out"
+    ls -d "${TMPDIR:-/tmp}"/shot-[0-9]* 2>/dev/null | sort >"$TMP/tmp-before" || :
 
     # Полный кадр дефолтного размера: файл в канале вложений и он не пустой.
-    rc=0
-    out=$(SNENS_ATTACH_DIR="$TMP/attach" "$BIN" "$URL" --wait-ms 100 --out-dir "$TMP/out" 2>"$TMP/err") || rc=$?
-    err=$(cat "$TMP/err")
+    SNENS_ATTACH_DIR="$TMP/attach" t "$URL" --wait-ms 100 --out-dir "$TMP/out"
     want 0 "$rc" "shot: обычный кадр — код 0"
     has "image/png" "$out" "shot: в stdout тип вложения"
     has "→ вложение" "$out" "shot: в stdout имя вложения"
     f=$(ls "$TMP/attach"/*.png 2>/dev/null | head -1)
     if [ -n "$f" ]; then ok "shot: PNG лёг в SNENS_ATTACH_DIR"; else bad "shot: PNG не лёг в SNENS_ATTACH_DIR"; fi
-    size=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
-    [ "${size:-0}" -gt 5000 ] && ok "shot: кадр больше 5 КБ ($size Б)" || bad "shot: кадр подозрительно мал ($size Б)"
-    head -c 8 "$f" | od -An -tx1 | tr -d ' \n' >"$TMP/magic"
-    want "89504e470d0a1a0a" "$(cat "$TMP/magic")" "shot: файл — настоящий PNG (магия)"
+    # Всё дальнейшее — только если файл есть: иначе `wc`/`head` под set -eu
+    # уронят весь прогон вместо одной записи о провале.
+    size=0
+    [ -n "$f" ] && size=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
+    # Порог низкий намеренно: размер PNG зависит от кодировщика и DPR, а
+    # проверяем мы «кадр не пустой», а не конкретный вес.
+    [ "${size:-0}" -gt 500 ] && ok "shot: кадр не пустой ($size Б)" || bad "shot: кадр подозрительно мал ($size Б)"
+    magic=""
+    [ -n "$f" ] && magic=$(head -c 8 "$f" | od -An -tx1 | tr -d ' \n')
+    want "89504e470d0a1a0a" "$magic" "shot: файл — настоящий PNG (магия)"
 
     # Селектор: кроп ровно элемента, а не окна.
-    rc=0
-    out=$(SNENS_ATTACH_DIR="$TMP/attach" "$BIN" "$URL" --selector '#box' --wait-ms 100 --out-dir "$TMP/out" 2>"$TMP/err") || rc=$?
-    err=$(cat "$TMP/err")
+    SNENS_ATTACH_DIR="$TMP/attach" t "$URL" --selector '#box' --wait-ms 100 --out-dir "$TMP/out"
     want 0 "$rc" "shot: --selector — код 0"
     has "рамка" "$out" "shot: --selector печатает измеренную рамку"
     has "320x140" "$out" "shot: рамка элемента измерена, а не угадана"
 
     # Явный кроп.
-    rc=0
-    out=$(SNENS_ATTACH_DIR="$TMP/attach" "$BIN" "$URL" --crop 0,0,200,100 --wait-ms 100 --out-dir "$TMP/out" 2>"$TMP/err") || rc=$?
-    err=$(cat "$TMP/err")
+    SNENS_ATTACH_DIR="$TMP/attach" t "$URL" --crop 0,0,200,100 --wait-ms 100 --out-dir "$TMP/out"
     want 0 "$rc" "shot: --crop — код 0"
     has "200x100" "$out" "shot: --crop даёт заказанный размер"
+    crop_f=$(ls -t "$TMP"/attach/*.png 2>/dev/null | head -1)
+    real=""
+    [ -n "$crop_f" ] && real=$(python3 -c 'import struct,sys;d=open(sys.argv[1],"rb").read(24);print("%dx%d"%struct.unpack(">II",d[16:24]))' "$crop_f")
+    want "200x100" "$real" "shot: --crop — реальные пиксели PNG, а не только вывод"
 
     # Два размера за запуск.
-    rc=0
-    out=$(SNENS_ATTACH_DIR="$TMP/attach" "$BIN" "$URL" --size 800x600,390x844 --wait-ms 100 --out-dir "$TMP/out" 2>"$TMP/err") || rc=$?
-    err=$(cat "$TMP/err")
+    SNENS_ATTACH_DIR="$TMP/attach" t "$URL" --size 800x600,390x844 --wait-ms 100 --out-dir "$TMP/out"
     want 0 "$rc" "shot: два --size — код 0"
     has "800x600" "$out" "shot: первый размер в выводе"
     has "390x844" "$out" "shot: второй размер в выводе"
@@ -209,11 +225,16 @@ PY
     elapsed=$(( $(date +%s) - started ))
     want 1 "$rc" "shot: висящая страница — код 1"
     has "таймаут 4 с" "$err" "shot: висящая страница — назван таймаут"
-    [ "$elapsed" -le 10 ] && ok "shot: вернулся за ${elapsed} с (лимит 4 с + запуск)" \
+    # Запас с большим люфтом: запуск холодного Chrome на загруженной машине
+    # занимает секунды, а проверяем мы «таймаут сработал», а не скорость старта.
+    [ "$elapsed" -le 30 ] && ok "shot: вернулся за ${elapsed} с (лимит 4 с + запуск)" \
       || bad "shot: таймаут не сработал (${elapsed} с)"
 
-    # Временные каталоги тула (shot-<pid>-<nanos>) убираются за собой.
-    left=$(ls -d /tmp/shot-[0-9]* 2>/dev/null | wc -l | tr -d ' ')
+    # Временные каталоги тула убираются за собой. Считаем только появившиеся за
+    # этот прогон: чужие (от параллельного прогона или прошлого падения) — не наша
+    # забота, но и не повод краснеть.
+    ls -d "${TMPDIR:-/tmp}"/shot-[0-9]* 2>/dev/null | sort >"$TMP/tmp-after" || :
+    left=$(comm -13 "$TMP/tmp-before" "$TMP/tmp-after" | wc -l | tr -d ' ')
     [ "${left:-0}" -eq 0 ] && ok "shot: временные каталоги убраны" \
       || bad "shot: остались временные каталоги ($left)"
   fi

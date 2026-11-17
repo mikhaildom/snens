@@ -1,8 +1,9 @@
 #!/bin/sh
 # Контракты тула desk: коды возврата, --help, схема, отказ без машины.
-# Живые проверки (окна, дерево, действия) требуют машину пользователя и ssh,
-# поэтому в общий прогон не входят: они запускаются вручную с --tunnel.
-# Запуск из корня репо: sh tools/desk/selftest.sh
+# Живые проверки (окна, дерево, действия) требуют машину пользователя и ssh:
+# они идут только при явном `--tunnel user@machine`, иначе пропускаются с
+# громкой строкой (а не молча: «все проверки прошли» без живых — неправда).
+# Запуск из корня репо: sh tools/desk/selftest.sh [--tunnel user@machine]
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 TMP=$(mktemp -d)
@@ -19,12 +20,30 @@ has() {
   esac
 }
 
+LIVE_HOST=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tunnel) LIVE_HOST=${2:-}; [ -n "$LIVE_HOST" ] || { echo "FAIL: --tunnel без адреса"; exit 2; }; shift 2 ;;
+    --tunnel=*) LIVE_HOST=${1#--tunnel=}; shift ;;
+    *) echo "FAIL: неизвестный аргумент $1"; exit 2 ;;
+  esac
+done
+
 BIN=$HERE/desk
 [ -x "$BIN" ] || { echo "FAIL: нет бинарника $BIN — собери: snens build desk"; exit 1; }
+# Старый бинарь давал бы зелёный прогон на устаревшем коде: сверяем время.
+if [ -n "$(find "$HERE/src" -name '*.rs' -newer "$BIN" 2>/dev/null | head -1)" ]; then
+  echo "FAIL: $BIN старше исходников — пересобери: cargo build -p desk"
+  exit 1
+fi
 [ -f "$HERE/schema.json" ] && ok "desk: schema.json рядом с бинарником" || bad "desk: нет schema.json"
 has '"x-snens"' "$(cat "$HERE/schema.json")" "desk: в схеме есть ключ x-snens"
-has '"command"' "$(cat "$HERE/schema.json")" "desk: схема объявляет command"
-has '"tunnel"' "$(cat "$HERE/schema.json")" "desk: схема объявляет tunnel"
+# Анкер на ключ в properties: подстрока '"command"' встречается и в x-snens.argv,
+# поэтому прежняя проверка была зелёной даже без верхнеуровневых свойств.
+flat=$(tr -d '\n' <"$HERE/schema.json" | sed 's/[[:space:]]\{1,\}/ /g')
+has '"properties": { "command": {' "$flat" "desk: схема объявляет command в properties"
+has '"tunnel": {' "$flat" "desk: схема объявляет tunnel в properties"
+has '"required": ["command", "tunnel"]' "$flat" "desk: command и tunnel обязательны"
 
 t() {
   rc=0
@@ -66,10 +85,45 @@ t act --tunnel nosuchhost.invalid --json '{"click":"e1"}'
 want 1 "$rc" "act с объектом вместо массива: код 1"
 has "массив" "$err" "act с объектом: подсказывает про массив"
 
-# Агент на недоступной машине: ошибка ssh, а не зависание.
+# Неизвестный флаг — ошибка аргументов, а не тихо проигнорированный флаг.
+t apps --windw 0 --tunnel nosuchhost.invalid
+want 2 "$rc" "desk: неизвестный флаг — код 2"
+has "--windw" "$err" "desk: неизвестный флаг назван"
+
+# Кривой порт — ошибка, а не тихий дефолт/насыщение.
+t apps --port abc --tunnel nosuchhost.invalid
+want 1 "$rc" "desk: --port abc — код 1 (ошибка выполнения разбора)"
+has "port" "$err" "desk: --port abc назван в ошибке"
+want "" "$out" "desk: --port abc — stdout пуст"
+
+# Все команды отвечают без машины: код 1 и подсказка про --tunnel в stderr.
+for cmd in apps snap act shot focus launch stop status; do
+  t "$cmd"
+  want 1 "$rc" "desk: $cmd без --tunnel — код 1"
+  want "" "$out" "desk: $cmd без --tunnel — stdout пуст"
+  has "tunnel" "$err" "desk: $cmd без --tunnel — подсказка про tunnel"
+done
+
+# Агент на недоступной машине: ошибка ssh, а не зависание и не код 0.
 t status --tunnel nosuchhost.invalid
-want 0 "$rc" "status на недоступной машине: код 0, но пишет «недоступен»"
-has "недоступен" "$out" "status: честно сказал, что агент недоступен"
+want 1 "$rc" "status на недоступной машине: код 1"
+has "недоступен" "$err" "status: честно сказал, что агент недоступен"
+
+# ---- живые проверки: только с --tunnel ----------------------------------
+if [ -n "$LIVE_HOST" ]; then
+  t apps --tunnel "$LIVE_HOST"
+  want 0 "$rc" "живой: apps — код 0"
+  has "окон" "$out" "живой: apps перечисляет окна"
+
+  t snap --tunnel "$LIVE_HOST"
+  want 0 "$rc" "живой: snap — код 0"
+
+  t status --tunnel "$LIVE_HOST"
+  want 0 "$rc" "живой: status — код 0"
+  has "жив" "$out" "живой: status говорит, что агент жив"
+else
+  echo "пропуск: живые проверки (окна, snap, status) не выполнялись — нет --tunnel user@machine"
+fi
 
 if [ "$fails" -eq 0 ]; then
   echo "все проверки desk прошли"

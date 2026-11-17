@@ -19,29 +19,10 @@ fn ps_encoded(script: &str) -> String {
     for u in script.encode_utf16() {
         bytes.extend_from_slice(&u.to_le_bytes());
     }
-    base64(&bytes)
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if c.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    // Готовая кодировка из ядра: своя копия base64 уже была источником тонких
+    // ошибок (паддинг, вариант алфавита).
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(&bytes)
 }
 
 /// Запустить powershell-скрипт на той стороне.
@@ -55,25 +36,52 @@ fn powershell(host: &str, script: &str) -> Result<String, String> {
     )
 }
 
+/// Путь профиля уезжает в удалённую команду на обеих платформах: разрешаем
+/// только то, что не может изменить смысл строки.
+fn check_profile(profile: Option<&str>) -> Result<(), String> {
+    let Some(p) = profile else { return Ok(()) };
+    let bad = p.is_empty()
+        || p.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '\'' | '"' | '&' | '|' | '>' | '<' | '$' | ';' | '\n' | '\r' | '`'
+                )
+        });
+    if bad {
+        return Err(format!(
+            "web: недопустимый путь профиля `{p}` — кавычки, пробелы и метасимволы запрещены"
+        ));
+    }
+    Ok(())
+}
+
 fn ssh<A: AsRef<str>>(host: &str, cmd: A) -> Result<String, String> {
+    crate::tunnel::check_host(host)?;
     let out = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
+        .arg("--")
         .arg(host)
         .arg(cmd.as_ref())
         .output()
         .map_err(|e| format!("ssh {host}: {e}"))?;
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    // Нормализуем вывод обеих сторон до проверки статуса: иначе на пути ошибки
+    // в сообщение попадали \r от Windows.
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+        let err = String::from_utf8_lossy(&out.stderr).replace('\r', "");
         return Err(format!(
             "на {host} команда не прошла: {}",
-            err.trim().lines().last().unwrap_or("причина не сказана")
+            err
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("причина не сказана")
         ));
     }
-    text = text.replace('\r', "");
     Ok(text)
 }
 
@@ -126,7 +134,7 @@ pub fn ours_on_port(host: &str, port: u16) -> Result<bool, String> {
         let out = ssh(
             host,
             format!(
-                "sh -c 'for p in $(pgrep -f \"remote-debugging-port={port}\"); do tr \"\\0\" \" \" < /proc/$p/cmdline | grep -q snens-chrome && echo ours && exit; done; echo no'"
+                "sh -c 'for p in $(pgrep -f \"remote-debugging-port={port}( |$)\"); do tr \"\\0\" \" \" < /proc/$p/cmdline | grep -q snens-chrome && echo ours && exit; done; echo no'"
             ),
         )?;
         Ok(out.contains("ours"))
@@ -137,7 +145,14 @@ pub fn ours_on_port(host: &str, port: u16) -> Result<bool, String> {
 /// Chrome молча прилипнет к уже запущенному процессу с ЧУЖИМ профилем (проверено:
 /// так и вышло на 9222 с профилем человека), и отладка будет не туда.
 pub fn port_free(host: &str, port: u16) -> Result<bool, String> {
-    if remote_os(host)? == "windows" {
+    let os = remote_os(host)?;
+    port_free_on(host, os, port)
+}
+
+/// То же, но ОС уже известна: `pick_port` перебирает до десяти портов, и каждый
+/// `remote_os` — это лишний ssh-вызов.
+fn port_free_on(host: &str, os: &str, port: u16) -> Result<bool, String> {
+    if os == "windows" {
         let out = powershell(
             host,
             &format!(
@@ -146,18 +161,38 @@ pub fn port_free(host: &str, port: u16) -> Result<bool, String> {
         )?;
         Ok(out.contains("free"))
     } else {
+        // `A && B || C` отдавал «free» при любом сбое (нет ss, grep ошибся) —
+        // именно тогда Chrome и прилипал к чужому профилю. Теперь три исхода,
+        // и «не знаю» — ошибка, а не «свободно».
         let out = ssh(
             host,
-            format!("sh -c 'command -v ss >/dev/null && ss -ltn | grep -q \":{port} \" && echo busy || echo free'"),
+            format!(
+                "sh -c 'if command -v ss >/dev/null 2>&1; then \
+                   if ss -ltn 2>/dev/null | grep -q \":{port} \"; then echo busy; else echo free; fi; \
+                 elif command -v netstat >/dev/null 2>&1; then \
+                   if netstat -ltn 2>/dev/null | grep -q \":{port} \"; then echo busy; else echo free; fi; \
+                 elif command -v lsof >/dev/null 2>&1; then \
+                   if lsof -nP -iTCP:{port} -sTCP:LISTEN 2>/dev/null | grep -q .; then echo busy; else echo free; fi; \
+                 else echo unknown; fi'"
+            ),
         )?;
-        Ok(out.contains("free"))
+        if out.contains("busy") {
+            Ok(false)
+        } else if out.contains("free") {
+            Ok(true)
+        } else {
+            Err(format!(
+                "на {host} нечем проверить порт {port} (нет ss/netstat/lsof):                  запуск вслепую прилип бы к чужому профилю — поставь --port или утилиту"
+            ))
+        }
     }
 }
 
 /// Первый свободный порт начиная с `from` (не больше десяти попыток).
 pub fn pick_port(host: &str, from: u16) -> Result<u16, String> {
+    let os = remote_os(host)?;
     for p in from..from.saturating_add(10) {
-        if port_free(host, p)? {
+        if port_free_on(host, os, p)? {
             return Ok(p);
         }
     }
@@ -174,10 +209,13 @@ pub fn pick_port(host: &str, from: u16) -> Result<u16, String> {
 pub fn start_visible(host: &str, port: u16, profile: Option<&str>) -> Result<(), String> {
     if remote_os(host)? != "windows" {
         return Err(
-            "видимое окно сейчас поддержано на Windows (через schtasks /IT). На unix запускай              Chrome внутри своей X/Wayland-сессии — там окно видно по определению"
+            "видимое окно сейчас поддержано на Windows (через schtasks /IT). На unix запускай Chrome внутри своей X/Wayland-сессии — там окно видно по определению"
                 .into(),
         );
     }
+    // Путь профиля подставляется в удалённую команду: кавычка, пробел или
+    // метасимвол ломают её (а `'` в PowerShell-литерале — это уже исполнение).
+    check_profile(profile)?;
     let prof = match profile {
         Some(p) => p.to_string(),
         None => r"C:\Users\%USERNAME%\.snens-chrome".to_string(),
@@ -215,11 +253,24 @@ $log = Join-Path $env:USERPROFILE 'snens-chrome-visible.out'
 fn write_remote_file(host: &str, name: &str, content: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::Stdio;
+    // Имя уходит в удалённую команду без кавычек: пробел, `&`, `>` или кавычка
+    // меняли бы её смысл. Сегодня передаются только литералы, но проверка
+    // стоит одну строку и снимает грабли на будущее.
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(format!("web: недопустимое имя файла `{name}`"));
+    }
     let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg(host)
-        .arg(format!(r"cmd /c more > C:\Users\%USERNAME%\{}", name))
+        .arg(format!(
+            r#"cmd /c more > "C:\Users\%USERNAME%\{}""#,
+            name
+        ))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -228,9 +279,13 @@ fn write_remote_file(host: &str, name: &str, content: &str) -> Result<(), String
     if let Some(mut stdin) = child.stdin.take() {
         // Windows-переводы строк: powershell их ждёт.
         let crlf = content.replace("\r\n", "\n").replace('\n', "\r\n");
-        stdin
-            .write_all(crlf.as_bytes())
-            .map_err(|e| format!("stdin ssh: {e}"))?;
+        if let Err(e) = stdin.write_all(crlf.as_bytes()) {
+            // Ребёнок остался бы писать на ту сторону без нас: гасим и забираем.
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("stdin ssh: {e}"));
+        }
     }
     let out = child
         .wait_with_output()
@@ -256,14 +311,22 @@ pub fn show_window(host: &str) -> Result<(), String> {
 [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
 [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
 [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 public delegate bool EnumProc(IntPtr h, IntPtr p);
 '@
+# PID-ы нашего профиля: без этого находился первый попавшийся «Google Chrome» —
+# личный браузер человека, а не агентский.
+$ours = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+  Where-Object { $_.CommandLine -match 'snens-chrome' -and $_.CommandLine -notmatch '--type=' } |
+  ForEach-Object { $_.ProcessId })
 $found = $false
 $cb = [W.U+EnumProc]{
   param($h, $p)
+  $pid2 = 0
+  [void][W.U]::GetWindowThreadProcessId($h, [ref]$pid2)
   $sb = New-Object System.Text.StringBuilder 512
   [void][W.U]::GetWindowText($h, $sb, 512)
-  if ($sb.ToString() -like '*Google Chrome*') {
+  if ($ours -contains $pid2 -and $sb.ToString() -like '*Google Chrome*') {
     [void][W.U]::ShowWindow($h, 9)
     [void][W.U]::BringWindowToTop($h)
     [void][W.U]::SetForegroundWindow($h)
@@ -299,6 +362,7 @@ pub fn start_agent_chrome(host: &str, port: u16, profile: Option<&str>) -> Resul
             // Склейка через конкатенацию, без интерполяции в строке: PowerShell
             // не подставляет переменные внутрь одинарных кавычек, и `$prof`
             // уезжал в командную строку Chrome буквально.
+            check_profile(profile)?;
             let prof_expr = match profile {
                 Some(p) => format!("'{}'", p),
                 None => "(Join-Path $env:USERPROFILE '.snens-chrome')".to_string(),
@@ -309,6 +373,7 @@ pub fn start_agent_chrome(host: &str, port: u16, profile: Option<&str>) -> Resul
             powershell(host, &script)?;
         }
         _ => {
+            check_profile(profile)?;
             let prof = profile.unwrap_or("$HOME/.snens-chrome");
             let cmd = format!(
                 "sh -c 'nohup setsid \"$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser)\" \
@@ -329,6 +394,9 @@ pub fn start_agent_chrome(host: &str, port: u16, profile: Option<&str>) -> Resul
 fn wait_port(host: &str, port: u16, budget: Duration) -> Result<(), String> {
     let os = remote_os(host)?;
     let until = Instant::now() + budget;
+    // Последняя ошибка пробы: недоступный хост/сломанный ssh иначе выглядит как
+    // «Chrome не поднялся», и диагностика уводит не туда.
+    let mut last_err: Option<String> = None;
     loop {
         let probe = match os {
             "windows" => powershell(
@@ -336,13 +404,18 @@ fn wait_port(host: &str, port: u16, budget: Duration) -> Result<(), String> {
                 &format!(
                     "try {{ (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:{port}/json/version -TimeoutSec 3).StatusCode }} catch {{ 0 }}"
                 ),
-            )
-            .unwrap_or_default(),
+            ),
             _ => ssh(
                 host,
                 format!("curl -s -o /dev/null -w '%{{http_code}}' --max-time 3 http://127.0.0.1:{port}/json/version"),
-            )
-            .unwrap_or_default(),
+            ),
+        };
+        let probe = match probe {
+            Ok(p) => p,
+            Err(e) => {
+                last_err = Some(e);
+                String::new()
+            }
         };
         if probe.trim().trim_matches('"') == "200" {
             return Ok(());
@@ -353,8 +426,12 @@ fn wait_port(host: &str, port: u16, budget: Duration) -> Result<(), String> {
                 "cmd /c type C:\\Users\\%USERNAME%\\snens-chrome-visible.out 2>nul",
             )
             .unwrap_or_default();
+            let cause = match &last_err {
+                Some(e) => format!("\nпоследняя ошибка пробы: {e}"),
+                None => String::new(),
+            };
             return Err(format!(
-                "Chrome на {host} не поднял отладку на порту {port} за {} с.{}\n\
+                "Chrome на {host} не поднял отладку на порту {port} за {} с.{cause}{}\n\
                  Частые причины: порт занят другим Chrome (тогда профиль агента не свой), \
                  chrome.exe не найден в стандартном месте, на unix не установлен google-chrome.\n\
                  Уже запущенные агентские Chrome: `web launch` без --port переиспользует свой.",

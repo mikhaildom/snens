@@ -8,10 +8,12 @@ mod net;
 use std::io::Read;
 use std::process::exit;
 
-use cli::{Args, HELP, USAGE};
+use cli::{Args, USAGE};
 
 /// Лимит тела для текста: страница длиннее — уже не для контекста, а бомба по памяти.
 const MAX_BODY: u64 = 2 * 1024 * 1024;
+/// Потолок файла для не-html: враждебный URL не должен забить диск агентского хоста.
+const MAX_FILE: u64 = 64 * 1024 * 1024;
 /// Ниже этого порога после очистки результат считается пустым и идёт фолбэк.
 /// Порог низкий намеренно: короткая страница-заглушка (example.com) — это текст,
 /// и подменять его ответом jina незачем; пустой JS-шелл даёт ноль-двадцать символов.
@@ -25,7 +27,7 @@ fn die(msg: &str, code: i32) -> ! {
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if !argv.is_empty() && (argv[0] == "-h" || argv[0] == "--help") {
-        println!("{HELP}");
+        println!("{}", cli::help());
         exit(0);
     }
     if argv.is_empty() {
@@ -42,7 +44,12 @@ fn main() {
             2,
         );
     }
-    print!("{}", trim(&net::fetch(&a), a.max_chars));
+    let out = trim(&net::fetch(&a), a.max_chars);
+    // Пустота — не успех: иначе агент считает «страница без текста» ответом.
+    if out.trim().is_empty() {
+        eprintln!("fetch: пустой результат — страница пустая, отдана заглушка блокировщика или фолбэк не сработал");
+    }
+    print!("{out}");
     exit(0);
 }
 
@@ -62,12 +69,21 @@ fn save_binary(
         .filter(|v| !v.trim().is_empty());
     // Временность помечаем явно: путь под /tmp не значит «временный» (там же может
     // лежать каталог вложений человека).
-    let (path, temp) = match (&a.save, attach) {
+    let (path, temp) = match (&a.save, attach.clone()) {
         (Some(p), _) => (std::path::PathBuf::from(p), false),
         (None, Some(d)) => (std::path::PathBuf::from(d).join(fname), false),
         // Ни --save, ни каталога вложений: PDF всё равно стоит попробовать вытащить текстом
-        // (файл временный) — иначе человеку нужна подсказка, куда класть.
-        (None, None) if is_pdf && has_pdftotext() => (std::env::temp_dir().join(fname), true),
+        // (файл временный) — иначе человеку нужна подсказка, куда класть. Имя делаем
+        // уникальным: предсказуемый `/tmp/<имя>` — это и симлинк-атака, и гонка между
+        // одновременными вызовами.
+        (None, None) if is_pdf && has_pdftotext() => (
+            std::env::temp_dir().join(format!(
+                "fetch-{}-{}-{fname}",
+                std::process::id(),
+                crate::now_nanos()
+            )),
+            true,
+        ),
         (None, None) => {
             return Err(format!(
                 "не-html ответ ({ctype}); куда сохранить неясно — укажи --save путь \
@@ -81,16 +97,46 @@ fn save_binary(
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
     }
-    let mut f = std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    std::io::copy(&mut resp.take(u64::MAX), &mut f)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // create_new: отказываем, если по этому имени уже что-то есть (в том числе
+    // симлинк). Уникальное имя временного файла уже само по себе защита, но
+    // проверка стоит одну строку и снимает гонку вовсе.
+    let file = if temp {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+    };
+    let mut f = file.map_err(|e| format!("{}: {e}", path.display()))?;
+    // Потолок на файл: сервер не должен уметь забить диск. Обрезка честно сообщается.
+    let copied = std::io::copy(&mut resp.take(MAX_FILE + 1), &mut f);
+    let n = match copied {
+        Ok(n) => n,
+        Err(e) => {
+            drop(f);
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("{}: {e}", path.display()));
+        }
+    };
     drop(f);
+    if n > MAX_FILE {
+        eprintln!("fetch: файл обрезан по потолку {MAX_FILE} Б");
+    }
 
-    // PDF без --save: человек просил текст, а не файл — отдаём текст, временный файл убираем.
+    // PDF без --save: человек просил текст, а не файл — отдаём текст, файл убираем.
+    // Файл в каталоге вложений не удаляем (он там по делу), но путь печатаем:
+    // иначе он осиротеет без следа в выводе.
     if is_pdf && !explicit {
         if let Some(text) = pdftotext(&path) {
             if temp {
                 let _ = std::fs::remove_file(&path);
+            } else {
+                eprintln!("fetch: файл сохранён: {}", path.display());
             }
             return Ok(text);
         }
@@ -108,10 +154,8 @@ fn has_pdftotext() -> bool {
 }
 
 /// Что вытащил системный pdftotext. Нет утилиты/ошибка — None (отдаём путь к файлу).
+/// Наличие утилиты вызывающий уже проверил: лишний `sh -c` на каждый PDF не нужен.
 fn pdftotext(path: &std::path::Path) -> Option<String> {
-    if !has_pdftotext() {
-        return None;
-    }
     let out = std::process::Command::new("pdftotext")
         .arg("-q")
         .arg(path)
@@ -142,6 +186,14 @@ fn trim(s: &str, max_chars: usize) -> String {
         "{}\n…[обрезано: {dropped} символов]\n",
         cut.trim_end_matches('\n')
     )
+}
+
+/// Наносекунды эпохи — для уникального имени временного файла.
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 fn ensure_nl(s: &str) -> String {

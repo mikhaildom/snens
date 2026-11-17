@@ -32,6 +32,16 @@ fn sniff(b: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Первые `n` байт файла: спецфайл вроде `/dev/zero` не может утащить процесс
+/// в бесконечное чтение, и память ограничена размером головы.
+fn read_head(p: &Path, n: usize) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let f = std::fs::File::open(p)?;
+    let mut buf = Vec::with_capacity(n);
+    f.take(n as u64).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 fn dims(b: &[u8], mime: &str) -> Option<(u32, u32)> {
     match mime {
         "image/png" if b.len() >= 24 => Some((
@@ -90,26 +100,58 @@ fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// Имя в канале: базовое имя источника, при коллизии — с индексом. Расширение
-/// сохраняем: по нему ядро выбирает mime вложения.
-fn dest(dir: &Path, src: &Path) -> PathBuf {
+/// Расширение по распознанному типу — не по имени источника: ядро выбирает mime
+/// вложения по расширению, а файл `photo.png` с JPEG-байтами иначе уехал бы как
+/// сломанный PNG.
+fn ext_for(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => ".png",
+        "image/jpeg" => ".jpg",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        _ => "",
+    }
+}
+
+/// Положить файл в канал и вернуть путь. Имя занимается атомарно (`create_new`),
+/// поэтому два параллельных `view` не выбирают одно и то же имя и не затирают
+/// вложение друг друга. Содержимое копируется потоком: файл в память не читаем.
+fn place(dir: &Path, src: &Path, mime: &str) -> Result<PathBuf, String> {
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("image");
-    let mut dest = dir.join(name);
     let stem = Path::new(name)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("image");
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
-    let mut i = 1;
-    while dest.exists() {
-        dest = dir.join(format!("{stem}-{i}{ext}"));
-        i += 1;
+    let ext = ext_for(mime);
+    let mut last = String::new();
+    for i in 0..1000 {
+        let dest = if i == 0 {
+            dir.join(format!("{stem}{ext}"))
+        } else {
+            dir.join(format!("{stem}-{i}{ext}"))
+        };
+        let mut out = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = dest.display().to_string();
+                continue;
+            }
+            Err(e) => return Err(format!("{}: {e}", dest.display())),
+        };
+        let mut input = std::fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        if let Err(e) = std::io::copy(&mut input, &mut out) {
+            // Недописанное вложение модели не нужно: убираем и говорим вслух.
+            drop(out);
+            let _ = std::fs::remove_file(&dest);
+            return Err(format!("{}: {e}", dest.display()));
+        }
+        return Ok(dest);
     }
-    dest
+    Err(format!("в канале {last}: не нашлось свободного имени"))
 }
 
 fn main() {
@@ -122,44 +164,48 @@ fn main() {
 
     for path in &argv {
         let p = Path::new(path);
-        let data = match std::fs::read(p) {
-            Ok(d) => d,
+        // Голова файла, а не весь файл: для sniff и первых полей заголовка хватает
+        // килобайт, а гигабайтная картинка в память не влезает. Копирование
+        // в канал всё равно прочитает файл ещё раз, потоком.
+        let meta = match std::fs::metadata(p) {
+            Ok(m) => m,
             Err(e) => die(format!("view: {path}: {e}")),
         };
+        if !meta.is_file() {
+            die(format!("view: {path} — не обычный файл"));
+        }
+        let data = read_head(p, 64 * 1024).unwrap_or_else(|e| die(format!("view: {path}: {e}")));
         let Some(mime) = sniff(&data) else {
             die(format!(
                 "view: {path} — не изображение (PNG/JPEG/GIF/WebP), {} Б",
                 data.len()
             ));
         };
-        let (w, h) = dims(&data, mime).unwrap_or((0, 0));
+        // Размер — из заголовка; «не разобрал» печатаем явно, а не как 0x0.
+        let size = match dims(&data, mime) {
+            Some((w, h)) => format!("{w}x{h}"),
+            None => "?x?".to_string(),
+        };
         match &dir {
             Some(d) => {
                 if let Err(e) = std::fs::create_dir_all(d) {
                     die(format!("view: канал вложений {}: {e}", d.display()));
                 }
-                let to = dest(d, p);
-                if let Err(e) = std::fs::copy(p, &to) {
-                    die(format!("view: {}: {e}", to.display()));
-                }
+                let to = place(d, p, mime).unwrap_or_else(|e| die(format!("view: {e}")));
                 println!(
-                    "{}: {} {}x{} {} Б → вложение {}",
+                    "{}: {} {size} {} Б → вложение {}",
                     path,
                     mime,
-                    w,
-                    h,
-                    data.len(),
+                    meta.len(),
                     to.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                 );
             }
             None => println!(
-                "{}: {} {}x{} {} Б — канал вложений недоступен (нет SNENS_ATTACH_DIR), \
+                "{}: {} {size} {} Б — канал вложений недоступен (нет SNENS_ATTACH_DIR), \
                  метаданные показаны, но картинка модели не уехала",
                 path,
                 mime,
-                w,
-                h,
-                data.len()
+                meta.len()
             ),
         }
     }
