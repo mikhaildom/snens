@@ -139,12 +139,16 @@ async fn serve_inner(
     // Курсоры пишем не только при восстановлении после падения: сразу после
     // импорта старого `store.json` события уже есть, а таблица курсоров пуста, и
     // без запущенных сессий она отставала бы до graceful shutdown.
+    //
+    // Две отдельные записи, а не одна общая транзакция: `persist_store` открывает
+    // свою, и вложенная транзакция в rusqlite падает (`cannot start a transaction
+    // within a transaction`) — сервер тогда не поднимался после краша вообще.
+    if had_running {
+        // Persist restart recovery before accepting requests.
+        rt::persist_store(&db, &store)?;
+    }
     {
         let tx = db.unchecked_transaction()?;
-        if had_running {
-            // Persist restart recovery before accepting requests.
-            rt::persist_store(&tx, &store)?;
-        }
         for (id, seq) in &discovered_ids {
             upsert_cursor(&tx, id, *seq)?;
         }
@@ -251,19 +255,24 @@ async fn shutdown(s: &Arc<Runtime>) -> crate::R<()> {
     rt::interrupt_running(&mut d, &mut sequences);
     // Отравленный замок не повод терять graceful stop: `Runtime::db()` везде
     // восстанавливает его именно ради этого, и здесь — последняя запись на
-    // диск, которая важнее строгости. Значения пишутся одной транзакцией:
-    // построчный `execute` даёт fsync на сессию и растягивает остановку.
+    // диск, которая важнее строгости.
     let db = s
         .db
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let tx = db.unchecked_transaction()?;
-    for (id, seq) in sequences.iter() {
-        upsert_cursor(&tx, id, *seq)?;
+    // Курсоры — одной транзакцией (построчный `execute` даёт fsync на сессию и
+    // растягивает остановку), store — своим `persist_store`. Две записи, а не
+    // одна: `persist_store` открывает собственную транзакцию, и вложенная падает
+    // (`cannot start a transaction within a transaction`) — тогда graceful stop
+    // терял и курсоры, и store.
+    {
+        let tx = db.unchecked_transaction()?;
+        for (id, seq) in sequences.iter() {
+            upsert_cursor(&tx, id, *seq)?;
+        }
+        tx.commit()?;
     }
-    rt::persist_store(&tx, &d)?;
-    tx.commit()?;
-    Ok(())
+    rt::persist_store(&db, &d)
 }
 
 #[cfg(test)]

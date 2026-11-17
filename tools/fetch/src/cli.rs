@@ -5,15 +5,12 @@ use crate::die;
 pub const USAGE: &str =
     "fetch <url> [--raw] [--fallback auto|never|always] [--save путь] [--max-chars N] [--timeout S]";
 
-/// Хелп собирается из `USAGE`, а не повторяет его: два списка флагов в одном
-/// файле всегда расходятся, и `--help` начинает врать о контракте.
-pub fn help() -> String {
-    format!("{HEAD}\n{USAGE}\n\n{BODY}")
-}
+/// Справка целиком одним литералом: `scripts/docs-tools.py` собирает из неё
+/// машинный `tools.txt`, и второй источник текста тут же разошёлся бы с первым.
+pub const HELP: &str = "\
+fetch — прочитать веб-страницу как markdown.
+fetch <url> [--raw] [--fallback auto|never|always] [--save путь] [--max-chars N] [--timeout S]
 
-const HEAD: &str = "fetch — прочитать веб-страницу как markdown.";
-
-const BODY: &str = "\
 Свой путь: GET с браузерным User-Agent, очистка DOM (script/nav/header/footer/…),
 <main>/<article> в приоритете, затем markdown. Не-html (pdf и бинарь) сливается в файл.
 
@@ -25,6 +22,11 @@ const BODY: &str = "\
   --timeout S        таймаут запроса, секунды (дефолт 30)
 
 PDF при наличии системного pdftotext извлекается в текст (если нет --save).";
+
+/// Текст, который печатает `--help`.
+pub fn help() -> String {
+    HELP.to_string()
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Fallback {

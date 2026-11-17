@@ -49,7 +49,14 @@ class DocsError(Exception):
 
 
 def decode_rust_string(src, i, where):
-    """Декодировать Rust-строковый литерал; i — сразу за открывающей кавычкой.
+    """Декодировать Rust-строковый литерал; i — сразу за открывающей кавычкой."""
+    text, _ = decode_rust_string_at(src, i, where)
+    return text
+
+
+def decode_rust_string_at(src, i, where):
+    """То же, но с позицией сразу за закрывающей кавычкой: нужно `concat!`,
+    чтобы продолжить разбор с того места, где кончился литерал.
 
     Понимает escapes \\" \\\\ \\n \\t \\r \\0 \\xNN \\u{...} и продолжение строки
     (обратный слэш + перевод строки + ведущие пробелы следующей строки).
@@ -59,7 +66,7 @@ def decode_rust_string(src, i, where):
     while i < n:
         ch = src[i]
         if ch == '"':
-            return "".join(out)
+            return "".join(out), i + 1
         if ch != "\\":
             out.append(ch)
             i += 1
@@ -101,15 +108,69 @@ def decode_rust_string(src, i, where):
     raise DocsError("%s: незакрытый строковый литерал" % where)
 
 
-def const_str(src, name, where):
-    """Значение `const <name>: &str = "...";` или None, если константы нет."""
+def const_rust(src, name, where):
+    """Значение константы: строковый литерал ИЛИ `concat!(литералы и константы)`.
+
+    Тул может собирать справку из частей (`USAGE` рядом с разбором argv, тело —
+    рядом с описанием флагов): дублировать весь текст в один `const HELP` значит
+    заводить второй список флагов, который разойдётся с первым. `concat!`
+    склеивает части без рантайма, а здесь он раскрывается так же.
+    """
     m = re.search(r"\bconst\s+%s\s*:\s*&str\s*=\s*" % re.escape(name), src)
     if not m:
         return None
     start = m.end()
-    if src[start : start + 1] != '"':
-        raise DocsError("%s: const %s — не строковый литерал" % (where, name))
-    return decode_rust_string(src, start + 1, where)
+    if src[start : start + 1] == '"':
+        return decode_rust_string(src, start + 1, where)
+    if not src.startswith("concat!", start):
+        raise DocsError("%s: const %s — не литерал и не concat!" % (where, name))
+    open_paren = src.find("(", start)
+    close = _matching_paren(src, open_paren)
+    if close < 0:
+        raise DocsError("%s: const %s — не закрыт concat!(" % (where, name))
+    parts = []
+    i = open_paren + 1
+    while i < close:
+        c = src[i]
+        if c in " \t\r\n,":
+            i += 1
+            continue
+        if c == '"':
+            text, i = decode_rust_string_at(src, i + 1, where)
+            parts.append(text)
+            continue
+        m2 = re.match(r"[A-Za-z_][A-Za-z0-9_]*", src[i:])
+        if not m2:
+            raise DocsError("%s: const %s — непонятный элемент concat!: %r" % (where, name, src[i : i + 20]))
+        inner = const_rust(src, m2.group(0), where)
+        if inner is None:
+            raise DocsError("%s: const %s — в concat! ссылка на неизвестную константу %s" % (where, name, m2.group(0)))
+        parts.append(inner)
+        i += len(m2.group(0))
+    return "".join(parts)
+
+
+def _matching_paren(src, open_paren):
+    depth = 0
+    i = open_paren
+    while i < len(src):
+        c = src[i]
+        if c == '"':
+            _, i = decode_rust_string_at(src, i + 1, "parens")
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def const_str(src, name, where):
+    """Значение `const <name>: &str = ...` или None, если константы нет."""
+    return const_rust(src, name, where)
 
 
 def read_text(path):

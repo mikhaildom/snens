@@ -44,7 +44,7 @@ def _target_dir() -> pathlib.Path | None:
 
 
 TARGET = _target_dir()
-BIN = pathlib.Path(os.environ.get("SNENS_BIN") or TARGET / "debug/snens")
+BIN = pathlib.Path(os.environ['SNENS_BIN'] if os.environ.get('SNENS_BIN') else TARGET / 'debug/snens')
 WAIT = 10
 
 

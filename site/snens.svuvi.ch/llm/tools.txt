@@ -89,9 +89,10 @@ JSON-строке через ssh-туннель. Снимок дерева ух�
 Поля (schema.json):
 - command: string, обязательное — Что сделать. apps — список окон; snap — дерево окна с адресами e1…eN; act — действия по адресам батчем; shot — скриншот окна; focus — поднять окно; launch/stop — поднять или остановить агента на той машине; значения: launch|stop|apps|snap|act|shot|focus|status
 - window: string — Выбор окна: индекс из apps (0,1,2…), подстрока заголовка, или пусто — окно в фокусе
-- json: string — Для act: JSON-массив действий по адресам, напр. [{"click":"e3"},{"set":{"ref":"e1","text":"hi"}}]
+- json: string|array — Для act: действия по адресам — массив объектов, напр. [{"click":"e3"},{"set":{"ref":"e1","text":"hi"}}]
 - tunnel: string, обязательное — Машина, где живёт агент (ssh): например user@machine. Нужна для любой команды
 - out: string — Для shot: путь к PNG
+- full: boolean — Для snap: дерево без ограничения глубины
 - port: integer — Порт агента (дефолт 9227)
 stdin: none
 
@@ -115,7 +116,7 @@ edit <путь>   — либо old_string + new_string, либо edits[...] (JSO
 - old_string: string — Точный фрагмент, который надо заменить. Должен встречаться ровно один раз, если replace_all не задан. Многострочный текст подавай как есть, с реальными переводами строк.
 - new_string: string — Чем заменить old_string
 - replace_all: boolean — Заменить все совпадения old_string, а не требовать единственного
-- edits: array — Несколько правок одного файла одним вызовом: применяются по порядку и атомарно. Вместо old_string/new_string.
+- edits: array — Несколько правок одного файла одним вызовом: все old_string матчатся против исходного текста (не последовательно), не должны пересекаться, применяются разом и атомарно. Пустой массив отвергается. Вместо old_string/new_string.
 stdin: json (объект из полей old_string, new_string, replace_all, edits)
 
 ### fetch
@@ -195,7 +196,7 @@ stdin: none
 ### memory
 
 memory — долгая память агента (SQLite + FTS5 + sqlite-vec)
-memory recall <запрос> | memory retain | memory flush | memory stats | memory reindex | memory forget <uid>
+memory recall <запрос> | memory retain | memory flush | memory stats | memory reindex | memory forget <uid> | memory import [--replace]
 
 recall  — гибридный поиск: BM25 ∪ вектор → RRF → реранк → порог; по строке на факт.
 retain  — ход (JSON {"user","assistant"} на stdin) в очередь на дистилляцию.
@@ -203,6 +204,8 @@ flush   — разобрать очередь: извлечь факты, пог
 stats   — сколько живых фактов, устаревших, что в очереди.
 reindex — посчитать вектора для фактов, записанных без провайдера.
 forget  — закрыть факт по uid (остаётся в таймлайне, но не выдаётся).
+import  — разовый импорт из другой системы: JSON {"units":[…]} на stdin;
+--replace закрывает всё, что пришло прошлыми импортами.
 
 Настройки: ~/.config/snens/memory.toml (db, api_base, embed_model, rerank,
 rerank_model, max_facts, max_tokens), ключ — SNENS_API_KEY в ~/.config/snens/.env.
@@ -332,7 +335,7 @@ web show                               вывести окно агентско�
 Коды: 0 — успех, 2 — неверные аргументы, 1 — ошибка выполнения (включая таймаут).
 
 Поля (schema.json):
-- command: string, обязательное — Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется; значения: connect|status|tabs|use|open|snap|act|shot|eval|text|probe|disconnect|launch|close
+- command: string, обязательное — Что сделать. connect — найти Chrome (тумблер в chrome://inspect/#remote-debugging); open — перейти; snap — снять дерево с адресами; act — действия батчем по адресам; text — видимый текст; shot — скриншот; eval — JS; probe — проверить, что ввод доставляется; show — вывести окно агентского Chrome на экран; значения: connect|status|tabs|use|open|snap|act|shot|eval|text|probe|disconnect|launch|show|close
 - url: string — Адрес для open (только http/https/file)
 - tab: string — Вкладка для use: id (или его начало) либо номер из tabs
 - json: string — Для act: JSON-массив действий, напр. [{"click":"e3"},{"type":{"ref":"e1","text":"hi"}},{"press":"Enter"}]. Действия: click/hover (адрес или [x,y]), type {ref,text}, clear, press, scroll, navigate, wait, upload {ref,file}, eval
@@ -341,6 +344,10 @@ web show                               вывести окно агентско�
 - depth: integer — Для snap: максимальная глубина дерева (дефолт 30)
 - out: string — Для shot: путь к PNG (дефолт — канал вложений или каталог состояния)
 - port: integer — Порт CDP (дефолт 9222 или порт из состояния connect)
+- visible: boolean — Для launch: поднять Chrome в сессии пользователя, с видимым окном
+- full: boolean — Для snap: дерево без ограничения глубины (весь документ)
+- new: boolean — Для open: открыть в новой вкладке
+- all: boolean — Для tabs: показать и чужие вкладки, не только наши
 - host: string — Машина пользователя для ssh: та же команда выполняется там (там тоже должен стоять web). Пример: user@machine
 - profile: string — Для launch: каталог профиля Chrome на той машине (по умолчанию ~/.snens-chrome). Отдельный профиль = отладка без подтверждений
 - tunnel: string — Машина пользователя для ssh-туннеля к её Chrome: на той стороне web ставить не нужно, только Chrome с включённым тумблером в chrome://inspect/#remote-debugging. Пример: user@machine. Дальше все команды идут через туннель
