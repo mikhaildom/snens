@@ -500,7 +500,12 @@ def run_tui(config, endpoint, token_path, session_id, commands, timeout=8):
                 if not chunk:
                     break
                 output.extend(chunk)
-                if not sent and "сессия ".encode() in output:
+                # Готовность — по последней строке старта (HELP), а не по
+                # «сессия »: её TUI печатает раньше, чем закончит баннер, и
+                # отправленная следом команда иногда опережала отрисовку:
+                # `/sessions` не попадал в захваченный вывод, и проверка
+                # «список есть» падала через раз.
+                if not sent and "команды: ".encode() in output:
                     time.sleep(.15)
                     for command in commands:
                         if command.startswith("@wait:"):
@@ -517,6 +522,11 @@ def run_tui(config, endpoint, token_path, session_id, commands, timeout=8):
                                 raise AssertionError(f"PTY did not render marker {marker!r}: {output[-1500:]!r}")
                             continue
                         os.write(master, command.encode() + b"\n")
+                        # Пауза перед следующей командой не гарантирует, что TUI
+                        # успел отрисовать предыдущую: под нагрузкой `/quit`
+                        # обгонял рендер транскрипта, и проверка «маркер есть»
+                        # падала через раз. Явный @wait: перед /quit — условие
+                        # готовности, а не гонка со сном.
                         time.sleep(.25)
                     sent = True
             done, _status = os.waitpid(child, os.WNOHANG)
@@ -549,7 +559,10 @@ def wait_idle(base, token, sid):
 
 def check_tui_flows(config, base, token_path, token, legacy_id, llm, checks):
     def legacy_resume():
-        text = run_tui(config, base, token_path, legacy_id, ["/sessions", f"/resume {legacy_id}", "/quit"])
+        # @wait: перед /quit — иначе выход обгоняет рендер транскрипта и
+        # проверка ниже падает через раз под нагрузкой (проверено на 8f9195c).
+        text = run_tui(config, base, token_path, legacy_id,
+                       ["/sessions", f"/resume {legacy_id}", "@wait:legacy-tool-marker", "/quit"])
         assert f"ты: legacy-user-marker" in text, text[-1800:]
         expected_call = '[run] ' + json.dumps('{"command":"true"}')
         assert "legacy-assistant-marker" in text and expected_call in text, text[-1800:]
