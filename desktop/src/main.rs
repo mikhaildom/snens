@@ -174,6 +174,12 @@ pub fn open_window(
     // на чужой origin (редирект, ссылка из ленты) получил бы токен инстанса в
     // `window.__SNENS__`. Поэтому разрешаем остаться только внутри своего
     // бандла или на самом адресе ядра.
+    //
+    // Схема своего бандла зависит от платформы: на Windows это
+    // `http://tauri.localhost`, на macOS/Linux — `tauri://localhost`.
+    // Проверка только по `https://tauri.localhost` (было в 0.3.0) блокировала
+    // ПЕРВУЮ же навигацию на свой `index.html`: окно оставалось about:blank,
+    // то есть пустой экран у каждого, кто поставил установщик.
     let own = conn.base_url.clone();
     tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
         .title("snens")
@@ -181,7 +187,10 @@ pub fn open_window(
         .min_inner_size(900.0, 600.0)
         .on_navigation(move |url| {
             let s = url.as_str();
-            if s.starts_with("tauri://") || s.starts_with("https://tauri.localhost") {
+            let scheme = url.scheme();
+            let host = url.host_str().unwrap_or("");
+            // Свой бандл: любая локальная схема tauri.
+            if scheme == "tauri" || host == "tauri.localhost" {
                 return true;
             }
             s.starts_with(&own)
