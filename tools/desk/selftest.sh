@@ -31,6 +31,11 @@ done
 
 BIN=$HERE/desk
 [ -x "$BIN" ] || { echo "FAIL: нет бинарника $BIN — собери: snens build desk"; exit 1; }
+# Старый бинарь давал бы зелёный прогон на устаревшем коде: сверяем время.
+if [ -n "$(find "$HERE/src" -name '*.rs' -newer "$BIN" 2>/dev/null | head -1)" ]; then
+  echo "FAIL: $BIN старше исходников — пересобери: cargo build -p desk"
+  exit 1
+fi
 [ -f "$HERE/schema.json" ] && ok "desk: schema.json рядом с бинарником" || bad "desk: нет schema.json"
 has '"x-snens"' "$(cat "$HERE/schema.json")" "desk: в схеме есть ключ x-snens"
 # Анкер на ключ в properties: подстрока '"command"' встречается и в x-snens.argv,

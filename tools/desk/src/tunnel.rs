@@ -335,11 +335,15 @@ pub fn start_agent(host: &str, port: u16) -> Result<(), String> {
                 include_str!("../agent/desk-agent.ps1"),
             )?;
             let task = "snens-desk-agent";
+            // Путь берём настоящий: на доменных/переадресованных профилях
+            // %USERPROFILE% != C:\Users\%USERNAME%, и задача запускала бы файл,
+            // которого там нет.
+            let home = remote_profile(host)?;
             // Токен уезжает в командной строке задачи: другого канала в schtasks
             // нет. Остаточный риск в том, что он виден в списке процессов этой же
             // машины — там и так работает сам агент от того же пользователя.
             let tr = format!(
-                r"powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\%USERNAME%\snens-desk-agent.ps1 -Port {port} -Token {token}"
+                r"powershell -NoProfile -ExecutionPolicy Bypass -File {home}\snens-desk-agent.ps1 -Port {port} -Token {token}"
             );
             let _ = ssh(host, &format!("schtasks /Delete /TN {task} /F"));
             ssh(
@@ -384,6 +388,16 @@ fn listening(host: &str, port: u16) -> Result<bool, String> {
 /// доезжал короче на ~900 байт) и не через `more` (перекодирует поток в ANSI, и
 /// кириллица в скрипте превращается в мусор, на котором PowerShell падает).
 /// scp копирует байт в байт.
+/// Настоящий домашний каталог на той стороне (`%USERPROFILE%`).
+fn remote_profile(host: &str) -> Result<String, String> {
+    let out = ssh(host, "cmd /c echo %USERPROFILE%")?;
+    let p = out.trim().trim_end_matches('"').to_string();
+    if p.is_empty() {
+        return Err(format!("не смог узнать домашний каталог на {host}"));
+    }
+    Ok(p)
+}
+
 fn put_file(host: &str, name: &str, content: &str) -> Result<(), String> {
     //
     // BOM обязателен: PowerShell 5.1 без него читает .ps1 как ANSI, кириллица
@@ -412,9 +426,10 @@ fn put_file(host: &str, name: &str, content: &str) -> Result<(), String> {
         .arg("--")
         .arg(&local)
         .arg(format!("{host}:{target}"))
-        .output()
-        .map_err(|e| format!("scp: {e}"))?;
+        .output();
+    // Убираем в любом исходе: пропавший scp раньше оставлял файл в /tmp навсегда.
     let _ = std::fs::remove_file(&local);
+    let out = out.map_err(|e| format!("scp: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "scp {name} на {host} не прошёл: {}",
@@ -463,7 +478,7 @@ fn wait_agent(host: &str, port: u16, budget: Duration) -> Result<(), String> {
             Err(e) => e,
         };
         if Instant::now() >= until {
-            let diag = ssh(host, "cmd /c type C:\\Users\\%USERNAME%\\snens-desk.out")
+            let diag = ssh(host, "cmd /c type %USERPROFILE%\\snens-desk.out")
                 .unwrap_or_else(|_| "нет snens-desk.out".into());
             return Err(format!(
                 "агент на {host} не ответил за {} с: {last}\nвывод агента:\n{}",

@@ -138,7 +138,7 @@ function Get-WindowElement($win) {
 # Обход дерева в ширину: возвращает элементы с путём (индексы детей от окна).
 # Путь — это адрес (`e12` в выводе), по нему потом находим элемент заново:
 # AutomationElement нельзя сохранить между запросами, а путь стабилен.
-function Walk-Tree($rootEl, [int]$MaxNodes = 4000) {
+function Walk-Tree($rootEl, [int]$MaxNodes = 4000, $MaxDepth = 0) {
   $result = New-Object System.Collections.ArrayList
   $queue = New-Object System.Collections.Queue
   $queue.Enqueue(@{ el = $rootEl; path = ''; depth = 0 })
@@ -147,6 +147,8 @@ function Walk-Tree($rootEl, [int]$MaxNodes = 4000) {
     $item = $queue.Dequeue()
     $n++
     [void]$result.Add($item)
+    # --full: MaxDepth = 0 — без ограничения; иначе не глубже заданного.
+    if ($MaxDepth -gt 0 -and $item.depth -ge $MaxDepth) { continue }
     $kids = $item.el.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
     $i = 0
     foreach ($k in $kids) {
@@ -251,7 +253,10 @@ function Cmd-Snap($req) {
   if (-not $winEl) { return @{ ok = $false; error = "окно без UIA-элемента: $($win.name)" } }
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $all = Walk-Tree $winEl 4000
+  # --full: без ограничения глубины (и с большим потолком узлов).
+  $maxDepth = if ($req.full) { 0 } else { 24 }
+  $maxNodes = if ($req.full) { 20000 } else { 4000 }
+  $all = Walk-Tree $winEl $maxNodes $maxDepth
   $lines = New-Object System.Collections.ArrayList
   $refs = New-Object System.Collections.ArrayList
   $counter = 0
