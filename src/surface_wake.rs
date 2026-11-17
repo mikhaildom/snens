@@ -90,3 +90,84 @@ async fn wake(s: Arc<Runtime>, cfg: &crate::cfg::Config, id: &str) {
     )
     .await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::surface_runtime::Session;
+    use tokio::sync::{broadcast, Mutex};
+
+    /// Runtime с настоящим store и своим каталогом данных: будильник работает по
+    /// файлам, поэтому подменять их нечем — только временный каталог.
+    fn runtime(root: &std::path::Path) -> Arc<Runtime> {
+        let cfg: crate::cfg::Config = toml::from_str(&format!(
+            "sessions_dir = \"{}/sessions\"\nmail_dir = \"{}/mail\"\n",
+            root.display(),
+            root.display()
+        ))
+        .unwrap();
+        std::fs::create_dir_all(cfg.sessions_path()).unwrap();
+        std::fs::create_dir_all(cfg.mail_path()).unwrap();
+        let (mut store, db) = crate::surface_runtime::open_store(&root.join("surface-api")).unwrap();
+        store.sessions.insert(
+            "1700000000-111".into(),
+            Session::new("1700000000-111", "web"),
+        );
+        crate::surface_runtime::persist_store(&db, &store).unwrap();
+        let (tx, _) = broadcast::channel(64);
+        let (tx_updates, _) = broadcast::channel(64);
+        Arc::new(Runtime {
+            data: Mutex::new(store),
+            db: std::sync::Mutex::new(db),
+            tx,
+            cfg,
+            // Ключа нет намеренно: ход упадёт на провайдере, но проверяется не
+            // он, а то, что сессию разбудили и ящик забрали.
+            llm: Arc::new(crate::llm::OpenAi::without_key().unwrap()),
+            locks: Default::default(),
+            controls: Default::default(),
+            pending_tools: Default::default(),
+            writers: Default::default(),
+            event_seq: Default::default(),
+            review_gen: Default::default(),
+            approvals: Default::default(),
+            pending: Default::default(),
+            registry: Default::default(),
+            tx_updates,
+        })
+    }
+
+    /// Главный контракт: итог, лежащий в ящике, поднимает ход спящей сессии без
+    /// чьего-либо сообщения — и забирается из ящика, чтобы не доехать дважды.
+    #[tokio::test]
+    async fn pending_mail_wakes_idle_session_once() {
+        let root = std::env::temp_dir().join(format!("snens-wake-live-{}", uuid::Uuid::new_v4()));
+        let s = runtime(&root);
+        let id = "1700000000-111";
+        crate::mail::send(
+            &s.cfg.mail_path(),
+            id,
+            "1700000000-222",
+            "report",
+            "миграции применены",
+        )
+        .unwrap();
+        spawn(s.clone());
+        let journal = s.cfg.sessions_path().join(format!("{id}.jsonl"));
+        let mut found = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let text = std::fs::read_to_string(&journal).unwrap_or_default();
+            if text.contains("миграции применены") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "сессия не разбужена: в журнале нет текста из ящика");
+        assert!(
+            !crate::mail::has_pending(&s.cfg.mail_path(), id),
+            "ящик не забрали: сообщение доедет второй раз"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
