@@ -8,7 +8,6 @@ snens processes; never installs a binary or contacts a real provider/service.
 """
 from __future__ import annotations
 
-import http.client
 import json
 import os
 import pathlib
@@ -22,14 +21,19 @@ import tempfile
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-def _target_dir() -> pathlib.Path:
-    """Каталог сборки спрашиваем у cargo, а не хардкодим: у каждой машины свой."""
+def _target_dir() -> pathlib.Path | None:
+    """Каталог сборки спрашиваем у cargo, а не хардкодим: у каждой машины свой.
+
+    Вызывается лениво (только если `SNENS_BIN` не задан): прогон по готовому
+    бинарю не должен требовать cargo в PATH.
+    """
+    if os.environ.get("SNENS_BIN"):
+        return None
     if os.environ.get("CARGO_TARGET_DIR"):
         return pathlib.Path(os.environ["CARGO_TARGET_DIR"])
     meta = subprocess.run(
@@ -40,7 +44,7 @@ def _target_dir() -> pathlib.Path:
 
 
 TARGET = _target_dir()
-BIN = pathlib.Path(os.environ.get("SNENS_BIN", TARGET / "debug/snens"))
+BIN = pathlib.Path(os.environ.get("SNENS_BIN") or TARGET / "debug/snens")
 WAIT = 10
 
 
@@ -110,8 +114,9 @@ class MockLLM(ThreadingHTTPServer):
         super().__init__(addr, MockLLMHandler)
         self.requests = []
         self.lock = threading.Lock()
-        self.hold = threading.Event()
         self.delta_sent = threading.Event()
+        # `release` выставляет main() в finally: иначе висящий ответ
+        # (release.wait()) держит поток и `shutdown()` не дожидается его.
         self.release = threading.Event()
 
 
@@ -127,8 +132,6 @@ class MockLLMHandler(BaseHTTPRequestHandler):
         with self.server.lock:
             self.server.requests.append(body)
         crash_turn = any(message.get("role") == "user" and "cursor-crash-marker" in str(message.get("content")) for message in body.get("messages", []))
-        if crash_turn:
-            self.server.hold.set()
         frames = [
             {"id": "offline-mock", "choices": [{"index": 0, "delta": {"content": "mock-ok"}, "finish_reason": None}]},
             {"id": "offline-mock", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
@@ -207,7 +210,7 @@ def wait_server(base, token, proc):
     eventually(ready, "authenticated production server")
 
 
-def check_projection(base, token, sid, expected_rows, raw_before, raw_path):
+def check_projection(base, token, sid, raw_before, raw_path):
     status, history = http_json(base, f"/v1/sessions/{sid}/history", token)
     assert status == 200, (status, history)
     assert set(history) == {"cursor", "events", "messages"}, history.keys()
@@ -308,7 +311,7 @@ def production_server_smoke(temp, checks, llm):
             assert all(row["surface"] == "local" for row in response["sessions"] if row["id"] in (sid, uuid_sid))
         checks.check("production serve discovers timestamp-counter and UUID JSONL, rejects invalid basenames", discovery)
         checks.check("JSONL authoritative history projection preserves physical sequence and raw bytes",
-                     lambda: check_projection(base, token, sid, rows, raw, log_path))
+                     lambda: check_projection(base, token, sid, raw, log_path))
         check_tui_flows(config, base, token_path, token, sid, llm, checks)
 
         def late_legacy_post_without_discovery():
@@ -431,7 +434,7 @@ def production_server_smoke(temp, checks, llm):
         proc, log = start_serve(config, data, port, token_path, server_log)
         wait_server(base, token, proc)
         checks.check("legacy discovery/history and raw JSONL survive server restart",
-                     lambda: (check_projection(base, token, sid, rows, raw, log_path),
+                     lambda: (check_projection(base, token, sid, raw, log_path),
                               assert_discovered(base, token, sid)))
         checks.check("legacy run-child still executes with explicit temp config and mock provider",
                      lambda: check_run_child(config, dirs, llm))
@@ -476,7 +479,13 @@ def run_tui(config, endpoint, token_path, session_id, commands, timeout=8):
         argv = [str(BIN), "tui", "--config", str(config), "--endpoint", endpoint, "--token-file", str(token_path)]
         if session_id is not None:
             argv.extend(["--session", session_id])
-        os.execve(str(BIN), argv, env)
+        # `execve` может не состояться (нет бинаря, нет прав, плохой argv).
+        # Исключение вылетело бы в ветку родителя, и форк ушёл бы дальше по тесту
+        # с копией его состояния — вплоть до дедлока в llm.shutdown().
+        try:
+            os.execve(str(BIN), argv, env)
+        finally:
+            os._exit(127)
     output = bytearray()
     deadline = time.monotonic() + timeout
     sent = False
@@ -510,18 +519,24 @@ def run_tui(config, endpoint, token_path, session_id, commands, timeout=8):
                         os.write(master, command.encode() + b"\n")
                         time.sleep(.25)
                     sent = True
-            done, status = os.waitpid(child, os.WNOHANG)
+            done, _status = os.waitpid(child, os.WNOHANG)
             if done:
                 child = None
                 break
+        return bytes(output).decode(errors="replace")
+    finally:
+        # Ребёнка убираем в finally, а не в теле try: любое исключение выше
+        # (AssertionError про маркер, ошибка записи в pty) оставляло бы живой
+        # процесс TUI — а он держит сессию и ломает следующие проверки.
         if child is not None:
-            os.kill(child, signal.SIGTERM)
+            try:
+                os.kill(child, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 os.waitpid(child, 0)
             except ChildProcessError:
                 pass
-        return bytes(output).decode(errors="replace")
-    finally:
         os.close(master)
 
 
@@ -584,6 +599,9 @@ def main():
         with tempfile.TemporaryDirectory(prefix="snens-production-smoke-") as root:
             production_server_smoke(pathlib.Path(root), checks, llm)
     finally:
+        # Сначала отпускаем висящий SSE-ответ: `shutdown()` иначе ждёт поток,
+        # который стоит в `release.wait()`.
+        llm.release.set()
         llm.shutdown()
         llm.server_close()
     if checks.failures:

@@ -15,6 +15,7 @@
 #   6. snens-web: tsc + тесты + сборка бандла (если репозиторий клиента рядом)
 #   7. сайт: python3 scripts/site.py --check (ссылки, плейсхолдеры, манифест)
 #   8. selftest ядра: реестр тулов, контракт --help, argv/stdin
+#   9. брокер привилегий: валидация путей/юнитов в dryrun (scripts/tests/)
 #
 # Использование:
 #   scripts/release-check.sh              # полный гейт
@@ -37,16 +38,29 @@ while [ $# -gt 0 ]; do
         --fast) FAST=1 ;;
         --skip-site) SKIP_SITE=1 ;;
         --list) LIST=1 ;;
-        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "release-check: неизвестный аргумент: $1" >&2; exit 2 ;;
     esac
     shift
 done
 
-say()  { printf '>>> %s\n' "$*"; }
-ok()   { printf '  ok   %s\n' "$*"; }
+say() { printf '>>> %s\n' "$*"; }
+ok()  { printf '  ok   %s\n' "$*"; }
 bad()  { printf '  ПРОВАЛ %s\n' "$*" >&2; FAILED="${FAILED} $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Логи прогонов — в приватном каталоге, а не по фиксированным путям в /tmp:
+# `/tmp/snens-gate-test.log` мог заранее создать другой пользователь (симлинк
+# на чужой файл), и `>` писал бы по нему от нашего имени.
+LOGDIR=""
+OWN_LOGDIR=0
+if command -v mktemp >/dev/null 2>&1 && LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/snens-gate.XXXXXX")"; then
+    OWN_LOGDIR=1
+else
+    LOGDIR="${TMPDIR:-/tmp}"
+fi
+# Убираем только свой каталог: `rm -rf "$TMPDIR"` на запасном пути снёс бы /tmp.
+trap '[ "$OWN_LOGDIR" = 1 ] && rm -rf "$LOGDIR"' EXIT INT TERM
 
 # Прогон с хвостом вывода и честным кодом возврата.
 #
@@ -65,16 +79,50 @@ run_tail() {
 }
 
 FAILED=""
+# Ядро может быть не собрано (или cargo/python3 нет): с `set -u` обращение к
+# незаданной переменной обрывало бы весь прогон вместо сводки «ПРОВАЛ»,
+# поэтому заводим пустую заранее.
+SNENS_BIN=""
+
+# `--list` — только показать, что будет запущено: выходим до проверок, иначе
+# провал тега на грязном дереве делал бы «список» бесполезным.
+if [ "$LIST" = 1 ]; then
+    say "будет запущено:"
+    say "  1) версия: Cargo.toml = desktop = tauri.conf.json = package.json = web"
+    say "  2) worktree ядра и клиента чист"
+    say "  3) тег v<версия> = HEAD"
+    if [ "$FAST" = 1 ]; then
+        say "  4) cargo test --workspace   (--fast: пропуск)"
+        say "  5) смоук поверхности      (--fast: пропуск)"
+    else
+        say "  4) cargo test --workspace"
+        say "  5) смоук поверхности и TUI на мок-провайдере"
+    fi
+    say "  6) клиент: npm test + npm run build"
+    if [ "$SKIP_SITE" = 1 ]; then
+        say "  7) сайт                      (--skip-site: пропуск)"
+    else
+        say "  7) сайт: tools.txt + site.py --check"
+    fi
+    say "  8) selftest ядра"
+    say "  9) брокер привилегий (dryrun)"
+    exit 0
+fi
 
 # --- 1. версия --------------------------------------------------------------
-say "1/8 версия"
+say "1/9 версия"
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/Cargo.toml" | head -1)"
 [ -n "$VERSION" ] || bad "Cargo.toml: не нашёл version"
-profile() { printf '%s\n' "$1"; }
 DESK_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/desktop/Cargo.toml" | head -1)"
-TAURI_VER="$(python3 -c "import json;print(json.load(open('$REPO/desktop/tauri.conf.json'))['version'])")"
-PKG_VER="$(python3 -c "import json;print(json.load(open('$REPO/desktop/package.json'))['version'])")"
+# Разбор JSON и cargo metadata — через `|| true`: под `set -e` неудачная
+# подстановка завершает скрипт целиком, и вместо сводки «ПРОВАЛ» человек видит
+# пустой вывод. Отсутствие python3 тоже должно быть видно как шаг, а не падение.
+TAURI_VER="$(python3 -c "import json;print(json.load(open('$REPO/desktop/tauri.conf.json'))['version'])" 2>/dev/null || true)"
+PKG_VER="$(python3 -c "import json;print(json.load(open('$REPO/desktop/package.json'))['version'])" 2>/dev/null || true)"
 WEB_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/web/Cargo.toml" | head -1)"
+if [ -z "$TAURI_VER" ] || [ -z "$PKG_VER" ]; then
+    bad "версия из desktop/tauri.conf.json или desktop/package.json не прочиталась (нет python3 или битый JSON)"
+fi
 if [ "$VERSION" = "$DESK_VER" ] && [ "$VERSION" = "$TAURI_VER" ] && [ "$VERSION" = "$PKG_VER" ] && [ "$VERSION" = "$WEB_VER" ]; then
     ok "версия $VERSION везде"
 else
@@ -82,16 +130,22 @@ else
 fi
 
 # --- 2. worktree ------------------------------------------------------------
-say "2/8 worktree"
-if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
-    git -C "$REPO" status --porcelain | sed 's/^/  /' >&2
+say "2/9 worktree"
+# Код возврата `git status` — отдельно от вывода: ошибка git (не репозиторий,
+# dubious ownership, lock) даёт пустой вывод, и раньше это читалось как «чисто».
+if ! WORKTREE_STATUS="$(git -C "$REPO" status --porcelain)"; then
+    bad "git status в $REPO не выполнился — чистоту проверить нельзя"
+elif [ -n "$WORKTREE_STATUS" ]; then
+    printf '%s\n' "$WORKTREE_STATUS" | sed 's/^/  /' >&2
     bad "worktree ядра грязный: закоммить или спрячь правки"
 else
     ok "ядро: чисто"
 fi
-if [ -d "$WEB/.git" ]; then
-    if [ -n "$(git -C "$WEB" status --porcelain)" ]; then
-        git -C "$WEB" status --porcelain | sed 's/^/  /' >&2
+if [ -e "$WEB/.git" ]; then
+    if ! WEB_STATUS="$(git -C "$WEB" status --porcelain)"; then
+        bad "git status в $WEB не выполнился — чистоту проверить нельзя"
+    elif [ -n "$WEB_STATUS" ]; then
+        printf '%s\n' "$WEB_STATUS" | sed 's/^/  /' >&2
         bad "worktree клиента грязный: $WEB"
     else
         ok "клиент: чисто"
@@ -101,7 +155,7 @@ else
 fi
 
 # --- 3. тег -----------------------------------------------------------------
-say "3/8 тег"
+say "3/9 тег"
 if git -C "$REPO" rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
     TAG_SHA="$(git -C "$REPO" rev-list -n1 "v$VERSION")"
     HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
@@ -114,18 +168,12 @@ else
     bad "нет тега v$VERSION: релиз без тега не воспроизводим"
 fi
 
-if [ "$LIST" = 1 ]; then
-    say "дальше: cargo test --workspace, production-smoke, клиент, сайт, selftest"
-    [ "$FAST" = 1 ] && say "(с --fast шаг cargo test и смоук пропускаются)"
-    exit 0
-fi
-
 # --- 4. тесты ядра и тулов --------------------------------------------------
-say "4/8 cargo test --workspace"
+say "4/9 cargo test --workspace"
 if [ "$FAST" = 1 ]; then
     printf '  --   пропущено (--fast)\n'
 elif have cargo; then
-    if ( cd "$REPO" && run_tail /tmp/snens-gate-test.log 20 cargo test --workspace --quiet ); then
+    if ( cd "$REPO" && run_tail "$LOGDIR/test.log" 20 cargo test --workspace --quiet ); then
         ok "тесты зелёные"
     else
         bad "cargo test провалился"
@@ -134,16 +182,25 @@ else
     bad "нет cargo в PATH"
 fi
 
+# Ядро ищем ДО шага 5 и независимо от --fast: путь нужен и смоуку, и selftest
+# в шаге 8. Раньше при --fast SNENS_BIN оставался пустым, и шаг 8 всегда писал
+# «нет собранного ядра» даже когда ядро собрано — то есть --fast не мог пройти.
+if have cargo; then
+    TARGET_DIR="$(cd "$REPO" && cargo metadata --no-deps --format-version 1 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null || true)"
+    [ -n "$SNENS_BIN" ] || SNENS_BIN="${TARGET_DIR:+$TARGET_DIR/debug/snens}"
+fi
+
 # --- 5. смоук поверхности ---------------------------------------------------
-say "5/8 смоук поверхности (мок-провайдер)"
+say "5/9 смоук поверхности (мок-провайдер)"
 if [ "$FAST" = 1 ]; then
     printf '  --   пропущено (--fast)\n'
 elif have python3; then
-    SNENS_BIN="${SNENS_BIN:-$(cd "$REPO" && cargo metadata --no-deps --format-version 1 \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug/snens}"
-    if [ ! -x "$SNENS_BIN" ]; then
+    if [ -z "$SNENS_BIN" ]; then
+        bad "cargo metadata не вернул target-каталог (нет cargo или сломан манифест)"
+    elif [ ! -x "$SNENS_BIN" ]; then
         bad "нет $SNENS_BIN — собери: cargo build --workspace"
-    elif ( SNENS_BIN="$SNENS_BIN"; export SNENS_BIN; run_tail /tmp/snens-gate-smoke.log 12 python3 "$REPO/scripts/production-smoke.py" ); then
+    elif ( SNENS_BIN="$SNENS_BIN"; export SNENS_BIN; run_tail "$LOGDIR/smoke.log" 12 python3 "$REPO/scripts/production-smoke.py" ); then
         ok "смоук прошёл"
     else
         bad "смоук поверхности провалился"
@@ -153,19 +210,19 @@ else
 fi
 
 # --- 6. клиент --------------------------------------------------------------
-say "6/8 клиент (snens-web)"
+say "6/9 клиент (snens-web)"
 if [ -d "$WEB" ]; then
     if have npm; then
-        if ( cd "$WEB" && npm test --silent ) >/tmp/snens-release-web-test.log 2>&1; then
+        if ( cd "$WEB" && npm test --silent ) >"$LOGDIR/web-test.log" 2>&1; then
             ok "тесты клиента"
         else
-            tail -20 /tmp/snens-release-web-test.log | sed 's/^/  /' >&2
+            tail -20 "$LOGDIR/web-test.log" | sed 's/^/  /' >&2
             bad "тесты клиента провалились"
         fi
-        if ( cd "$WEB" && npm run build --silent ) >/tmp/snens-release-web-build.log 2>&1; then
+        if ( cd "$WEB" && npm run build --silent ) >"$LOGDIR/web-build.log" 2>&1; then
             ok "бандл собран"
         else
-            tail -20 /tmp/snens-release-web-build.log | sed 's/^/  /' >&2
+            tail -20 "$LOGDIR/web-build.log" | sed 's/^/  /' >&2
             bad "сборка клиента провалилась"
         fi
     else
@@ -176,13 +233,21 @@ else
 fi
 
 # --- 7. сайт ----------------------------------------------------------------
-say "7/8 сайт"
+say "7/9 сайт"
 if [ "$SKIP_SITE" = 1 ]; then
     printf '  --   пропущено (--skip-site)\n'
 elif have python3; then
-    if python3 "$REPO/scripts/docs-tools.py" --write "$SITE/llm/tools.txt" >/dev/null 2>&1 &&
-       run_tail /tmp/snens-gate-site.log 6 python3 "$REPO/scripts/site.py" --check --releases "${SNENS_RELEASES:-/var/www/snens.svuvi.ch/releases}"; then
-        ok "контент сайта сходится"
+    # Шаг перегенерирует `site/.../llm/tools.txt` — то есть МЕНЯЕТ дерево уже
+    # после проверки шага 2. Если файл после этого отличается от HEAD, гейт
+    # объявил бы чистым то, что чистым уже не является: релиз не воспроизводим.
+    if python3 "$REPO/scripts/docs-tools.py" --write "$SITE/llm/tools.txt" >/dev/null 2>&1 \
+       && run_tail "$LOGDIR/site.log" 6 python3 "$REPO/scripts/site.py" --check --releases "${SNENS_RELEASES:-/var/www/snens.svuvi.ch/releases}"; then
+        if git -C "$REPO" rev-parse -q --verify HEAD >/dev/null 2>&1 \
+           && ! git -C "$REPO" diff --quiet -- "$SITE/llm/tools.txt"; then
+            bad "tools.txt не совпадает с закоммиченным: пересобери и закоммить (гейт изменил дерево)"
+        else
+            ok "контент сайта сходится"
+        fi
     else
         bad "сайт: проверка контента провалилась"
     fi
@@ -191,15 +256,29 @@ else
 fi
 
 # --- 8. selftest ------------------------------------------------------------
-say "8/8 selftest ядра"
-if [ -x "$SNENS_BIN" ]; then
-    if run_tail /tmp/snens-gate-selftest.log 4 "$SNENS_BIN" selftest; then
+say "8/9 selftest ядра"
+if [ -n "$SNENS_BIN" ] && [ -x "$SNENS_BIN" ]; then
+    if run_tail "$LOGDIR/selftest.log" 4 "$SNENS_BIN" selftest; then
         ok "selftest ok"
     else
         bad "selftest провалился"
     fi
 else
     bad "нет собранного ядра: cargo build --workspace"
+fi
+
+# --- 9. скрипты -------------------------------------------------------------
+# Брокер привилегий — единственное место, где ошибка стоит root-доступа,
+# а проверяется он целиком в dryrun: конфиг, границы путей, симлинки.
+say "9/9 скрипты (snens-priv)"
+if [ -x "$REPO/scripts/tests/snens-priv.sh" ] || [ -f "$REPO/scripts/tests/snens-priv.sh" ]; then
+    if run_tail "$LOGDIR/priv.log" 8 sh "$REPO/scripts/tests/snens-priv.sh"; then
+        ok "брокер привилегий: валидация верна"
+    else
+        bad "тест snens-priv провалился"
+    fi
+else
+    bad "нет scripts/tests/snens-priv.sh"
 fi
 
 if [ -n "$FAILED" ]; then

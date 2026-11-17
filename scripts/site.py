@@ -24,10 +24,13 @@ import json
 import re
 import shutil
 import sys
-import unicodedata
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+class SiteError(Exception):
+    """Ошибка контента: сообщение человеку, без трейсбека."""
+
+
 SITE = REPO / "site" / "snens.svuvi.ch"
 CONTENT = SITE / "content"
 ASSET = SITE / "asset"
@@ -143,20 +146,32 @@ def inline(text: str, depth: int = 0) -> str:
         return keep(f"<code>{m.group(1)}</code>")
 
     def link(m: re.Match) -> str:
-        label = inline(m.group(1), depth + 1)
+        # `src` уже прошёл `html.escape`, поэтому метка в группе тоже
+        # экранирована. Без `unescape` рекурсивный `inline()` экранировал бы её
+        # второй раз (`&amp;amp;` на странице), а метка с `&lt;`/`&gt;`
+        # превращалась бы в мусор.
+        label = inline(html.unescape(m.group(1)), depth + 1)
         cls = m.group(3)
         attr = f' class="{cls[2:-1]}"' if cls else ""
-        return keep(f'<a{attr} href="{m.group(2)}">{label}</a>')
+        # Адрес экранируем сами: `html.escape(quote=False)` выше пропустил `"`,
+        # и `[x](a" onmouseover="alert(1))` дал бы лишний атрибут в href.
+        href = html.escape(html.unescape(m.group(2)), quote=True)
+        return keep(f'<a{attr} href="{href}">{label}</a>')
 
     src = html.escape(text, quote=False)
+    # Порядок важен: сначала код, потом автоссылки. Наоборот `keep()` заменил бы
+    # `&lt;https://…&gt;` токеном, токен попал бы внутрь `<code>`, а при
+    # раскрытии стал бы живой ссылкой внутри кода вместо литерала.
+    src = CODE.sub(code, src)
     # Автоссылка `<https://…>` — как в markdown; после escape угловые скобки
     # стали `&lt;`/`&gt;`, ловим их именно в этом виде.
     src = re.sub(
         r"&lt;(https?://[^\s&]+)&gt;",
-        lambda m: keep(f'<a href="{m.group(1)}">{m.group(1)}</a>'),
+        lambda m: keep(
+            f'<a href="{html.escape(m.group(1), quote=True)}">{m.group(1)}</a>'
+        ),
         src,
     )
-    src = CODE.sub(code, src)
     src = LINK.sub(link, src)
     src = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", src)
     while token.search(src):
@@ -219,6 +234,12 @@ def render(md: str, land: bool = False) -> str:
             while i < len(lines) and not FENCE.match(lines[i].strip()):
                 code.append(lines[i])
                 i += 1
+            if i >= len(lines):
+                # Незакрытый фенс молча съел бы остаток страницы в `<pre>`:
+                # лучше упасть с местом ошибки, чем отдать обрезанную страницу.
+                raise SiteError(
+                    "незакрытый блок кода (```) — страница обрезана бы молча"
+                )
             i += 1  # закрывающий ```
             blocks.append(
                 "<pre><code>" + html.escape("\n".join(code), quote=False) + "</code></pre>"
@@ -297,12 +318,6 @@ def render(md: str, land: bool = False) -> str:
     flush_cards()
     return "\n".join(blocks)
 
-
-def title_of(md: str) -> str:
-    for line in md.splitlines():
-        if line.startswith("# "):
-            return line[2:].strip()
-    return "snens"
 
 
 def summary_of(md: str) -> str:
@@ -403,7 +418,7 @@ def latest_installer(releases: Path) -> str | None:
     if not manifest.is_file():
         return None
     try:
-        data = json.loads(manifest.read_text())
+        data = json.loads(manifest.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
     for info in data.get("platforms", {}).values():
@@ -439,7 +454,7 @@ def main() -> int:
         if not path.is_file():
             fail.append(f"нет страницы: {path.relative_to(REPO)}")
             continue
-        md = path.read_text()
+        md = path.read_text(encoding="utf-8")
         if len(md) < 200:
             fail.append(f"страница подозрительно короткая: {slug}.md ({len(md)} Б)")
         # Разрешён только один плейсхолдер — адрес установщика из latest.json.
@@ -454,12 +469,12 @@ def main() -> int:
         path = LLM_SRC / name
         if not path.is_file():
             fail.append(f"нет машинного файла: {path.relative_to(REPO)}")
-        elif len(path.read_text()) < 150:
+        elif len(path.read_text(encoding="utf-8")) < 150:
             fail.append(f"машинный файл пуст: {name}")
 
     llm_index = LLM_SRC / "index.txt"
     if llm_index.is_file():
-        text = llm_index.read_text()
+        text = llm_index.read_text(encoding="utf-8")
         # index.txt — точка входа: он перечисляет все остальные файлы и
         # сам себя в списке не дублирует.
         for name, _ in LLM_FILES:
@@ -471,7 +486,7 @@ def main() -> int:
     # Внутренние ссылки: битая ссылка на сайте хуже её отсутствия, а поймать её
     # глазами по 21 странице нельзя.
     known = {slug for slug, _ in PAGES}
-    for slug, _, body in [(s, l, (CONTENT / f"{s}.md").read_text()) for s, l in PAGES if s in pages]:
+    for slug, _, body in [(s, l, (CONTENT / f"{s}.md").read_text(encoding="utf-8")) for s, l in PAGES if s in pages]:
         for target in re.findall(r"\]\((/docs/([a-z-]+)\.html)\)", body):
             if target[1] not in known:
                 fail.append(f"{slug}.md ссылается на несуществующую страницу {target[0]}")
@@ -501,7 +516,7 @@ def main() -> int:
     for slug, label in PAGES:
         md = pages[slug].replace("{{INSTALLER}}", subs["INSTALLER"])
         target = out / "index.html" if slug == "index" else docs / f"{slug}.html"
-        target.write_text(build_page(slug, label, md))
+        target.write_text(build_page(slug, label, md), encoding="utf-8")
         written.append(target)
 
     for name, _ in LLM_FILES:
@@ -525,4 +540,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SiteError as e:
+        print(f"site: {e}", file=sys.stderr)
+        sys.exit(1)

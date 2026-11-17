@@ -19,13 +19,21 @@
 #
 # Переменные:
 #   SNENS_WEB_REPO      репозиторий клиента (дефолт ~/projects/snens-web)
+#   SNENS_WEB_RELEASE_DIR  куда собирать архив (дефолт target/web-release)
 #   SNENS_RELEASE_WEBROOT  корень сайта (дефолт /var/www/snens.svuvi.ch)
+#   SNENS_RELEASE_URL   публичный адрес для проверки ссылки
+#                          (дефолт https://snens.svuvi.ch)
+#   SNENS_WEB_ARCHIVE   имя архива (дефолт с платформой из uname)
 set -eu
 
 REPO="${SNENS_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 WEB="${SNENS_WEB_REPO:-$HOME/projects/snens-web}"
 WEBROOT="${SNENS_RELEASE_WEBROOT:-/var/www/snens.svuvi.ch}"
+# `OUT` — абсолютный: шаг упаковки делает `cd "$STAGE"`, и относительный путь
+# из окружения уводил архив не туда.
 OUT="${SNENS_WEB_RELEASE_DIR:-$REPO/target/web-release}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 
 CHECK=0
 PUBLISH=1
@@ -33,7 +41,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --check) CHECK=1 ;;
         --no-publish) PUBLISH=0 ;;
-        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "web-release: неизвестный аргумент: $1" >&2; exit 2 ;;
     esac
     shift
@@ -53,12 +61,18 @@ fi
 
 say "1/5 бандл клиента"
 [ -d "$WEB" ] || die "нет репозитория клиента: $WEB"
+# Гейт (шаг 0) уже собирал бандл для того же коммита, но полагаться на это
+# нельзя: `--skip-site` или чужой SNENS_REPO его не гарантируют, а на релизном
+# хосте `dist/` мог быть сметён. Сборка здесь — сознательное повторение ради
+# воспроизводимости архива.
 ( cd "$WEB" && npm run build ) || die "сборка клиента провалилась"
+[ -f "$WEB/dist/index.html" ] || die "нет $WEB/dist/index.html — клиент не собрался"
 
 say "2/5 бинарь snens-web"
 ( cd "$REPO" && cargo build --release -p snens-web ) || die "cargo build провалился"
-TARGET="$(cd "$REPO" && cargo metadata --no-deps --format-version 1 \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+TARGET="$( (cd "$REPO" && cargo metadata --no-deps --format-version 1) \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' )" ||
+    die "cargo metadata / python3 не отработали — не нашёл target-каталог"
 BIN="$TARGET/release/snens-web"
 [ -x "$BIN" ] || die "нет $BIN"
 
@@ -88,7 +102,10 @@ enable --now snens-web.service (пути в юните — %h, поправь, �
 только после рестарта) и перезапусти юнит.
 EOF
 
-ARCHIVE="snens-web_${VERSION}_linux-x86_64.tar.gz"
+# Платформа — из хоста, а не зашитая: иначе имя файла врёт о платформе, а
+# два хоста с одной версией пишут в одно имя.
+PLATFORM="$(uname -s | tr 'A-Z' 'a-z')-$(uname -m)"
+ARCHIVE="${SNENS_WEB_ARCHIVE:-snens-web_${VERSION}_${PLATFORM}.tar.gz}"
 # tar пишет в `OUT`, а не в `STAGE`: `-C` меняет каталог, и относительный
 # `../../` оттуда уводил архив на два уровня выше, а sha256sum потом искал его
 # в `OUT` и не находил. Скрипт теперь ещё и проверяет, что архив появился.
@@ -101,9 +118,11 @@ SIZE="$(wc -c <"$OUT/$ARCHIVE")"
 say "архив: $OUT/$ARCHIVE ($SIZE байт)"
 say "sha256: $SHA"
 # Архив без бинаря или без клиента — это не релиз, а пустышка; проверяем, что
-# внутри то, что обещали, а не только что файл есть.
+# внутри то, что обещали, а не только что файл есть. Листинг читаем ОДИН раз:
+# битый архив иначе давал бы «нет ./snens-web» вместо ошибки tar.
+LISTING="$(tar tzf "$OUT/$ARCHIVE")" || die "архив не читается: $OUT/$ARCHIVE"
 for want in ./snens-web ./web/index.html ./snens-web.service ./README.txt; do
-    tar tzf "$OUT/$ARCHIVE" | grep -qx "$want" || die "в архиве нет $want"
+    printf '%s\n' "$LISTING" | grep -qx "$want" || die "в архиве нет $want"
 done
 
 say "4/5 выкладка"
@@ -114,20 +133,34 @@ fi
 DEST="$WEBROOT/releases/web/$VERSION"
 [ -d "$WEBROOT" ] || die "нет $WEBROOT"
 mkdir -p "$DEST"
-# Каталог версии неизменяем: люди со старой версией могут её ещё качать.
-cp "$OUT/$ARCHIVE" "$OUT/$ARCHIVE.sha256" "$DEST/"
+# Каталог версии неизменяем: люди со старой версией могут её ещё качать, а
+# байты под уже разданной суммой менять нельзя.
+[ -e "$DEST/$ARCHIVE" ] &&
+    die "версия $VERSION уже выложена: $DEST/$ARCHIVE (удали каталог осознанно)"
+# Копируем через временное имя в том же каталоге и переименовываем: клиент,
+# попавший на URL во время копирования, иначе скачал бы обрезанный файл.
+cp "$OUT/$ARCHIVE" "$DEST/.$ARCHIVE.tmp" && mv -f "$DEST/.$ARCHIVE.tmp" "$DEST/$ARCHIVE" ||
+    die "не скопировал архив в $DEST"
+cp "$OUT/$ARCHIVE.sha256" "$DEST/.$ARCHIVE.sha256.tmp" &&
+    mv -f "$DEST/.$ARCHIVE.sha256.tmp" "$DEST/$ARCHIVE.sha256" ||
+    die "не скопировал .sha256 в $DEST"
 # Права для Caddy: он чужой пользователь, а mkdir -p с umask 077 делал
 # родительские каталоги 0700 — сайт отдавал 403 на весь релиз.
 . "$REPO/scripts/publish-perms.sh"
 publish_perms "$WEBROOT" "$DEST" || die "не выставить права на $DEST"
 # Проверка по факту: бит «others» на всех родителях и на самом файле.
 # Если 403 случится, лучше здесь и с именем пути, чем у человека в браузере.
-publish_readable "$DEST/$ARCHIVE" || die "файл нечитаем для Caddy: $DEST/$ARCHIVE"
+for f in "$ARCHIVE" "$ARCHIVE.sha256"; do
+    publish_readable "$DEST/$f" || die "файл нечитаем для Caddy: $DEST/$f"
+done
 say "выложено: $DEST"
 
 say "5/5 проверка ссылки"
-URL="https://snens.svuvi.ch/releases/web/$VERSION/$ARCHIVE"
-CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL" || true)"
+command -v curl >/dev/null || die "нет curl — ссылку не проверить"
+BASE="${SNENS_RELEASE_URL:-https://snens.svuvi.ch}"
+URL="$BASE/releases/web/$VERSION/$ARCHIVE"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$URL")" ||
+    die "не удалось запросить $URL"
 [ "$CODE" = 200 ] || die "файл не отдаётся ($CODE): $URL"
 say "скачивается: $URL"
 say "готово. Проверь: скачай архив, распакуй в пустой каталог, запусти --help"

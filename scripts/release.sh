@@ -28,7 +28,6 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DESKTOP="$REPO/desktop"
 OUT="${SNENS_RELEASE_DIR:-$REPO/desktop/target/release/bundle}"
 BASE_URL="${SNENS_RELEASE_URL:-https://snens.svuvi.ch/releases}"
-VERSION="$(python3 -c "import json;print(json.load(open('$DESKTOP/tauri.conf.json'))['version'])")"
 
 say() { printf '>>> %s\n' "$*"; }
 die() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
@@ -39,7 +38,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --check) check_only=1 ;;
         --skip-gate) skip_gate=1 ;;
-        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,/^[^#]/p' "$0" | sed -n '/^#/p' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'release: неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
     esac
     shift
@@ -48,8 +47,16 @@ done
 [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}${TAURI_SIGNING_PRIVATE_KEY:-}" ] ||
     die "нет ключа подписи: задай TAURI_SIGNING_PRIVATE_KEY_PATH (updater.key)"
 
+# Версию читаем после разбора аргументов: `--help` не должен требовать ни
+# python3, ни целого tauri.conf.json.
+command -v python3 >/dev/null || die "нет python3 (нужен для чтения tauri.conf.json)"
+[ -r "$DESKTOP/tauri.conf.json" ] || die "нет $DESKTOP/tauri.conf.json"
+VERSION="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' \
+    "$DESKTOP/tauri.conf.json" 2>/dev/null || true)"
+[ -n "$VERSION" ] || die "не смог прочитать version из desktop/tauri.conf.json"
+
 if [ "$check_only" = 0 ] && [ "$skip_gate" = 0 ]; then
-    say "0/4 гейт: scripts/release-check.sh --skip-site"
+    say "0/5 гейт: scripts/release-check.sh --skip-site"
     "$REPO/scripts/release-check.sh" --skip-site ||
         die "гейт не пройден — релиз не собираю (--skip-gate только для отладки)"
 fi
@@ -67,7 +74,13 @@ say "1/5 раскладка sidecar'ов и клиента"
 "$REPO/scripts/desktop-stage.sh"
 
 say "2/5 сборка бандлов (nsis/appimage/deb) с подписью"
+# Подпись и упаковка идут через `@tauri-apps/cli`: версия зафиксирована точно
+# (2.12.5 — та, что тянет `tauri` 2.12.5 из desktop/Cargo.lock), а
+# `package-lock.json` закоммичен. Без этого `npm ci` падает на отсутствии
+# lockfile, а голый `npx` скачивает тот 2.x, который редит реестр на момент
+# релиза — то есть инсталлятор подписывается непроверенным CLI.
 cd "$DESKTOP"
+npm ci --no-audit --no-fund
 npx tauri build
 
 say "3/5 манифест latest.json"
@@ -86,18 +99,27 @@ patterns = {
     "linux-x86_64-appimage": "appimage/*.AppImage",
 }
 for key, pattern in patterns.items():
-    for path in sorted(root.glob(pattern)):
-        sig = path.with_name(path.name + ".sig")
-        if not sig.is_file():
-            print(f"  {key}: нет подписи {sig.name} — пропускаю")
-            continue
-        platforms[key] = {
-            "url": f"{base}/{version}/{path.name}",
-            "signature": sig.read_text().strip(),
-            "size": path.stat().st_size,
-        }
-        print(f"  {key}: {path.name} ({path.stat().st_size} байт)")
-        break
+    # Только артефакт НЫНЕШНЕЙ версии: `target/release/bundle` не чистится между
+    # релизами, и первый по алфавиту файл часто оказывается прошлогодним —
+    # манифест тогда рекламирует новую версию, а отдаёт старый билд.
+    matches = [p for p in sorted(root.glob(pattern)) if version in p.name]
+    if not matches:
+        print(f"  {key}: нет артефакта версии {version} ({pattern}) — пропускаю")
+        continue
+    if len(matches) > 1:
+        names = ", ".join(p.name for p in matches)
+        sys.exit(f"{key}: под {pattern} подходит несколько артефактов этой версии: {names} — почисти каталог бандлов")
+    path = matches[0]
+    sig = path.with_name(path.name + ".sig")
+    if not sig.is_file():
+        print(f"  {key}: нет подписи {sig.name} — пропускаю")
+        continue
+    platforms[key] = {
+        "url": f"{base}/{version}/{path.name}",
+        "signature": sig.read_text().strip(),
+        "size": path.stat().st_size,
+    }
+    print(f"  {key}: {path.name} ({path.stat().st_size} байт)")
 
 if not platforms:
     sys.exit("нет ни одного подписанного артефакта: обновление собрать не из чего")
@@ -117,6 +139,23 @@ print(f"  манифест: {dest}")
 PY
 
 say "готово. Выложи на $BASE_URL: latest.json и каталог $VERSION/ с артефактами"
+# Каталог версии рядом с бандлами. `tauri build` кладёт артефакты в `nsis/` и
+# `appimage/`, а не в `<версия>/`, и раньше всё ниже (выкладка и печатаемый
+# rsync) ходило по несуществующему пути: копировалось ноль файлов, а манифест
+# обещал URL, которые отдают 404. Собираем здесь ровно то, что попало в
+# манифест; фильтр по версии обязателен — в каталоге бандлов лежат артефакты
+# прошлых релизов (`tauri` его не чистит).
+rm -rf "$OUT/$VERSION"
+mkdir -p "$OUT/$VERSION"
+for f in "$OUT"/nsis/*-setup.exe "$OUT"/nsis/*-setup.exe.sig \
+         "$OUT"/appimage/*.AppImage "$OUT"/appimage/*.AppImage.sig; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in
+        *"$VERSION"*) cp -p "$f" "$OUT/$VERSION/" ;;
+    esac
+done
+[ -n "$(ls -A "$OUT/$VERSION")" ] ||
+    die "в $OUT нет артефактов версии $VERSION (nsis/appimage) — публиковать нечего"
 # Путь назначения — тот же корень, что раздаёт Caddy (deploy/caddy-sites.conf):
 # сайт берёт `/releases/*` из каталога релизов, один домен на всё.
 WEBROOT="${SNENS_RELEASE_WEBROOT:-/var/www/snens.svuvi.ch}"
@@ -134,21 +173,29 @@ if [ "${SNENS_RELEASE_PUBLISH:-0}" = 1 ] && [ -d "$WEBROOT" ] && [ -w "$WEBROOT"
     # Каталог версии неизменяем: обновление кладёт новый, а не перезаписывает старый
     # (люди с прошлой версией могут ещё качать её артефакт).
     mkdir -p "$DEST/$VERSION"
-    for f in "$OUT"/$VERSION/*; do
+    for f in "$OUT"/"$VERSION"/*; do
         [ -f "$f" ] && cp -p "$f" "$DEST/$VERSION/"
     done
-    cp -p "$OUT/latest.json" "$DEST/latest.json"
+    # Манифест кладём атомарно: клиент, попавший на latest.json во время
+    # копирования, иначе прочитал бы обрезанный JSON и обновление бы сорвалось.
+    cp -p "$OUT/latest.json" "$DEST/.latest.json.tmp"
+    chmod 0644 "$DEST/.latest.json.tmp"
+    mv -f "$DEST/.latest.json.tmp" "$DEST/latest.json"
     # Caddy читает не нашим пользователем, а umask бывает 077.
     # Каталоги — 0755, файлы — 0644. Раньше здесь был только `chmod -R a+rX`,
     # а umask 077 делал новые каталоги 0700: Caddy отдавал 403 на установщик,
     # а причина не видна ни в логе сборки, ни в `ls` файлов. Проверено живьём.
-    find "$DEST" -type d -exec chmod 0755 {} +
-    find "$DEST" -type f -exec chmod 0644 {} +
+    # Только свой каталог версии и манифест: по всему $DEST лежат артефакты
+    # прошлых релизов, возможно чужого владельца — один EPERM от `find` уронил
+    # бы выкладку посередине без сообщения.
+    find "$DEST/$VERSION" -type d -exec chmod 0755 {} + 2>/dev/null || true
+    find "$DEST/$VERSION" -type f -exec chmod 0644 {} + 2>/dev/null || true
+    chmod 0755 "$DEST" 2>/dev/null || true
     say "выложено: $DEST"
     ls -l "$DEST/latest.json" "$DEST/$VERSION" | sed 's/^/  /'
 else
     say "выложить руками:"
-    say "  rsync -av --mkpath $OUT/latest.json $OUT/$VERSION/ \${SNENS_RELEASE_HOST:-<host>}:$DEST/"
+    say "  rsync -av --mkpath \"$OUT/latest.json\" \"$OUT/$VERSION/\" \"${SNENS_RELEASE_HOST:-<host>}:$DEST/\""
     [ "$WEBROOT" = /var/www/snens.svuvi.ch ] && [ -d "$WEBROOT" ] && [ "${SNENS_RELEASE_PUBLISH:-0}" != 1 ] &&
         say "  (каталог доступен локально: тот же скрипт с SNENS_RELEASE_PUBLISH=1 скопирует сам)"
 fi

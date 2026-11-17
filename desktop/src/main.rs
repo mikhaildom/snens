@@ -28,7 +28,7 @@ mod tray;
 
 use tauri::{Manager, RunEvent, WindowEvent};
 
-use daemon::Daemon;
+use daemon::{Daemon, Session};
 
 fn main() {
     // Второй экземпляр не должен поднимать второе ядро и воровать окно: он
@@ -59,8 +59,17 @@ fn main() {
             };
             {
                 let state = app.state::<Daemon>();
-                *state.connection.lock().unwrap() = Some(conn.clone());
-                *state.remote.lock().unwrap() = remote;
+                // Замок отравлен — это паника в другом потоке, а `unwrap` здесь
+                // уронил бы setup: в GUI-сборке паника не видна (нет ни консоли,
+                // ни трея, ни окна). Отдаём ошибку наружу.
+                *state
+                    .session
+                    .lock()
+                    .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? =
+                    Some(Session {
+                        connection: conn.clone(),
+                        remote,
+                    });
             }
             // Порядок важен: СНАЧАЛА окно, потом трей. Трей поднимает своё
             // скрытое окно-посредник, и если оно создано раньше главного,
@@ -93,16 +102,46 @@ fn main() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("приложение не собралось");
+        .unwrap_or_else(|e| {
+            // Панику в GUI-сборке некому показать (нет консоли), поэтому хотя бы
+            // сохранём текст в файл рядом с логом ядра и выйдем с кодом 1.
+            let text = format!("snens-desktop: не запустилось: {e}");
+            eprintln!("{text}");
+            if let Ok(dir) = app_handle_log_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join("desktop.log"), &text);
+            }
+            std::process::exit(1);
+        });
 
     app.run(|handle, event| {
-        if let RunEvent::ExitRequested { .. } = event {
-            // Гасим ядро до выхода: иначе оно переживёт окно и следующая
-            // установка не сможет перезаписать его файлы. При удалённом
-            // подключении своего процесса нет — гасить нечего.
+        // Гасим ядро только когда приложение действительно завершается.
+        // `ExitRequested` отменяемо (`api.prevent_exit()` — например, плагином
+        // автообновления), и убитое там ядро оставило бы живое окно без
+        // соединения и без способа поднять его заново.
+        if let RunEvent::Exit = event {
+            // При удалённом подключении своего процесса нет — гасить нечего.
             handle.state::<Daemon>().stop();
         }
     });
+}
+
+/// Каталог логов приложения — без `AppHandle` (он недоступен, когда `build`
+/// уже упал). Правило то же, что у Tauri: `%LOCALAPPDATA%`/`XDG_STATE_HOME`.
+fn app_handle_log_dir() -> Result<std::path::PathBuf, ()> {
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library/Logs"))
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+            })
+    };
+    base.map(|b| b.join("ch.svuvi.snens").join("logs"))
+        .ok_or(())
 }
 
 /// Открыть окно на ядре `conn`. Окно всегда грузит **свой** бандл клиента
@@ -130,10 +169,23 @@ pub fn open_window(
         base = serde_json::to_string(&conn.base_url)?,
         token = serde_json::to_string(&conn.token)?,
     );
+    // `initialization_script` выполняется на КАЖДОЙ навигации верхнего уровня,
+    // а не только на первой загрузке своего бандла. Без фильтра любой переход
+    // на чужой origin (редирект, ссылка из ленты) получил бы токен инстанса в
+    // `window.__SNENS__`. Поэтому разрешаем остаться только внутри своего
+    // бандла или на самом адресе ядра.
+    let own = conn.base_url.clone();
     tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
         .title("snens")
         .inner_size(1280.0, 860.0)
         .min_inner_size(900.0, 600.0)
+        .on_navigation(move |url| {
+            let s = url.as_str();
+            if s.starts_with("tauri://") || s.starts_with("https://tauri.localhost") {
+                return true;
+            }
+            s.starts_with(&own)
+        })
         .initialization_script(&init)
         .build()?;
     Ok(())

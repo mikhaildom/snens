@@ -32,8 +32,10 @@ use tauri::Manager;
 /// процессу делать нечего.
 pub fn already_running() -> bool {
     if !claim_lock() {
-        request_show();
-        return true;
+        // Просьба не дошла (устаревший файл порта, первый экземпляр уже умирает):
+        // тогда мы не «уже работаем», а единственные — и обязаны открыть окно.
+        // Раньше признак игнорировался, и запуск по шорткату ничего не делал.
+        return request_show();
     }
     false
 }
@@ -52,6 +54,11 @@ fn claim_lock() -> bool {
         .chain(std::iter::once(0))
         .collect();
     unsafe {
+        // SAFETY: имя — `Vec<u16>` с завершающим NUL, живёт до конца вызова
+        // (передаём указатель на его буфер). `null` вместо SECURITY_ATTRIBUTES
+        // — это дефолтный DACL, что для Local\-мьютекса и нужно. `GetLastError`
+        // читается сразу после вызова, без промежуточных вызовов Win32, иначе
+        // код ошибки уже был бы перезаписан.
         let handle = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
         if handle.is_null() {
             // Не смогли создать мьютекс — считаем себя первыми: лучше открыть
@@ -67,13 +74,24 @@ fn claim_lock() -> bool {
 
 #[cfg(not(windows))]
 fn claim_lock() -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    let path = std::env::temp_dir().join("snens-desktop-single.lock");
+    // Замок — в каталоге конфига пользователя, а не в общем /tmp: на машине с
+    // несколькими людьми замок в /tmp отказывал бы второму пользователю
+    // («уже работает»), хотя никакого его экземпляра нет. Права 0600 — чтобы
+    // чужой не мог пересоздать файл и сбить flock.
+    let Some(path) = port_file_path().map(|p| p.with_file_name("instance.lock")) else {
+        return true;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
+        .mode(0o600)
         .open(&path)
     else {
         return true;
@@ -95,31 +113,44 @@ fn claim_lock() -> bool {
 
 /// Второй экземпляр: попросить первый показать окно. Не блокируется и не
 /// падает, если первый уже умирает — тогда человек просто запустит ещё раз.
-fn request_show() {
-    let Some(path) = port_file_path() else { return };
+fn request_show() -> bool {
+    let Some(path) = port_file_path() else {
+        return false;
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
-        return;
+        return false;
     };
     let Ok(port) = text.trim().parse::<u16>() else {
-        return;
+        return false;
     };
-    if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
-        let _ = s.write_all(b"show\n");
-        let _ = s.flush();
-    }
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    s.write_all(b"show\n").is_ok() && s.flush().is_ok()
 }
 
-/// Путь к файлу порта без `AppHandle`: у второго экземпляра его ещё нет
-/// (окно не создаётся), а каталог конфига Tauri вычисляет от идентификатора.
+/// Идентификатор приложения — один на все места, где путь зависит от него.
+const IDENT: &str = "ch.svuvi.snens";
+
+/// Путь к файлу порта.
+///
+/// Функция одна на обоих концах: и писатель (первый экземпляр), и читатель
+/// (второй) берут путь отсюда. Раньше писатель брал `app_config_dir()` Tauri, а
+/// читатель строил путь сам по XDG/HOME — на macOS это разные каталоги
+/// (`~/Library/Application Support`), и второй экземпляр вообще не находил
+/// порт (ровно тот симптом, ради которого модуль и написан).
 fn port_file_path() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)?
+    } else if cfg!(target_os = "macos") {
+        // Ровно то, что Tauri зовёт `app_config_dir` на macOS.
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))?
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
     };
-    Some(base.join("ch.svuvi.snens").join("instance.port"))
+    Some(base.join(IDENT).join("instance.port"))
 }
 
 /// Первый экземпляр: слушать просьбы и показывать окно. Вызывается из setup
@@ -132,12 +163,11 @@ pub fn serve_show_requests(app: tauri::AppHandle) {
     let Ok(addr) = listener.local_addr() else {
         return;
     };
-    // Порт — в тот же файл, откуда его читает второй экземпляр.
-    let path = app
-        .path()
-        .app_config_dir()
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("instance.port");
+    // Порт — в тот же файл, откуда его читает второй экземпляр (тот же
+    // `port_file_path`), иначе показ окна молча перестанет работать.
+    let Some(path) = port_file_path() else {
+        return;
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -147,6 +177,10 @@ pub fn serve_show_requests(app: tauri::AppHandle) {
 
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            // Таймаут обязателен: локальный процесс может открыть соединение и
+            // не прислать перевода строки. Без него этот поток встал бы на
+            // чтении навсегда, и все следующие «покажи окно» игнорировались бы.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
             let mut line = String::new();
             let _ = BufReader::new(&stream).read_line(&mut line);
             if line.trim() != "show" {

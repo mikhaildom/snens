@@ -31,7 +31,7 @@ while [ $# -gt 0 ]; do
         --check) CHECK=1 ;;
         --dry-run) DRY=1 ;;
         -h | --help)
-            sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -49,10 +49,19 @@ die() {
 
 command -v python3 >/dev/null 2>&1 || die "нужен python3"
 
-# Справка тулов — генерируемая: устаревший tools.txt хуже отсутствующего,
-# поэтому генерируем всегда, в том числе при --check.
-python3 "$REPO/scripts/docs-tools.py" --write "$REPO/site/snens.svuvi.ch/llm/tools.txt" ||
-    die "генератор tools.txt упал"
+# Справка тулов — генерируемая: устаревший tools.txt хуже отсутствующего.
+# При --check не пишем в дерево: проверка контента не должна пачкать worktree
+# (иначе `git diff --exit-code` в CI падает от самой проверки).
+TOOLS_TXT="$REPO/site/snens.svuvi.ch/llm/tools.txt"
+if [ "$CHECK" = 1 ] || [ "$DRY" = 1 ]; then
+    TMP_TOOLS="$(mktemp)"
+    trap 'rm -f "$TMP_TOOLS"' EXIT
+    python3 "$REPO/scripts/docs-tools.py" --write "$TMP_TOOLS" || die "генератор tools.txt упал"
+    cmp -s "$TMP_TOOLS" "$TOOLS_TXT" ||
+        die "tools.txt устарел: запусти scripts/site-publish.sh (без флагов) и закоммить"
+else
+    python3 "$REPO/scripts/docs-tools.py" --write "$TOOLS_TXT" || die "генератор tools.txt упал"
+fi
 
 if [ "$CHECK" = 1 ]; then
     python3 "$REPO/scripts/site.py" --check --releases "$RELEASES"
@@ -62,21 +71,38 @@ fi
 
 if [ "$DRY" = 1 ]; then
     OUT=$(mktemp -d)
-    trap 'rm -rf "$OUT"' EXIT
+    # Без trap: каталог обещан в сообщении как «где посмотреть результат» —
+    # удалять его сразу после печати пути бессмысленно.
     python3 "$REPO/scripts/site.py" --out "$OUT" --releases "$RELEASES"
-    echo "dry-run: собрано в $OUT (ничего не выложено)"
+    echo "dry-run: собрано в $OUT (ничего не выложено, каталог не удаляю)"
     exit 0
 fi
 
 [ -d "$WEBROOT" ] || mkdir -p "$WEBROOT" || die "не могу создать $WEBROOT (нужны права на запись)"
 [ -w "$WEBROOT" ] || die "$WEBROOT не доступен на запись"
 
-python3 "$REPO/scripts/site.py" --out "$WEBROOT" --releases "$RELEASES"
+# Собираем в отдельный каталог и подменяем содержимое только целиком: провал
+# сборки на середине не должен оставить сайт из смеси старых и новых страниц.
+# `releases/` — чужой корень (его кладёт release.sh) и в подмену не входит.
+STAGE="$WEBROOT/.site-new"
+rm -rf "$STAGE"
+python3 "$REPO/scripts/site.py" --out "$STAGE" --releases "$RELEASES" ||
+    { rm -rf "$STAGE"; die "сборка сайта провалилась"; }
 
 # Caddy читает не нашим пользователем, а umask бывает 077: без этого сайт
 # отдаёт 403, и причина не видна ни из вывода сборки, ни из `ls` файлов.
-find "$WEBROOT" -type d -exec chmod 0755 {} +
-find "$WEBROOT" -type f -exec chmod 0644 {} +
+# Права ставим до подмены и только на своё: `find` по всему $WEBROOT задевал
+# бы `releases/` (его права — дело release.sh).
+find "$STAGE" -type d -exec chmod 0755 {} +
+find "$STAGE" -type f -exec chmod 0644 {} +
+
+for item in "$STAGE"/*; do
+    name="$(basename "$item")"
+    [ "$name" = releases ] && continue
+    rm -rf "$WEBROOT/$name"
+    mv "$item" "$WEBROOT/$name"
+done
+rm -rf "$STAGE"
 
 echo
 echo "проверка снаружи: curl -sI --max-time 8 $BASE_URL/ | head -1"

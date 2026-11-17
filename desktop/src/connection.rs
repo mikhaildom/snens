@@ -38,27 +38,60 @@ pub fn load_stored(app: &tauri::AppHandle) -> Option<Connection> {
     let path = stored_path(app)?;
     let text = std::fs::read_to_string(path).ok()?;
     let conn: Connection = serde_json::from_str(&text).ok()?;
-    // Тот же минимум, что проверяет `set_remote`: без него файл не соединение.
-    (conn.base_url.starts_with("http") && conn.token.trim().len() >= 32).then_some(conn)
+    // Тот же минимум, что проверяет `set_remote` (там — `trim` и http(s)://):
+    // без него правленый руками файл грузился бы как «валидное» соединение,
+    // которое остальной код считает рабочим.
+    let base_ok = conn.base_url.starts_with("http://") || conn.base_url.starts_with("https://");
+    (base_ok && conn.token.trim().len() >= 32).then_some(conn)
 }
 
-/// Запомнить (или забыть, если `None`) удалённое соединение.
-pub fn save_stored(app: &tauri::AppHandle, conn: &Connection) {
+/// Запомнить удалённое соединение (забыть — `forget_stored`). Ошибка записи
+/// возвращается наружу: молча «сохранённое» соединение теряется при следующем
+/// запуске, и человек видит окно на своём ядре без объяснения.
+pub fn save_stored(app: &tauri::AppHandle, conn: &Connection) -> Result<(), String> {
     let Some(path) = stored_path(app) else {
-        return;
+        return Err("не нашёл каталог конфигурации приложения".into());
     };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("не удалось создать {}: {e}", dir.display()))?;
     }
-    let body = serde_json::to_string_pretty(conn).unwrap_or_default();
+    let body = serde_json::to_string_pretty(conn)
+        .map_err(|e| format!("не удалось сериализовать соединение: {e}"))?;
     // Пишем через временный файл: оборванная запись (диск, антивирус) не должна
-    // оставить окно без адреса, по которому оно уже работало.
+    // оставить окно без адреса, по которому оно уже работало. В файле — токен
+    // инстанса, поэтому создаём его сразу 0600, а не по umask: иначе 0644
+    // отдал бы живой токен любому местному пользователю.
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    write_private(&tmp, body.as_bytes())
+        .map_err(|e| format!("не удалось записать {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("не удалось сохранить {}: {e}", path.display())
+    })
 }
 
+/// Записать файл с правами «только владельцу» (на unix — 0600).
+fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Режим действует только при создании; старый файл мог остаться 0644 —
+        // тогда права ставим явно ниже.
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    file.write_all(body)?;
+    file.flush()
+}
 pub fn forget_stored(app: &tauri::AppHandle) {
     if let Some(path) = stored_path(app) {
         let _ = std::fs::remove_file(path);
@@ -74,23 +107,39 @@ pub fn forget_stored(app: &tauri::AppHandle) {
 /// создаётся заново — с новым инжектом.
 #[tauri::command]
 pub fn reopen(app: tauri::AppHandle, state: tauri::State<'_, crate::Daemon>) -> Result<(), String> {
-    let conn = state
-        .connection
+    let session = state
+        .session
         .lock()
         .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")?
         .clone()
         .ok_or("нет соединения")?;
-    let remote = state.remote.lock().map(|g| *g).unwrap_or(false);
-    if let Some(w) = app.get_webview_window("main") {
+    let conn = session.connection;
+    let remote = session.remote;
+    // Старое окно сносим ДО создания нового (метка `main` должна освободиться),
+    // но если новое не собралось — поднимаем его обратно на том же соединении:
+    // иначе остаётся приложение без единого окна (трей показывает то же окно).
+    let previous = app.get_webview_window("main");
+    if let Some(w) = previous {
         let _ = w.destroy();
     }
-    crate::open_window(&app, &conn, remote).map_err(|e| e.to_string())
+    if let Err(e) = crate::open_window(&app, &conn, remote) {
+        let restored = crate::open_window(&app, &conn, remote);
+        return match restored {
+            Ok(()) => Err(format!("окно не пересоздалось: {e}")),
+            Err(_) => Err(format!("окно потеряно: {e}")),
+        };
+    }
+    Ok(())
 }
 
 /// Ответ команды: адрес и токен текущего соединения.
 #[tauri::command]
 pub fn connection(state: tauri::State<'_, crate::Daemon>) -> Option<Connection> {
-    state.connection.lock().ok().and_then(|g| g.clone())
+    state
+        .session
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.connection.clone()))
 }
 
 /// Подключиться к чужому ядру (экран пейринга). Обмен кода на токен делает
@@ -114,12 +163,15 @@ pub fn set_remote(
         base_url: base,
         token: token.trim().to_string(),
     };
-    save_stored(&app, &conn);
+    save_stored(&app, &conn)?;
     *state
-        .connection
+        .session
         .lock()
-        .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = Some(conn);
-    *state.remote.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = true;
+        .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? =
+        Some(crate::daemon::Session {
+            connection: conn,
+            remote: true,
+        });
     Ok(())
 }
 
@@ -127,9 +179,14 @@ pub fn set_remote(
 /// поднимется при следующем запуске — менять процесс на ходу нельзя, клиент
 /// держит уже открытые подписки на старый адрес.
 #[tauri::command]
-pub fn clear_remote(app: tauri::AppHandle, state: tauri::State<'_, crate::Daemon>) -> Result<(), String> {
+pub fn clear_remote(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::Daemon>,
+) -> Result<(), String> {
     forget_stored(&app);
-    *state.connection.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = None;
-    *state.remote.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = false;
+    *state
+        .session
+        .lock()
+        .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = None;
     Ok(())
 }

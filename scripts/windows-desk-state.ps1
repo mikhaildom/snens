@@ -5,9 +5,20 @@
 # создать окно ("Invalid window handle", HRESULT 0x80070578) и CopyFromScreen
 # падает с "handle is invalid" — это ограничение среды, а не приложения.
 # Поэтому скрипт запускается планировщиком с флагом /it в сессии пользователя.
-$out = "C:\Users\Svuvich\desk-state.txt"
-$png = "C:\Users\Svuvich\desk.png"
+#
+# Пути — от профиля текущего пользователя, а не зашитые: на другом аккаунте
+# `C:\Users\Svuvich` не существует.
+param(
+  [string]$Out = (Join-Path $env:USERPROFILE 'desk-state.txt'),
+  [string]$Png = (Join-Path $env:USERPROFILE 'desk.png')
+)
+$out = $Out
+$png = $Png
 
+# Глобальный тип PowerShell создаётся один раз на сессию: повторный Add-Type с
+# тем же именем падает, если скрипт запускают дважды из одного хоста
+# (например, из одной сессии планировщика).
+if (-not ("Win" -as [type])) {
 Add-Type @"
 using System;
 using System.Text;
@@ -20,6 +31,7 @@ public class Win {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 }
 "@
+}
 
 $lines = New-Object System.Collections.ArrayList
 $cb = [Win+EnumWindowsProc]{
@@ -29,9 +41,11 @@ $cb = [Win+EnumWindowsProc]{
     [void][Win]::GetWindowText($h, $sb, 512)
     $t = $sb.ToString()
     if ($t) {
-      $pid = 0
-      [void][Win]::GetWindowThreadProcessId($h, [ref]$pid)
-      $pname = (Get-Process -Id $pid -ErrorAction SilentlyContinue).ProcessName
+      # Не `$pid`: в PowerShell это автоматическая read-only переменная (PID
+      # хоста), присвоение в неё падает — и все окна резолвились бы в сам хост.
+      $procId = 0
+      [void][Win]::GetWindowThreadProcessId($h, [ref]$procId)
+      $pname = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName
       [void]$lines.Add("$pname | $t")
     }
   }
@@ -59,4 +73,8 @@ try {
   Add-Content -Encoding UTF8 $out "screenshot=ok"
 } catch {
   Add-Content -Encoding UTF8 $out ("screenshot=ERR " + $_.Exception.Message)
+} finally {
+  # Без Dispose на каждый прогон остаётся битмап размером с экран.
+  if ($g) { $g.Dispose() }
+  if ($bmp) { $bmp.Dispose() }
 }

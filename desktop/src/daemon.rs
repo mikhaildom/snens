@@ -22,15 +22,25 @@ use crate::connection::Connection;
 const READY_BUDGET: Duration = Duration::from_secs(30);
 const PING_BUDGET: Duration = Duration::from_secs(20);
 
+/// Текущее соединение окна и откуда оно взялось.
+///
+/// Два поля — одно состояние, и читать их порознь нельзя: `set_remote`
+/// записывает адрес и признак «чужое ядро», и `reopen` между этими записями
+/// увидел бы новый адрес с `remote == false`, то есть окно, которое считает
+/// себя работающим на своём ядре.
+#[derive(Clone)]
+pub struct Session {
+    pub connection: Connection,
+    pub remote: bool,
+}
+
 /// Запущенное ядро и то, что окно о нём знает.
 pub struct Daemon {
     child: Mutex<Option<Child>>,
     /// Привязка жизни ядра к жизни окна (Windows: job object). Из `Daemon`
     /// никогда не достаётся — держится только ради ручки.
     job: Mutex<Option<crate::job::Job>>,
-    pub connection: Mutex<Option<Connection>>,
-    /// Окно работает с чужим ядром: своего процесса нет, `child` пуст.
-    pub remote: Mutex<bool>,
+    pub session: Mutex<Option<Session>>,
 }
 
 impl Daemon {
@@ -38,8 +48,7 @@ impl Daemon {
         Self {
             child: Mutex::new(None),
             job: Mutex::new(None),
-            connection: Mutex::new(None),
-            remote: Mutex::new(false),
+            session: Mutex::new(None),
         }
     }
 
@@ -50,7 +59,11 @@ impl Daemon {
     /// `lock()` живёт до конца выражения и держит заимствование `state`, а
     /// `state` умирает раньше (E0597 — ловится только на Windows-сборке).
     pub fn stop(&self) {
-        let stopped = self.child.lock().map(|mut guard| guard.take()).unwrap_or(None);
+        let stopped = self
+            .child
+            .lock()
+            .map(|mut guard| guard.take())
+            .unwrap_or(None);
         if let Some(mut child) = stopped {
             let _ = child.kill();
             let _ = child.wait();
@@ -64,15 +77,92 @@ impl Daemon {
 }
 
 /// Где лежит sidecar: рядом с exe (так его кладёт установщик).
-fn side(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let dir = exe.parent().unwrap_or(Path::new("."));
-    dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+///
+/// Ошибку не подменяем пустым путём: `unwrap_or_default()` давал `"."`, и ядро
+/// искалось бы в текущем каталоге процесса (а cwd бывает чужим — ярлык с
+/// рабочим столом), то есть бинарник можно подменить.
+fn side(name: &str) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("не удалось определить путь к приложению: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "у пути к приложению нет каталога".to_string())?;
+    Ok(dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+}
+
+/// Приватный каталог для ready-файла.
+///
+/// Путь вида `/tmp/snens-desktop-ready-<pid>.json` предсказуем, а `/tmp` общий
+/// для всех пользователей: чужой файл по этому пути подсовывал бы свой `url`
+/// (окно подключилось бы к чужому серверу и отдало туда токен инстанса) и свой
+/// `token_file` (адрес любого файла, содержимое которого ушло бы в окно как
+/// токен). Каталог создаём с 0700 и с непредсказуемым именем; `create_dir`
+/// атомарен, так что предсозданный чужой каталог не подхватится.
+fn ready_dir() -> Result<PathBuf, String> {
+    let base = std::env::temp_dir();
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut last = String::new();
+    for attempt in 0..8u32 {
+        let dir = base.join(format!(
+            "snens-desktop-{}-{seed:x}{attempt}",
+            std::process::id()
+        ));
+        #[cfg(unix)]
+        let made = {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(false)
+                .mode(0o700)
+                .create(&dir)
+        };
+        #[cfg(not(unix))]
+        let made = std::fs::create_dir(&dir);
+        match made {
+            Ok(()) => return Ok(dir),
+            // Имя занято — это либо чужой каталог, либо прошлый прогон: берём другое.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!(
+        "не удалось создать каталог для ready-файла в {}: {last}",
+        base.display()
+    ))
+}
+
+/// Файл, куда пишется stderr ядра. Без него текст «смотри лог» отправлял в
+/// пустоту: stderr шёл в `Stdio::null()`, и диагностировать старт было нечем.
+fn core_log(app: &tauri::AppHandle) -> PathBuf {
+    let dir = app
+        .path()
+        .app_log_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("core.log")
+}
+
+/// Ошибочная ветка запуска: гасим уже поднятый процесс и убираем ready-каталог.
+///
+/// Лишний `kill` тут не забота, а необходимость: живое ядро держит
+/// `surface-api/server.lock`, и следующий запуск молча не поднимется — ровно
+/// та проблема, ради которой сделан job object.
+fn abandon(
+    app: &tauri::AppHandle,
+    ready: &Path,
+    log: &Path,
+    what: String,
+) -> Box<dyn std::error::Error> {
+    app.state::<Daemon>().stop();
+    let _ = std::fs::remove_dir_all(ready);
+    format!("{what} — смотри {}", log.display()).into()
 }
 
 /// Запустить своё ядро и дождаться готовности. Возвращает адрес и токен.
 pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Error>> {
-    let bin = side("snens");
+    let bin = side("snens")?;
     if !bin.is_file() {
         return Err(format!(
             "ядро не найдено: {}. Переустанови приложение или укажи адрес в настройках",
@@ -81,12 +171,11 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
         .into());
     }
     // ready-файл уникален на процесс окна: два окна (или окно и TUI) не должны
-    // читать адрес друг друга.
-    let ready_path = std::env::temp_dir().join(format!(
-        "snens-desktop-ready-{}.json",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&ready_path);
+    // читать адрес друг друга. Каталог приватный — см. `ready_dir`.
+    let ready_dir = ready_dir()?;
+    let ready_path = ready_dir.join("ready.json");
+    let log_path = core_log(app);
+    let log = std::fs::File::create(&log_path).ok();
 
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
@@ -95,7 +184,7 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
         .env("SNENS_READY_FILE", &ready_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(log.map(Stdio::from).unwrap_or_else(Stdio::null));
     // Окно без консоли. `CREATE_NO_WINDOW` обязателен даже при
     // `windows_subsystem = "windows"` у оболочки: атрибут окна гасит консоль
     // ТОЛЬКО у нашего exe, а дочерний консольный процесс получил бы свою —
@@ -105,7 +194,13 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let child = cmd.spawn()?;
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&ready_dir);
+            return Err(format!("не удалось запустить {}: {e}", bin.display()).into());
+        }
+    };
     // Привязка к job — ДО того, как что-либо может упасть ниже: если setup
     // упадёт или окно выгрузят, ядро умрёт вместе с процессом и не оставит
     // за собой лок `surface-api/server.lock` (из-за него следующий запуск
@@ -113,28 +208,85 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
     let job = crate::job::attach(&child);
     {
         let state = app.state::<Daemon>();
-        *state.child.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = Some(child);
-        *state.job.lock().map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = job;
+        let mut child = child;
+        // Замки берём именованными переменными, а не прямо в `match`: временный
+        // `Result` живёт до конца выражения, а `state` умирает раньше — E0597
+        // (лень ревью: ловится только сборкой окна).
+        let child_slot = state.child.lock();
+        match child_slot {
+            Ok(mut guard) => {
+                *guard = Some(child);
+                drop(guard);
+                let job_slot = state.job.lock();
+                match job_slot {
+                    Ok(mut j) => *j = job,
+                    // Замок job не нужен для жизни процесса: `stop()` забирает child.
+                    Err(_) => {
+                        if let Some(j) = job {
+                            crate::job::close(j);
+                        }
+                    }
+                }
+            }
+            // Отравленный замок — не повод оставить процесс жить: убиваем и уходим.
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&ready_dir);
+                return Err("внутренняя ошибка окна — перезапусти приложение".into());
+            }
+        }
     }
 
-    let ready = wait_ready_file(&ready_path, READY_BUDGET)
-        .ok_or("ядро не запустилось за 30 с — смотри лог, потом перезапусти окно")?;
-    let _ = std::fs::remove_file(&ready_path);
-    let base = ready
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or("ядро не сообщило url")?
-        .to_string();
-    let token_file = ready
-        .get("token_file")
-        .and_then(|v| v.as_str())
-        .ok_or("ядро не сообщило token_file")?;
-    let token = read_token(Path::new(token_file)).ok_or("нет api.token")?;
+    let ready = match wait_ready_file(&ready_path, READY_BUDGET, app) {
+        Ok(v) => v,
+        Err(e) => return Err(abandon(app, &ready_dir, &log_path, e)),
+    };
+    let base = match ready.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u.to_string(),
+        None => {
+            return Err(abandon(
+                app,
+                &ready_dir,
+                &log_path,
+                "ядро не сообщило url".into(),
+            ))
+        }
+    };
+    let token_file = match ready.get("token_file").and_then(|v| v.as_str()) {
+        Some(p) => PathBuf::from(p),
+        None => {
+            return Err(abandon(
+                app,
+                &ready_dir,
+                &log_path,
+                "ядро не сообщило token_file".into(),
+            ))
+        }
+    };
+    // Только обычный файл: через ready-файл можно было подсунуть путь к любому
+    // файлу, и его содержимое ушло бы в окно как токен.
+    let regular = std::fs::symlink_metadata(&token_file)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false);
+    if !regular {
+        return Err(abandon(
+            app,
+            &ready_dir,
+            &log_path,
+            format!("токен ядра не обычный файл: {}", token_file.display()),
+        ));
+    }
+    let token = match read_token(&token_file) {
+        Some(t) => t,
+        None => return Err(abandon(app, &ready_dir, &log_path, "нет api.token".into())),
+    };
+    let _ = std::fs::remove_dir_all(&ready_dir);
 
     // Адрес получен, но HTTP-сервер мог ещё не подняться: окно на пустоту
     // открывать незачем.
-    if !wait_ready(&base, &token, PING_BUDGET) {
-        return Err("ядро не отвечает — перезапусти окно".into());
+    if let Err(e) = wait_ready(&base, &token, PING_BUDGET) {
+        return Err(abandon(app, &ready_dir, &log_path, e));
     }
     Ok(Connection {
         base_url: base,
@@ -143,17 +295,42 @@ pub fn start(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::E
 }
 
 /// Дождаться ready-файла от ядра и разобрать его.
-fn wait_ready_file(path: &Path, budget: Duration) -> Option<serde_json::Value> {
+///
+/// Заодно следим за самим процессом: если ядро умерло на старте (нет прав,
+/// плохой аргумент), ответ известен сразу, и ждать 30 с незачем — человек
+/// получает код возврата, а не «не запустилось за 30 с».
+fn wait_ready_file(
+    path: &Path,
+    budget: Duration,
+    app: &tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
     let until = Instant::now() + budget;
     while Instant::now() < until {
         if let Ok(text) = std::fs::read_to_string(path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                return Some(v);
+                return Ok(v);
             }
+        }
+        if let Some(how) = child_exit(app) {
+            return Err(format!("ядро завершилось на старте ({how})"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    None
+    Err(format!("ядро не сообщило адрес за {} с", budget.as_secs()))
+}
+
+/// Как завершился дочерний процесс, если уже завершился.
+fn child_exit(app: &tauri::AppHandle) -> Option<String> {
+    let state = app.state::<Daemon>();
+    let mut guard = state.child.lock().ok()?;
+    let child = guard.as_mut()?;
+    match child.try_wait() {
+        Ok(Some(status)) => Some(match status.code() {
+            Some(c) => format!("код {c}"),
+            None => "убит сигналом".to_string(),
+        }),
+        _ => None,
+    }
 }
 
 /// Прочитать токен инстанса; если его нет — ядро создаст при старте, поэтому
@@ -166,26 +343,37 @@ fn read_token(path: &Path) -> Option<String> {
 }
 
 /// Ждём, пока ядро ответит на /v1/model: окно не должно открываться на пустоту.
-fn wait_ready(base: &str, token: &str, budget: Duration) -> bool {
+///
+/// Возвращает текст ошибки, а не `bool`: «ядро не отвечает» и «ядро ответило
+/// 401» — разные диагнозы, и второй уводит человека искать сеть вместо токена.
+fn wait_ready(base: &str, token: &str, budget: Duration) -> Result<(), String> {
     let until = Instant::now() + budget;
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(e) => return Err(format!("не создать HTTP-клиент: {e}")),
     };
+    let mut refusal = None;
     while Instant::now() < until {
-        let ok = client
+        match client
             .get(format!("{base}/v1/model"))
             .bearer_auth(token)
             .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        if ok {
-            return true;
+        {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            // 401/403 — токен не тот. Повторять его 20 с незачем.
+            Ok(r) if r.status().is_client_error() => {
+                refusal = Some(r.status().as_u16());
+                break;
+            }
+            Ok(_) | Err(_) => {}
         }
         std::thread::sleep(Duration::from_millis(120));
     }
-    false
+    Err(match refusal {
+        Some(code) => format!("ядро ответило {code}: токен не подходит — перезапусти окно"),
+        None => format!("ядро не отвечает на /v1/model за {} с", budget.as_secs()),
+    })
 }

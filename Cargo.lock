@@ -1567,10 +1567,8 @@ version = "0.2.4"
 dependencies = [
  "axum",
  "futures-util",
- "http-body-util",
  "reqwest",
  "tokio",
- "tower-http",
 ]
 
 [[package]]
@@ -1859,7 +1857,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 

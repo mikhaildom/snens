@@ -40,7 +40,9 @@ pub fn install(app: &tauri::AppHandle) -> tauri::Result<()> {
                 }
             }
             QUIT => {
-                app.state::<crate::Daemon>().stop();
+                // Гасит ядро `RunEvent::Exit` в main.rs — здесь только выход.
+                // Свой `stop()` на UI-потоке морозил бы событийный цикл на
+                // kill+wait (и был бы вторым вызовом того же).
                 app.exit(0);
             }
             _ => {}
@@ -57,8 +59,22 @@ pub fn install(app: &tauri::AppHandle) -> tauri::Result<()> {
         });
     // Иконка окна, а не отдельный файл: она уже собрана из `icons/icon.png`, и
     // вторая её копия в бандле расходилась бы с первой при смене логотипа.
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
+    // Если иконки в бандле нет (запуск не из установленного пакета на Linux),
+    // берём встроенную: без иконки трей может не создаться вообще, а тогда
+    // спрятанное крестиком окно нечем вернуть и нечем выйти.
+    let icon = match app.default_window_icon() {
+        Some(icon) => icon.clone(),
+        // `include_image!` встраивает PNG в бинарь (фича `image-png` не нужна).
+        // Без иконки трей на Linux может не создаться вовсе — а тогда
+        // спрятанное крестиком окно нечем вернуть и нечем выйти.
+        None => tauri::include_image!("icons/icon.png"),
+    };
+    builder = builder.icon(icon);
+    // На macOS иконка в строке меню должна быть template (монохром), иначе
+    // цветной логотип выпадает из оформления системы.
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.icon_as_template(true);
     }
     builder.build(app)?;
     Ok(())

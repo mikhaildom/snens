@@ -27,10 +27,17 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY=1 ;;
         --no-restart) RESTART=0 ;;
-        --service) SERVICE="$2"; shift ;;
-        --repo) REPO="$2"; shift ;;
-        --port) PORT="$2"; shift ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        # Флаги со значением проверяют, что значение вообще есть.
+        --service | --repo | --port)
+            [ $# -ge 2 ] || { echo "$1 требует значение" >&2; exit 2; }
+            case "$1" in
+                --service) SERVICE="$2" ;;
+                --repo) REPO="$2" ;;
+                --port) PORT="$2" ;;
+            esac
+            shift
+            ;;
+        -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "неизвестный флаг: $1" >&2; exit 2 ;;
     esac
     shift
@@ -44,9 +51,19 @@ die() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
 command -v cargo >/dev/null || die "cargo не в PATH"
 command -v systemctl >/dev/null || die "systemctl не в PATH"
+for tool in curl python3 sha256sum install; do
+    command -v "$tool" >/dev/null || die "$tool не в PATH"
+done
 
 # Старый релиз — для отката. Печатаем до любых изменений.
-OLD_TARGET="$(readlink -f "$LAUNCHER" 2>/dev/null || true)"
+# `readlink -f` подставляет и несуществующий последний компонент: на чистой
+# машине `OLD_TARGET` был бы невенным, а откат — на несуществующий путь.
+if [ -L "$LAUNCHER" ]; then
+    OLD_TARGET="$(readlink -f "$LAUNCHER" 2>/dev/null || true)"
+    [ -f "$OLD_TARGET" ] || OLD_TARGET=""
+else
+    OLD_TARGET=""
+fi
 [ -n "$OLD_TARGET" ] && say "текущий launcher → $OLD_TARGET"
 
 if [ "$DRY" = 1 ]; then
@@ -60,8 +77,10 @@ fi
 say "сборка релиза (cargo build --release --bin snens)…"
 ( cd "$REPO" && cargo build --release --bin snens )
 
-TARGET_DIR="$(cd "$REPO" && cargo metadata --no-deps --format-version 1 \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+TARGET_DIR="$( (cd "$REPO" && cargo metadata --no-deps --format-version 1) \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' )" ||
+    die "cargo metadata / python3 не отработали — не нашёл target-каталог"
+[ -n "$TARGET_DIR" ] || die "пустой target-каталог из cargo metadata"
 BIN="$TARGET_DIR/release/snens"
 [ -x "$BIN" ] || die "нет исполняемого $BIN"
 
@@ -79,6 +98,9 @@ install -m 0555 "$BIN" "$RELEASE/snens"
 chmod 0555 "$RELEASE"
 
 say "переключаю launcher $LAUNCHER → $RELEASE/snens"
+# `ln -s` не перезаписывает существующий файл, а `$LAUNCHER.new` мог остаться
+# от прошлого упавшего прогона.
+rm -f "$LAUNCHER.new"
 ln -s "$RELEASE/snens" "$LAUNCHER.new"
 mv -Tf "$LAUNCHER.new" "$LAUNCHER"
 readlink -f "$LAUNCHER" | grep -qx "$RELEASE/snens" || die "launcher не переключился"
@@ -89,11 +111,16 @@ if [ "$RESTART" = 0 ]; then
 fi
 
 say "перезапуск сервиса systemctl --user restart $SERVICE"
-systemctl --user restart "$SERVICE"
+# Провал рестарта не должен обрывать скрипт без подсказки: launcher уже
+# переключён, и человеку нужно знать именно это.
+if ! systemctl --user restart "$SERVICE"; then
+    die "systemctl --user restart $SERVICE упал (launcher уже на $RELEASE/snens) — смотри journalctl --user -u $SERVICE"
+fi
 
+# Старые релизы не удаляем: откат — такая же операция, как деплой, и без
+# прежнего артефакта он невозможен. Каждый релиз — один бинарник (~10 МБ).
 # Ждём готовности: auth-слой отвечает 401 без токена — этого достаточно,
 # чтобы отличить «сервер поднялся» от «порт молчит».
-TOKEN_FILE="$HOME/.local/share/snens/api.token"
 i=0
 while [ "$i" -lt 30 ]; do
     i=$((i + 1))
