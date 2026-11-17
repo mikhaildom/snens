@@ -88,7 +88,7 @@ if [ -z "$CORE" ]; then
   # проверялся бы не тот код.
   # Не жадный `.*`: берём первое вхождение поля, а не последнее.
   TARGET=$(cd "$HERE/.." && cargo metadata --no-deps --format-version 1 2>/dev/null \
-    | sed -n 's/^[^"]*"target_directory":"\([^"]*\)".*/\1/p' | head -1)
+    | tr ',' '\n' | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)
   for c in "${TARGET:-/nonexistent}/debug/snens" "${CARGO_TARGET_DIR:-/nonexistent}/debug/snens"; do
     [ -x "$c" ] && CORE=$c && break
   done
@@ -172,7 +172,8 @@ has '"replaced":1' "$out" "edit: одна замена в событии"
 eqf "$f" "alpha
 BETA
 gamma
-delta" "edit: файл изменён точно (побайтово)"
+delta
+" "edit: файл изменён точно (побайтово, с хвостовым переводом строки)"
 
 ti edit '{"old_string":"нетакого","new_string":"x"}' "$f"
 want 1 "$rc" "edit: нет совпадений — код 1"
@@ -472,11 +473,12 @@ printf 'needle three\n' >"$g/sub/c.rs"
 printf 'needle в служебном каталоге\n' >"$g/target/d.rs"
 printf 'needle \000 бинарник\n' >"$g/bin.dat"
 
-# Находка: формат `путь:строка: текст`, путь относительно переданного корня.
+# Находка: формат `путь:строка: текст`, путь от переданного корня — как у `grep -r`:
+# два корня с одинаковыми именами иначе слились бы в неразличимые строки.
 t grep needle "$g" --glob '*.rs'
 want 0 "$rc" "grep: код 0 на находке"
-has "a.rs:2: needle one" "$out" "grep: формат путь:строка: текст"
-has "sub/c.rs:1: needle three" "$out" "grep: обход рекурсивный"
+has "$g/a.rs:2: needle one" "$out" "grep: формат путь:строка: текст"
+has "$g/sub/c.rs:1: needle three" "$out" "grep: обход рекурсивный"
 case "$out" in
   *target*) bad "grep: каталог target не пропущен" ;;
   *) ok "grep: каталог target пропущен" ;;
@@ -492,18 +494,18 @@ esac
 
 # --no-ignore возвращает служебные каталоги.
 t grep needle "$g" --no-ignore
-has "target/d.rs" "$out" "grep: --no-ignore снимает пропуск каталогов"
+has "$g/target/d.rs" "$out" "grep: --no-ignore снимает пропуск каталогов"
 
 # --context: соседние строки с префиксом `-`.
 t grep 'needle one' "$g/a.rs" --context 1
-has "a.rs:1- alpha" "$out" "grep: контекст с префиксом -"
-has "a.rs:2: needle one" "$out" "grep: совпадение с префиксом :"
+has "$g/a.rs:1- alpha" "$out" "grep: контекст с префиксом -"
+has "$g/a.rs:2: needle one" "$out" "grep: совпадение с префиксом :"
 
 # --files-only: только имена файлов.
 t grep needle "$g" --files-only
-want "a.rs
-b.txt
-sub/c.rs" "$out" "grep: --files-only — одни имена"
+want "$g/a.rs
+$g/b.txt
+$g/sub/c.rs" "$out" "grep: --files-only — одни имена"
 
 # --limit обрезает с явной пометкой.
 t grep needle "$g" --limit 1
