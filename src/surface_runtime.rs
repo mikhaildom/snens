@@ -280,62 +280,13 @@ impl Runtime {
         Ok(())
     }
 
-    /// Записать сессию и все её сообщения с вложениями (грубый, но безопасный
-    /// способ для путей, которые меняют состав очереди целиком).
-    pub fn save_session_messages(&self, id: &str, data: &Store) -> crate::R<()> {
-        let db = self.db();
-        let tx = db.unchecked_transaction()?;
-        if let Some(s) = data.sessions.get(id) {
-            tx.execute(
-                "INSERT INTO sessions(id,surface,state,run_id,context_budget,context_target,parent)\n                 VALUES(?1,?2,?3,?4,?5,?6,?7)\n                 ON CONFLICT(id) DO UPDATE SET surface=excluded.surface,state=excluded.state,\n                   run_id=excluded.run_id,context_budget=excluded.context_budget,\n                   context_target=excluded.context_target,parent=excluded.parent",
-                params![
-                    s.id,
-                    s.surface,
-                    s.state,
-                    s.run_id,
-                    s.context_budget,
-                    s.context_target,
-                    s.parent
-                ],
-            )?;
-        }
-        tx.execute(
-            "DELETE FROM message_attachments WHERE session_id=?1",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
-        if let Some(ms) = data.messages.get(id) {
-            for (seq, m) in ms.iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO messages(session_id,id,command_id,seq,text,state,run_id)\n                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                    params![
-                        id,
-                        m.id,
-                        m.command_id,
-                        seq as i64,
-                        m.text,
-                        m.state,
-                        m.run_id
-                    ],
-                )?;
-                for (aseq, aid) in m.attachment_ids.iter().enumerate() {
-                    tx.execute(
-                        "INSERT INTO message_attachments VALUES(?1,?2,?3,?4)",
-                        params![id, m.id, aid, aseq as i64],
-                    )?;
-                }
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Записать одну сессию и её сообщения — без полной перезаписи store.
     ///
-    /// Отдельно от `save_session_messages`: тот берёт `&Store` целиком, а
-    /// вызывать его приходится после того, как async-замок `data` уже отпущен
+    /// Вызывать его приходится после того, как async-замок `data` уже отпущен
     /// (блокирующий SQLite под ним держал бы всех, кому нужен store). Поэтому
     /// снимок нужной сессии клонируется под замком, а пишется — вне его.
+    /// Берёт `&Store` целиком больше не нужен: полная перезапись на каждый ход —
+    /// это O(объём истории), а нужна запись одной сессии.
     pub fn save_session_and_messages(
         &self,
         id: &str,

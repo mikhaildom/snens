@@ -18,8 +18,7 @@ use crate::{
 };
 use futures_util::StreamExt;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::{Mutex, oneshot};
-
+use tokio::sync::{oneshot, Mutex};
 
 #[test]
 fn session_cleanup_limits_prefer_own_budget_over_config() {
@@ -43,7 +42,10 @@ fn session_cleanup_limits_prefer_own_budget_over_config() {
     // Ноль — это «не задано», а не «уборка на нуле».
     let mut zero = Session::new("s", "telegram");
     zero.context_budget = Some(0);
-    assert_eq!(session_cleanup_limits(&cfg, Some(&zero)), (500_000, 350_000));
+    assert_eq!(
+        session_cleanup_limits(&cfg, Some(&zero)),
+        (500_000, 350_000)
+    );
 }
 
 #[test]
@@ -82,20 +84,17 @@ fn review_marker_neither_counts_as_a_turn_nor_moves_the_boundary() {
     lines.push("{\"kind\":\"review\",\"ts\":20,\"review_id\":\"s-review\",\"turns\":20,\"text\":\"саморевью · 20 ходов\"}".to_string());
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 
-    let turns = session_turns(&cfg, "s");
+    let turns = session_turns(&cfg, "s").expect("журнал читается");
     assert_eq!(turns, 20, "маркер посчитался ходом");
     assert!(review_due(20, turns, 0), "маркер съел границу 0");
     // Ревью прошло на 20: отметка в журнале не делает ревью «пора» снова.
-    assert!(
-        !review_due(20, turns, 20),
-        "маркер сдвинул границу вверх"
-    );
+    assert!(!review_due(20, turns, 20), "маркер сдвинул границу вверх");
     // +20 ходов после отметки — снова пора.
     assert!(review_due(20, 40, 20));
 
     // Запись без полей (ручная/будущая правка формата) не роняет чтение.
     std::fs::write(&path, "{\"kind\":\"review\"}\n").unwrap();
-    assert_eq!(session_turns(&cfg, "s"), 0);
+    assert_eq!(session_turns(&cfg, "s"), Some(0));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -125,11 +124,9 @@ async fn failed_launch_clears_running_state_and_cancels_queued_messages() {
     assert_eq!(data.sessions["a"].state, "error");
     assert_eq!(data.sessions["a"].run_id, None);
     assert_eq!(data.messages["a"][0].state, "cancelled");
-    assert!(
-        data.events["a"]
-            .iter()
-            .any(|event| event.kind == "run.finished")
-    );
+    assert!(data.events["a"]
+        .iter()
+        .any(|event| event.kind == "run.finished"));
     drop(data);
     drop(runtime);
     std::fs::remove_dir_all(dir).unwrap();
@@ -258,11 +255,10 @@ async fn after_cursor_and_lag_replay_are_session_scoped_and_gapless() {
         got.push((event.session_id, event.seq));
     }
     assert_eq!(got.len(), 1097);
-    assert!(
-        got.iter()
-            .enumerate()
-            .all(|(index, (id, seq))| id == "a" && *seq == index as u64 + 4)
-    );
+    assert!(got
+        .iter()
+        .enumerate()
+        .all(|(index, (id, seq))| id == "a" && *seq == index as u64 + 4));
 
     // Replay drained the gap; the same subscription must continue live,
     // including while traffic from the other session keeps arriving.
@@ -282,4 +278,3 @@ async fn after_cursor_and_lag_replay_are_session_scoped_and_gapless() {
     drop(runtime);
     std::fs::remove_dir_all(dir).unwrap();
 }
-

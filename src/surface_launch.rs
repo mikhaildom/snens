@@ -31,7 +31,7 @@ where
 }
 
 pub(super) async fn finalize_launch_error(s: &Arc<Runtime>, id: &str, run: &str, message: &str) {
-    {
+    let snapshot = {
         let mut data = s.data.lock().await;
         if let Some(session) = data.sessions.get_mut(id) {
             session.state = "error".into();
@@ -46,7 +46,16 @@ pub(super) async fn finalize_launch_error(s: &Arc<Runtime>, id: &str, run: &str,
         {
             queued.state = "cancelled".into();
         }
-        let _ = s.save_session_messages(id, &data);
+        let snapshot = data.sessions.get(id).cloned();
+        drop(data);
+        snapshot
+    };
+    // Запись и публикация карточки — как в успешном пути: без `publish_session`
+    // подписчики `GET /v1/events` продолжали показывать сессию `running`, хотя
+    // ход уже закончился ошибкой.
+    if let Some(live) = snapshot {
+        let _ = s.save_session(&live);
+        s.publish_session(live);
     }
     s.controls.lock().await.remove(id);
     let _ = s
@@ -115,7 +124,8 @@ pub(super) async fn launch(
             let key = format!("{broker_id}/{broker_run}/{}", req.call_id);
             {
                 let mut d = broker_s.data.lock().await;
-                let payload = serde_json::json!({"status":"pending","name":req.name,"args":req.args});
+                let payload =
+                    serde_json::json!({"status":"pending","name":req.name,"args":req.args});
                 d.tool_requests.insert(key.clone(), payload.clone());
                 if broker_s.save_tool_request(&key, &payload).is_err() {
                     d.tool_requests.remove(&key);
@@ -323,19 +333,26 @@ pub(super) async fn launch(
                 serde_json::json!({"status":status,"error":error}),
             )
             .await;
-        s.controls.lock().await.remove(&id);
-        let mut d = s.data.lock().await;
-        if let Some(x) = d.sessions.get_mut(&id) {
-            x.state = "idle".into();
-            x.run_id = None
-        }
-        if let Some(live) = d.sessions.get(&id) {
-            let _ = s.save_session(live);
-        }
-        if let Some(live) = d.sessions.get(&id).cloned() {
+        // Порядок важен: сперва сессия становится `idle`, и только потом снимается
+        // контроль. Наоборот было окно, в котором `message` уже видел `running`,
+        // но `controls.get` возвращал `None` — вход терялся молча, а клиент ждал
+        // `applied`, которого никогда не будет.
+        let snapshot = {
+            let mut d = s.data.lock().await;
+            if let Some(x) = d.sessions.get_mut(&id) {
+                x.state = "idle".into();
+                x.run_id = None
+            }
+            let snapshot = d.sessions.get(&id).cloned();
+            drop(d);
+            snapshot
+        };
+        // Запись — без замка store: блокирующий SQLite под ним держал всё.
+        if let Some(live) = snapshot {
+            let _ = s.save_session(&live);
             s.publish_session(live);
         }
-        drop(d);
+        s.controls.lock().await.remove(&id);
         // Ход завершён и сессия снова idle — планируем авторевью после простоя.
         // Считаем только успешные ходы: отменённый/ошибочный ход ревью не стоит.
         if status == "ok" {
