@@ -140,6 +140,18 @@ impl Args {
     pub fn num(&self, name: &str, def: f64) -> f64 {
         self.flag(name).and_then(|v| v.parse().ok()).unwrap_or(def)
     }
+
+    /// Число с проверкой: отрицательное, NaN и inf — ошибка аргументов, а не
+    /// тихое 0/усечение (`--timeout 0.5` раньше давало нулевой таймаут).
+    pub fn num_checked(&self, name: &str, def: f64, lo: f64, hi: f64) -> Result<f64, String> {
+        let v = self.num(name, def);
+        if !v.is_finite() || v < lo || v > hi {
+            return Err(format!(
+                "web: --{name} ждёт число {lo}..{hi}, получено {v}"
+            ));
+        }
+        Ok(v)
+    }
 }
 
 /// Флаги-переключатели: значения не принимают.
@@ -281,7 +293,7 @@ pub fn live(args: &Args) -> Result<Live, String> {
         )
     })?;
     let host_header = format!("127.0.0.1:{}", ep.remote_port);
-    let timeout = args.num("timeout", 30.0);
+    let timeout = args.num_checked("timeout", 30.0, 0.1, 3600.0)?;
     // Два пути к вкладке. Обычный Chrome пускает по прямому ws вкладки; Chrome
     // ≥144 в режиме одобрения отвечает на него 403 и пускает только через
     // сессию (`Target.attachToTarget` в ws браузера).
@@ -495,24 +507,39 @@ fn cmd_use(args: &Args) -> Result<(), String> {
         return Err("не подключено: сначала `web connect`".into());
     }
     let targets = page_targets(&ep)?;
-    let tab = if let Ok(n) = want.parse::<usize>() {
-        targets
-            .get(n.saturating_sub(1))
+    // Число — номер из `web tabs` (нумерация с 1); `0` — ошибка, а не «первая».
+    // Иначе ищем по префиксу id: hex-идентификаторы бывают из одних цифр.
+    let as_number = want.parse::<usize>().ok().filter(|n| *n > 0);
+    let tab = match as_number {
+        Some(n) => targets
+            .get(n - 1)
             .and_then(|t| t.get("id").and_then(Value::as_str))
-            .ok_or_else(|| format!("нет вкладки №{n}"))?
-            .to_string()
-    } else {
-        targets
-            .iter()
-            .find(|t| {
-                t.get("id")
-                    .and_then(Value::as_str)
-                    .map(|id| id.starts_with(want.as_str()))
-                    .unwrap_or(false)
-            })
-            .and_then(|t| t.get("id").and_then(Value::as_str))
-            .ok_or_else(|| format!("нет вкладки с id, начинающимся на {want}"))?
-            .to_string()
+            .ok_or_else(|| {
+                format!(
+                    "нет вкладки №{n} (в tabs их {}; нумерация с 1)",
+                    targets.len()
+                )
+            })?
+            .to_string(),
+        None => {
+            // Сначала id, потом номер: если число не совпало как номер, пробуем id.
+            let by_id = targets
+                .iter()
+                .find(|t| {
+                    t.get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| id.starts_with(want.as_str()))
+                        .unwrap_or(false)
+                })
+                .and_then(|t| t.get("id").and_then(Value::as_str));
+            match by_id {
+                Some(id) => id.to_string(),
+                None if want == "0" => {
+                    return Err("web use: нумерация вкладок начинается с 1".into())
+                }
+                None => return Err(format!("нет вкладки с id, начинающимся на {want}")),
+            }
+        }
     };
     state::save_target(
         state::Target {
@@ -540,7 +567,7 @@ fn cmd_open(args: &Args) -> Result<(), String> {
         // Новая вкладка создаётся браузерным endpoint'ом, а не вкладочным:
         // Target.createTarget доступен только там.
         let ws = l.ep.browser_ws()?;
-        let mut b = cdp::Cdp::connect(&ws, args.num("timeout", 30.0))?;
+        let mut b = cdp::Cdp::connect(&ws, args.num_checked("timeout", 30.0, 0.1, 3600.0)?)?;
         let r = b.call("Target.createTarget", json!({"url": url}))?;
         let id = r
             .get("targetId")
@@ -592,7 +619,12 @@ fn report_page(cdp: &mut cdp::Cdp, verb: &str) -> Result<(), String> {
 fn cmd_snap(args: &Args) -> Result<(), String> {
     let mut l = live(args)?;
     // --full: дерево без ограничения глубины. Иначе флаг из справки ничего не делал.
-    let depth = args.num("depth", 30.0) as usize;
+    // Отрицательное/дробное значение раньше молча становилось 0: проверяем.
+    let depth_raw = args.num("depth", 30.0);
+    if !depth_raw.is_finite() || depth_raw < 1.0 {
+        return Err(format!("web: --depth ждёт положительное число, получено {depth_raw}"));
+    }
+    let depth = depth_raw as usize;
     let depth = if args.on("full") {
         usize::MAX
     } else {
@@ -626,7 +658,7 @@ fn cmd_snap(args: &Args) -> Result<(), String> {
 
 fn cmd_text(args: &Args) -> Result<(), String> {
     let mut l = live(args)?;
-    let limit = args.num("limit", 4000.0) as usize;
+    let limit = args.num_checked("limit", 4000.0, 1.0, 1e7)? as usize;
     let v = l.cdp.eval(
         "(() => { const b = document.body; if (!b) return ''; \
          const t = b.innerText || b.textContent || ''; return t.replace(/\\n{3,}/g, '\\n\\n').trim(); })()",
@@ -821,7 +853,7 @@ fn cmd_disconnect(_args: &Args) -> Result<(), String> {
 fn cmd_close(args: &Args) -> Result<(), String> {
     let l = live(args)?;
     let ws = l.ep.browser_ws()?;
-    let mut b = cdp::Cdp::connect(&ws, args.num("timeout", 30.0))?;
+    let mut b = cdp::Cdp::connect(&ws, args.num_checked("timeout", 30.0, 0.1, 3600.0)?)?;
     b.call("Target.closeTarget", json!({"targetId": l.tab}))?;
     state::clear_target();
     println!("вкладка закрыта, привязка снята");
@@ -863,26 +895,46 @@ fn cmd_shot(args: &Args) -> Result<(), String> {
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     const NL: u8 = 10;
     const CR: u8 = 13;
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    // `=` только в хвосте, длина кратна 4, остаточные биты нулевые: иначе
+    // обрезанный/порченный base64 давал бы валидный на вид, но битый файл.
+    let bad = || "CDP: не base64 в data".to_string();
+    let body: Vec<u8> = s.bytes().filter(|c| *c != NL && *c != CR).collect();
+    if body.is_empty() || !body.len().is_multiple_of(4) {
+        return Err(bad());
+    }
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut bits = 0;
-    for c in s.bytes() {
+    let mut pad = false;
+    for (i, c) in body.iter().copied().enumerate() {
+        if c == b'=' {
+            if i < body.len() - 2 {
+                return Err(bad());
+            }
+            pad = true;
+            continue;
+        }
+        if pad {
+            return Err(bad());
+        }
         let v = match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
-            b'=' => continue,
-            NL | CR => continue,
-            _ => return Err("CDP: не base64 в data".into()),
+            _ => return Err(bad()),
         } as u32;
         acc = (acc << 6) | v;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
             out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
         }
+    }
+    if bits > 0 && acc != 0 {
+        return Err(bad());
     }
     Ok(out)
 }

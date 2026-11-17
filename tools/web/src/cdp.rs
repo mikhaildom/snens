@@ -50,6 +50,10 @@ pub fn http_get_host(
     host_header: &str,
     path: &str,
 ) -> Result<String, String> {
+    // path и Host — публичные входы: `\r\n` дописал бы в запрос лишние заголовки.
+    if path.contains(['\r', '\n', ' ']) || host_header.contains(['\r', '\n', ' ']) {
+        return Err("CDP http: в path/Host недопустимые символы".into());
+    }
     let addr = format!("{host}:{port}");
     let sa = addr
         .to_socket_addrs()
@@ -171,17 +175,19 @@ impl Endpoint {
     /// это в `live()`. Здесь возвращается адрес, который может не открыться —
     /// и это не ошибка этой функции.
     pub fn browser_ws(&self) -> Result<String, String> {
-        if let Ok(ws) = self.ws_url(None) {
-            return Ok(ws);
-        }
+        // Ошибку пробы сохраняем и показываем: иначе причина (отказ соединения,
+        // 403 из-за чужого Host, битый /json/version) прячется за общим текстом.
+        let probe = match self.ws_url(None) {
+            Ok(ws) => return Ok(ws),
+            Err(e) => e,
+        };
         match &self.browser_path {
             Some(p) => Ok(format!("ws://{}:{}{}", self.host, self.port, p)),
-            None => Err(
-                "CDP: браузерный endpoint недоступен. Chrome ≥144 в режиме одобрения не отдаёт \
-                 /json/*; путь берётся из файла DevToolsActivePort — проверь, что `web connect --tunnel` \
-                 видит его на той стороне"
-                    .into(),
-            ),
+            None => Err(format!(
+                "CDP: браузерный endpoint недоступен ({probe}). Chrome ≥144 в режиме одобрения \
+                 не отдаёт /json/*; путь берётся из файла DevToolsActivePort — проверь, что \
+                 `web connect --tunnel` видит его на той стороне"
+            )),
         }
     }
 

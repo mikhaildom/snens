@@ -52,7 +52,7 @@ pub struct Snap {
     pub text: String,
     pub refs: Vec<Ref>,
     pub total: usize,
-    pub kept: usize,
+
     pub title: String,
     pub url: String,
 }
@@ -167,7 +167,7 @@ pub fn take(cdp: &mut Cdp, depth_cap: usize) -> Result<Snap, String> {
         }
         walk(n, &by_id, 0, depth_cap, &mut counter, &mut snap);
     }
-    snap.kept = snap.refs.len();
+
     Ok(snap)
 }
 

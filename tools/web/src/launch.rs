@@ -19,29 +19,10 @@ fn ps_encoded(script: &str) -> String {
     for u in script.encode_utf16() {
         bytes.extend_from_slice(&u.to_le_bytes());
     }
-    base64(&bytes)
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if c.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    // Готовая кодировка из ядра: своя копия base64 уже была источником тонких
+    // ошибок (паддинг, вариант алфавита).
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(&bytes)
 }
 
 /// Запустить powershell-скрипт на той стороне.
@@ -87,15 +68,20 @@ fn ssh<A: AsRef<str>>(host: &str, cmd: A) -> Result<String, String> {
         .arg(cmd.as_ref())
         .output()
         .map_err(|e| format!("ssh {host}: {e}"))?;
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    // Нормализуем вывод обеих сторон до проверки статуса: иначе на пути ошибки
+    // в сообщение попадали \r от Windows.
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+        let err = String::from_utf8_lossy(&out.stderr).replace('\r', "");
         return Err(format!(
             "на {host} команда не прошла: {}",
-            err.trim().lines().last().unwrap_or("причина не сказана")
+            err
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("причина не сказана")
         ));
     }
-    text = text.replace('\r', "");
     Ok(text)
 }
 
@@ -223,7 +209,7 @@ pub fn pick_port(host: &str, from: u16) -> Result<u16, String> {
 pub fn start_visible(host: &str, port: u16, profile: Option<&str>) -> Result<(), String> {
     if remote_os(host)? != "windows" {
         return Err(
-            "видимое окно сейчас поддержано на Windows (через schtasks /IT). На unix запускай              Chrome внутри своей X/Wayland-сессии — там окно видно по определению"
+            "видимое окно сейчас поддержано на Windows (через schtasks /IT). На unix запускай Chrome внутри своей X/Wayland-сессии — там окно видно по определению"
                 .into(),
         );
     }

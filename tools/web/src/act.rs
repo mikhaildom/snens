@@ -88,7 +88,9 @@ fn activate(l: &mut crate::Live) -> Result<(), String> {
             eprintln!(
                 "внимание: вкладка {} сообщает hidden — ввод может уйти в другую вкладку. \
                  Держи одну вкладку на сессию или работай в headed-браузере",
-                &l.tab[..8.min(l.tab.len())]
+                // По символам, а не байтам: срез по байту паниковал бы на
+                // многобайтовом id — ровно на пути предупреждения.
+                l.tab.chars().take(8).collect::<String>()
             );
         }
     }
@@ -163,15 +165,24 @@ fn apply(
             Ok(format!("клавиша {combo}"))
         }
         "scroll" => {
+            // Кривое значение — ошибка, а не тихие 600 px: иначе вызов выглядит
+            // успешным, хотя прокрутил не туда (или не туда, куда просили).
             let dy = match arg {
-                Value::Number(n) => n.as_f64().unwrap_or(600.0),
+                Value::Number(n) => n
+                    .as_f64()
+                    .ok_or_else(|| format!("act scroll: не число: {arg}"))?,
                 Value::String(s) => match s.as_str() {
                     "up" => -600.0,
                     "down" => 600.0,
-                    other => other.parse().unwrap_or(600.0),
+                    other => other
+                        .parse()
+                        .map_err(|_| format!("act scroll: ждёт up|down|число, получено {other}"))?,
                 },
-                Value::Object(o) => o.get("dy").and_then(Value::as_f64).unwrap_or(600.0),
-                _ => 600.0,
+                Value::Object(o) => o
+                    .get("dy")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| format!("act scroll: нет числового dy: {arg}"))?,
+                _ => return Err(format!("act scroll: непонятное значение {arg}")),
             };
             cdp.call(
                 "Input.dispatchMouseEvent",
@@ -191,7 +202,10 @@ fn apply(
             Ok(format!("переход {url}"))
         }
         "wait" => {
-            let ms = arg.as_u64().unwrap_or(500).min(30_000);
+            let ms = arg
+                .as_u64()
+                .ok_or_else(|| format!("act wait: ждёт целое число миллисекунд, получено {arg}"))?
+                .min(30_000);
             std::thread::sleep(std::time::Duration::from_millis(ms));
             Ok(format!("пауза {ms} мс"))
         }
@@ -398,7 +412,8 @@ fn settle(l: &mut crate::Live) {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
-        if url != old && !url.is_empty() {
+        // `old` — None значит «снимка не было»: тогда ждать нечего.
+        if old.as_deref() != Some(url.as_str()) && !url.is_empty() && old.is_some() {
             l.cdp
                 .wait_ready(std::time::Duration::from_millis(3000))
                 .ok();
@@ -422,7 +437,7 @@ fn delta(l: &mut crate::Live) -> Result<(), String> {
     let path = state::save_page(&l.tab, &s.text)?;
     state::save_url(&l.tab, &s.url);
     let refs_path = state::save_refs(&l.tab, &s.refs)?;
-    if prev_url != s.url && !before.is_empty() {
+    if prev_url.as_deref() != Some(s.url.as_str()) && !before.is_empty() && prev_url.is_some() {
         // Ушли на другую страницу: «дельта» между разными документами — шум.
         // Печатаем компактную сводку новой страницы, ссылки уже перезаписаны.
         println!(

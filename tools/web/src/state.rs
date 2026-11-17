@@ -172,21 +172,41 @@ pub fn save_refs(tab: &str, refs: &[Ref]) -> Result<PathBuf, String> {
 pub fn load_refs(tab: &str) -> Result<Vec<Ref>, String> {
     let tab = &safe_tab(tab);
     let p = dir().join(tab).join("refs.json");
-    let text = fs::read_to_string(&p)
-        .map_err(|e| format!("нет адресов для вкладки {tab} ({}): сначала `web snap`", e))?;
-    serde_json::from_str(&text).map_err(|e| format!("refs: {e}"))
+    let text = match fs::read_to_string(&p) {
+        Ok(t) => t,
+        // «Нет снимка» и «снимок не читается» — разные болезни: во втором случае
+        // совет сделать snap не поможет.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "нет адресов для вкладки {tab} ({}): сначала `web snap`",
+                p.display()
+            ))
+        }
+        Err(e) => return Err(format!("{}: {e}", p.display())),
+    };
+    serde_json::from_str(&text).map_err(|e| format!("{}: {e} — сделай `web snap` заново", p.display()))
 }
 
 /// URL, к которому относится последний снимок: по нему отличаем «страница та
 /// же» от «мы уже на другой, просто снимок сделан про старую».
+/// Сохранить URL последнего снимка.
 pub fn save_url(tab: &str, url: &str) {
     let d = dir().join(safe_tab(tab));
     let _ = fs::create_dir_all(&d);
     let _ = write_atomic(&d.join("url.txt"), url);
 }
 
-pub fn load_url(tab: &str) -> String {
-    fs::read_to_string(dir().join(safe_tab(tab)).join("url.txt")).unwrap_or_default()
+/// URL последнего снимка. `None` — файла нет; ошибку чтения (права, EISDIR)
+/// тоже отдаём наружу: молча пустая строка меняла поведение `settle()`.
+pub fn load_url(tab: &str) -> Option<String> {
+    match fs::read_to_string(dir().join(safe_tab(tab)).join("url.txt")) {
+        Ok(u) => Some(u),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("state: url.txt не читается: {e}");
+            None
+        }
+    }
 }
 
 pub fn save_page(tab: &str, text: &str) -> Result<PathBuf, String> {
