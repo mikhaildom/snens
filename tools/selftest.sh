@@ -10,6 +10,14 @@ fails=0
 ok() { echo "ok: $1"; }
 bad() { echo "FAIL: $1"; fails=$((fails + 1)); }
 want() { [ "$1" = "$2" ] && ok "$3" || bad "$3 (ожидалось '$1', получено '$2')"; }
+# eqf <файл> <ожидаемый текст> <метка> — сравнение побайтово: `$(cat …)` срезает
+# хвостовые переводы строк, и «файл без последнего \n» иначе проходит незамеченным.
+eqf() {
+  printf '%s' "$2" >"$TMP/expect"
+  if cmp -s "$TMP/expect" "$1"; then ok "$3"; else
+    bad "$3 (содержимое не совпало побайтово: $(wc -c <"$1") Б против $(wc -c <"$TMP/expect") Б)"
+  fi
+}
 has() {
   case "$2" in
     *"$1"*) ok "$3" ;;
@@ -18,11 +26,13 @@ has() {
 }
 
 # t <тул> [args...]  → $out, $err, $rc
+# stdin закрыт: иначе тул без stdin-аргументов (edit) читал бы stdin самого
+# скрипта — в терминале это повисание, из пайпа — съеденные данные вызывающего.
 t() {
   name=$1
   shift
   rc=0
-  out=$("$HERE/$name/$name" "$@" 2>"$TMP/err") || rc=$?
+  out=$("$HERE/$name/$name" "$@" </dev/null 2>"$TMP/err") || rc=$?
   err=$(cat "$TMP/err")
 }
 
@@ -33,7 +43,7 @@ th() {
   name=$2
   shift 2
   rc=0
-  out=$(HOME="$home" "$HERE/$name/$name" "$@" 2>"$TMP/err") || rc=$?
+  out=$(HOME="$home" "$HERE/$name/$name" "$@" </dev/null 2>"$TMP/err") || rc=$?
   err=$(cat "$TMP/err")
 }
 
@@ -76,13 +86,16 @@ if [ -z "$CORE" ]; then
   # Каталог сборки берём у самого cargo: target-dir живёт в .cargo/config.toml
   # репозитория, и без этого брался бинарь из PATH — то есть production, а
   # проверялся бы не тот код.
+  # Не жадный `.*`: берём первое вхождение поля, а не последнее.
   TARGET=$(cd "$HERE/.." && cargo metadata --no-deps --format-version 1 2>/dev/null \
-    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    | sed -n 's/^[^"]*"target_directory":"\([^"]*\)".*/\1/p' | head -1)
   for c in "${TARGET:-/nonexistent}/debug/snens" "${CARGO_TARGET_DIR:-/nonexistent}/debug/snens"; do
     [ -x "$c" ] && CORE=$c && break
   done
   if [ -z "$CORE" ]; then
-    echo "selftest: ядро не собрано (cargo build) — проверки схем пропущены" >&2
+    # Молчаливый пропуск давал зелёный прогон без проверок контракта для модели.
+    echo "selftest: ядро не собрано (cargo build) — проверки схем не выполнены" >&2
+    bad "schema: ядро не найдено — проверки definitions пропущены (собери cargo build или задай SNENS_SELFTEST_BIN)"
   fi
 fi
 if [ -n "$CORE" ]; then
@@ -146,20 +159,20 @@ rm -f "$homefile"
 # Потеряется — требование stdin пропадёт из схемы тула.
 t edit --help
 # Правила матчинга — часть контракта тула: по хелпу модель решает, как дробить
-# правку. Проверяются до t has, который перезаписывает $out.
+# правку. Проверяются сразу: следующий вызов t перезаписывает $out.
 help=$out
 has "хвостовых пробелов" "$help" "edit: хелп объявляет fuzzy-матчинг"
 has "ИСХОДНОГО файла" "$help" "edit: хелп объявляет батч от исходного файла"
-t has "stdin" "$help" "edit: хелп объявляет stdin (признак для реестра)"
+has "stdin" "$help" "edit: хелп объявляет stdin (признак для реестра)"
 
 JSON='{"old_string":"beta","new_string":"BETA"}'
 ti edit "$JSON" "$f"
 want 0 "$rc" "edit: код 0"
 has '"replaced":1' "$out" "edit: одна замена в событии"
-want "alpha
+eqf "$f" "alpha
 BETA
 gamma
-delta" "$(cat "$f")" "edit: файл изменён точно"
+delta" "edit: файл изменён точно (побайтово)"
 
 ti edit '{"old_string":"нетакого","new_string":"x"}' "$f"
 want 1 "$rc" "edit: нет совпадений — код 1"
@@ -199,7 +212,9 @@ has "-- " "$err" "edit: --dry-run печатает участок"
 
 chmod 600 "$TMP/dry.txt"
 ti edit '{"old_string":"one","new_string":"one2"}' "$TMP/dry.txt"
-want "600" "$(stat -c %a "$TMP/dry.txt")" "edit: права файла сохраняются"
+# stat -c — GNU; на BSD его нет, поэтому есть фолбэк на -f %Lp.
+perms=$(stat -c %a "$TMP/dry.txt" 2>/dev/null || stat -f %Lp "$TMP/dry.txt" 2>/dev/null || echo "?")
+want "600" "$perms" "edit: права файла сохраняются"
 
 printf 'one\ntwo\nthree\n' >"$TMP/multi.txt"
 ti edit '{"edits":[{"old_string":"one","new_string":"1"},{"old_string":"three","new_string":"3"}]}' "$TMP/multi.txt"
@@ -290,13 +305,13 @@ want 1 "$rc" "edit: пустой stdin — код 1"
 # ---- write ----
 # Суть «содержимое берётся со stdin» — тот же признак для реестра.
 t write --help
-t has "stdin" "$out" "write: хелп объявляет stdin (признак для реестра)"
+has "stdin" "$out" "write: хелп объявляет stdin (признак для реестра)"
 
 newf=$TMP/sub/n.txt
 ti write "привет" "$newf"
 want 0 "$rc" "write: код 0"
 has '"created":true' "$out" "write: created в событии"
-want "привет" "$(cat "$newf")" "write: создаёт каталоги и пишет"
+eqf "$newf" "привет" "write: создаёт каталоги и пишет (побайтово)"
 
 ti write "ещё" "$newf"
 has '"overwrote":true' "$out" "write: перезапись отмечена"
@@ -333,7 +348,7 @@ want 2 "$rc" "memory: forget без uid — код 2"
 # Пустой ход — не работа для памяти: код 0 и ничего не обещаем.
 ti memory '{"user":"","assistant":""}' retain
 want 0 "$rc" "memory: пустой ход — код 0"
-has "" "$out" "memory: пустой ход — молчит"
+want "" "$out" "memory: пустой ход — молчит"
 
 # Мусор на stdin — ошибка ввода, а не повод работать.
 ti memory 'не json' retain
@@ -543,14 +558,16 @@ want 1 "$rc" "agent: wait несуществующего — код 1"
 # status — неблокирующий снимок по логу; ждать живого подагента не нужно.
 mkdir -p "$TMP/sessions"
 printf '{"kind":"assistant","ts":%s,"text":null,"tool_calls":[{"id":"c1","name":"run","args":"{\\"command\\":\\"echo hi\\"}"}]}\n' "$(date +%s)" >"$TMP/sessions/kid.jsonl"
-SNENS_SESSIONS_DIR=$TMP/sessions t agent status kid
+SNENS_SESSIONS_DIR=$TMP/sessions; export SNENS_SESSIONS_DIR
+t agent status kid
 want 0 "$rc" "agent: status — код 0"
 has "ходов: 1" "$out" "agent: status — число ходов"
 has "echo hi" "$out" "agent: status — последний вызов с хинтом"
 has "с назад" "$out" "agent: status — свежесть лога"
 
 # Таймаут wait — не ошибка: код 3 и снимок, а не «сбой» и не тишина.
-SNENS_SESSIONS_DIR=$TMP/sessions t agent wait kid --timeout 1 --progress 5
+SNENS_SESSIONS_DIR=$TMP/sessions; export SNENS_SESSIONS_DIR
+t agent wait kid --timeout 1 --progress 5
 want 3 "$rc" "agent: wait по таймауту — код 3, а не 1"
 has "ещё работает" "$err" "agent: wait по таймауту — говорит, что жив"
 
@@ -570,11 +587,13 @@ want 0 "$rc" "genui: --help — код 0"
 has "genui check" "$out" "genui: --help описывает проверку"
 
 ghome=$TMP/genui-lib
-SNENS_GENUI_DIR=$ghome t genui new card
+SNENS_GENUI_DIR=$ghome; export SNENS_GENUI_DIR
+t genui new card
 want 0 "$rc" "genui: new — код 0"
 [ -f "$TMP/genui-lib/components/card.js" ] && ok "genui: new создал компонент" \
   || bad "genui: new не создал компонент"
-SNENS_GENUI_DIR=$ghome t genui list
+t genui list
+unset SNENS_GENUI_DIR
 want 0 "$rc" "genui: list — код 0"
 has "my-card" "$out" "genui: list показывает новый тег"
 
