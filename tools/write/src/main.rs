@@ -58,24 +58,27 @@ fn set_mode(_p: &std::path::Path, _mode: Option<u32>) {}
 
 /// Последний байт файла — перевод строки? Нечитаемый файл считаем разделённым:
 /// лишняя пустая строка безвредна, склейка — нет.
-fn ends_with_newline(path: &str) -> bool {
-    match std::fs::File::open(path) {
-        Ok(mut f) => {
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len == 0 {
-                return true;
-            }
-            if std::io::Seek::seek(&mut f, std::io::SeekFrom::End(-1)).is_err() {
-                return true;
-            }
-            let mut b = [0u8; 1];
-            match f.read_exact(&mut b) {
-                Ok(()) => b[0] == b'\n',
-                Err(_) => true,
-            }
-        }
-        Err(_) => true,
+/// Последний байт открытого файла — перевод строки? Читаем из того же дескриптора,
+/// куда будем писать: так решение о разделителе не зависит от гонки с другим
+/// писателем.
+fn handle_ends_with_newline(f: &mut std::fs::File) -> bool {
+    use std::io::Seek;
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return true;
     }
+    let Ok(pos) = f.stream_position() else {
+        return true;
+    };
+    if f.seek(std::io::SeekFrom::End(-1)).is_err() {
+        return true;
+    }
+    let mut b = [0u8; 1];
+    let nl = matches!(f.read_exact(&mut b), Ok(()) if b[0] == b'\n');
+    // Возвращаем указатель: файл открыт в режиме append, но позиция нужна
+    // предсказуемая для последующей записи.
+    let _ = f.seek(std::io::SeekFrom::Start(pos));
+    nl
 }
 
 /// temp в том же каталоге + rename: обрыв на середине не оставит обрезанный файл.
@@ -212,7 +215,7 @@ fn main() {
     let path = &resolve_symlink(path)[..];
     let meta = std::fs::metadata(path).ok();
     let existed = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
-    let before = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mut before = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mode = meta.as_ref().and_then(mode_of);
 
     if let Some(dir) = parent(path) {
@@ -224,17 +227,29 @@ fn main() {
     }
     let mut separated = false;
     if append {
+        // read тоже нужен: хвост файла проверяем через этот же дескриптор.
         let mut f = std::fs::OpenOptions::new()
+            .read(true)
             .create(true)
             .append(true)
             .open(path)
             .unwrap_or_else(|e| die(format!("write: {path}: {e}")));
+        // Длину и «есть ли перевод строки в хвосте» берём уже из открытого файла:
+        // отдельные вызовы до open оставляли гонку с другим писателем, и проверка
+        // длины после записи падала на чужом байте, уже записав своё.
+        if let Ok(m) = f.metadata() {
+            before = m.len();
+        }
         // Хвост без перевода строки + блок без него = склейка строк
         // (`}/// комментарий`), которую видно только сборкой. Разделитель
         // дописываем сами — вызывающему не надо про него помнить.
         // Пустой вход ничего не пишет и не должен менять файл: иначе `--append`
         // без данных дописывал синтетический перевод строки.
-        if !data.is_empty() && before > 0 && !data.starts_with(b"\n") && !ends_with_newline(path) {
+        if !data.is_empty()
+            && before > 0
+            && !data.starts_with(b"\n")
+            && !handle_ends_with_newline(&mut f)
+        {
             f.write_all(b"\n")
                 .unwrap_or_else(|e| die(format!("write: {path}: {e}")));
             separated = true;
