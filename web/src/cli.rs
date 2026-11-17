@@ -12,7 +12,7 @@ pub const HELP: &str = "\
 snens-web — отдаёт собранный веб-клиент и проксирует /api в ядро snens.
 
   snens-web [--listen 127.0.0.1:5180] [--api http://127.0.0.1:7420]
-            [--token-file PATH] [--dist DIR] [--no-proxy]
+            [--token-file PATH] [--dist DIR] [--no-proxy] [--allow-public]
 
   --listen ADDR      где слушать (по умолчанию 127.0.0.1:5180, SNENS_WEB_LISTEN)
   --api URL          адрес ядра (по умолчанию http://127.0.0.1:7420, SNENS_API_BASE)
@@ -21,6 +21,9 @@ snens-web — отдаёт собранный веб-клиент и прокс�
   --dist DIR         каталог собранного клиента (по умолчанию ./web рядом с
                      бинарём, SNENS_WEB_DIST)
   --no-proxy         не проксировать /api: клиент ходит в ядро сам (пейринг)
+  --allow-public     разрешить не-loopback адрес в режиме прокси (по умолчанию —
+                     запрещено: прокси подставляет токен ядра, и порт наружу =
+                     полный доступ к API для любого)
 
 Прокси нужен ровно затем, зачем раньше был нужен vite: браузер не должен знать
 токен инстанса. С `--no-proxy` клиент получает адрес и токен сам — это режим
@@ -47,6 +50,7 @@ impl Args {
         let mut token_file = std::env::var("SNENS_API_TOKEN_FILE").ok();
         let mut dist = std::env::var("SNENS_WEB_DIST").ok();
         let mut proxy = true;
+        let mut allow_public = false;
 
         let mut i = 0;
         while i < argv.len() {
@@ -64,6 +68,7 @@ impl Args {
                 "--token-file" => token_file = Some(value("--token-file")?),
                 "--dist" => dist = Some(value("--dist")?),
                 "--no-proxy" => proxy = false,
+                "--allow-public" => allow_public = true,
                 other => return Err(format!("неизвестный аргумент: {other}")),
             }
             i += 1;
@@ -71,10 +76,21 @@ impl Args {
 
         let listen: SocketAddr = listen
             .parse()
-            .map_err(|e| format!("--listen {listen}: {e}"))?;
+            .map_err(|e| format!("адрес прослушивания {listen}: {e}"))?;
         let api = api.trim_end_matches('/').to_string();
         if !(api.starts_with("http://") || api.starts_with("https://")) {
             return Err(format!("--api должен быть http(s)-адресом: {api}"));
+        }
+        // Прокси подставляет Bearer-токен ядра в каждый `/api`, а своей
+        // аутентификации у snens-web нет. На не-loopback адресе это был бы
+        // полный доступ к API ядра для любого, кто дотянется до порта, —
+        // поэтому такой запуск требует явного подтверждения.
+        if proxy && !listen.ip().is_loopback() && !allow_public {
+            return Err(format!(
+                "--listen {listen} слушает не только loopback, а прокси подставляет токен ядра: \
+                 кто угодно, кто дотянется до порта, получит полный доступ к API. \
+                 Нужно осознанно — добавь --allow-public (только за доверенным прокси/Caddy)"
+            ));
         }
         // Дистрибутив по умолчанию — `web/` рядом с бинарём: ровно так его
         // кладут установщик и релизный архив. `current_exe` недоступен только

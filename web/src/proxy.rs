@@ -88,10 +88,25 @@ pub async fn proxy(State(up): State<Shared>, req: Request) -> Response {
         .strip_prefix("/api")
         .filter(|p| !p.is_empty())
         .unwrap_or("/");
+    // `..`/`.` в пути схлопывает сам reqwest: `GET /api/../admin` ушёл бы в ядро
+    // как `/admin` и достал бы ручку вне `/v1` — с нашим Bearer-токеном в
+    // заголовке. То есть обоёл бы ровно ту границу, ради которой сделан прокси.
+    if path
+        .split('/')
+        .any(|seg| seg == ".." || seg == ".")
+        || path.contains('\\')
+    {
+        return (StatusCode::BAD_REQUEST, "недопустимый путь").into_response();
+    }
     let url = match parts.uri.query() {
         Some(q) => format!("{}{path}?{q}", up.base),
         None => format!("{}{path}", up.base),
     };
+    // Собранный из частей URL тоже проверяем: `Url` нормализует путь, и если
+    // после нормализации он перестал начинаться с `/`, запрос ушёл бы не туда.
+    if !path.starts_with('/') {
+        return (StatusCode::BAD_REQUEST, "недопустимый путь").into_response();
+    }
 
     let method = match reqwest::Method::from_bytes(parts.method.as_str().as_bytes()) {
         Ok(m) => m,

@@ -38,8 +38,12 @@ fn content_type(path: &std::path::Path) -> &'static str {
 
 /// Ассеты с хешем в имени кешируются навсегда: имя меняется вместе с
 /// содержимым. `index.html` — никогда: иначе обновление клиента не доедет.
-fn cache_control(path: &std::path::Path) -> &'static str {
-    let immutable = path.components().any(|c| c.as_os_str() == "assets");
+///
+/// Смотрим только путь ОТНОСИТЕЛЬНО `dist`: абсолютный путь включит в проверку
+/// каталоги-предки, и поставка, распакованная в `/srv/assets/web/dist`, отдавала
+/// бы `index.html` с `immutable` — то есть обновление никогда бы не доехало.
+fn cache_control(rel: &std::path::Path) -> &'static str {
+    let immutable = rel.components().any(|c| c.as_os_str() == "assets");
     if immutable {
         "public, max-age=31536000, immutable"
     } else {
@@ -57,7 +61,7 @@ pub async fn serve(State(st): State<Shared>, req: Request) -> Response {
     let candidate = st.dist.join(rel);
 
     if candidate.is_file() {
-        return file(&candidate).await;
+        return file(&candidate, std::path::Path::new(rel)).await;
     }
 
     // Нет файла. С расширением — честный 404 (картинка, шрифт, чанк),
@@ -80,7 +84,7 @@ pub async fn serve(State(st): State<Shared>, req: Request) -> Response {
     response
 }
 
-async fn file(path: &std::path::Path) -> Response {
+async fn file(path: &std::path::Path, rel: &std::path::Path) -> Response {
     let body = match tokio::fs::read(path).await {
         Ok(b) => b,
         Err(e) => {
@@ -96,7 +100,8 @@ async fn file(path: &std::path::Path) -> Response {
     if let Ok(value) = header::HeaderValue::from_str(content_type(path)) {
         headers.insert(header::CONTENT_TYPE, value);
     }
-    if let Ok(value) = header::HeaderValue::from_str(cache_control(path)) {
+    // Кеш-политика — от пути ВНУТРИ клиента, не от абсолютного: см. `cache_control`.
+    if let Ok(value) = header::HeaderValue::from_str(cache_control(rel)) {
         headers.insert(header::CACHE_CONTROL, value);
     }
     response
