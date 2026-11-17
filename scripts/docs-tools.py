@@ -2,7 +2,7 @@
 """Собрать справку по инструментам snens в один plaintext.
 
 Источники фактов (и только они):
-  * tools/<имя>/src/*.rs           — const HELP / const USAGE (Rust-строковый литерал);
+  * tools/<имя>/src/*.rs           — const HELP (Rust-строковый литерал);
   * tools/<имя>/schema.json        — properties / required / x-snens;
   * src/dispatch.rs::builtin_defs  — описания встроенных run и ctx.
 
@@ -201,10 +201,18 @@ def stdin_line(schema, where):
     xsnens = schema.get("x-snens") or {}
     if not isinstance(xsnens, dict):
         raise DocsError("%s: x-snens — не объект" % where)
-    rule = xsnens.get("stdin") or {"mode": "none"}
+    rule = xsnens.get("stdin")
+    # «Ключ отсутствует» и «ключ есть, но пустой» — разные вещи: `"stdin": {}`
+    # или `null` — ошибка автора схемы, а не «stdin: none».
+    if rule is None:
+        rule = {"mode": "none"}
     if not isinstance(rule, dict):
         raise DocsError("%s: x-snens.stdin — не объект" % where)
-    mode = rule.get("mode", "none")
+    if not rule:
+        raise DocsError("%s: x-snens.stdin — пустой объект" % where)
+    if "mode" not in rule:
+        raise DocsError("%s: x-snens.stdin без mode" % where)
+    mode = rule.get("mode")
     if mode == "none":
         return "stdin: none"
     if mode == "field":
@@ -242,16 +250,25 @@ def builtins():
     m = re.search(r"\bfn\s+builtin_defs\s*\(", src)
     if not m:
         raise DocsError("%s: не найдена функция builtin_defs()" % where)
-    # Тело функции — до следующего определения верхнего уровня.
-    tail = re.search(r"\n(?:pub |fn |async |impl |#\[)", src[m.end() :])
+    # Тело функции — до следующего определения верхнего уровня. Список шире,
+    # чем было: пропущенный `const`/`use`/`struct` расширял `body` на остаток
+    # файла, и оттуда подхватывались чужие "name"/"description".
+    tail = re.search(
+        r"\n(?:pub |fn |async |impl |#\[|const |static |struct |enum |type |mod |use |trait )",
+        src[m.end() :],
+    )
     body_end = m.end() + tail.start() if tail else len(src)
     body = src[m.end() : body_end]
     out = []
     pos = 0
     while True:
-        nm = re.search(r'"name"\s*:\s*(?=")', body[pos:])
+        # Только начало строки: внутри уже съеденного description литерал
+        # `"name": "foo"` иначе был бы принят за следующий встроенный тул.
+        nm = re.search(r'\n\s*"name"\s*:\s*(?="[^"]*")', body[pos:])
         if not nm:
             break
+        # `+1` — перешагнуть открывающую кавычку: decode_rust_string ждёт индекс
+        # сразу за ней.
         name_at = pos + nm.end() + 1
         name = decode_rust_string(body, name_at, where)
         dm = re.search(r'"description"\s*:\s*(?=")', body[name_at:])
@@ -263,6 +280,8 @@ def builtins():
         # показываем дефолт unix — символ в тексте был бы неправдой.
         desc = desc.replace("$shell", "sh -c")
         out.append((name, desc))
+        # Дальше — ЗА конец description, а не в его начало: иначе повторный
+        # поиск ходил бы по тексту уже прочитанного литерала.
         pos = desc_at
     if not out:
         raise DocsError("%s: в builtin_defs() не нашлось ни одного описания" % where)
@@ -276,12 +295,17 @@ def render():
 
     parts = ["\n".join(HEADER)]
     parts.append("## Встроенные в ядро")
-    for name, desc in builtins():
+    # Список встроенных читаем один раз: он нужен и телу, и итоговой строке —
+    # захардкоженная «2» врала бы после любого добавления.
+    builtin = builtins()
+    for name, desc in builtin:
         parts.append("### %s\n\n%s" % (name, desc))
     parts.append("## Тулы реестра")
     for name in names:
         parts.append("### %s\n\n%s\n\n%s" % (name, tool_help(name), tool_contract(name)))
-    parts.append("Всего: %d тулов реестра + 2 встроенных." % len(names))
+    parts.append(
+        "Всего: %d тулов реестра + %d встроенных." % (len(names), len(builtin))
+    )
     return "\n\n".join(parts) + "\n"
 
 
@@ -292,6 +316,12 @@ def write_atomic(path, text):
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
+        # `mkstemp` создаёт файл 0600, а `os.replace` сохраняет режим inode:
+        # публичный tools.txt остался бы `-rw-------`. Ставим обычные 0644 по
+        # umask — так файл читается и человеком, и раздатчиком.
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -328,11 +358,23 @@ def main(argv):
 
     out = getattr(sys.stdout, "buffer", None)
     data = text.encode("utf-8")
-    if out is not None:
-        out.write(data)
-        out.flush()
-    else:
-        sys.stdout.write(text)
+    try:
+        if out is not None:
+            out.write(data)
+            out.flush()
+        else:
+            sys.stdout.write(text)
+    except BrokenPipeError:
+        # `docs-tools.py | head -1`: труба уже закрыта — это не ошибка, но без
+        # перехвата печатался бы трейсбек и «Exception ignored».
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        return 0
+    except OSError as e:
+        sys.stderr.write("docs-tools: не записать вывод: %s\n" % e)
+        return 1
     return 0
 
 

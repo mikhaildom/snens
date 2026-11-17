@@ -15,6 +15,7 @@
 #   6. snens-web: tsc + тесты + сборка бандла (если репозиторий клиента рядом)
 #   7. сайт: python3 scripts/site.py --check (ссылки, плейсхолдеры, манифест)
 #   8. selftest ядра: реестр тулов, контракт --help, argv/stdin
+#   9. брокер привилегий: валидация путей/юнитов в dryrun (scripts/tests/)
 #
 # Использование:
 #   scripts/release-check.sh              # полный гейт
@@ -37,7 +38,7 @@ while [ $# -gt 0 ]; do
         --fast) FAST=1 ;;
         --skip-site) SKIP_SITE=1 ;;
         --list) LIST=1 ;;
-        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "release-check: неизвестный аргумент: $1" >&2; exit 2 ;;
     esac
     shift
@@ -84,7 +85,7 @@ FAILED=""
 SNENS_BIN=""
 
 # --- 1. версия --------------------------------------------------------------
-say "1/8 версия"
+say "1/9 версия"
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/Cargo.toml" | head -1)"
 [ -n "$VERSION" ] || bad "Cargo.toml: не нашёл version"
 DESK_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/desktop/Cargo.toml" | head -1)"
@@ -104,7 +105,7 @@ else
 fi
 
 # --- 2. worktree ------------------------------------------------------------
-say "2/8 worktree"
+say "2/9 worktree"
 # Код возврата `git status` — отдельно от вывода: ошибка git (не репозиторий,
 # dubious ownership, lock) даёт пустой вывод, и раньше это читалось как «чисто».
 if ! WORKTREE_STATUS="$(git -C "$REPO" status --porcelain)"; then
@@ -129,7 +130,7 @@ else
 fi
 
 # --- 3. тег -----------------------------------------------------------------
-say "3/8 тег"
+say "3/9 тег"
 if git -C "$REPO" rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
     TAG_SHA="$(git -C "$REPO" rev-list -n1 "v$VERSION")"
     HEAD_SHA="$(git -C "$REPO" rev-parse HEAD)"
@@ -143,13 +144,13 @@ else
 fi
 
 if [ "$LIST" = 1 ]; then
-    say "дальше: cargo test --workspace, production-smoke, клиент, сайт, selftest"
+    say "дальше: cargo test --workspace, production-smoke, клиент, сайт, selftest, snens-priv"
     [ "$FAST" = 1 ] && say "(с --fast шаг cargo test и смоук пропускаются)"
     exit 0
 fi
 
 # --- 4. тесты ядра и тулов --------------------------------------------------
-say "4/8 cargo test --workspace"
+say "4/9 cargo test --workspace"
 if [ "$FAST" = 1 ]; then
     printf '  --   пропущено (--fast)\n'
 elif have cargo; then
@@ -163,7 +164,7 @@ else
 fi
 
 # --- 5. смоук поверхности ---------------------------------------------------
-say "5/8 смоук поверхности (мок-провайдер)"
+say "5/9 смоук поверхности (мок-провайдер)"
 if [ "$FAST" = 1 ]; then
     printf '  --   пропущено (--fast)\n'
 elif have python3; then
@@ -186,19 +187,19 @@ else
 fi
 
 # --- 6. клиент --------------------------------------------------------------
-say "6/8 клиент (snens-web)"
+say "6/9 клиент (snens-web)"
 if [ -d "$WEB" ]; then
     if have npm; then
         if ( cd "$WEB" && npm test --silent ) >"$LOGDIR/web-test.log" 2>&1; then
             ok "тесты клиента"
         else
-            tail -20 "$LOGDIR/web-test.log | sed 's/^/  /' >&2
+            tail -20 "$LOGDIR/web-test.log" | sed 's/^/  /' >&2
             bad "тесты клиента провалились"
         fi
         if ( cd "$WEB" && npm run build --silent ) >"$LOGDIR/web-build.log" 2>&1; then
             ok "бандл собран"
         else
-            tail -20 "$LOGDIR/web-build.log | sed 's/^/  /' >&2
+            tail -20 "$LOGDIR/web-build.log" | sed 's/^/  /' >&2
             bad "сборка клиента провалилась"
         fi
     else
@@ -209,7 +210,7 @@ else
 fi
 
 # --- 7. сайт ----------------------------------------------------------------
-say "7/8 сайт"
+say "7/9 сайт"
 if [ "$SKIP_SITE" = 1 ]; then
     printf '  --   пропущено (--skip-site)\n'
 elif have python3; then
@@ -232,7 +233,7 @@ else
 fi
 
 # --- 8. selftest ------------------------------------------------------------
-say "8/8 selftest ядра"
+say "8/9 selftest ядра"
 if [ -n "$SNENS_BIN" ] && [ -x "$SNENS_BIN" ]; then
     if run_tail "$LOGDIR/selftest.log" 4 "$SNENS_BIN" selftest; then
         ok "selftest ok"
@@ -241,6 +242,20 @@ if [ -n "$SNENS_BIN" ] && [ -x "$SNENS_BIN" ]; then
     fi
 else
     bad "нет собранного ядра: cargo build --workspace"
+fi
+
+# --- 9. скрипты -------------------------------------------------------------
+# Брокер привилегий — единственное место, где ошибка стоит root-доступа,
+# а проверяется он целиком в dryrun: конфиг, границы путей, симлинки.
+say "9/9 скрипты (snens-priv)"
+if [ -x "$REPO/scripts/tests/snens-priv.sh" ] || [ -f "$REPO/scripts/tests/snens-priv.sh" ]; then
+    if run_tail "$LOGDIR/priv.log" 8 sh "$REPO/scripts/tests/snens-priv.sh"; then
+        ok "брокер привилегий: валидация верна"
+    else
+        bad "тест snens-priv провалился"
+    fi
+else
+    bad "нет scripts/tests/snens-priv.sh"
 fi
 
 if [ -n "$FAILED" ]; then

@@ -28,7 +28,6 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DESKTOP="$REPO/desktop"
 OUT="${SNENS_RELEASE_DIR:-$REPO/desktop/target/release/bundle}"
 BASE_URL="${SNENS_RELEASE_URL:-https://snens.svuvi.ch/releases}"
-VERSION="$(python3 -c "import json;print(json.load(open('$DESKTOP/tauri.conf.json'))['version'])")"
 
 say() { printf '>>> %s\n' "$*"; }
 die() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
@@ -39,7 +38,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --check) check_only=1 ;;
         --skip-gate) skip_gate=1 ;;
-        -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,/^[^#]/p' "$0" | sed -n '/^#/p' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'release: неизвестный аргумент: %s\n' "$1" >&2; exit 2 ;;
     esac
     shift
@@ -48,8 +47,16 @@ done
 [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}${TAURI_SIGNING_PRIVATE_KEY:-}" ] ||
     die "нет ключа подписи: задай TAURI_SIGNING_PRIVATE_KEY_PATH (updater.key)"
 
+# Версию читаем после разбора аргументов: `--help` не должен требовать ни
+# python3, ни целого tauri.conf.json.
+command -v python3 >/dev/null || die "нет python3 (нужен для чтения tauri.conf.json)"
+[ -r "$DESKTOP/tauri.conf.json" ] || die "нет $DESKTOP/tauri.conf.json"
+VERSION="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' \
+    "$DESKTOP/tauri.conf.json" 2>/dev/null || true)"
+[ -n "$VERSION" ] || die "не смог прочитать version из desktop/tauri.conf.json"
+
 if [ "$check_only" = 0 ] && [ "$skip_gate" = 0 ]; then
-    say "0/4 гейт: scripts/release-check.sh --skip-site"
+    say "0/5 гейт: scripts/release-check.sh --skip-site"
     "$REPO/scripts/release-check.sh" --skip-site ||
         die "гейт не пройден — релиз не собираю (--skip-gate только для отладки)"
 fi
@@ -169,13 +176,21 @@ if [ "${SNENS_RELEASE_PUBLISH:-0}" = 1 ] && [ -d "$WEBROOT" ] && [ -w "$WEBROOT"
     for f in "$OUT"/"$VERSION"/*; do
         [ -f "$f" ] && cp -p "$f" "$DEST/$VERSION/"
     done
-    cp -p "$OUT/latest.json" "$DEST/latest.json"
+    # Манифест кладём атомарно: клиент, попавший на latest.json во время
+    # копирования, иначе прочитал бы обрезанный JSON и обновление бы сорвалось.
+    cp -p "$OUT/latest.json" "$DEST/.latest.json.tmp"
+    chmod 0644 "$DEST/.latest.json.tmp"
+    mv -f "$DEST/.latest.json.tmp" "$DEST/latest.json"
     # Caddy читает не нашим пользователем, а umask бывает 077.
     # Каталоги — 0755, файлы — 0644. Раньше здесь был только `chmod -R a+rX`,
     # а umask 077 делал новые каталоги 0700: Caddy отдавал 403 на установщик,
     # а причина не видна ни в логе сборки, ни в `ls` файлов. Проверено живьём.
-    find "$DEST" -type d -exec chmod 0755 {} +
-    find "$DEST" -type f -exec chmod 0644 {} +
+    # Только свой каталог версии и манифест: по всему $DEST лежат артефакты
+    # прошлых релизов, возможно чужого владельца — один EPERM от `find` уронил
+    # бы выкладку посередине без сообщения.
+    find "$DEST/$VERSION" -type d -exec chmod 0755 {} + 2>/dev/null || true
+    find "$DEST/$VERSION" -type f -exec chmod 0644 {} + 2>/dev/null || true
+    chmod 0755 "$DEST" 2>/dev/null || true
     say "выложено: $DEST"
     ls -l "$DEST/latest.json" "$DEST/$VERSION" | sed 's/^/  /'
 else
