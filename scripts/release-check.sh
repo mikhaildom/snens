@@ -84,6 +84,31 @@ FAILED=""
 # поэтому заводим пустую заранее.
 SNENS_BIN=""
 
+# `--list` — только показать, что будет запущено: выходим до проверок, иначе
+# провал тега на грязном дереве делал бы «список» бесполезным.
+if [ "$LIST" = 1 ]; then
+    say "будет запущено:"
+    say "  1) версия: Cargo.toml = desktop = tauri.conf.json = package.json = web"
+    say "  2) worktree ядра и клиента чист"
+    say "  3) тег v<версия> = HEAD"
+    if [ "$FAST" = 1 ]; then
+        say "  4) cargo test --workspace   (--fast: пропуск)"
+        say "  5) смоук поверхности      (--fast: пропуск)"
+    else
+        say "  4) cargo test --workspace"
+        say "  5) смоук поверхности и TUI на мок-провайдере"
+    fi
+    say "  6) клиент: npm test + npm run build"
+    if [ "$SKIP_SITE" = 1 ]; then
+        say "  7) сайт                      (--skip-site: пропуск)"
+    else
+        say "  7) сайт: tools.txt + site.py --check"
+    fi
+    say "  8) selftest ядра"
+    say "  9) брокер привилегий (dryrun)"
+    exit 0
+fi
+
 # --- 1. версия --------------------------------------------------------------
 say "1/9 версия"
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$REPO/Cargo.toml" | head -1)"
@@ -141,12 +166,6 @@ if git -C "$REPO" rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
     fi
 else
     bad "нет тега v$VERSION: релиз без тега не воспроизводим"
-fi
-
-if [ "$LIST" = 1 ]; then
-    say "дальше: cargo test --workspace, production-smoke, клиент, сайт, selftest, snens-priv"
-    [ "$FAST" = 1 ] && say "(с --fast шаг cargo test и смоук пропускаются)"
-    exit 0
 fi
 
 # --- 4. тесты ядра и тулов --------------------------------------------------
