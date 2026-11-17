@@ -79,7 +79,14 @@ want 2 "$rc" "shot: --timeout 0 — код 2"
 
 # ---- живой прогон: локальный сервер ----
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "selftest: python3 нет — живые проверки (сервер страниц) пропущены"
+  # Живые проверки — почти весь контракт тула (PNG, --selector, --crop, --script,
+  # внутренний таймаут). Молчаливый пропуск в CI даёт зелёный прогон, в котором
+  # ничего не проверено, поэтому пропуск возможен только явным переключателем.
+  if [ "${SHOT_SELFTEST_SKIP_LIVE:-0}" = 1 ]; then
+    echo "selftest: python3 нет — живые проверки пропущены (SHOT_SELFTEST_SKIP_LIVE=1)"
+  else
+    bad "shot: python3 не найден — живые проверки (PNG, --selector, --crop, --script, таймаут) не выполнены; пропустить явно: SHOT_SELFTEST_SKIP_LIVE=1"
+  fi
 else
   mkdir -p "$TMP/www"
   printf '<html><head><title>shot selftest</title></head><body style="background:#eef"><h1>shot selftest</h1><div id="box" style="width:320px;height:140px;background:#4a90d9">box</div><textarea>typed</textarea></body></html>\n' >"$TMP/www/index.html"
@@ -98,10 +105,13 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            self.wfile.write(b"14\r\n<html><body>hang\r\n\r\n")
+            # Размер чанка — ровно длина данных: "<html><body>hang" = 16 = 0x10,
+            # а не 0x14. Ошибка в размере ломает chunked-ответ, и /hang перестаёт
+            # проверять внутренний таймаут (хром падает на сети, а не висит).
+            self.wfile.write(b"10\r\n<html><body>hang\r\n")
             try:
                 while True:
-                    self.wfile.write(b"5\r\n....\r\n")
+                    self.wfile.write(b"4\r\n....\r\n")
                     self.wfile.flush()
                     time.sleep(1)
             except Exception:

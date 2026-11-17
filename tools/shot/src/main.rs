@@ -192,7 +192,14 @@ fn parse(argv: &[String]) -> Args {
                         });
                         a.script = Some(PathBuf::from(v));
                     }
-                    "--wait-ms" => a.wait_ms = num(&argv, i, "--wait-ms"),
+                    "--wait-ms" => {
+                        a.wait_ms = num(&argv, i, "--wait-ms");
+                        // Потолок паузы: она целиком внутри бюджета запуска, и
+                        // абсурдное значение — опечатка, а не намерение.
+                        if a.wait_ms > 600_000 {
+                            die(&format!("shot: --wait-ms вне 0..600000 мс\n{USAGE}"), 2);
+                        }
+                    }
                     "--timeout" => {
                         let t: f64 = num(&argv, i, "--timeout");
                         if t <= 0.0 || t > 600.0 {
@@ -200,8 +207,21 @@ fn parse(argv: &[String]) -> Args {
                         }
                         a.timeout = t;
                     }
-                    "--chrome" => a.chrome = Some(argv[i + 1].clone()),
-                    _ => a.out_dir = Some(PathBuf::from(&argv[i + 1])),
+                    "--chrome" => {
+                        let v = argv.get(i + 1).unwrap_or_else(|| {
+                            die(&format!("shot: --chrome без значения\n{USAGE}"), 2)
+                        });
+                        a.chrome = Some(v.clone());
+                    }
+                    // Явная ветка, а не `_`: иначе любой новый флаг молча становится
+                    // каталогом вывода.
+                    "--out-dir" => {
+                        let v = argv.get(i + 1).unwrap_or_else(|| {
+                            die(&format!("shot: --out-dir без значения\n{USAGE}"), 2)
+                        });
+                        a.out_dir = Some(PathBuf::from(v));
+                    }
+                    _ => unreachable!("ветка только для перечисленных флагов"),
                 }
                 i += 2;
             }
@@ -367,7 +387,13 @@ fn run(a: &Args) -> Result<(), String> {
     let ready_budget = br.cdp.left()?;
     br.wait_ready(ready_budget)?;
     if a.wait_ms > 0 {
-        cdp::Browser::sleep(a.wait_ms);
+        // Пауза не должна пережить бюджет всего запуска: `--timeout 5 --wait-ms 600000`
+        // иначе висит десять минут вопреки документированному таймауту.
+        let left = br.cdp.left()?;
+        let pause = a.wait_ms.min(left.as_millis() as u64);
+        if pause > 0 {
+            cdp::Browser::sleep(pause);
+        }
     }
     if let Some(script) = &a.script {
         probe(&mut br, script)?;
