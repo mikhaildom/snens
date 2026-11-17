@@ -316,7 +316,7 @@ impl Runtime {
         tx.execute("DELETE FROM messages WHERE session_id=?1", params![id])?;
         for (seq, m) in messages.iter().enumerate() {
             tx.execute(
-                "INSERT INTO messages(session_id,id,command_id,seq,text,state,run_id)\n                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO messages(session_id,id,command_id,seq,text,state,run_id,ask)\n                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     id,
                     m.id,
@@ -324,7 +324,8 @@ impl Runtime {
                     seq as i64,
                     m.text,
                     m.state,
-                    m.run_id
+                    m.run_id,
+                    m.ask.as_ref().map(serde_json::to_string).transpose()?
                 ],
             )?;
             for (aseq, aid) in m.attachment_ids.iter().enumerate() {
@@ -590,7 +591,7 @@ fn schema(c: &Connection) -> crate::R<()> {
     let _: String = c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     c.execute_batch("PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,surface TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,context_budget INTEGER,context_target INTEGER);
-      CREATE TABLE IF NOT EXISTS messages(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL UNIQUE,seq INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
+      CREATE TABLE IF NOT EXISTS messages(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL UNIQUE,seq INTEGER NOT NULL,text TEXT NOT NULL,state TEXT NOT NULL,run_id TEXT,ask TEXT,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE TABLE IF NOT EXISTS attachments(session_id TEXT NOT NULL,id TEXT NOT NULL,command_id TEXT NOT NULL,filename TEXT NOT NULL,name TEXT NOT NULL,part TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(session_id,id),FOREIGN KEY(session_id) REFERENCES sessions(id));
       CREATE UNIQUE INDEX IF NOT EXISTS attachments_command ON attachments(session_id,command_id);
       CREATE TABLE IF NOT EXISTS message_attachments(session_id TEXT NOT NULL,message_id TEXT NOT NULL,attachment_id TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(session_id,message_id,attachment_id),FOREIGN KEY(session_id,message_id) REFERENCES messages(session_id,id),FOREIGN KEY(session_id,attachment_id) REFERENCES attachments(session_id,id));
@@ -620,6 +621,18 @@ fn schema(c: &Connection) -> crate::R<()> {
             }
         }
     }
+    // `ask` — ответ на вопрос артефакта (`snens.ask`): в базах, созданных до
+    // этой колонки, её нет, и без миграции повтор после рестарта считался бы
+    // другим payload'ом (409 вместо идемпотентного ответа).
+    if let Err(error) = c.execute("ALTER TABLE messages ADD COLUMN ask TEXT", []) {
+        if !error
+            .to_string()
+            .to_lowercase()
+            .contains("duplicate column")
+        {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 pub fn persist_store(c: &Connection, d: &Store) -> crate::R<()> {
@@ -647,7 +660,7 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
     for (sid, ms) in &d.messages {
         for (seq, m) in ms.iter().enumerate() {
             tx.execute(
-                "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     sid,
                     m.id,
@@ -655,7 +668,8 @@ fn persist(c: &Connection, d: &Store) -> crate::R<()> {
                     seq as i64,
                     m.text,
                     m.state,
-                    m.run_id
+                    m.run_id,
+                    m.ask.as_ref().map(serde_json::to_string).transpose()?
                 ],
             )?;
         }
@@ -775,14 +789,19 @@ fn read_store(c: &Connection) -> crate::R<Store> {
         }
     }
     {
-        let mut q=c.prepare("SELECT session_id,id,command_id,text,state,run_id FROM messages ORDER BY session_id,seq")?;
+        let mut q=c.prepare("SELECT session_id,id,command_id,text,state,run_id,ask FROM messages ORDER BY session_id,seq")?;
         for row in q.query_map([], |r| {
             let sid: String = r.get(0)?;
             let mid: String = r.get(1)?;
+            // `ask` — часть payload'а идемпотентности (`same`-сравнение в
+            // `surface_commands::message`). Пока колонки не было, после рестарта
+            // повтор ответа на артефакт сравнивал `Some(..)` с `None` и получал
+            // 409 `idempotency_conflict` вместо идемпотентного ответа.
+            let ask: Option<String> = r.get(6)?;
             Ok((
                 sid,
                 Message {
-                    ask: None,
+                    ask: ask.and_then(|raw| serde_json::from_str(&raw).ok()),
                     id: mid,
                     command_id: r.get(2)?,
                     text: r.get(3)?,
@@ -1096,7 +1115,7 @@ mod tests {
         assert_eq!(got.commands["cmd"]["ok"], true);
         assert!(db
             .execute(
-                "INSERT INTO messages VALUES('s','m2','cmd',1,'dup','accepted',NULL)",
+                "INSERT INTO messages VALUES('s','m2','cmd',1,'dup','accepted',NULL,NULL)",
                 []
             )
             .is_err());
@@ -1191,7 +1210,14 @@ mod tests {
                 attachment_ids: vec!["a2".into(), "a1".into()],
                 state: "applied".into(),
                 run_id: None,
-                ask: None,
+                // `ask` обязан пережить рестарт: он участвует в сравнении
+                // payload'а при повторе команды.
+                ask: Some(crate::log::AskRef {
+                    seq: 3,
+                    artifact: "quiz".into(),
+                    id: "q".into(),
+                    question: "какой вариант?".into(),
+                }),
             }],
         );
 
@@ -1200,6 +1226,14 @@ mod tests {
         assert_eq!(loaded.attachments["s"]["a1"], first);
         assert_eq!(loaded.attachments["s"]["a2"], second);
         assert_eq!(loaded.messages["s"][0].attachment_ids, ["a2", "a1"]);
+        assert_eq!(
+            loaded.messages["s"][0]
+                .ask
+                .as_ref()
+                .map(|a| a.artifact.as_str()),
+            Some("quiz"),
+            "ask не пережил перезапись store"
+        );
         drop(db);
         fs::remove_dir_all(dir).unwrap();
     }
