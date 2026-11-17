@@ -188,6 +188,14 @@ pub fn collect_finished(sess_path: &Path) -> Vec<String> {
             }
             // Процесса нет, а `done` нет — задание сняли наглухо (OOM, SIGKILL).
             // Молчать об этом нельзя: ход ждёт результата, которого не будет.
+            // Старое задание в расчёт не идёт: его pid давно переиспользован, и
+            // докладывать о нём как о свежем — врать.
+            None if stale(&job) => {
+                let collected = dir.join("collected");
+                let _ = std::fs::create_dir_all(&collected);
+                let _ = std::fs::rename(&path, collected.join(path.file_name().unwrap_or_default()));
+                continue;
+            }
             None if !crate::subagent::alive(job.pid) => {
                 let tail = std::fs::read_to_string(&job.log).unwrap_or_default();
                 let tail = tail.trim();
@@ -216,6 +224,19 @@ pub fn collect_finished(sess_path: &Path) -> Vec<String> {
     out
 }
 
+/// Сколько задание считается новым после запуска. Всё, что старше, — мусор от
+/// прежних сессий: pid переиспользован, а `done` мог не записаться. Без порога
+/// будильник поднимал сессии месячной давности (они же и устроили шторм).
+const STALE_AFTER: u64 = 24 * 3600;
+
+fn stale(job: &Job) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(job.started) > STALE_AFTER
+}
+
 /// Есть ли что забирать — дешёвая проверка без изъятия. Кроме готового задания
 /// это ещё и снятое (pid мёртв, а `done` нет): иначе о таком сессия узнала бы
 /// только когда её разбудят по другому поводу.
@@ -235,7 +256,7 @@ pub fn has_finished(sess_path: &Path) -> bool {
             return true;
         }
         let job = serde_json::from_slice::<Job>(&std::fs::read(&path).unwrap_or_default());
-        if job.is_ok_and(|job| !crate::subagent::alive(job.pid)) {
+        if job.is_ok_and(|job| !stale(&job) && !crate::subagent::alive(job.pid)) {
             return true;
         }
     }
@@ -280,7 +301,12 @@ mod tests {
             timeout_s: 60,
             log: log.display().to_string(),
             pid: dead_pid,
-            started: 0,
+            // Текущее время, а не 0: задание с `started: 0` считается старьём,
+            // и о снятом задании тогда молчат — проверяется не это.
+            started: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         };
         std::fs::write(
             jobs.join("7-1.json"),

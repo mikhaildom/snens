@@ -56,6 +56,20 @@ pub fn has_pending(mail_dir: &Path, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Есть ли в ящике слово человека (`steer` от "human" или сообщение с его id).
+/// Только такое пробуждение оправдано для любой сессии: это не внутренняя
+/// переписка агентов.
+pub fn has_human(mail_dir: &Path, id: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(new_dir(mail_dir, id)) else {
+        return false;
+    };
+    rd.flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter_map(|e| std::fs::read(e.path()).ok())
+        .filter_map(|b| serde_json::from_slice::<Msg>(&b).ok())
+        .any(|m| m.from == "human")
+}
+
 /// Вычитать и забрать входящие: переносит их в `read/` (ровно один потребитель).
 pub fn drain(mail_dir: &Path, id: &str) -> Vec<Msg> {
     let dir = new_dir(mail_dir, id);

@@ -33,6 +33,14 @@ pub(super) fn spawn(s: Arc<Runtime>) -> tokio::task::JoinHandle<()> {
                 if !crate::wake::has_pending(&live, &id) {
                     continue;
                 }
+                // Заслон от шторма. Будить сессию можно только в двух случаях:
+                // в ящике есть слово человека или сессия молодая (её работа реально
+                // ждёт ответа). Старая сессия со случайным report в ящике — не повод
+                // запускать ход: раньше такие поднимались сотнями, переписывались
+                // steer'ами и не давали друг другу закончить.
+                if !crate::wake::may_wake(&live, &id) {
+                    continue;
+                }
                 // Замок сессии: пока его держит кто-то другой, ход уже начался
                 // или начинается — второй не нужен.
                 let Some(guard) = s.session_lock(&id).await.try_lock_owned().ok() else {
@@ -144,6 +152,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("snens-wake-live-{}", uuid::Uuid::new_v4()));
         let s = runtime(&root);
         let id = "1700000000-111";
+        // Журнал есть у любой реально существующей сессии: по его mtime считается
+        // возраст, а без журнала будильник не судит — нечего судить.
+        std::fs::write(s.cfg.sessions_path().join(format!("{id}.jsonl")), "").unwrap();
         crate::mail::send(
             &s.cfg.mail_path(),
             id,
@@ -168,6 +179,72 @@ mod tests {
             !crate::mail::has_pending(&s.cfg.mail_path(), id),
             "ящик не забрали: сообщение доедет второй раз"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Заслон от шторма 17.11: старая сессия, которой сосед написал `steer`, не
+    /// должна подниматься. Иначе круги «проснулся → ответил → разбудил соседа →
+    /// получил ответ» не заканчиваются, а агенты из прошлых месяцев ведут
+    /// переписку между собой.
+    #[tokio::test]
+    async fn old_session_is_not_woken_by_inner_mail() {
+        let root = std::env::temp_dir().join(format!("snens-wake-storm-{}", uuid::Uuid::new_v4()));
+        let s = runtime(&root);
+        let id = "1700000000-111";
+        let journal = s.cfg.sessions_path().join(format!("{id}.jsonl"));
+        std::fs::write(&journal, "").unwrap();
+        // Состарить журнал: сессия из прошлого месяца.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 3600);
+        let f = std::fs::OpenOptions::new().write(true).open(&journal).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        crate::mail::send(
+            &s.cfg.mail_path(),
+            id,
+            "1700000000-222",
+            "steer",
+            "ответ соседа",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&journal).unwrap();
+        spawn(s.clone());
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let after = std::fs::read_to_string(&journal).unwrap();
+        assert_eq!(before, after, "старую сессию разбудили внутренней перепиской");
+        assert!(
+            crate::mail::has_pending(&s.cfg.mail_path(), id),
+            "вход пропал из ящика, хотя будить было нельзя"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// А слово человека поднимает любую сессию — даже старую: это не шторм, это
+    /// человек вернулся к своей задаче.
+    #[tokio::test]
+    async fn human_word_wakes_old_session() {
+        let root = std::env::temp_dir().join(format!("snens-wake-human-{}", uuid::Uuid::new_v4()));
+        let s = runtime(&root);
+        let id = "1700000000-111";
+        let journal = s.cfg.sessions_path().join(format!("{id}.jsonl"));
+        std::fs::write(&journal, "").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(400 * 24 * 3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&journal)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        crate::mail::send(&s.cfg.mail_path(), id, "human", "steer", "вернись к задаче").unwrap();
+        spawn(s.clone());
+        let mut found = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if std::fs::read_to_string(&journal).unwrap_or_default().contains("вернись к задаче") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "слово человека не разбудило старую сессию");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

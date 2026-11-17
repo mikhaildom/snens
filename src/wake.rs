@@ -55,21 +55,48 @@ pub fn has_pending(cfg: &crate::cfg::Config, id: &str) -> bool {
         || crate::jobs::has_finished(sess_path(cfg, id).as_path())
 }
 
-/// Кандидаты на пробуждение: сессии, известные поверхности, и те, у кого есть
-/// каталог ящика. Писать в ящик умеет только тот, кто знает получателя, поэтому
-/// одного чтения каталога достаточно и оно дешевле перебора журналов.
+/// Кандидаты на пробуждение — только известные поверхности сессии.
+///
+/// Раньше сюда подмешивались все каталоги `mail/`: писать в ящик умеет любой,
+/// кто знает id, и на диске остаются сотни ящиков от старых сессий. Будильник
+/// поднимал их все, каждая разбуженная сессия отвечала `steer`/`ask` соседям, у
+/// тех появлялся непрочитанный ящик — и шторм не заканчивался. Живую сессию
+/// поверхность и так знает (store или журнал), остальные не наши.
 pub fn mailboxes(cfg: &Config, known: impl Iterator<Item = String>) -> Vec<String> {
-    let mut ids: std::collections::BTreeSet<String> = known.collect();
-    if let Ok(rd) = std::fs::read_dir(cfg.mail_path()) {
-        for e in rd.flatten() {
-            if let Some(name) = e.file_name().to_str() {
-                if crate::surface_runtime::valid_id(name) {
-                    ids.insert(name.to_string());
-                }
-            }
-        }
+    let _ = cfg;
+    known.collect::<std::collections::BTreeSet<String>>().into_iter().collect()
+}
+
+/// Сколько сессия считается молодой: в этом окне её ещё можно будить по любой
+/// весточке из ящика — работа реально ждёт ответа (подагент или задание).
+const YOUNG: u64 = 6 * 3600;
+
+/// Можно ли вообще будить эту сессию.
+///
+/// Шторм 17.11: живые сессии отвечали друг другу `steer`/`ask`, каждая ответ
+/// ложился в чужой ящик, и будильник поднимал следующий круг. Признак настоящего
+/// пробуждения — в ящике есть слово человека. Всё остальное (report, steer от
+/// другой сессии) — внутренняя переписка агентов, и будить ею старую сессию
+/// можно только в молодом окне, где она ещё ведёт живую работу; иначе агенты
+/// из прошлых месяцев переписываются между собой бесконечно.
+pub fn may_wake(cfg: &Config, id: &str) -> bool {
+    if crate::mail::has_human(&cfg.mail_path(), id) {
+        return true;
     }
-    ids.into_iter().collect()
+    let Some(age) = session_age(cfg, id) else {
+        // Журнала нет — судить не по чему. Не будим: без возраста не отличить
+        // живой ход от археологии.
+        return false;
+    };
+    age <= YOUNG
+}
+
+/// Возраст сессии в секундах — по mtime журнала: это последняя запись хода.
+fn session_age(cfg: &Config, id: &str) -> Option<u64> {
+    let md = std::fs::metadata(sess_path(cfg, id)).ok()?;
+    let touched = md.modified().ok()?;
+    let age = std::time::SystemTime::now().duration_since(touched).ok()?;
+    Some(age.as_secs())
 }
 
 
