@@ -86,7 +86,18 @@ PY
     done
     # Cargo.lock тоже держит версию своего пакета: без обновления `cargo test
     # --locked` ругается, а сборка релиза переписывает его молча.
-    ( cd "$REPO" && cargo update --workspace --offline >/dev/null 2>&1 ) || true
+    #
+    # Два вызова, а не один: `desktop` — отдельный workspace (свой `[workspace]`
+    # в desktop/Cargo.toml), и `cargo update` из корня правит только корневой
+    # lock. Раньше desktop/Cargo.lock оставался с версией 0.1.0 при 0.2.4 в
+    # манифесте, и `--locked` сборка окна падала. Ошибки не глотаем молча:
+    # `--offline` может не найтись без локального кеша, и это стоит видеть.
+    cargo update --manifest-path "$CORE" --workspace --offline >/dev/null ||
+        printf 'version: не удалось обновить корневой Cargo.lock — проверь вручную\n' >&2
+    if [ -f "$REPO/desktop/Cargo.toml" ]; then
+        cargo update --manifest-path "$DESK" --workspace --offline >/dev/null ||
+            printf 'version: не удалось обновить desktop/Cargo.lock — проверь вручную\n' >&2
+    fi
     check >/dev/null || die "после правки версии всё ещё расходятся: запусти --check"
     printf 'версия: %s\n' "$new"
     printf 'дальше: cargo build --workspace && git commit -am "release: %s" && git tag v%s\n' "$new" "$new"
