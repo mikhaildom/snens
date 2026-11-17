@@ -33,7 +33,10 @@ fn with_headers(rb: reqwest::blocking::RequestBuilder) -> reqwest::blocking::Req
 /// кодом 200 — это повод сходить в jina и в любом случае предупредить в stderr.
 pub fn looks_blocked(md: &str) -> bool {
     let low = md.to_ascii_lowercase();
-    low.contains("access denied") && (low.contains("automation tools") || low.contains("security"))
+    // «security» — слишком частое слово: страница про права доступа на сайте про
+    // безопасность не должна уезжать в jina. Признак стаба — «automation tools»/капча.
+    (low.contains("access denied")
+        && (low.contains("automation tools") || low.contains("captcha")))
         || low.contains("enable javascript and cookies")
         || low.contains("unusual traffic")
 }
@@ -41,23 +44,43 @@ pub fn looks_blocked(md: &str) -> bool {
 pub enum Own {
     Text(String),
     Binary(String),
-    /// HTTP-ошибка/сеть: код и сообщение для stderr.
-    Unavailable(u16, String),
+    /// Ответ пришёл, но не тот: HTTP-код и сообщение для stderr.
+    Http(u16, String),
+    /// Ответа нет вовсе: сеть, таймаут, локальная запись файла. Ноль как код
+    /// HTTP смешивал бы это с «сайт ответил 0» и врал в решении о фолбэке.
+    Offline(String),
+}
+
+/// Байты тела → строка по charset из content-type. Неизвестная кодировка — UTF-8
+/// с заменой невалидных байтов: это лучше, чем пустой документ.
+fn decode(bytes: &[u8], ctype: &str) -> String {
+    let label = ctype
+        .split(';')
+        .filter_map(|p| p.trim().strip_prefix("charset="))
+        .map(|v| v.trim().trim_matches('"').to_ascii_lowercase())
+        .next();
+    match label
+        .as_deref()
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+    {
+        Some(enc) => enc.decode(bytes).0.into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
 }
 
 /// Свой путь: GET и разбор по content-type.
 pub fn own(a: &Args) -> Own {
     let cl = match client(a.timeout) {
         Ok(c) => c,
-        Err(e) => return Own::Unavailable(0, format!("{}: {e}", a.url)),
+        Err(e) => return Own::Offline(format!("{}: {e}", a.url)),
     };
     let resp = match with_headers(cl.get(&a.url)).send() {
         Ok(r) => r,
-        Err(e) => return Own::Unavailable(0, format!("{}: {e}", a.url)),
+        Err(e) => return Own::Offline(format!("{}: {e}", a.url)),
     };
     let status = resp.status();
     if !status.is_success() {
-        return Own::Unavailable(
+        return Own::Http(
             status.as_u16(),
             format!("{} → HTTP {}", a.url, status.as_u16()),
         );
@@ -79,12 +102,21 @@ pub fn own(a: &Args) -> Own {
         ctype.is_empty() || ctype.contains("text/html") || ctype.contains("application/xhtml");
     if is_html {
         // Лимит — только на текст в контекст: больше в модель не влезет.
+        // Читаем на байт больше потолка, чтобы отличить «ровно столько» от «упёрлось».
         let mut bytes = Vec::new();
-        let _ = resp.take(MAX_BODY).read_to_end(&mut bytes);
-        if bytes.len() as u64 == MAX_BODY {
+        if let Err(e) = resp.take(MAX_BODY + 1).read_to_end(&mut bytes) {
+            // Обрыв посреди тела дал бы обрезанный документ под видом целого.
+            return Own::Offline(format!("{}: {e}", a.url));
+        }
+        let cut = bytes.len() as u64 > MAX_BODY;
+        if cut {
+            bytes.truncate(MAX_BODY as usize);
             eprintln!("fetch: тело обрезано по потолку {MAX_BODY} Б ({})", a.url);
         }
-        return Own::Text(html::to_markdown(&String::from_utf8_lossy(&bytes), a.raw));
+        // Кодировка — из charset в content-type: `from_utf8_lossy` превратил бы
+        // windows-1251/koi8-r (а в ACCEPT_LANG есть ru) в мусор.
+        let text = decode(&bytes, &ctype);
+        return Own::Text(html::to_markdown(&text, a.raw));
     }
 
     // Бинарь не держим в памяти и не режем потолком: обрезанный на 2 МБ PDF —
@@ -92,7 +124,7 @@ pub fn own(a: &Args) -> Own {
     let name = filename(a, &ctype, disposition.as_deref());
     match save_binary(a, resp, name.as_deref(), &ctype) {
         Ok(line) => Own::Binary(line),
-        Err(e) => Own::Unavailable(0, format!("{}: {e}", a.url)),
+        Err(e) => Own::Offline(format!("{}: {e}", a.url)),
     }
 }
 
@@ -104,23 +136,28 @@ fn jina_check(text: &str) -> Result<(), String> {
     if !text.contains("Markdown Content:") {
         return Err("не похоже на ответ jina".into());
     }
-    if let Some(p) = text.find("Target URL returned error") {
-        let tail = text[p..].lines().next().unwrap_or("").trim().to_string();
+    // Шапка — только до «Markdown Content:»: иначе страница, в тексте которой
+    // встречается эта фраза, считалась бы ошибкой доставки.
+    let head = text.split_once("Markdown Content:").map_or(text, |(h, _)| h);
+    if let Some(p) = head.find("Target URL returned error") {
+        let tail = head[p..].lines().next().unwrap_or("").trim().to_string();
         return Err(format!("jina: {tail}"));
     }
-    // Заглушка антибота: тело есть, толку нет. Лучше честный отказ, чем «Access Denied»
-    // в контексте как содержимое страницы.
-    if text.contains("Access Denied") && text.contains("automation tools") {
+    // Заглушка антибота: тело есть, толку нет. Проверка та же, что у своего пути, —
+    // регистр и локализованные варианты разбирает `looks_blocked`.
+    if looks_blocked(text) {
         return Err("jina отдала страницу-заглушку блокировщика".into());
     }
     Ok(())
 }
 
 /// Время публикации из шапки jina — в своём выводе не нужно, отрезаем шапку.
+/// Маркер гарантирован `jina_check`, который вызывается раньше; запасной ветки
+/// нет намеренно, иначе проверка и нарезка разошлись бы.
 fn jina_body(text: &str) -> String {
     match text.split_once("Markdown Content:") {
         Some((_, body)) => body.trim().to_string(),
-        None => text.trim().to_string(),
+        None => String::new(),
     }
 }
 
@@ -140,7 +177,7 @@ pub fn jina(a: &Args) -> Result<String, String> {
     let mut bytes = Vec::new();
     resp.take(MAX_BODY)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{url}: {e}"))?;
     let text = String::from_utf8_lossy(&bytes).to_string();
     jina_check(&text).map_err(|e| format!("{url}: {e}"))?;
     let body = html::collapse_blank_lines(&jina_body(&text));
@@ -153,16 +190,10 @@ pub fn jina(a: &Args) -> Result<String, String> {
 /// Имя файла: из content-disposition, иначе из URL. Расширение по content-type.
 fn filename(a: &Args, ctype: &str, disposition: Option<&str>) -> Option<String> {
     if let Some(cd) = disposition {
-        for part in cd.split(';') {
-            let part = part.trim();
-            if let Some(v) = part
-                .strip_prefix("filename=")
-                .or_else(|| part.strip_prefix("filename*="))
-            {
-                let v = v.trim_matches('"').trim_start_matches("UTF-8''");
-                if !v.is_empty() {
-                    return Some(sanitize(v));
-                }
+        if let Some(v) = disposition_filename(cd) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(sanitize(v));
             }
         }
     }
@@ -195,7 +226,84 @@ fn filename(a: &Args, ctype: &str, disposition: Option<&str>) -> Option<String> 
     Some(format!("{base}.{ext}"))
 }
 
+/// `filename`/`filename*` из Content-Disposition по RFC 6266: имена параметров
+/// без учёта регистра, значение в кавычках не режется по `;`, у `*` снимается
+/// ровно префикс `charset'lang'`.
+fn disposition_filename(cd: &str) -> Option<String> {
+    let mut rest = cd;
+    let mut plain: Option<String> = None;
+    let mut extended: Option<String> = None;
+    while let Some(eq) = rest.find('=') {
+        // Имя параметра — всё после последней `;`: `attachment; filename=x`.
+        let name = rest[..eq]
+            .rsplit(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let after = &rest[eq + 1..];
+        let (value, tail) = if let Some(stripped) = after.trim_start().strip_prefix('"') {
+            match stripped.find('"') {
+                Some(end) => (&stripped[..end], &stripped[end + 1..]),
+                None => (stripped, ""),
+            }
+        } else {
+            match after.find(';') {
+                Some(end) => (&after[..end], &after[end..]),
+                None => (after, ""),
+            }
+        };
+        if name == "filename" && plain.is_none() {
+            plain = Some(value.trim().to_string());
+        } else if name == "filename*" && extended.is_none() {
+            // `utf-8''имя` → `имя`. charset/lang нужны только для декодирования,
+            // а процент-кодирование разворачиваем сами: `%D0%9F` иначе попадёт
+            // в имя файла буквально.
+            let (charset, v) = match value.split_once("''") {
+                Some((cs, v)) => (cs, v),
+                None => ("utf-8", value),
+            };
+            extended = Some(percent_decode(v, charset).trim().to_string());
+        }
+        rest = tail;
+    }
+    extended.or(plain)
+}
+
+/// Процент-кодирование из `filename*`: байты собираются и декодируются по charset.
+/// Ошибки декодирования не фатальны — берём UTF-8 с заменой.
+fn percent_decode(v: &str, charset: &str) -> String {
+    let mut bytes = Vec::with_capacity(v.len());
+    let mut it = v.bytes();
+    while let Some(b) = it.next() {
+        if b == b'%' {
+            let hi = it.next().and_then(hex);
+            let lo = it.next().and_then(hex);
+            match (hi, lo) {
+                (Some(h), Some(l)) => bytes.push(h * 16 + l),
+                _ => {
+                    bytes.push(b'%');
+                    if let Some(h) = hi {
+                        bytes.push(h);
+                    }
+                }
+            }
+        } else {
+            bytes.push(b);
+        }
+    }
+    let enc = encoding_rs::Encoding::for_label(charset.trim().as_bytes())
+        .unwrap_or(encoding_rs::UTF_8);
+    enc.decode(&bytes).0.into_owned()
+}
+
+fn hex(b: u8) -> Option<u8> {
+    (b as char).to_digit(16).map(|d| d as u8)
+}
+
 fn sanitize(name: &str) -> String {
+    // Управляющие символы из заголовка (\n, \r, ANSI-последовательности) в имени
+    // файла и в выводе пути недопустимы: это инъекция в терминал.
     let s: String = name
         .chars()
         .map(|c| {
@@ -205,8 +313,14 @@ fn sanitize(name: &str) -> String {
                 c
             }
         })
+        .filter(|c| !c.is_control())
         .collect();
     let s = s.trim_matches('.').to_string();
+    // Длина: ENAMETOOLONG из File::create хуже понятного усечения.
+    let s = match s.char_indices().nth(120) {
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s,
+    };
     if s.is_empty() {
         "page".into()
     } else {
@@ -258,7 +372,24 @@ pub fn fetch(a: &Args) -> String {
                 }
             }
             Own::Binary(path_line) => path_line,
-            Own::Unavailable(code, msg) => {
+            Own::Offline(msg) => {
+                // Ответа нет вовсе — фолбэк по режиму: сайт не отказал, до него не дошли.
+                if a.fallback == Fallback::Auto {
+                    match jina(a) {
+                        Ok(t) => {
+                            eprintln!("fetch: свой путь не дошёл до сайта — фолбэк r.jina.ai");
+                            t
+                        }
+                        Err(e) => crate::die(
+                            &format!("fetch: {msg}; фолбэк r.jina.ai тоже не сработал ({e})"),
+                            1,
+                        ),
+                    }
+                } else {
+                    crate::die(&format!("fetch: {msg}"), 1)
+                }
+            }
+            Own::Http(code, msg) => {
                 // 403/429 — повод для фолбэка; прочее (404 и т.п.) — честная ошибка.
                 if a.fallback == Fallback::Auto && (code == 403 || code == 429) {
                     match jina(a) {

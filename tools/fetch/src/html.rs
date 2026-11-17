@@ -1,19 +1,62 @@
 // HTML → markdown: выбросить мусор DOM, предпочесть main/article, сконвертировать
 // и подчистить пустые строки. Отдельный модуль — main.rs держим читаемым.
 use scraper::{Html, Selector};
+use std::sync::OnceLock;
 
 /// Теги, которые в markdown не нужны: навигация, скрипты, каркас страницы.
+/// `header`/`nav`/`aside` внутри будущего корня (`main`/`article`) сохраняются:
+/// там это заголовок статьи и оглавление, а не каркас сайта.
 const DROP: &[&str] = &[
     "script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form", "iframe",
 ];
+
+/// Селекторы компилируются один раз: `Selector::parse` — не бесплатная операция,
+/// и паника на константном литерале в рабочем пути никому не нужна.
+fn drop_selector() -> &'static Selector {
+    static SEL: OnceLock<Selector> = OnceLock::new();
+    SEL.get_or_init(|| Selector::parse(DROP.join(",").as_str()).expect("селектор drop"))
+}
+
+fn sel(tag: &'static str) -> Selector {
+    Selector::parse(tag).expect("селектор тега")
+}
 
 /// Очистить DOM и вернуть markdown. `raw` отключает очистку (конвертируется всё body).
 pub fn to_markdown(html: &str, raw: bool) -> String {
     let mut doc = Html::parse_document(html);
 
+    let body = sel("body");
+    // Корень выбираем до чистки: его предки и он сам — каркас сайта, их нельзя
+    // сносить по общему списку.
+    let main_sel = sel("main");
+    let art_sel = sel("article");
+    let root_id = if raw {
+        doc.select(&body).next().map(|e| e.id())
+    } else {
+        doc.select(&main_sel)
+            .next()
+            .or_else(|| doc.select(&art_sel).next())
+            .or_else(|| doc.select(&body).next())
+            .map(|e| e.id())
+    };
+
     if !raw {
-        let sel = Selector::parse(DROP.join(",").as_str()).expect("селектор drop");
-        let ids: Vec<_> = doc.select(&sel).map(|e| e.id()).collect();
+        // Целимся только в то, что вне выбранного корня: `<header>` каркаса сайта
+        // выкидываем, `<header>` статьи — оставляем (там заголовок и байлайн).
+        let keep: std::collections::HashSet<_> = root_id
+            .and_then(|id| doc.tree.get(id))
+            .map(|node| {
+                node.descendants()
+                    .map(|d| d.id())
+                    .chain(std::iter::once(node.id()))
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let ids: Vec<_> = doc
+            .select(drop_selector())
+            .map(|e| e.id())
+            .filter(|id| !keep.contains(id))
+            .collect();
         for id in ids {
             // detach отвязывает узел вместе с поддеревом: повторно к детям не ходим.
             if let Some(mut n) = doc.tree.get_mut(id) {
@@ -22,22 +65,23 @@ pub fn to_markdown(html: &str, raw: bool) -> String {
         }
     }
 
-    let body = Selector::parse("body").expect("body");
-    let root = if raw {
-        doc.select(&body).next()
-    } else {
-        // main/article — если есть; иначе body; иначе корень документа.
-        ["main", "article"]
-            .iter()
-            .find_map(|s| doc.select(&Selector::parse(s).unwrap()).next())
-            .or_else(|| doc.select(&body).next())
-    };
+    let root = root_id.and_then(|id| doc.tree.get(id)).map(|e| {
+        scraper::ElementRef::wrap(e).expect("корень — элемент")
+    });
 
     let inner = match root {
         Some(el) => el.inner_html(),
         None => doc.html(),
     };
-    let md = htmd::convert(&inner).unwrap_or_default();
+    // Ошибку конверсии не глотаем молча: иначе пустой результат неотличим от
+    // пустой страницы и уводит в фолбэк, скрывая настоящую причину.
+    let md = match htmd::convert(&inner) {
+        Ok(md) => md,
+        Err(e) => {
+            eprintln!("fetch: html → markdown не удался: {e}");
+            String::new()
+        }
+    };
     squeeze_table_padding(collapse_blank_lines(&md).trim())
 }
 
@@ -55,9 +99,16 @@ fn align_marker(cell: &str) -> &'static str {
 /// ячейки разделяет `|`, так что серии подряд идущих пробелов сжимаем в один.
 /// Трогаем только строки таблиц: двойной пробел в абзаце — это перенос строки.
 fn squeeze_table_padding(md: &str) -> String {
+    // Внутри фенса — код как есть: ASCII-таблица в примере не таблица markdown,
+    // и выравнивание там трогать нельзя.
+    let mut fenced = false;
     md.lines()
         .map(|line| {
-            if !line.starts_with('|') {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                return line.to_string();
+            }
+            if fenced || !line.starts_with('|') {
                 return line.to_string();
             }
             // Строка-разделитель шапки состоит из „|“, „-“, „:“ и пробелов: длину
@@ -114,7 +165,9 @@ pub fn collapse_blank_lines(s: &str) -> String {
             out.push("");
         }
         blanks = 0;
-        out.push(line.trim_end());
+        // Хвостовые пробелы — это markdown-перенос строки (`<br>` после конвертации):
+        // срезаем только \r и \t, пробелы оставляем.
+        out.push(line.trim_end_matches(['\r', '\t']));
     }
     out.join("\n")
 }
@@ -173,6 +226,18 @@ mod tests {
         );
         assert!(out.contains("| --- | ---: |"), "разделитель не сжат: {out}");
         assert!(out.contains("абзац  с  двойным"), "абзац тронут: {out}");
+    }
+
+    #[test]
+    fn fenced_code_is_not_squeezed() {
+        let md = "```\n| a    | b     |\n| ---- | ----- |\n```";
+        assert_eq!(squeeze_table_padding(md), md, "код внутри фенса тронут");
+    }
+
+    #[test]
+    fn hard_break_spaces_survive() {
+        // Два пробела в конце — markdown-перенос строки; их срезать нельзя.
+        assert_eq!(collapse_blank_lines("a  \n\nb"), "a  \n\nb");
     }
 
     #[test]

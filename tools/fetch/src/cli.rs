@@ -37,11 +37,19 @@ pub struct Args {
     pub timeout: u64,
 }
 
+/// Флаги, которые значения не принимают: `--raw=1` — ошибка, а не «--raw плюс URL 1».
+const BOOL_FLAGS: [&str; 1] = ["raw"];
+
 /// `--max-chars=2000` → `["--max-chars", "2000"]`: один разбор вместо двух.
+/// Булевы флаги не разворачиваются: иначе значение уехало бы в позиционные.
 fn expand(argv: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for a in argv {
         match a.strip_prefix("--").and_then(|r| r.split_once('=')) {
+            Some((k, _)) if BOOL_FLAGS.contains(&k) => die(
+                &format!("fetch: --{k} значения не принимает\n{USAGE}"),
+                2,
+            ),
             Some((k, v)) => {
                 out.push(format!("--{k}"));
                 out.push(v.to_string());
@@ -90,12 +98,12 @@ pub fn parse(argv: &[String]) -> Args {
                         }
                     }
                     "--save" => a.save = Some(v.clone()),
-                    "--max-chars" => a.max_chars = num(&argv, i, "--max-chars").unwrap_or(40_000),
-                    _ => a.timeout = num(&argv, i, "--timeout").unwrap_or(30) as u64,
+                    "--max-chars" => a.max_chars = num(&argv, i, "--max-chars", 1, 10_000_000),
+                    _ => a.timeout = num(&argv, i, "--timeout", 1, 600) as u64,
                 }
                 i += 2;
             }
-            _ if arg.starts_with('-') && arg != "-" => {
+            _ if arg.starts_with('-') => {
                 die(&format!("fetch: неизвестный аргумент {arg}\n{USAGE}"), 2)
             }
             _ => {
@@ -111,12 +119,25 @@ pub fn parse(argv: &[String]) -> Args {
     a
 }
 
-fn num(argv: &[String], i: usize, name: &str) -> Option<usize> {
-    let v = argv.get(i + 1)?;
-    Some(v.parse().unwrap_or_else(|_| {
+/// Число из argv[i+1] в границах `lo..=hi`: ноль и абсурдные значения — ошибка,
+/// иначе `--timeout 0` делает запрос мгновенно просроченным.
+fn num(argv: &[String], i: usize, name: &str, lo: usize, hi: usize) -> usize {
+    let Some(v) = argv.get(i + 1) else {
+        die(&format!("fetch: {name} без значения\n{USAGE}"), 2);
+    };
+    let n: usize = v.parse().unwrap_or_else(|_| {
         die(
             &format!("fetch: {name} ждёт число, получено {v}\n{USAGE}"),
             2,
         )
-    }))
+    });
+    if n < lo || n > hi {
+        die(
+            &format!(
+                "fetch: {name} ждёт число {lo}..{hi}, получено {v}\n{USAGE}"
+            ),
+            2,
+        );
+    }
+    n
 }
