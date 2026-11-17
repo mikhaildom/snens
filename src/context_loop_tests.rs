@@ -4,15 +4,14 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
         atomic::{AtomicU64, Ordering},
+        Mutex,
     },
 };
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::{
-    R,
     agent::run_agent,
     cfg::Config,
     context,
@@ -20,6 +19,7 @@ use crate::{
     log::{Call, Rec, Session},
     project,
     render::Ui,
+    R,
 };
 
 const GOAL: &str = "Finish the task using exact datum NEEDLE-739.";
@@ -60,6 +60,9 @@ impl Fixture {
             // Пять последних результатов уборка не трогает: единственный крупный
             // результат защищён, поэтому автоэлизия молчит, а чистит модель.
             keep_results: 5,
+            // В маленьком сценарии сжимать нечего: проверяется видимость отказа,
+            // а не механический фильтр сжатия (он — в unit-тестах).
+            context_min_savings: if large { Some(2000) } else { Some(1) },
             max_turns: 8,
             ..Config::default()
         };
@@ -180,11 +183,11 @@ fn compact_mirror(path: &Path) -> R<()> {
     let mut draft: Value = serde_json::from_slice(&fs::read(path)?)?;
     let blocks = draft["blocks"].as_array_mut().expect("mirror blocks");
     blocks.retain(|block| {
-        !block["messages"].as_array().unwrap().iter().any(|m| {
-            m["content"]
-                .as_str()
-                .is_some_and(|s| s.contains(BULK_TOOL))
-        })
+        !block["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|s| s.contains(BULK_TOOL)))
     });
     let goal = blocks
         .iter()
