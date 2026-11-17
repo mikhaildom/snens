@@ -167,10 +167,11 @@ pub fn set_remote(
     *state
         .session
         .lock()
-        .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? = Some(crate::daemon::Session {
-        connection: conn,
-        remote: true,
-    });
+        .map_err(|_| "внутренняя ошибка окна — перезапусти приложение")? =
+        Some(crate::daemon::Session {
+            connection: conn,
+            remote: true,
+        });
     Ok(())
 }
 

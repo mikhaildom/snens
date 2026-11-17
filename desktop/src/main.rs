@@ -169,10 +169,23 @@ pub fn open_window(
         base = serde_json::to_string(&conn.base_url)?,
         token = serde_json::to_string(&conn.token)?,
     );
+    // `initialization_script` выполняется на КАЖДОЙ навигации верхнего уровня,
+    // а не только на первой загрузке своего бандла. Без фильтра любой переход
+    // на чужой origin (редирект, ссылка из ленты) получил бы токен инстанса в
+    // `window.__SNENS__`. Поэтому разрешаем остаться только внутри своего
+    // бандла или на самом адресе ядра.
+    let own = conn.base_url.clone();
     tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
         .title("snens")
         .inner_size(1280.0, 860.0)
         .min_inner_size(900.0, 600.0)
+        .on_navigation(move |url| {
+            let s = url.as_str();
+            if s.starts_with("tauri://") || s.starts_with("https://tauri.localhost") {
+                return true;
+            }
+            s.starts_with(&own)
+        })
         .initialization_script(&init)
         .build()?;
     Ok(())

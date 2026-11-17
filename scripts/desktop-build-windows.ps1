@@ -54,16 +54,27 @@ if ($LASTEXITCODE -ne 0) { Write-Output "EXIT=$LASTEXITCODE (stage)"; exit $LAST
 # Проверка, что в бандл уехал СВЕЖИЙ клиент: дашборд и переключатель ядра
 # появились в нём позже первой раскладки, и их отсутствие — та самая ошибка,
 # которую ловим здесь, а не на машине человека.
-$js = Get-ChildItem (Join-Path $Repo "desktop\resources\web\assets") -Filter "*.js" |
-      Sort-Object LastWriteTime -Descending | Select-Object -First 1
-$src = Get-Content $js.FullName -Raw
+$assetsDir = Join-Path $Repo "desktop\resources\web\assets"
+if (-not (Test-Path $assetsDir)) {
+  Write-Output "EXIT=1 (нет $assetsDir — стейдж не разложил клиент)"
+  exit 1
+}
+# Ищем пусковые строки во ВСЕХ js-файлах бандла, а не в самом свежем: vite может
+# разрезать код на несколько чанков, и нужный маркер оказался бы не в последнем
+# по времени файле — проверка ложно ругалась бы «клиент устарел».
+$jsFiles = Get-ChildItem $assetsDir -Filter "*.js"
+if (-not $jsFiles) {
+  Write-Output "EXIT=1 (в $assetsDir нет js — клиент собран не туда)"
+  exit 1
+}
+$all = ($jsFiles | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
 foreach ($needle in @("/v1/tickets", "dash__card")) {
-  if ($src -notmatch [regex]::Escape($needle)) {
-    Write-Output "EXIT=1 (клиент устарел: нет '$needle' в $($js.Name))"
+  if ($all -notmatch [regex]::Escape($needle)) {
+    Write-Output "EXIT=1 (клиент устарел: нет '$needle' ни в одном js из $assetsDir)"
     exit 1
   }
 }
-Write-Output "клиент свежий: $($js.Name)"
+Write-Output "клиент свежий: $($jsFiles.Count) файл(ов), маркеры на месте"
 
 Write-Output "=== 3/3 бандл с подписью"
 # Ключ проверяем ДО запуска: если файла нет, `Get-Content` даёт non-terminating
