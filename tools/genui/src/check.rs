@@ -195,11 +195,55 @@ fn is_standard(tag: &str) -> bool {
     STANDARD.contains(&tag)
 }
 
+/// Тело без `<!-- комментариев -->`, содержимого `<script>` и `<style>`: `i<count`
+/// в JS или закомментированная разметка не должны выглядеть как теги.
+fn markup_only(body: &str) -> String {
+    let lower = body.to_ascii_lowercase();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        // Комментарий.
+        if lower[i..].starts_with("<!--") {
+            match lower[i..].find("-->") {
+                Some(end) => i += end + 3,
+                None => break,
+            }
+            continue;
+        }
+        // Содержимое script/style пропускаем целиком: там код, а не теги.
+        let mut skipped = false;
+        for tag in ["<script", "<style"] {
+            if lower[i..].starts_with(tag) {
+                let name = &tag[1..];
+                match lower[i..].find(&format!("</{name}")) {
+                    Some(end) => {
+                        i += end;
+                        skipped = true;
+                    }
+                    None => {
+                        i = body.len();
+                        skipped = true;
+                    }
+                }
+                break;
+            }
+        }
+        if skipped {
+            continue;
+        }
+        let ch = body[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Теги, использованные в разметке. Грубый поиск по `<имя`, а не HTML-парсер:
 /// задача — найти опечатку в имени компонента, а не построить дерево.
 fn used_tags(body: &str) -> Vec<String> {
+    let markup = markup_only(body);
     let mut out = Vec::new();
-    let bytes = body.as_bytes();
+    let bytes = markup.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'<' {
@@ -214,7 +258,7 @@ fn used_tags(body: &str) -> Vec<String> {
             end += 1;
         }
         if end > start {
-            let tag = body[start..end].to_ascii_lowercase();
+            let tag = markup[start..end].to_ascii_lowercase();
             if !out.contains(&tag) {
                 out.push(tag);
             }
@@ -229,6 +273,12 @@ pub fn lint(art: &Artifact, lib_tags: &[String]) -> Report {
     let mut r = Report::default();
     if art.open {
         r.error("фенс не закрыт: модель ещё печатает или забыла закрывающие бэктики");
+    }
+    for (key, value) in &art.head.rejected {
+        r.error(format!(
+            "значение `{key}={value}` не принято: форма не та (id/src — простой набор, \
+             net — хост или хост:порт, height — 80..4000). Молча подставлен дефолт"
+        ));
     }
     for (key, _) in &art.head.raw {
         if !["id", "src", "net", "height", "lib"].contains(&key.as_str()) {
@@ -267,18 +317,48 @@ pub fn lint(art: &Artifact, lib_tags: &[String]) -> Report {
         ));
     }
     // Внешние скрипты: только с домена, объявленного в net=. Иначе `<script src>`
-    // грузился бы мимо CSP и молча падал.
-    for src in attr_values(&art.body, "src") {
-        let host = host_of(&src);
-        let Some(host) = host else { continue };
-        let declared = art.head.net.iter().any(|n| n.eq_ignore_ascii_case(&host));
+    // грузился бы мимо CSP и молча падал. Проверяем именно скрипты: картинки,
+    // шрифты и медиа CSP разрешает с любого https, и ругаться на них — врать.
+    for src in script_srcs(&art.body) {
+        let declared = match host_of(&src) {
+            Some(host) => {
+                // CSP перечисляет только https:// — `http://`-скрипт не загрузится.
+                src.starts_with("https://")
+                    && art
+                        .head
+                        .net
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(&host))
+            }
+            // Относительный или протокол-относительный URL: у документа нет
+            // origin, и `default-src 'none'` его не пустит.
+            None => false,
+        };
         if !declared {
             r.error(format!(
-                "<script src={src}>: домен {host} не объявлен в net= — CSP его заблокирует"
+                "<script src={src}>: CSP его заблокирует — объяви домен в net= (и только https)"
             ));
         }
     }
     r
+}
+
+/// Значения `src` у тегов `<script>` (комментарии и содержимое других тегов не в счёт).
+fn script_srcs(body: &str) -> Vec<String> {
+    let markup = markup_only(body);
+    let lower = markup.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("<script") {
+        let at = from + pos;
+        let Some(close) = lower[at..].find('>') else { break };
+        let tag = &markup[at..at + close];
+        if let Some(src) = attr_values(tag, "src").into_iter().next() {
+            out.push(src);
+        }
+        from = at + close + 1;
+    }
+    out
 }
 
 /// Значения атрибута в тела фенса (только для `src`).
@@ -287,6 +367,12 @@ fn attr_values(body: &str, attr: &str) -> Vec<String> {
     let needle = format!("{attr}=");
     let mut rest = body;
     while let Some(pos) = rest.find(&needle) {
+        // Настоящий атрибут отделён пробелом (или это первый в теге): `data-src=`
+        // и `xsrc=` — не он.
+        if !body_had_boundary(rest, pos) {
+            rest = &rest[pos + needle.len()..];
+            continue;
+        }
         let after = &rest[pos + needle.len()..];
         let (value, tail) = if let Some(stripped) = after.strip_prefix('"') {
             match stripped.find('"') {
@@ -310,6 +396,14 @@ fn attr_values(body: &str, attr: &str) -> Vec<String> {
         rest = tail;
     }
     out
+}
+
+/// Стоит ли перед `attr=` граница имени: пробел, таб, перевод строки или `<`.
+fn body_had_boundary(rest: &str, pos: usize) -> bool {
+    match rest[..pos].chars().next_back() {
+        None => true,
+        Some(c) => c.is_whitespace() || c == '<',
+    }
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -416,29 +510,44 @@ const SHIM: &str = r#"<script>
 })();
 </script>"#;
 
+/// Позиция конца открывающего тега ровно с этим именем: `find("<head")` цеплял
+/// `<header>`, и CSP оказывалась внутри шапки, где браузер её игнорирует.
+fn tag_end(doc: &str, tag: &str) -> Option<usize> {
+    let lower = doc.to_ascii_lowercase();
+    let needle = format!("<{tag}");
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(&needle) {
+        let at = from + pos;
+        let after = lower[at + needle.len()..].chars().next();
+        // Граница имени: `<header>` — не `<head>`.
+        if matches!(after, Some(c) if c == '>' || c == '/' || c.is_whitespace()) {
+            let end = lower[at..].find('>')?;
+            return Some(at + end + 1);
+        }
+        from = at + needle.len();
+    }
+    None
+}
+
 fn inject(doc: &str, what: &str, html: &str) -> String {
     if what == "head" {
-        if let Some(pos) = doc.to_ascii_lowercase().find("<head") {
-            if let Some(end) = doc[pos..].find('>') {
-                let at = pos + end + 1;
-                return format!("{}{html}{}", &doc[..at], &doc[at..]);
-            }
+        if let Some(at) = tag_end(doc, "head") {
+            return format!("{}{html}{}", &doc[..at], &doc[at..]);
         }
-        if let Some(pos) = doc.to_ascii_lowercase().find("<html") {
-            if let Some(end) = doc[pos..].find('>') {
-                let at = pos + end + 1;
-                return format!("{}{html}{}", &doc[..at], &doc[at..]);
-            }
+        if let Some(at) = tag_end(doc, "html") {
+            return format!("{}{html}{}", &doc[..at], &doc[at..]);
         }
         return format!("<head>{html}</head>{doc}");
     }
-    if let Some(pos) = doc.to_ascii_lowercase().find("<body") {
-        if let Some(end) = doc[pos..].find('>') {
-            let at = pos + end + 1;
-            return format!("{}{html}{}", &doc[..at], &doc[at..]);
-        }
+    // Скрипты — в конец body: до `<!doctype>` они включили бы quirks mode и
+    // обошли CSP, которая объявлена в head.
+    if let Some(at) = tag_end(doc, "body") {
+        return format!("{}{html}{}", &doc[..at], &doc[at..]);
     }
-    format!("{html}{doc}")
+    if let Some(at) = tag_end(doc, "html") {
+        return format!("{}<body>{html}</body>{}", &doc[..at], &doc[at..]);
+    }
+    format!("{doc}{html}")
 }
 
 /// Документ целиком — как его собирает клиент (`composeDocument`).
@@ -476,18 +585,19 @@ font-size:13px;line-height:1.45}body{padding:10px 12px;overflow:hidden}</style>"
     // но не `</` — закрывающий тег внутри значений сломал бы документ.
     let data_script = match data {
         Some(v) => {
+            // Двойное кодирование не нужно: сначала JSON значения, потом JSON-строка
+            // для литерала — так `</script>` внутри данных не закроет тег, а
+            // кавычки в значениях останутся данными.
             let json = serde_json::to_string(v).unwrap_or_else(|_| "null".into());
-            format!(
-                "<script>window.snens.data=JSON.parse({});</script>",
-                serde_json::to_string(&json).unwrap_or_else(|_| "\"null\"".into())
-            )
+            let literal = serde_json::to_string(&json).unwrap_or_else(|_| "\"null\"".into());
+            format!("<script>window.snens.data=JSON.parse({literal});</script>")
         }
         None => String::new(),
     };
     let boot = format!("{SHIM}{data_script}{scripts}");
     if art.body.to_ascii_lowercase().contains("<html") {
         let doc = inject(&art.body, "head", &format!("{meta}{theme}"));
-        return inject(&doc, "start", &boot);
+        return inject(&doc, "end", &boot);
     }
     format!(
         "<!doctype html>\n<html lang=\"ru\"><head><meta charset=\"utf-8\">{meta}{theme}</head>\n\
@@ -511,6 +621,31 @@ fn escape_close(s: &str) -> String {
         i = at + "</script".len();
     }
     out.push_str(&s[i..]);
+    out
+}
+
+/// `file://`-URL из пути: percent-кодирование по сегментам, без внешней зависимости.
+fn file_url(path: &Path) -> String {
+    let mut out = String::from("file://");
+    let mut push = |seg: &str| {
+        for b in seg.bytes() {
+            match b {
+                b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'-'
+                | b'.'
+                | b'_'
+                | b'~'
+                | b'/'
+                | b':' => out.push(b as char),
+                other => out.push_str(&format!("%{other:02X}")),
+            }
+        }
+    };
+    let text = path.display().to_string();
+    // Windows-путь `C:\…` начинается с буквы диска — она остаётся как есть.
+    push(&text);
     out
 }
 
@@ -560,7 +695,12 @@ pub fn check_in_browser(
 ) -> Result<Report, String> {
     let mut report = Report::default();
     let doc = compose_with(art, lib, data);
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_s);
+    // from_secs_f64 паникует на NaN/отрицательном: это pub-функция, проверяем сами.
+    let budget = Duration::try_from_secs_f64(timeout_s)
+        .map_err(|e| format!("genui: таймаут {timeout_s} не годится: {e}"))?;
+    let observe_budget = Duration::try_from_secs_f64(timeout_s.min(8.0))
+        .unwrap_or(Duration::from_secs(0));
+    let deadline = Instant::now() + budget;
     let mut br = cdp::open(chrome, deadline, timeout_s, out_dir, "genui")?;
     br.set_viewport(1000, 900)?;
 
@@ -576,7 +716,9 @@ pub fn check_in_browser(
         eprintln!("genui: страница-хост {}", dump.display());
     }
     std::fs::write(&page, &host).map_err(|e| format!("host.html: {e}"))?;
-    let url = format!("file://{}", page.display());
+    // Путь кодируем: пробел, `#`, `?` или `%` в TMPDIR дали бы невалидный URL и
+    // непонятную ошибку навигации.
+    let url = file_url(&page);
     br.navigate(&url)?;
     br.wait_ready(Duration::from_secs(5)).or_else(|e| {
         if e.contains("readyState") {
@@ -590,12 +732,18 @@ pub fn check_in_browser(
     // `postMessage`, родитель складывает их в `window.__ready`/`__genui`.
     // Ждём до готовности или до короткого бюджета: висящий документ не должен
     // съедать весь таймаут тула.
-    let observe_until = Instant::now() + Duration::from_secs_f64(timeout_s.min(8.0));
+    let observe_until = Instant::now() + observe_budget;
     let mut ready = false;
     let mut seen = 0usize;
     while Instant::now() < observe_until {
-        if let Ok(v) = br.cdp.eval(&br.session, "window.__ready === true") {
-            ready = v.as_bool().unwrap_or(false);
+        match br.cdp.eval(&br.session, "window.__ready === true") {
+            Ok(v) => ready = v.as_bool().unwrap_or(false),
+            Err(e) => {
+                // Мёртвый браузер/таргет: без этого сообщения видно только
+                // «документ не прислал ready», и настоящая причина теряется.
+                report.warn(format!("браузер не отвечает на пробу готовности: {e}"));
+                break;
+            }
         }
         // Забираем новые доклады: ошибки приходят раньше `ready` и сразу.
         if let Ok(v) = br
@@ -642,13 +790,21 @@ pub fn check_in_browser(
              dpr:window.devicePixelRatio||1}}}})()"
         ),
     )?;
-    if let (Some(x), Some(y), Some(w), Some(h), Some(dpr)) = (
+    let rect_geo = (
         rect.get("x").and_then(Value::as_f64),
         rect.get("y").and_then(Value::as_f64),
         rect.get("w").and_then(Value::as_f64),
         rect.get("h").and_then(Value::as_f64),
         rect.get("dpr").and_then(Value::as_f64),
-    ) {
+    );
+    if !matches!(&rect_geo, (Some(_), Some(_), Some(w), Some(h), Some(_)) if *w > 0.0 && *h > 0.0)
+    {
+        // Кадр не снят — модель должна знать почему, иначе правит вслепую.
+        report.warn(format!(
+            "снимок не снят: iframe артефакта не измерен (прямоугольник: {rect})"
+        ));
+    }
+    if let (Some(x), Some(y), Some(w), Some(h), Some(dpr)) = rect_geo {
         let png = br.screenshot(Some(cdp::clip_of(x, y, w, h, dpr)))?;
         let name = format!(
             "genui-{}-{}.png",

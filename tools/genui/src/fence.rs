@@ -14,6 +14,9 @@ pub struct Head {
     pub height: u32,
     /// Все токены как есть: по ним ищутся опечатки в ключах.
     pub raw: Vec<(String, String)>,
+    /// Значения, которые не прошли проверку формы и были отброшены: иначе
+    /// опечатка модели молча превращается в дефолт и `check` о ней не скажет.
+    pub rejected: Vec<(String, String)>,
 }
 
 /// Артефакт, вынутый из текста ответа.
@@ -33,6 +36,17 @@ fn valid_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// Хост из `net=`: то же плюс порт и обрамление IPv6-литерала. Раньше `:` не
+/// проходил, и `net=localhost:8080` просто выпадал из списка — запрет не
+/// срабатывал, потому что проверять было нечего.
+fn valid_net_host(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '-' | ':' | '[' | ']' | '%')
+        })
+}
+
 /// Разобрать заголовок: токены `ключ=значение` через пробелы.
 pub fn parse_head(line: &str) -> Head {
     let mut h = Head::default();
@@ -47,25 +61,46 @@ pub fn parse_head(line: &str) -> Head {
         h.raw.push((key.to_string(), value.to_string()));
         match key {
             "id" if valid_name(value) => h.id = value.to_string(),
-            "src" => h.src = value.to_string(),
+            "id" => h.rejected.push((key.to_string(), value.to_string())),
+            // `src` — путь внутри каталога сессии (`<id>.out/…`): заголовок пишет
+            // модель, поэтому `../..`, абсолютный путь и схема отсекаются сразу.
+            "src" if valid_src(value) => h.src = value.to_string(),
+            "src" => h.rejected.push((key.to_string(), value.to_string())),
             "net" => {
-                h.net = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| valid_name(s))
-                    .map(str::to_string)
-                    .collect()
+                h.net.clear();
+                for item in value.split(',').map(str::trim) {
+                    if item.is_empty() {
+                        continue;
+                    }
+                    if valid_net_host(item) {
+                        h.net.push(item.to_string());
+                    } else {
+                        h.rejected.push((key.to_string(), item.to_string()));
+                    }
+                }
             }
             "height" => {
                 let n: u32 = value.parse().unwrap_or(0);
                 if (80..=4000).contains(&n) {
                     h.height = n;
+                } else {
+                    h.rejected.push((key.to_string(), value.to_string()));
                 }
             }
             _ => {}
         }
     }
     h
+}
+
+/// Путь из `src`: относительный, без `..`, без схемы и ведущего слэша.
+fn valid_src(v: &str) -> bool {
+    !v.is_empty()
+        && !v.starts_with('/')
+        && !v.starts_with('\\')
+        && !v.contains("..")
+        && !v.contains(':')
+        && !v.chars().any(|c| c.is_control())
 }
 
 /// Открывающая строка фенса: три и более бэктика + инфо-строка `artifact`.
@@ -93,7 +128,9 @@ fn close_line(line: &str, fence: usize) -> bool {
 /// Порезать текст ответа на артефакты. Текст между ними не нужен: клиент
 /// рендерит его как обычно, а проверке интересны только фенсы.
 pub fn parse(text: &str) -> Vec<Artifact> {
-    let lines: Vec<&str> = text.split('\n').collect();
+    // `lines()` срезает `\r` у CRLF: иначе `\`\`\`artifact\r` не опознаётся как фенс
+    // и тело тащит `\r` в каждой строке.
+    let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -367,6 +404,24 @@ mod tests {
             assert!(is_private_host(h), "{h}");
         }
         assert!(!is_private_host("2001:4860:4860::8888"));
+    }
+
+    #[test]
+    fn crlf_fence_is_recognised() {
+        // `\r` в конце строки не должен мешать опознать фенс и попадать в тело.
+        let arts = parse("```artifact id=a\r\n<p>1</p>\r\n```\r\n");
+        assert_eq!(arts.len(), 1, "фенс с CRLF не опознан");
+        assert_eq!(arts[0].head.id, "a");
+        assert!(!arts[0].body.contains('\r'), "тело тащит \r");
+    }
+
+    #[test]
+    fn src_outside_the_session_dir_is_ignored() {
+        for bad in ["../../etc/passwd", "/etc/passwd", "https://evil.example/x"] {
+            let h = parse_head(&format!("id=a src={bad}"));
+            assert!(h.src.is_empty(), "{bad} принят как src");
+        }
+        assert_eq!(parse_head("id=a src=out/chart.svg").src, "out/chart.svg");
     }
 
     #[test]

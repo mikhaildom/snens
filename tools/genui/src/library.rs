@@ -48,9 +48,14 @@ pub fn read() -> Result<Vec<File>, String> {
     }
     let comps = dir.join("components");
     if comps.is_dir() {
+        // Ошибку обхода не глотаем: молча неполная библиотека даёт успешный
+        // `check` на части компонентов и нестабильный отпечаток кэша.
         let mut names: Vec<PathBuf> = std::fs::read_dir(&comps)
             .map_err(|e| format!("{}: {e}", comps.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{}: {e}", comps.display()))?
+            .into_iter()
+            .map(|e| e.path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("js"))
             .collect();
         names.sort();
@@ -95,18 +100,19 @@ pub fn tags(files: &[File]) -> Vec<String> {
     out
 }
 
-/// Отпечаток содержимого: по нему клиент решает, что кэш устарел. Штатный
-/// `DefaultHasher` (SipHash) — не криптография, но для кэша этого хватает, и
-/// лишней зависимости не требует.
+/// Отпечаток содержимого: по нему клиент решает, что кэш устарел.
+/// FNV-1a, а не `DefaultHasher`: у того алгоритм не зафиксирован и меняется
+/// между версиями компилятора — отпечаток обязан быть воспроизводимым между
+/// сборками харнесса и клиента.
 pub fn hash(files: &[File]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for f in files {
-        f.name.hash(&mut h);
-        f.source.hash(&mut h);
+        for b in f.name.as_bytes().iter().chain(b"\0").chain(f.source.as_bytes()) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
     }
-    format!("{:016x}", h.finish())
+    format!("{h:016x}")
 }
 
 /// Скелет компонента: то, с чего начинается новый файл в `components/`.
@@ -181,7 +187,12 @@ pub fn file_name(name: &str) -> String {
             }
         })
         .collect();
-    let slug = slug.trim_matches('-').replace("--", "-");
+    // Серии разделителей схлопываем до одного: `replace` делает один проход,
+    // и `a---b` превращалось в `a--b`.
+    let mut slug = slug.trim_matches('-').to_string();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
     if slug.is_empty() {
         "component.js".into()
     } else {
@@ -189,15 +200,22 @@ pub fn file_name(name: &str) -> String {
     }
 }
 
-/// Заголовок компонента для `INDEX.md`: первая строка комментария файла.
+/// Заголовок компонента для `INDEX.md`: первая строка **шапки** файла —
+/// ведущего блока `//`-комментариев. Комментарий выше внутреннего помощника
+/// описанием компонента не является, поэтому на первом же непустом
+/// не-комментарии поиск прекращается.
 pub fn describe(source: &str) -> String {
     for line in source.lines() {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix("//") {
-            let rest = rest.trim();
-            if !rest.is_empty() && !rest.starts_with('-') {
-                return rest.to_string();
-            }
+        if t.is_empty() {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("//") else {
+            return String::new();
+        };
+        let rest = rest.trim();
+        if !rest.is_empty() && !rest.starts_with('-') {
+            return rest.to_string();
         }
     }
     String::new()
@@ -267,5 +285,9 @@ mod tests {
     fn describe_takes_first_comment_line() {
         assert_eq!(describe("// Квиз\n// ещё"), "Квиз");
         assert_eq!(describe("class A {}"), "");
+        // Комментарий глубоко в файле — не описание компонента.
+        assert_eq!(describe("class A {}\n// helper\n"), "");
+        // Шапка с пустой строкой внутри остаётся шапкой.
+        assert_eq!(describe("// Квиз\n\n// ещё\nclass A {}"), "Квиз");
     }
 }
