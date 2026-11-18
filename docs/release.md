@@ -106,6 +106,50 @@ cd /tmp && curl -sO <url> && tar xzf <архив> && ./snens-web --help     # з
 Установщик Windows проверяется запуском на чистой машине: установка, первый
 запуск, окно грузит свой клиент.
 
+### 6а. Выкладка десктоп-артефакта, собранного на Windows
+
+`scripts/release.sh` собирает бандл на сервере и выкладывает сам, но
+Windows-установщик собирается на другой машине (`ssh svuv`). Его выкладка —
+четыре шага, и все они обязательны:
+
+```sh
+# 1. забрать артефакт и подпись с машины сборки
+scp svuv:'.../bundle/nsis/snens_<версия>_x64-setup.exe{,.sig}' /tmp/rel/
+
+# 2. latest.json: version + url + signature из .sig (байт в байт, без trim)
+#    platforms: только то, что реально подписано — "windows-x86_64-nsis"
+
+# 3. каталог версии и владелец. `sudo mkdir` создаёт root-каталог, и после
+#    этого `cp` падает Permission denied: сначала создать, потом chown.
+sudo mkdir -p /var/www/snens.svuvi.ch/releases/<версия>
+sudo chown -R clawdich:clawdich /var/www/snens.svuvi.ch/releases/<версия>
+cp -p /tmp/rel/* /var/www/snens.svuvi.ch/releases/<версия>/
+chmod 0755 /var/www/snens.svuvi.ch/releases/<версия>
+chmod 0644 /var/www/snens.svuvi.ch/releases/<версия>/*
+
+# 4. манифест — АТОМАРНО и последним: пока его нет, старый latest.json
+#    обещает старую версию, и никто не скачает 404.
+cp /tmp/rel/latest.json /var/www/snens.svuvi.ch/releases/.latest.json.tmp
+mv -f /var/www/snens.svuvi.ch/releases/.latest.json.tmp \
+      /var/www/snens.svuvi.ch/releases/latest.json
+```
+
+Проверка — на скачанном файле, а не на «лежит»:
+
+```sh
+curl -s https://snens.svuvi.ch/releases/latest.json | python3 -m json.tool
+curl -s -o /tmp/x.exe -w '%{http_code} %{size_download}\n' <url из манифеста>
+sha256sum /tmp/x.exe      # совпадает с собранным на машине сборки
+```
+
+Установщик ставится в отдельный каталог (`/S /D=...`), чтобы не тронуть
+рабочую установку. **Проверка установкой перезаписывает запись в реестре**
+`HKCU\...\Uninstall\snens` на новый путь: после проверки её надо вернуть на
+рабочий каталог (DisplayVersion, InstallLocation, UninstallString, DisplayIcon),
+иначе «Удалить программу» ведёт в удалённую папку. Данные (`%APPDATA%\snens`)
+установщик не трогает; чистый инстанс делается через `SNENS_DATA_DIR` и
+`SNENS_CONFIG_DIR`, а не удалением чужого каталога.
+
 ### 7. Обновить рабочий сервис
 
 ```sh
