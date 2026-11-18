@@ -284,3 +284,6 @@ mod tests;
 #[cfg(test)]
 #[path = "surface_commands_tests.rs"]
 mod command_tests;
+#[cfg(test)]
+#[path = "surface_control_tests.rs"]
+mod control_tests;

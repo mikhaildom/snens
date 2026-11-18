@@ -64,12 +64,13 @@ printf 'alpha\nbeta\ngamma\ndelta\n' >"$f"
 # Модель видит не generic args/stdin, а настоящие поля из tools/<имя>/schema.json.
 # Проверяем файлы и то, что `snens tools` их показывает; сборку argv по схеме
 # проверяют unit-тесты (src/dispatch.rs, src/registry.rs).
-for tool in read write edit; do
+for tool in read write edit index; do
   s=$HERE/$tool/schema.json
   if [ -f "$s" ]; then ok "schema: $tool — schema.json рядом с бинарником"; else bad "schema: у $tool нет schema.json"; fi
   if grep -q '"x-snens"' "$s" 2>/dev/null; then ok "schema: $tool — есть ключ x-snens"; else bad "schema: в $tool/schema.json нет x-snens"; fi
 done
 has '"path"' "$(cat "$HERE/read/schema.json")" "schema: read объявляет path"
+has '"path"' "$(cat "$HERE/index/schema.json")" "schema: index объявляет path"
 has '"content"' "$(cat "$HERE/write/schema.json")" "schema: write объявляет content"
 has '"edits"' "$(cat "$HERE/edit/schema.json")" "schema: edit объявляет edits"
 has '"mode": "field"' "$(cat "$HERE/write/schema.json")" "schema: write берёт stdin из поля content"
@@ -118,6 +119,73 @@ if [ -n "$CORE" ]; then
     *) bad "schema: snens tools потерял пометку generic" ;;
   esac
 fi
+
+# ---- index ----
+# Скелет — это карта файла: импорты, типы, сигнатуры с номерами строк. Проверяем
+# секции, номера и отказ на неподдержанном расширении: модель иначе прочтёт файл
+# целиком и весь смысл тула потеряется молча.
+rs=$TMP/a.rs
+cat >"$rs" <<'RS'
+use std::io;
+
+pub struct P {
+    pub x: u8,
+}
+
+impl P {
+    pub fn new() -> Self { P { x: 0 } }
+}
+
+pub fn run(a: u8) -> u8 {
+    a
+}
+RS
+t index "$rs"
+want 0 "$rc" "index: код 0"
+has "imports:" "$out" "index: секция импортов"
+has "std::io" "$out" "index: текст импорта"
+has "types:" "$out" "index: секция типов"
+has "pub struct P" "$out" "index: заголовок struct"
+has "x: u8" "$out" "index: поле struct"
+has "impls:" "$out" "index: секция impl"
+has "new() -> Self" "$out" "index: сигнатура метода"
+has "fns:" "$out" "index: секция функций"
+has "run(a: u8) -> u8" "$out" "index: сигнатура функции"
+# Номер строки в квадратных скобках — по нему модель зовёт read --offset.
+has "[11]" "$out" "index: номер строки у объявления"
+
+# Скелет обязан быть кратно меньше файла: иначе тул бесполезен, но выглядит
+# рабочим. Тело у функций должно быть настоящим — файл из однострочных `fn f(){}`
+# не сжимается по определению (номер строки в скелете длиннее самого объявления).
+big=$TMP/big.rs
+: >"$big"
+for i in $(seq 1 60); do cat >>"$big" <<'FN'
+pub fn handler(input: &str) -> Result<usize, std::io::Error> {
+    let parsed: Vec<&str> = input.split(',').collect();
+    let total = parsed.iter().map(|s| s.len()).sum();
+    if total == 0 {
+        return Err(std::io::Error::other("пусто"));
+    }
+    Ok(total)
+}
+FN
+done
+size=$(wc -c <"$big")
+t index "$big"
+sk=$(printf '%s' "$out" | wc -c)
+if [ "$sk" -lt $((size / 2)) ]; then ok "index: скелет вдвое меньше файла ($size → $sk Б)"; else bad "index: скелет не экономит ($size → $sk Б)"; fi
+
+t index "$f"
+want 1 "$rc" "index: .txt — отказ"
+has "не поддержан" "$err" "index: отказ называет причину"
+has "rs" "$err" "index: отказ перечисляет поддержанные расширения"
+
+t index "$TMP"
+want 1 "$rc" "index: каталог — отказ"
+has "каталог" "$err" "index: каталог — подсказка"
+
+t index --help
+has "index —" "$out" "index: --help, строка 1 = суть"
 
 # ---- read ----
 t read "$f"

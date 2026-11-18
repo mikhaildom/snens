@@ -138,6 +138,11 @@ impl Session {
 }
 
 pub struct Control {
+    /// Чей это контроль: `run_id` хода, который его поставил. Без него снятие
+    /// контроля было безусловным, и закончившийся ход уносил канал живого
+    /// наследника — тот видел закрытый канал, считал себя отменённым и умирал
+    /// молча (сообщения ложились в очередь, которую никто не читал).
+    pub run: String,
     pub cancel: watch::Sender<bool>,
     pub queued: mpsc::UnboundedSender<crate::agent::QueuedInput>,
 }
@@ -583,6 +588,21 @@ impl Runtime {
         m.entry(id.into())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Снять контроль, только если он принадлежит этому ходу.
+    ///
+    /// `launch` занимает место, отменив прежний ход, поэтому к моменту
+    /// завершения старого хода в карте может лежать уже чужой контроль. Снимать
+    /// его нельзя: вместе с `watch::Sender` закрывается канал, а закрытый канал
+    /// живой ход читает как «меня отменили» (см. `agent::wait_cancel`), и ещё
+    /// `message` перестаёт находить очередь входа — `busy` без контрола означал
+    /// потерю сообщения.
+    pub async fn release_control(&self, id: &str, run: &str) {
+        let mut controls = self.controls.lock().await;
+        if controls.get(id).is_some_and(|c| c.run == run) {
+            controls.remove(id);
+        }
     }
 }
 

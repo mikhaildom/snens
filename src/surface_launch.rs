@@ -57,7 +57,7 @@ pub(super) async fn finalize_launch_error(s: &Arc<Runtime>, id: &str, run: &str,
         let _ = s.save_session(&live);
         s.publish_session(live);
     }
-    s.controls.lock().await.remove(id);
+    s.release_control(id, run).await;
     let _ = s
         .emit(
             id,
@@ -168,6 +168,7 @@ pub(super) async fn launch(
         controls.insert(
             id.clone(),
             rt::Control {
+                run: run.clone(),
                 cancel: cancel_tx,
                 queued: queue_tx,
             },
@@ -420,11 +421,22 @@ pub(super) async fn launch(
         // контроль. Наоборот было окно, в котором `message` уже видел `running`,
         // но `controls.get` возвращал `None` — вход терялся молча, а клиент ждал
         // `applied`, которого никогда не будет.
+        //
+        // Состояние снимаем только со своего хода: `launch` мог уже занять место,
+        // отменив нас. Безусловная запись `idle`/`None` обнуляла `run_id` живого
+        // наследника — и `stop` по его `run_id` отвечал `conflict`, а `message`
+        // начинал новый ход поверх идущего (`busy` по `state` уже врал).
         let snapshot = {
             let mut d = s.data.lock().await;
-            if let Some(x) = d.sessions.get_mut(&id) {
-                x.state = "idle".into();
-                x.run_id = None
+            let ours = d
+                .sessions
+                .get(&id)
+                .is_some_and(|x| x.run_id.as_deref() == Some(run.as_str()));
+            if ours {
+                if let Some(x) = d.sessions.get_mut(&id) {
+                    x.state = "idle".into();
+                    x.run_id = None
+                }
             }
             let snapshot = d.sessions.get(&id).cloned();
             drop(d);
@@ -435,7 +447,7 @@ pub(super) async fn launch(
             let _ = s.save_session(&live);
             s.publish_session(live);
         }
-        s.controls.lock().await.remove(&id);
+        s.release_control(&id, &run).await;
         // Ход завершён и сессия снова idle — планируем авторевью после простоя.
         // Считаем только успешные ходы: отменённый/ошибочный ход ревью не стоит.
         if status == "ok" {

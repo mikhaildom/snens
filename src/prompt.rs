@@ -9,9 +9,10 @@ pub fn system_prompt(cfg: &Config) -> String {
 
 /// Правило чтения кода — одно на харнесс: уезжает в префикс, в промпт ревью
 /// и в промпт улучшения. Держим его здесь, чтобы копии не расходились.
-pub const READ_RULE: &str = "Файл целиком не читай: `grep -n <символ>` (тул `grep`, не `run grep` — \
-     он обходит .git/target/node_modules и умеет лимит), потом `read --offset N --limit M` по \
-     найденному месту. Вывод команды не выдумывай: сомневаешься — выполни.";
+pub const READ_RULE: &str = "Файл целиком не читай. Сперва карта: `index <файл>` — импорты, типы, \
+     сигнатуры с номерами строк (в разы дешевле самого файла). Потом точное место — `read --offset N \
+     --limit M` по найденному. Искать по символу — `grep -n <символ>` (тул `grep`, не `run grep` — \
+     он обходит .git/target/node_modules и умеет лимит). Вывод команды не выдумывай: сомневаешься — выполни.";
 
 /// Surface API sessions get one fixed, non-instructional annotation. Unknown IDs are
 /// deliberately not echoed: surface names are client-controlled input.

@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Файл для индексации: абсолютный или относительно рабочего каталога. Ведущий ~ разворачивается."
+    },
+    "max_chars": {
+      "type": "integer",
+      "description": "Потолок символов в ответе; обрезанный скелет помечен"
+    }
+  },
+  "required": ["path"],
+  "x-snens": {
+    "argv": [
+      {"field": "path"},
+      {"flag": "--max-chars", "field": "max_chars"}
+    ],
+    "stdin": {"mode": "none"}
+  }
+}

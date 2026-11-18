@@ -142,6 +142,26 @@ fn surface_tool_timeout_secs() -> u64 {
     60
 }
 
+/// Ждать отмены хода.
+///
+/// Закрытый канал — не отмена: он значит, что контрол снят и отменять больше
+/// некому. `watch::Receiver::changed()` на закрытом канале возвращает `Err`
+/// сразу, и раньше селект срабатывал на этом `Err`, как на отмене: ход умирал
+/// с `cancelled` (и это видел человек в ленте), хотя никто его не отменял. Ждём
+/// вечно: без отправляющего конца отменить нечего.
+async fn wait_cancel(c: &mut watch::Receiver<bool>) {
+    loop {
+        match c.changed().await {
+            Ok(()) => {
+                if *c.borrow() {
+                    return;
+                }
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    }
+}
+
 fn ignore_surface_signal(_: SurfaceSignal) {}
 
 impl Default for SurfaceRunOptions<'static> {
@@ -391,7 +411,7 @@ async fn run_loop<L: Llm>(
         // Модель уже подставлена `live()`; остальные поля — тоже из файла.
         let turn_cfg = cfg.clone();
         let reply: Reply = if let Some(c) = cancel.as_mut() {
-            tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), r = stream_reply(&turn_cfg, msgs, defs.clone(), llm, ui, observe) => r? }
+            tokio::select! { biased; _ = wait_cancel(c) => return Err("cancelled".into()), r = stream_reply(&turn_cfg, msgs, defs.clone(), llm, ui, observe) => r? }
         } else {
             stream_reply(&turn_cfg, msgs, defs.clone(), llm, ui, observe).await?
         };
@@ -540,7 +560,7 @@ async fn run_loop<L: Llm>(
                             result_rx,
                         );
                         let got = if let Some(c) = cancel.as_mut() {
-                            tokio::select! { biased; _ = c.changed() => { let _=sess.append(Rec::ToolResult{ts:log::now(),call_id:call.id.clone(),tool:call.name.clone(),argv:Vec::new(),exit:-1,bytes:0,ms:0,body:Body::Inline{ text:"cancelled".into() },parts:Vec::new()}); return Err("cancelled".into()) }, r = wait => r }
+                            tokio::select! { biased; _ = wait_cancel(c) => { let _=sess.append(Rec::ToolResult{ts:log::now(),call_id:call.id.clone(),tool:call.name.clone(),argv:Vec::new(),exit:-1,bytes:0,ms:0,body:Body::Inline{ text:"cancelled".into() },parts:Vec::new()}); return Err("cancelled".into()) }, r = wait => r }
                         } else {
                             wait.await
                         };
@@ -561,7 +581,7 @@ async fn run_loop<L: Llm>(
                     fail("surface tool executor unavailable".into())
                 }
             } else if let Some(c) = cancel.as_mut() {
-                tokio::select! { biased; _ = c.changed() => return Err("cancelled".into()), o = dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess) => o }
+                tokio::select! { biased; _ = wait_cancel(c) => return Err("cancelled".into()), o = dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess) => o }
             } else {
                 dispatch::dispatch(call, cfg, &reg, &path, &out_dir, sess).await
             };
