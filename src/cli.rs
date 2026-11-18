@@ -35,6 +35,7 @@ mod settings;
 mod subagent;
 mod jobs;
 mod wake;
+mod disk;
 mod sweep;
 mod surface_artifact;
 mod surface_client;
@@ -60,6 +61,7 @@ snens — агент с инструментами
   snens log [--session ID] — журнал сессии, строками JSON
   snens sessions — список сессий
   snens sweep [--older-than DAYS] [--attachments] [--dry-run] — удалить старые сессии и вложения
+  snens disk [--older-than DAYS] [--dry-run] — снести брошенные сборочные каталоги
   snens tickets [--all] [--target T] [--kind K] — заведённые проблемы
   snens tickets show <имя> | grep <текст> | stats — посмотреть, найти, сводка
   snens tools [--json] — список тулов; --json — определения для модели
@@ -118,6 +120,7 @@ async fn legacy_main() -> R<()> {
         Some("show") => cmd_show(&flags),
         Some("log") => cmd_log(&flags),
         Some("sweep") => sweep::cmd(&flags, positional),
+        Some("disk") => disk::cmd(&flags, positional),
         Some("sessions") => {
             let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
             for id in log::list(&cfg.sessions_path())? {
