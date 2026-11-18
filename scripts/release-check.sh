@@ -49,6 +49,26 @@ ok()  { printf '  ok   %s\n' "$*"; }
 bad()  { printf '  ПРОВАЛ %s\n' "$*" >&2; FAILED="${FAILED} $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Найти cargo, когда его нет в PATH.
+#
+# Гейт зовётся и из агента (`run`), а там PATH — это PATH процесса поверхности:
+# `~/.cargo/bin` в нём нет, хотя cargo у человека установлен. Раньше это валило
+# четыре шага сразу («нет cargo в PATH»), и релиз вставал на ровном месте —
+# запускать приходилось через `PATH=$HOME/.cargo/bin:$PATH`, то есть помнить
+# про это на каждом релизе.
+#
+# Добавляем в PATH, а не только помним путь: cargo зовёт rustc и линкер, и все
+# дочерние процессы должны видеть тот же каталог.
+if ! have cargo; then
+    for _d in "${CARGO_HOME:-$HOME/.cargo}/bin" /usr/local/cargo/bin "$HOME/.local/bin" /opt/homebrew/bin; do
+        if [ -x "$_d/cargo" ]; then
+            PATH="$_d:$PATH"
+            export PATH
+            break
+        fi
+    done
+fi
+
 # Логи прогонов — в приватном каталоге, а не по фиксированным путям в /tmp:
 # `/tmp/snens-gate-test.log` мог заранее создать другой пользователь (симлинк
 # на чужой файл), и `>` писал бы по нему от нашего имени.
