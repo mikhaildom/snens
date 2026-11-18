@@ -288,6 +288,25 @@ async fn run_loop<L: Llm>(
                 text: msg.text,
             });
         }
+        // Готовые фоновые задания забираются ЗДЕСЬ же, наравне с ящиком, и ход
+        // не заканчивается, не отчитавшись за них. Раньше их забирал только
+        // будильник поверхности по концу хода: результат, пришедший посреди
+        // работы, ждал её конца, и человек видел отчёт спустя минуты, хотя
+        // границ, на которых его можно было отдать, было много.
+        //
+        // Запись — `User { source: "wake" }`, а не `Steer`: задание запущено в
+        // этой же сессии, и для человека это часть её работы (лента кладёт его в
+        // пачку), а не чужое слово в ход (steer она рисует репликой).
+        let finished = crate::jobs::collect_finished(sess.path());
+        for text in finished {
+            let _ = sess.append(Rec::User {
+                ts: log::now(),
+                text,
+                source: "wake".into(),
+                parts: Vec::new(),
+                ask: None,
+            });
+        }
         let raw = sess.read()?;
         let mut msgs = mirror.prepare(&raw, cfg)?;
         // Автоэлизия: детерминированный пред-шаг, один раз на переходе через
@@ -1071,6 +1090,86 @@ mod tests {
         let fake = Fake::new(vec![text_reply(""), text_reply("")]);
         let err = run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await;
         assert!(err.is_err(), "два пустых ответа не дали ошибку");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Готовое фоновое задание отдаётся на границе хода, а не только по его
+    /// концу. Раньше его забирал только будильник поверхности, и результат,
+    /// пришедший посреди работы, ждал конца хода — а границ за это время много.
+    #[tokio::test]
+    async fn finished_job_is_delivered_at_turn_boundary() -> R<()> {
+        let dir = std::env::temp_dir().join(format!("snens-jobwake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let cfg = cfg_tmp(&dir);
+        let sess = Session::open(&dir, "j")?;
+        sess.append(Rec::User {
+            ts: log::now(),
+            text: "запусти в фоне".into(),
+            source: "test".into(),
+            parts: Vec::new(),
+            ask: None,
+        })?;
+        // Задание уже готово к первому шагу: `done` лежит рядом с журналом.
+        let jobs = crate::jobs::dir(sess.path());
+        std::fs::create_dir_all(&jobs)?;
+        std::fs::write(jobs.join("7-1.log"), "сборка прошла\n")?;
+        std::fs::write(
+            jobs.join("7-1.json"),
+            serde_json::to_vec(&crate::jobs::Job {
+                id: "7-1".into(),
+                command: "cargo build".into(),
+                cwd: dir.display().to_string(),
+                timeout_s: 60,
+                log: jobs.join("7-1.log").display().to_string(),
+                pid: 0,
+                started: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            })?,
+        )?;
+        std::fs::write(
+            jobs.join("7-1.done"),
+            serde_json::to_vec(&crate::jobs::Done {
+                exit: 0,
+                ms: 5,
+                timed_out: false,
+                bytes: 16,
+            })?,
+        )?;
+        let fake = Fake::new(vec![
+            Reply {
+                reasoning: String::new(),
+                upstream: Default::default(),
+                text: String::new(),
+                calls: vec![Call {
+                    id: "c".into(),
+                    name: "run".into(),
+                    args: r#"{"command":"true"}"#.into(),
+                }],
+                usage: Usage::default(),
+                finish_reason: String::new(),
+            },
+            text_reply("вижу отчёт"),
+        ]);
+        run_agent(&sess, &cfg, &fake, &crate::render::Ui::plain()).await?;
+        let recs = sess.read()?;
+        let at = recs
+            .iter()
+            .position(|r| matches!(r, Rec::User { source, .. } if source == "wake"))
+            .expect("итог задания не попал в журнал");
+        let answer_at = recs
+            .iter()
+            .position(|r| matches!(r, Rec::Assistant { text: Some(t), .. } if t == "вижу отчёт"))
+            .expect("ответ модели не записан");
+        assert!(
+            at < answer_at,
+            "отчёт лёг после ответа модели — значит ждал конца хода"
+        );
+        // Результат забран из очереди: второй раз его не отдадут.
+        assert!(crate::jobs::collect_finished(sess.path()).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
