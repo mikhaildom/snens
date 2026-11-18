@@ -492,6 +492,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_with(&path, false).unwrap().len(), 1);
+        // Итог фонового задания лежит записью `user` с `source: "wake"`, но это
+        // не слово человека: клиент узнаёт об этом по `via`, а не по `source`,
+        // и рисует работу, а не реплику.
+        fs::write(
+            &path,
+            "{\"kind\":\"user\",\"ts\":1,\"text\":\"[задание 1 завершилось]\",\"source\":\"wake\"}\n",
+        )
+        .unwrap();
+        let rows = read_with(&path, false).unwrap();
+        assert_eq!(rows[0].source.as_deref(), Some("wake"));
+        assert_eq!(rows[0].via.as_deref(), Some("wake"));
+        fs::write(
+            &path,
+            "{\"kind\":\"user\",\"ts\":1,\"text\":\"hi\",\"source\":\"surface\"}\n",
+        )
+        .unwrap();
+        assert_eq!(read_with(&path, false).unwrap()[0].via, None);
         fs::remove_dir_all(dir).unwrap();
     }
 }
