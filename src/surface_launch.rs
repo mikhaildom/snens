@@ -76,15 +76,83 @@ pub(super) async fn finalize_launch_error(s: &Arc<Runtime>, id: &str, run: &str,
         .await;
 }
 
+/// Слово, с которого начинается ход: что именно уйдёт в журнал записью `User`.
+///
+/// Источник (`source`) — поле, а не вывод из «есть ли `ask`»: пробуждение по
+/// фоновой задаче и итог подагента — не слово человека, и в ленте они не должны
+/// выглядеть его репликой.
+pub(super) struct Entry {
+    pub text: String,
+    pub source: String,
+    pub parts: Vec<crate::log::Part>,
+    pub ask: Option<crate::log::AskRef>,
+}
+
+impl Entry {
+    /// Слово человека из интерфейса (`source: "surface"`).
+    pub fn human(text: String, parts: Vec<crate::log::Part>) -> Self {
+        Self {
+            text,
+            source: "surface".into(),
+            parts,
+            ask: None,
+        }
+    }
+
+    /// Ответ на вопрос артефакта: текст собрал интерфейс, а не человек.
+    pub fn artifact(text: String, ask: crate::log::AskRef) -> Self {
+        Self {
+            text,
+            source: "artifact".into(),
+            parts: Vec::new(),
+            ask: Some(ask),
+        }
+    }
+
+    /// Вернувшаяся работа: итог подагента или фонового задания. Это не человек.
+    pub fn wake(text: String) -> Self {
+        Self {
+            text,
+            source: "wake".into(),
+            parts: Vec::new(),
+            ask: None,
+        }
+    }
+}
+
 pub(super) async fn launch(
     s: Arc<Runtime>,
     id: String,
     run: String,
-    text: String,
+    entry: Entry,
     surface: String,
-    parts: Vec<crate::log::Part>,
-    ask: Option<crate::log::AskRef>,
 ) {
+    // Слово в журнал пишется ЗДЕСЬ и до первого `spawn`, а не внутри задачи хода:
+    // обработчик `POST /message` отвечает клиенту только после возврата отсюда, и
+    // клиент сразу перечитывает историю. Раньше запись жила в фоновой задаче и
+    // гонка с этим чтением давала пустую ленту: отправленное человеком сообщение
+    // не появлялось, пока сессию не откроют заново.
+    let Some(sess) = s.writers.lock().await.get(&id).cloned() else {
+        finalize_launch_error(&s, &id, &run, "session writer missing").await;
+        return;
+    };
+    let start_records = match sess.read() {
+        Ok(records) => records.len(),
+        Err(error) => {
+            finalize_launch_error(&s, &id, &run, &error.to_string()).await;
+            return;
+        }
+    };
+    if let Err(error) = sess.append(crate::log::Rec::User {
+        ts: crate::log::now(),
+        text: entry.text,
+        source: entry.source,
+        parts: entry.parts,
+        ask: entry.ask,
+    }) {
+        finalize_launch_error(&s, &id, &run, &error.to_string()).await;
+        return;
+    }
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (queue_tx, queue_rx) = tokio::sync::mpsc::unbounded_channel();
     let queue_rx = Arc::new(tokio::sync::Mutex::new(queue_rx));
@@ -195,34 +263,6 @@ pub(super) async fn launch(
         }
     });
     tokio::spawn(async move {
-        let sess = match s.writers.lock().await.get(&id).cloned() {
-            Some(writer) => writer,
-            None => {
-                finalize_launch_error(&s, &id, &run, "session writer missing").await;
-                return;
-            }
-        };
-        let start_records = match sess.read() {
-            Ok(records) => records.len(),
-            Err(error) => {
-                finalize_launch_error(&s, &id, &run, &error.to_string()).await;
-                return;
-            }
-        };
-        // Ответ из артефакта помечается своим источником: в журнале видно, что
-        // текст собран интерфейсом, а не набран руками. Для проекции это ничего
-        // не меняет — роль всё равно `user`, различия едут полем `ask`.
-        let source = if ask.is_some() { "artifact" } else { "surface" };
-        if let Err(error) = sess.append(crate::log::Rec::User {
-            ts: crate::log::now(),
-            text,
-            source: source.into(),
-            parts,
-            ask,
-        }) {
-            finalize_launch_error(&s, &id, &run, &error.to_string()).await;
-            return;
-        }
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
         let observe = move |sig: crate::agent::SurfaceSignal| {
             let (kind, fields) = match sig {

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use super::discovery;
 use super::files::resolve_attachments;
 use super::http::err;
-use super::launch::launch;
+use super::launch::{launch, Entry};
 
 #[derive(Deserialize)]
 pub(super) struct ToolResultBody {
@@ -455,7 +455,17 @@ pub(super) async fn message(
         let Some(run_id) = run_id else {
             return err("conflict", "run_id is not current", StatusCode::CONFLICT).into_response();
         };
-        launch(s.clone(), id, run_id, b.text, surface, parts, ask).await
+        launch(
+            s.clone(),
+            id,
+            run_id,
+            match ask {
+                Some(ask) => Entry::artifact(b.text, ask),
+                None => Entry::human(b.text, parts),
+            },
+            surface,
+        )
+        .await
     } else if let Some(c) = s.controls.lock().await.get(&id) {
         if c.queued
             .send(crate::agent::QueuedInput {

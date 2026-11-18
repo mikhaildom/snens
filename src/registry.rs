@@ -379,20 +379,67 @@ pub fn sync_bin_dir(cfg: &Config, tools: &[Tool]) -> R<PathBuf> {
         if shadows_system_command(&t.name) {
             continue;
         }
-        let to = bin.join(name);
-        #[cfg(unix)]
-        let _ = std::os::unix::fs::symlink(&t.bin, &to);
-        // Windows: симлинк требует прав администратора, поэтому раньше здесь
-        // была копия — и установка держала второй полный комплект тулов (17 МБ
-        // рядом с бандлом, при каждом обновлении заново). Жёсткая ссылка решает
-        // то же самое без прав и без второго экземпляра: тот же том NTFS, тот
-        // же inode. Не получилось (чужой том, ФС без ссылок) — копия, как было.
-        #[cfg(not(unix))]
-        if std::fs::hard_link(&t.bin, &to).is_err() {
-            std::fs::copy(&t.bin, &to)?;
-        }
+        place(&t.bin, &bin.join(name))?;
     }
     Ok(bin)
+}
+
+/// Положить тул в `bin`: на unix симлинк, на Windows жёсткая ссылка (прав не
+/// требует), а если ФС ссылок не умеет — копия.
+///
+/// Повторный вызов обязан быть пустым, а `sync_bin_dir` зовётся на каждом ходу.
+/// Раньше первым шагом стоял `hard_link`, и на втором вызове он падал с
+/// «файл уже существует», уходил в `fs::copy` — а копирование файла в его
+/// собственную жёсткую ссылку на Windows и есть os error 32 («файл занят другим
+/// процессом»). Первый ход после установки работал (каталог `bin` создавался),
+/// а каждый следующий ход падал на подготовке тулов, и в клиенте это выглядело
+/// как «запись файла сессии не работает».
+fn place(from: &Path, to: &Path) -> R<()> {
+    if already_in_place(from, to) {
+        return Ok(());
+    }
+    // Имя занято, но содержимое другое (копия от установщика, старая версия,
+    // ссылка в никуда) — снимаем: следующий шаг создаст ссылку заново.
+    if to.symlink_metadata().is_ok() {
+        if let Err(error) = std::fs::remove_file(to) {
+            // Имя держит работающий процесс (тул зовут из `bin`) — это не повод
+            // ронять ход: каталог обновится на следующей попытке.
+            eprintln!("[snens] {} не обновлён: {error}", to.display());
+            return Ok(());
+        }
+    }
+    #[cfg(unix)]
+    {
+        if let Err(error) = std::os::unix::fs::symlink(from, to) {
+            // ФС без симлинков — кладём копию, лишь бы тул был в PATH.
+            eprintln!("[snens] {} — симлинк не создан, копирую: {error}", to.display());
+            std::fs::copy(from, to)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::hard_link(from, to).is_err() {
+            std::fs::copy(from, to)?;
+        }
+        Ok(())
+    }
+}
+
+/// Тул уже на месте: та же ссылка (жёсткая, симлинк) или та же копия.
+///
+/// Сравнение по размеру и mtime: этого достаточно, потому что два разных
+/// бинарника с совпадением до наносекунды не встречаются, а читать 17 МБ
+/// тулов на каждом ходу ради сверки содержимого нельзя.
+fn already_in_place(from: &Path, to: &Path) -> bool {
+    let Ok(a) = std::fs::metadata(from) else {
+        return false;
+    };
+    let Ok(b) = std::fs::metadata(to) else {
+        return false;
+    };
+    let same = a.len() == b.len() && a.modified().ok() == b.modified().ok();
+    same && a.modified().is_ok()
 }
 
 /// PATH детей: разделитель путей свой у каждой платформы, склеиваем им. Каталог
@@ -608,6 +655,34 @@ mod tests {
             bin.join(format!("edit{}", std::env::consts::EXE_SUFFIX)).exists(),
             "обычный тул должен быть в PATH"
         );
+    }
+
+    /// Повторный `sync_bin_dir` — пустая операция. Он зовётся на КАЖДОМ ходу,
+    /// а раньше падал на втором: `hard_link` под Windows отвечает «файл уже
+    /// существует», откат в `fs::copy` копирует файл в его же жёсткую ссылку и
+    /// получает os error 32. Из-за этого второй ход в установке на Windows не
+    /// начинался вовсе, и в клиенте это выглядело ошибкой записи сессии.
+    #[test]
+    fn bin_dir_sync_is_idempotent() {
+        let dir = tmpdir("idem");
+        let tools_dir = dir.join("tools");
+        std::fs::create_dir_all(tools_dir.join("read")).unwrap();
+        std::fs::write(tools_dir.join("read/read"), b"x").unwrap();
+        let cfg = Config {
+            tools_dir: tools_dir.display().to_string(),
+            ..Default::default()
+        };
+        let mut read = tool("read", None);
+        read.bin = tools_dir.join("read/read");
+        let bin = sync_bin_dir(&cfg, std::slice::from_ref(&read)).unwrap();
+        let placed = bin.join(format!("read{}", std::env::consts::EXE_SUFFIX));
+        assert!(placed.exists(), "первый вызов ставит тул");
+        sync_bin_dir(&cfg, std::slice::from_ref(&read)).expect("второй вызов не падает");
+        assert!(placed.exists(), "тул остаётся на месте");
+        // Обновлённый тул (другой размер) переезжает в `bin` без ошибки.
+        std::fs::write(tools_dir.join("read/read"), b"new-tool-bytes").unwrap();
+        sync_bin_dir(&cfg, std::slice::from_ref(&read)).expect("обновление не падает");
+        assert_eq!(std::fs::read(&placed).unwrap(), b"new-tool-bytes");
     }
 
     /// Пользовательские bin-каталоги (cargo, local/bin) попадают в PATH детей

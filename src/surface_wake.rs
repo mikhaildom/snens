@@ -91,10 +91,11 @@ async fn wake(s: Arc<Runtime>, cfg: &crate::cfg::Config, id: &str) {
         s,
         id.to_string(),
         uuid::Uuid::new_v4().to_string(),
-        inbox.as_turn(),
+        // Источник — `wake`: это вернувшаяся работа, а не слово человека. Раньше
+        // здесь уезжал `surface`, и итог фонового задания рисовался в ленте
+        // полноценной репликой человека.
+        super::launch::Entry::wake(inbox.as_turn()),
         surface,
-        Vec::new(),
-        None,
     )
     .await;
 }

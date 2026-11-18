@@ -132,6 +132,10 @@ pub fn read_with(path: &Path, with_recall: bool) -> crate::R<Vec<HistoryMessage>
                 // это была простыня JSON с системным промптом вместо реплики.
                 // Вложения едут отдельным полем `parts`.
                 content: Some(text),
+                // `wake` — вернувшаяся работа (итог фонового задания, отчёт
+                // подагента), а не слово человека. Едет в том же поле `via`, что
+                // у вставок в ход: лента по нему понимает, что это не реплика.
+                via: (source == "wake").then(|| source.clone()),
                 source: Some(source),
                 reasoning: None,
                 tool_calls: None,
@@ -141,7 +145,6 @@ pub fn read_with(path: &Path, with_recall: bool) -> crate::R<Vec<HistoryMessage>
                 ms: None,
                 argv: None,
                 parts: if parts.is_empty() { None } else { Some(parts) },
-                via: None,
                 from: None,
                 usage: None,
                 ask,
