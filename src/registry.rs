@@ -350,6 +350,14 @@ pub fn definitions(tools: &[Tool]) -> Vec<Value> {
 /// Каталог наш, но чужие файлы не трогаем — удаляем только симлинки.
 pub fn sync_bin_dir(cfg: &Config, tools: &[Tool]) -> R<PathBuf> {
     let bin = cfg.bin_path();
+    // Пустой список — это не «тулов нет, почисти каталог», а «искать было негде»:
+    // неверный `tools_dir`, чужой конфиг, запуск из другого каталога. Чистка в
+    // этом случае убивает рабочий каталог живого инстанса — а `bin_path()` при
+    // `--config` попадает в общий `%APPDATA%\snens\bin`, то есть в чужое место.
+    // Поймано живьём: проверка с временным конфигом стёрла `bin` установки.
+    if tools.is_empty() {
+        return Ok(bin);
+    }
     std::fs::create_dir_all(&bin)?;
     // Каталог наш; чистим только то, что сами и создали — на unix симлинки,
     // на Windows копии (симлинк там требует прав).
@@ -683,6 +691,26 @@ mod tests {
         std::fs::write(tools_dir.join("read/read"), b"new-tool-bytes").unwrap();
         sync_bin_dir(&cfg, std::slice::from_ref(&read)).expect("обновление не падает");
         assert_eq!(std::fs::read(&placed).unwrap(), b"new-tool-bytes");
+    }
+
+    /// Пустой список тулов не должен чистить `bin`: это не «тулов нет», а
+    /// «искать было негде». Случай не теоретический — проверка с временным
+    /// конфигом стёрла рабочий `bin` установки.
+    #[test]
+    fn empty_tool_list_does_not_wipe_bin_dir() {
+        let dir = tmpdir("empty");
+        let tools_dir = dir.join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let cfg = Config {
+            tools_dir: tools_dir.display().to_string(),
+            ..Default::default()
+        };
+        let bin = cfg.bin_path();
+        std::fs::create_dir_all(&bin).unwrap();
+        let keep = bin.join(format!("read{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&keep, b"x").unwrap();
+        sync_bin_dir(&cfg, &[]).unwrap();
+        assert!(keep.exists(), "пустой список стёр рабочий каталог тулов");
     }
 
     /// Пользовательские bin-каталоги (cargo, local/bin) попадают в PATH детей
