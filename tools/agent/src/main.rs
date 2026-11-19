@@ -39,6 +39,12 @@ status — неблокирующий снимок: жив/готов, числ�
 \"...\"`, вопрос остаётся в ящике и доедет до хода сам. Надёжный признак конца —
 запись Done в логе ребёнка, её пишет харнесс, а не модель.
 
+result — финальный текст. Пока ребёнок работает, это не ошибка: печатается
+состояние (ходы, время последней записи) и код 3, как у wait по таймауту.
+1 — отказ: нет лога или ребёнок завершился без текста.
+
+wait без --timeout ждёт 3600 с и печатает прогресс раз в 30 с (stderr).
+
 list — дерево: родитель (^), братья (=), я (>), дети (-) с состоянием, числом
 ходов и временем последней записи. peers — id братьев построчно. ask без id
 спрашивает родителя (обратная совместимость); ответ ждём только от адресата.
@@ -69,10 +75,16 @@ fn restore_sigpipe() {}
 
 fn main() {
     restore_sigpipe();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() || argv[0] == "-h" || argv[0] == "--help" {
         println!("{HELP}");
         std::process::exit(if argv.is_empty() { 1 } else { 0 });
+    }
+    // Массив аргументов, приехавший одним элементом (`["list"]`, `["start","…"]`),
+    // раньше разбирался по пробелам: `agent ["start",` — «неизвестная команда».
+    // Контракт тула разрешает оба вида, значит оба и принимаем.
+    if argv.len() == 1 {
+        argv = unwrap_json_argv(&argv[0]).unwrap_or(argv);
     }
     let cfg = Cfg::load();
     match argv[0].as_str() {
@@ -88,6 +100,17 @@ fn main() {
         "kill" => cmd_kill(&cfg, &argv[1..]),
         other => die(format!("agent: неизвестная команда {other}")),
     }
+}
+
+/// `["start", "задача"]` → argv. Не JSON-массив — None (обычная строка).
+fn unwrap_json_argv(raw: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let arr = v.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for x in arr {
+        out.push(x.as_str()?.to_string());
+    }
+    Some(out)
 }
 
 /// Короткий след вызова: command для run, args для тула — как в TUI.
@@ -315,10 +338,30 @@ fn cmd_wait(cfg: &Cfg, args: &[String]) {
 
 fn cmd_result(cfg: &Cfg, args: &[String]) {
     let id = need_id(&parse_args(args).pos, "result");
-    match log::final_text(cfg, &id) {
-        Some(t) => println!("{t}"),
-        None => die(format!("agent result: у {id} нет финального текста")),
+    if !cfg.sessions_dir.join(format!("{id}.jsonl")).is_file() {
+        die(format!("agent result: нет лога подагента {id}"));
     }
+    if let Some(t) = log::final_text(cfg, &id) {
+        println!("{t}");
+        return;
+    }
+    // Незавершённость — не ошибка и не «ид». Отказ с тем же текстом, что и у
+    // настоящей поломки, гнал родителя в цикл result→list→wait: нормальное
+    // состояние должно приходить состоянием, а не exit=1.
+    let state = log::state(cfg, &id);
+    let (steps, ago) = log::stats(cfg, &id);
+    eprintln!(
+        "agent result: у {id} ещё нет финального текста — {state}, ходов {steps}, запись {}\n\
+         Забрать итог, когда закончит: agent wait {id} (без --timeout ждёт 3600 с и печатает прогресс).\n\
+         Не жди вызовом: заверши ход — доклад придёт в ящик и разбудит следующий.",
+        ago_human(ago)
+    );
+    // 3 — «ещё работает»: тот же код, что у wait по таймауту. 1 остаётся для
+    // настоящих отказов (нет лога, битый id).
+    if log::done_status(cfg, &id).is_none() {
+        std::process::exit(3);
+    }
+    std::process::exit(1);
 }
 
 /// Адресат ask: `--parent` или первый позиционный, если это существующий ящик

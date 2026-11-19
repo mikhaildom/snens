@@ -229,7 +229,10 @@ pub async fn dispatch(
         // отдельным процессом, а результат вернётся в сессию уведомлением и
         // разбудит следующий ход. Ждать здесь значит блокировать единственный
         // цикл: человек со своим словом стоит в очереди до таймаута.
-        if a.get("background").and_then(Value::as_bool).unwrap_or(false) {
+        if a.get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             return match crate::jobs::start(
                 cfg,
                 sess.path(),
@@ -272,7 +275,7 @@ pub async fn dispatch(
                 // не должен незаметно сдвинуть точку отсчёта следующих тулов.
                 sesscwd::after_run(sess, command, explicit);
                 o.text = explain_signal_death(o.exit, o.bytes, &o.text, command);
-                o
+                timeout_note(o, Some(command))
             }
             Err(e) => fail(format!("run: {e}")),
         };
@@ -330,7 +333,7 @@ pub async fn dispatch(
     sp.max_attachment_bytes = cfg.max_attachment_bytes;
     sp.envs = session_env(sess, cfg);
     match exec::spawn(sp).await {
-        Ok(o) => o,
+        Ok(o) => timeout_note(o, None),
         Err(e) => fail(format!("{}: {e}", call.name)),
     }
 }
@@ -453,7 +456,7 @@ async fn dispatch_typed(
         .then(|| out_dir.join("attach").join(&call.id));
     sp.attach_dir = attach_dir.as_deref();
     match exec::spawn(sp).await {
-        Ok(o) => o,
+        Ok(o) => timeout_note(o, None),
         Err(e) => fail(format!("{}: {e}", call.name)),
     }
 }
@@ -504,7 +507,11 @@ fn normalize_fields(
 /// `args` от модели, привыкшей к generic-схеме: первые элементы раскладываем по
 /// позиционным полям (`{"field": X}` в порядке схемы), остальное — готовые
 /// argv-элементы, их допишем как есть. Флаги угадывать не берёмся.
-fn legacy_args(a: &Value, schema: &registry::ToolSchema, out: &mut serde_json::Map<String, Value>) -> Vec<String> {
+fn legacy_args(
+    a: &Value,
+    schema: &registry::ToolSchema,
+    out: &mut serde_json::Map<String, Value>,
+) -> Vec<String> {
     let Some(v) = a.get("args") else {
         return Vec::new();
     };
@@ -545,7 +552,11 @@ fn legacy_args(a: &Value, schema: &registry::ToolSchema, out: &mut serde_json::M
 /// тулу, у которого теперь есть схема. `stdin` разбираем как JSON-объект и
 /// раскладываем по полям схемы (не перетирая уже переданные). Спасти не вышло —
 /// дальше сработает ошибка про обязательные поля, процесс не запустится.
-fn legacy_fields(a: &Value, schema: &registry::ToolSchema, out: &mut serde_json::Map<String, Value>) {
+fn legacy_fields(
+    a: &Value,
+    schema: &registry::ToolSchema,
+    out: &mut serde_json::Map<String, Value>,
+) {
     let Some(stdin) = a.get("stdin") else {
         return;
     };
@@ -712,6 +723,35 @@ fn stdin_of(a: &Value) -> Option<String> {
 /// причина — `pkill -f`: shell-обёртка `run` содержит текст шаблона в собственном
 /// cmdline и `pkill -f` убивает сам себя, а остаток `;`-цепочки не выполняется.
 /// Один симптом, две трактовки — говорим об этом в ответе, а не оставляем -1 без слов.
+/// Таймаут вызова: подсказка зависит от того, что именно прервали. Общий текст
+/// «дроби команду» бесполезен там, где дробить нечего (`agent wait`, `web`), а у
+/// долгих прогонов единственный правильный путь — `background`, и он ниоткуда
+/// не виден (`long-job-no-handle`).
+fn timeout_note(mut o: exec::Out, command: Option<&str>) -> exec::Out {
+    if !o.timed_out {
+        return o;
+    }
+    let mut note = String::new();
+    if let Some(cmd) = command {
+        // Фоновый запуск внутри команды больше не держит вызов (потоки читает
+        // отдельный читатель), поэтому про него не напоминаем — только про лимит.
+        let _ = cmd;
+        note.push_str(
+            "\n[долгая работа: `background: true` уводит её отдельным процессом — ход \
+             освобождается сразу, а результат придёт сообщением и разбудит новый ход]",
+        );
+    } else {
+        note.push_str(
+            "\n[вызов прерван по лимиту времени: подними timeout_seconds для этого \
+             вызова или вынеси работу в background/подагента]",
+        );
+    }
+    o.text.push_str(&note);
+    o
+}
+
+/// Обрыв по сигналу объясняется только для shell-команды: у тула «убийца снаружи»
+/// и «pkill -f» не бывает.
 fn explain_signal_death(exit: i32, bytes: usize, text: &str, command: &str) -> String {
     if exit >= 0 {
         return text.to_string();
@@ -849,7 +889,8 @@ fn ctx_clear(sess: &crate::log::Session, a: &Value) -> exec::Out {
         timed_out: false,
         parts: Vec::new(),
     }
-}#[cfg(test)]
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::log::{Body, Call, Rec, Session};
@@ -1085,7 +1126,10 @@ mod tests {
         )
         .unwrap();
         let sent: Value = serde_json::from_str(tc.stdin.as_deref().unwrap()).unwrap();
-        assert!(sent.get("edits").is_none(), "пустой edits в stdin не едет: {sent}");
+        assert!(
+            sent.get("edits").is_none(),
+            "пустой edits в stdin не едет: {sent}"
+        );
         assert_eq!(sent["old_string"], "a");
     }
 
@@ -1117,7 +1161,11 @@ mod tests {
             Path::new("/base"),
         )
         .unwrap();
-        assert_eq!(tc.stdin.as_deref(), Some(body), "содержимое без JSON-обёртки");
+        assert_eq!(
+            tc.stdin.as_deref(),
+            Some(body),
+            "содержимое без JSON-обёртки"
+        );
     }
 
     #[test]
@@ -1140,7 +1188,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("file"), "имя неизвестного поля: {e}");
-        assert!(e.contains("path") && e.contains("offset"), "нет списка допустимых: {e}");
+        assert!(
+            e.contains("path") && e.contains("offset"),
+            "нет списка допустимых: {e}"
+        );
     }
 
     #[test]
@@ -1218,7 +1269,10 @@ mod tests {
     fn signal_death_is_explained() {
         let txt = explain_signal_death(-1, 0, "", "pkill -f 'app_live.py'; ls");
         assert!(txt.contains("убит сигналом"), "{txt}");
-        assert!(txt.contains("pkill -f"), "нет подсказки про самоубийство: {txt}");
+        assert!(
+            txt.contains("pkill -f"),
+            "нет подсказки про самоубийство: {txt}"
+        );
         // Обычный exit не трогаем и текст не дублируем.
         assert_eq!(explain_signal_death(0, 5, "ok", "echo hi"), "ok");
         assert_eq!(
@@ -1235,11 +1289,7 @@ mod tests {
         let log = sess.read().unwrap();
         let cleared = crate::project::cleared_map(&log);
         assert_eq!(cleared.len(), 2, "должны уйти a и b");
-        let wire = serde_json::to_string(&crate::project::msgs(
-            &log,
-            &Config::default(),
-        ))
-        .unwrap();
+        let wire = serde_json::to_string(&crate::project::msgs(&log, &Config::default())).unwrap();
         assert!(!wire.contains("output-a"), "старый результат остался");
         assert!(wire.contains("output-c"), "свежий результат вырезан");
         // Диалог и вызовы не тронуты.
@@ -1270,7 +1320,10 @@ mod tests {
         let (dir, sess) = fixture();
         assert_eq!(ctx_clear(&sess, &json!({"min_bytes": 200})).exit, 0);
         let cleared = crate::project::cleared_map(&sess.read().unwrap());
-        assert!(cleared.is_empty(), "маленькие результаты не должны вырезаться");
+        assert!(
+            cleared.is_empty(),
+            "маленькие результаты не должны вырезаться"
+        );
         let _ = std::fs::remove_dir_all(dir);
         let _ = kept(&sess);
     }

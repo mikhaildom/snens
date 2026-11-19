@@ -39,6 +39,22 @@ const DRY: &str = "--dry-run";
 const HINT_CUTOFF: f32 = 0.5;
 const FUZZY_NOTE: &str = "совпадение найдено с точностью до хвостовых пробелов/CRLF/юникода";
 
+/// От какой базы искали относительный путь. Процесс получает cwd сессии, но
+/// точка отсчёта из отказа не видна — модель считает, что она в каталоге
+/// проекта, и четыре раза подряд повторяет то же (`read-path-cwd-mismatch`).
+fn where_looked(path: &str) -> String {
+    if path.starts_with('/') || path.starts_with('~') {
+        return String::new();
+    }
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    format!(
+        "\n[искал от {cwd}: относительный путь разрешается от рабочего каталога сессии.\n \
+         Сменить его — `cd <каталог>` в run или поле cwd у вызова; абсолютный путь — всегда верно]"
+    )
+}
+
 fn die(msg: String) -> ! {
     eprintln!("{msg}");
     exit(1);
@@ -772,14 +788,30 @@ fn apply_all(orig: &str, edits: &[Edit], path: &str) -> Result<(String, Vec<Appl
     for w in plan.windows(2) {
         let (a, b) = (&w[0], &w[1]);
         if a.end > b.start {
+            // Отказ по делу, но модель узнавала о пересечении только из него и
+            // дальше дробила правку вслепую. Называем, что именно делят эти две
+            // правки и готовый путь: одна правка с общим old_string.
+            let seg = orig
+                .get(a.start..b.end.min(orig.len()))
+                .unwrap_or_default()
+                .lines()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join("\n");
             return Err(format!(
-                "edit: {} и {} задевают один и тот же участок (байты {}–{} и {}–{}) — правка пачки не должна менять то, что меняет другая\nни одна правка не применена — файл не тронут",
+                "edit: {} и {} задевают один и тот же участок (байты {}–{} и {}–{}) — правка пачки не должна менять то, что меняет другая\n\
+                 спорный участок (строка {}):\n{seg}\n\
+                 одна правка вместо двух: один old_string — от начала участка {} до конца участка {}; после объединения вторая правка не нужна\n\
+                 ни одна правка не применена — файл не тронут",
                 label(a.n),
                 label(b.n),
                 a.start,
                 a.end,
                 b.start,
-                b.end
+                b.end,
+                line_of(orig, a.start),
+                label(a.n),
+                label(b.n),
             ));
         }
     }
@@ -852,7 +884,10 @@ fn main() {
     // обычным файлом. Для слинкованных дотфайлов правка иначе уходит не туда.
     let path = resolve_symlink(&path);
     let meta = std::fs::metadata(&path).unwrap_or_else(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => die(format!("edit: файл не найден: {path}")),
+        std::io::ErrorKind::NotFound => die(format!(
+            "edit: файл не найден: {path}{}",
+            where_looked(&path)
+        )),
         _ => die(format!("edit: {path}: {e}")),
     });
     if meta.is_dir() {

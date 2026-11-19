@@ -17,6 +17,10 @@ pub struct Tool {
     /// помечает stdin обязательным, и модель узнаёт контракт заранее, а не
     /// тратит ход на exit=1 при первом вызове.
     pub uses_stdin: bool,
+    /// Строка полного хелпа, где тул говорит про stdin. Ей уезжает в описание
+    /// даже когда stdin не обязателен: `memory` читает его одной подкоманде из
+    /// восьми, и без этой строки модель узнаёт контракт только отказом.
+    pub stdin_hint: Option<String>,
     /// Типизированный интерфейс из `schema.json` рядом с бинарником. Есть —
     /// модель видит настоящие поля, а ядро само собирает argv/stdin; нет —
     /// остаётся generic-контракт `args`/`stdin` (обратная совместимость).
@@ -62,10 +66,7 @@ pub struct ToolSchema {
 impl ToolSchema {
     /// Поля схемы: имя → тип (для `snens tools` и сообщений об ошибке).
     pub fn fields(&self) -> Vec<(String, String)> {
-        let props = self
-            .parameters
-            .get("properties")
-            .and_then(Value::as_object);
+        let props = self.parameters.get("properties").and_then(Value::as_object);
         let Some(props) = props else {
             return Vec::new();
         };
@@ -143,8 +144,11 @@ pub async fn discover(cfg: &Config) -> Vec<Tool> {
         let mut sp = exec::Spawn::argv(&bin_s, vec!["--help".into()]);
         sp.timeout_s = 5;
         sp.cap = 4000;
-        let (summary, usage) = match exec::spawn(sp).await {
-            Ok(o) if o.exit == 0 => split_help(&o.text),
+        let (summary, usage, help) = match exec::spawn(sp).await {
+            Ok(o) if o.exit == 0 => {
+                let (s, u) = split_help(&o.text);
+                (s, u, o.text)
+            }
             Ok(o) => {
                 eprintln!("[snens] тул {name}: --help вернул код {}", o.exit);
                 continue;
@@ -159,6 +163,10 @@ pub async fn discover(cfg: &Config) -> Vec<Tool> {
             continue;
         }
         let uses_stdin = stdin_required(&summary, &usage);
+        // Весь хелп, а не две первые строки: подсказка про stdin живёт ниже и
+        // обязательной не делает — иначе у `memory` stdin потребовался бы и для
+        // `recall`.
+        let stdin_hint = stdin_line(&help);
         // schema.json рядом с бинарником: кривой файл — не повод терять тул,
         // он просто остаётся на generic-контракте, а причина видна в stderr.
         let schema = match read_schema(&d.join("schema.json")) {
@@ -174,6 +182,7 @@ pub async fn discover(cfg: &Config) -> Vec<Tool> {
             summary,
             usage,
             uses_stdin,
+            stdin_hint,
             schema,
         });
     }
@@ -193,6 +202,14 @@ fn split_help(text: &str) -> (String, String) {
 /// `--help`: отдельной схемы на тип тула не заводим.
 fn stdin_required(summary: &str, usage: &str) -> bool {
     summary.contains("stdin") || usage.contains("stdin")
+}
+
+/// Строка хелпа, где тул сам говорит про stdin (`memory`: «ход (JSON {"user",
+/// "assistant"} на stdin)»). Ей уезжает в описание тула — точнее общей фразы.
+fn stdin_line(help: &str) -> Option<String> {
+    help.lines()
+        .find(|l| l.contains("stdin"))
+        .map(|l| l.trim().to_string())
 }
 
 /// `schema.json` → ToolSchema. Отсутствующий файл — `None` (generic-контракт),
@@ -315,9 +332,21 @@ pub fn definitions(tools: &[Tool]) -> Vec<Value> {
             }
             let mut desc = format!("{}\n{}", t.summary, t.usage);
             // Требование stdin доезжает до модели из описания, а не из exit=1
-            // на первом вызове: это часть контракта тула, не сюрприз.
+            // на первом вызове: это часть контракта тула, не сюрприз. Берём
+            // строку самого тула — она точнее общей фразы: у `memory` stdin
+            // нужен одному подкомандиру из восьми и ждёт ход, а не «JSON правки».
+            let own = t.stdin_hint.clone();
+            if t.uses_stdin {
+                desc.push_str(&format!(
+                    "\nstdin обязателен: {}",
+                    own.unwrap_or_else(|| "JSON правки / содержимое файла.".into())
+                ));
+            } else if let Some(line) = own {
+                // Не обязателен, но тул его читает: без этой строки модель
+                // узнаёт про stdin только отказом.
+                desc.push_str(&format!("\nstdin: {line}"));
+            }
             let required: Vec<&str> = if t.uses_stdin {
-                desc.push_str("\nstdin обязателен: JSON правки / содержимое файла.");
                 vec!["args", "stdin"]
             } else {
                 vec!["args"]
@@ -420,7 +449,10 @@ fn place(from: &Path, to: &Path) -> R<()> {
     {
         if let Err(error) = std::os::unix::fs::symlink(from, to) {
             // ФС без симлинков — кладём копию, лишь бы тул был в PATH.
-            eprintln!("[snens] {} — симлинк не создан, копирую: {error}", to.display());
+            eprintln!(
+                "[snens] {} — симлинк не создан, копирую: {error}",
+                to.display()
+            );
             std::fs::copy(from, to)?;
         }
         Ok(())
@@ -520,11 +552,17 @@ fn user_bin_dirs() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
     };
-    [".cargo/bin", ".local/bin", "bin", ".bun/bin", ".npm-global/bin"]
-        .iter()
-        .map(|p| home.join(p))
-        .filter(|p| p.is_dir())
-        .collect()
+    [
+        ".cargo/bin",
+        ".local/bin",
+        "bin",
+        ".bun/bin",
+        ".npm-global/bin",
+    ]
+    .iter()
+    .map(|p| home.join(p))
+    .filter(|p| p.is_dir())
+    .collect()
 }
 
 /// Системные каталоги: там настоящие утилиты, фильтровать их нельзя.
@@ -545,9 +583,9 @@ fn is_system_dir(p: &Path) -> bool {
 /// это диспатч ядра по абсолютному пути; PATH ему для этого не нужен.
 pub fn shadows_system_command(name: &str) -> bool {
     const SYSTEM: &[&str] = &[
-        "grep", "find", "ls", "cat", "sed", "awk", "sort", "head", "tail", "cut", "date",
-        "view", "write", "test", "patch", "diff", "echo", "printf", "which", "tee", "wc", "tr",
-        "xargs", "mv", "cp", "rm", "true", "false", "yes", "seq", "basename", "dirname",
+        "grep", "find", "ls", "cat", "sed", "awk", "sort", "head", "tail", "cut", "date", "view",
+        "write", "test", "patch", "diff", "echo", "printf", "which", "tee", "wc", "tr", "xargs",
+        "mv", "cp", "rm", "true", "false", "yes", "seq", "basename", "dirname",
     ];
     SYSTEM.contains(&name)
 }
@@ -574,6 +612,7 @@ mod tests {
             summary: format!("{name} — суть"),
             usage: format!("{name} <args>"),
             uses_stdin: false,
+            stdin_hint: None,
             schema,
         }
     }
@@ -585,6 +624,25 @@ mod tests {
         read_schema(&p).unwrap()
     }
 
+    /// Подсказка про stdin берётся из полного хелпа, а не из двух первых строк:
+    /// у `memory` тело на stdin нужно одной подкоманде из восьми, и без этой
+    /// строки контракт добывался только отказом (`memory-retain-stdin-contract`).
+    /// Обязательным он при этом не становится — `recall` живёт без stdin.
+    #[test]
+    fn stdin_hint_comes_from_full_help_without_making_stdin_required() {
+        let help = "memory — долгая память\nmemory recall <запрос> | memory retain\n\n\
+                    recall  — поиск.\n\
+                    retain  — ход (JSON {\"user\",\"assistant\"} на stdin) в очередь.\n";
+        assert_eq!(
+            stdin_line(help).as_deref(),
+            Some("retain  — ход (JSON {\"user\",\"assistant\"} на stdin) в очередь.")
+        );
+        // Две первые строки stdin не называют — значит и обязательным он не станет.
+        let (summary, usage) = split_help(help);
+        assert!(!stdin_required(&summary, &usage));
+        assert!(stdin_line("write — файл\nwrite <путь>").is_none());
+    }
+
     /// Каталог тулов уезжает в PATH детей В КОНЦЕ, а каталог, из которого по
     /// имени зовётся тул с системным именем, в PATH не попадает вовсе.
     #[test]
@@ -594,7 +652,11 @@ mod tests {
         let path = child_path_with(std::slice::from_ref(&shim), &bin, &[]);
         let parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
         assert_eq!(parts.first(), Some(&shim), "шимы должны быть первыми");
-        assert_eq!(parts.last(), Some(&bin), "каталог тулов должен быть последним");
+        assert_eq!(
+            parts.last(),
+            Some(&bin),
+            "каталог тулов должен быть последним"
+        );
         assert_eq!(
             parts.iter().filter(|p| **p == bin).count(),
             1,
@@ -656,11 +718,13 @@ mod tests {
         edit.bin = tools_dir.join("edit/edit");
         let bin = sync_bin_dir(&cfg, &[grep, edit]).unwrap();
         assert!(
-            !bin.join(format!("grep{}", std::env::consts::EXE_SUFFIX)).exists(),
+            !bin.join(format!("grep{}", std::env::consts::EXE_SUFFIX))
+                .exists(),
             "симлинк на grep не должен появиться"
         );
         assert!(
-            bin.join(format!("edit{}", std::env::consts::EXE_SUFFIX)).exists(),
+            bin.join(format!("edit{}", std::env::consts::EXE_SUFFIX))
+                .exists(),
             "обычный тул должен быть в PATH"
         );
     }
@@ -730,9 +794,18 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
-        assert!(dirs.contains(&home.join(".cargo/bin")), "cargo не в PATH: {dirs:?}");
-        assert!(dirs.contains(&home.join(".local/bin")), "local/bin не в PATH: {dirs:?}");
-        assert!(!dirs.contains(&home.join(".bun/bin")), "несуществующий каталог в PATH");
+        assert!(
+            dirs.contains(&home.join(".cargo/bin")),
+            "cargo не в PATH: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&home.join(".local/bin")),
+            "local/bin не в PATH: {dirs:?}"
+        );
+        assert!(
+            !dirs.contains(&home.join(".bun/bin")),
+            "несуществующий каталог в PATH"
+        );
     }
 
     #[test]
@@ -826,7 +899,9 @@ mod tests {
                "x-snens":{"argv":[],"stdin":{"mode":"json","fields":["edits"]}}}"#,
         )
         .unwrap();
-        assert_eq!(s.fields(), vec![("edits".to_string(), "array<object>".to_string())]);
+        assert_eq!(
+            s.fields(),
+            vec![("edits".to_string(), "array<object>".to_string())]
+        );
     }
 }
-

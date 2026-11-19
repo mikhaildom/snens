@@ -52,10 +52,26 @@ pub fn write_if_dir(sess: &Session, dir: &Path, base: &Path) {
 
 /// Разрешить путь относительно базового каталога, если он относительный.
 pub fn resolve(p: &Path, base: &Path) -> PathBuf {
+    let p = PathBuf::from(expand_tilde(&p.display().to_string()));
     if p.is_absolute() {
-        normalize(p)
+        normalize(&p)
     } else {
         normalize(&base.join(p))
+    }
+}
+
+/// `~` в начале пути → $HOME: тулы исполняются без оболочки, и `cd ~/x` в run
+/// доезжал до эвристики буквальной тильдой, то есть никогда не становился
+/// каталогом сессии: отказ был молчаливый (`write` пишет только существующий
+/// абсолютный каталог), а следующие `read` искали файл в старом месте.
+fn expand_tilde(p: &str) -> String {
+    let rest = match p.strip_prefix('~') {
+        Some(r) if r.is_empty() || r.starts_with('/') => r,
+        _ => return p.to_string(),
+    };
+    match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        Ok(home) if !home.is_empty() => format!("{home}{rest}"),
+        _ => p.to_string(),
     }
 }
 
@@ -172,7 +188,8 @@ fn cd_target(seg: &str) -> Option<String> {
 fn is_env_assign(s: &str) -> bool {
     match s.split_once('=') {
         Some((k, _)) => {
-            !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
+            !k.is_empty()
+                && k.chars().all(|c| c.is_alphanumeric() || c == '_')
                 && !k.starts_with(|c: char| c.is_ascii_digit())
         }
         None => false,
@@ -254,6 +271,24 @@ mod tests {
         assert_eq!(last_cd("ls; cd /tmp && make").as_deref(), Some("/tmp"));
         assert_eq!(last_cd("cd /a\ncd /b").as_deref(), Some("/b"));
         assert_eq!(last_cd("cd /a || cd /b").as_deref(), Some("/b"));
+    }
+
+    /// `cd ~/x` — путь, а не тильда: relative-resolve пишет каталог сессии
+    /// только для существующего абсолютного, и с буквальной `~` он молчал, а
+    /// следующие read искали файл в старом месте (`read-path-cwd-mismatch`).
+    #[test]
+    fn tilde_resolves_from_home() {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        let Ok(home) = home else {
+            return; // платформа без HOME — проверять нечего
+        };
+        let got = resolve(Path::new("~/projects"), Path::new("/base"));
+        assert_eq!(got, PathBuf::from(format!("{home}/projects")));
+        // `~user` и тильда в середине пути не трогаются.
+        assert_eq!(
+            resolve(Path::new("~user/x"), Path::new("/base")),
+            PathBuf::from("/base/~user/x")
+        );
     }
 
     #[test]

@@ -4,9 +4,10 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::{
@@ -143,33 +144,57 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
         None => drop(child.stdin.take()),
     }
 
-    let res = tokio::time::timeout(
-        Duration::from_secs(sp.timeout_s.max(1)),
-        child.wait_with_output(),
-    )
-    .await;
+    // Потоки читаем отдельными задачами, а ждём ВЫХОД процесса, не EOF на пайпах.
+    // `wait_with_output` ждёт закрытия пайпа, а его держит любой потомок,
+    // унаследовавший stdout: `cmd &`, `setsid`, tmux. Вызов висел до таймаута,
+    // хотя работа давно ушла в фон (`run-background-holds-stdout`). Побочно это
+    // даёт частичный вывод: при обрыве по таймауту уже прочитанное не теряется.
+    let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let pumps: Vec<tokio::task::JoinHandle<()>> = [
+        pump(child.stdout.take(), Arc::clone(&out_buf)),
+        pump(child.stderr.take(), Arc::clone(&err_buf)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let waited = tokio::time::timeout(Duration::from_secs(sp.timeout_s.max(1)), child.wait()).await;
+    let (exit, timed_out) = match waited {
+        Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
+        Ok(Err(e)) => return Err(format!("spawn failed: {e}").into()),
+        // Таймаут: снимаем процесс сами (kill_on_drop сработал бы только на
+        // брошенном Child, а он теперь живёт дольше future) и забираем группу.
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            (-1, true)
+        }
+    };
+    // Дать читателям донести уже прочитанное, но не ждать EOF от потомков: его
+    // может не быть никогда. Нормальный выход — короткая пауза на долив пайпа.
+    for mut h in pumps {
+        let grace = Duration::from_millis(if timed_out { 50 } else { 250 });
+        let _ = tokio::time::timeout(grace, &mut h).await;
+        h.abort();
+    }
+    let drain =
+        |b: &Arc<Mutex<Vec<u8>>>| std::mem::take(&mut *b.lock().unwrap_or_else(|e| e.into_inner()));
+    let stdout = drain(&out_buf);
+    let stderr = drain(&err_buf);
     let ms = started.elapsed().as_millis() as u64;
 
-    let (exit, stdout, stderr, timed_out) = match res {
-        Ok(Ok(out)) => (
-            out.status.code().unwrap_or(-1),
-            out.stdout,
-            out.stderr,
-            false,
-        ),
-        Ok(Err(e)) => return Err(format!("spawn failed: {e}").into()),
+    let (exit, stderr) = if timed_out {
         // Молчаливый 124 выглядит как падение программы: агент выводит причину из кода
         // возврата и дробит команду вслепую. Называем причину и что с ней делать.
-        Err(_) => (
-            124,
-            Vec::new(),
-            format!(
-                "[таймаут {}s: команда прервана, вывод неполный — не падение. Дроби команду, подними timeout_seconds для этого вызова или уведи в фон]\n",
-                sp.timeout_s
-            )
-            .into_bytes(),
-            true,
-        ),
+        let mut note = format!(
+            "[таймаут {}s: команда прервана, вывод неполный — не падение. Дроби команду, подними timeout_seconds для этого вызова или уведи в фон]\n",
+            sp.timeout_s
+        );
+        note.push_str(&String::from_utf8_lossy(&stderr));
+        (124, note.into_bytes())
+    } else {
+        (exit, stderr)
     };
 
     // Полный вывод (то, что уйдёт в дамп) — байты как есть, до замены бинарных
@@ -215,6 +240,28 @@ pub async fn spawn(sp: Spawn<'_>) -> R<Out> {
     })
 }
 
+/// Читатель одного потока ребёнка: копит байты в общий буфер, пока пайп не
+/// закроется. Отдельная задача, потому что ждать EOF на пайпе нельзя — его
+/// держит фоновый потомок (см. комментарий в `spawn`).
+fn pump(
+    src: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    buf: Arc<Mutex<Vec<u8>>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut src = src?;
+    Some(tokio::spawn(async move {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match src.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                    b.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+    }))
+}
+
 #[cfg(unix)]
 struct ProcessGroup(i32);
 #[cfg(unix)]
@@ -256,6 +303,59 @@ mod tests {
             "в ответе нет причины и подсказки: {}",
             out.text
         );
+    }
+
+    /// Фоновый потомок не держит вызов: пайп наследуется, EOF не приходит, а
+    /// `run` должен вернуться по выходу шелла, а не по таймауту.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_child_does_not_hold_the_call() {
+        let started = Instant::now();
+        // Потомок живёт дольше таймаута и держит унаследованный stdout.
+        let out = spawn(Spawn::sh(
+            &["sh".into(), "-c".into()],
+            "sleep 30 & echo started",
+            5,
+            10_000,
+        ))
+        .await
+        .expect("спавн упал");
+        assert!(
+            !out.timed_out,
+            "вызов дождался EOF от фонового потомка и упал по таймауту"
+        );
+        assert_eq!(out.exit, 0, "выход шелла подменён: {}", out.text);
+        assert!(
+            out.text.contains("started"),
+            "вывод шелла потерян: {}",
+            out.text
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "вызов держался дольше таймаута"
+        );
+    }
+
+    /// Обрыв по таймауту отдаёт то, что успело прийти: пустой ответ не даёт
+    /// понять, началась ли работа вообще.
+    #[tokio::test]
+    async fn timeout_keeps_partial_output() {
+        let out = spawn(Spawn::sh(
+            &["sh".into(), "-c".into()],
+            "echo first; sleep 10",
+            1,
+            10_000,
+        ))
+        .await
+        .expect("спавн упал");
+        assert!(out.timed_out, "таймаут не отмечен");
+        assert_eq!(out.exit, 124);
+        assert!(
+            out.text.contains("first"),
+            "частичный вывод потерян: {}",
+            out.text
+        );
+        assert!(out.text.contains("таймаут 1s"), "нет причины: {}", out.text);
     }
 
     /// Обрезанное не теряется: полный вывод лежит в файле, путь уходит модели.

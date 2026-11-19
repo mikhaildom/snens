@@ -105,6 +105,24 @@ fn tilde(path: &str) -> String {
     }
 }
 
+/// Куда смотреть, когда относительный путь не найден. Процесс получает каталог
+/// сессии как cwd (тот, что накопили `cd` в run и поле `cwd`), но сама точка
+/// отсчёта не видна ниоткуда: 305 отказов «файл не найден» — это модель, которая
+/// думала, что она в каталоге проекта (`read-path-cwd-mismatch`). Отказ обязан
+/// называть базу, а не только путь.
+fn where_looked(path: &str) -> String {
+    if path.starts_with('/') || path.starts_with('~') {
+        return String::new();
+    }
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    format!(
+        "\n[искал от {cwd}: относительный путь разрешается от рабочего каталога сессии.\n \
+         Сменить его — `cd <каталог>` в run или поле cwd у вызова; абсолютный путь — всегда верно]"
+    )
+}
+
 /// Открыть файл, превратив типовые ошибки в человеческие сообщения.
 fn open(path: &str) -> fs::File {
     // Каталог на Linux открывается успешно и падает уже на чтении: проверяем до.
@@ -116,7 +134,10 @@ fn open(path: &str) -> fs::File {
     match fs::File::open(path) {
         Ok(f) => f,
         Err(e) => match e.kind() {
-            std::io::ErrorKind::NotFound => die(format!("read: файл не найден: {path}")),
+            std::io::ErrorKind::NotFound => die(format!(
+                "read: файл не найден: {path}{}",
+                where_looked(path)
+            )),
             std::io::ErrorKind::PermissionDenied => die(format!("read: нет доступа: {path}")),
             std::io::ErrorKind::IsADirectory => die(format!(
                 "read: {path} — это каталог, для списка используй `run ls`"
@@ -195,7 +216,10 @@ fn main() {
             a.offset
         ));
     }
-    let width = std::cmp::max(6, (a.offset + chunk.len().saturating_sub(1)).to_string().len());
+    let width = std::cmp::max(
+        6,
+        (a.offset + chunk.len().saturating_sub(1)).to_string().len(),
+    );
 
     let mut out: Vec<String> = Vec::new();
     let mut used = 0usize;

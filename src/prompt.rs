@@ -14,12 +14,20 @@ pub const READ_RULE: &str = "Файл целиком не читай. Сперв
      --limit M` по найденному. Искать по символу — `grep -n <символ>` (тул `grep`, не `run grep` — \
      он обходит .git/target/node_modules и умеет лимит). Вывод команды не выдумывай: сомневаешься — выполни.";
 
+/// Правило правки — в промпте, а не только в определении тула: по логам его не
+/// выбирают для собственного кода (0 `edit` за 254 вызова; весь рефакторинг —
+/// python-heredoc'ами), а правило про grep в промпте работает.
+pub const EDIT_RULE: &str = "Правку существующего файла начинай с `edit`: точный фрагмент — своей \
+     рукой, несколько мест — одной пачкой `edits` (они матчатся против исходного файла и \
+     применяются разом). `python3 - <<` и `sed -i` — обход, допустимый только после двух \
+     отказов `edit`; после отказа читай его подсказку, а не переписывай файл целиком.";
+
 /// Surface API sessions get one fixed, non-instructional annotation. Unknown IDs are
 /// deliberately not echoed: surface names are client-controlled input.
 pub fn system_prompt_for_surface(cfg: &Config, surface: Option<&str>) -> String {
     let mut s = match &cfg.system_prompt {
         Some(p) => std::fs::read_to_string(p).unwrap_or_else(|_| default_system()),
-        None => format!("{}\n{}", default_system(), READ_RULE),
+        None => format!("{}\n{}\n{}", default_system(), READ_RULE, EDIT_RULE),
     };
     s.push_str(&docs_hint(cfg));
     // Инстанс: кто я и что помню. Файлы правятся по ходу (агент — memory.md,
@@ -177,8 +185,7 @@ mod tests {
         assert!(system_prompt_for_surface(&cfg, Some("telegram"))
             .contains("Поверхность: Telegram, личный чат."));
         assert!(system_prompt_for_surface(&cfg, Some("tui")).contains("Поверхность: терминал."));
-        assert!(system_prompt_for_surface(&cfg, Some("web"))
-            .contains("Поверхность: веб-клиент."));
+        assert!(system_prompt_for_surface(&cfg, Some("web")).contains("Поверхность: веб-клиент."));
         // Чужой id (в т.ч. с инъекцией) не пересказывается и ничего не добавляет:
         // промпт байт-в-байт тот же, что без поверхности.
         let unknown =
@@ -226,6 +233,8 @@ mod tests {
         }
         // Правило чтения — одно на харнесс — и рабочий каталог в префиксе есть.
         assert!(p.contains(READ_RULE));
+        // Правка файла: `edit` первым, обход — только после двух отказов.
+        assert!(p.contains(EDIT_RULE), "нет правила правки файла");
         assert!(p.contains("Рабочий каталог:"));
         assert!(p.contains("в тикет: "), "нет канала самоулучшения");
         // Уборка за собой: сессии оставляли target-каталоги на гигабайты, и

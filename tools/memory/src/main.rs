@@ -26,7 +26,10 @@ const HELP: &str = "memory — долгая память агента (SQLite + 
 memory recall <запрос> | memory retain | memory flush | memory stats | memory reindex | memory forget <uid> | memory import [--replace]\n\
 \n\
 recall  — гибридный поиск: BM25 ∪ вектор → RRF → реранк → порог; по строке на факт.\n\
-retain  — ход (JSON {\"user\",\"assistant\"} на stdin) в очередь на дистилляцию.\n\
+retain  — ход (JSON {\"user\",\"assistant\"} на stdin) в очередь на дистилляцию:\n\
+          текст аргументом не принимается — это ход разговора, а не факт.\n\
+          printf '%s' '{\"user\":\"вопрос\",\"assistant\":\"ответ\"}' | memory retain\n\
+          --help понимает и подкоманда: справка не требует тела на stdin.\n\
 flush   — разобрать очередь: извлечь факты, погасить противоречащие, слить дубли.\n\
 stats   — сколько живых фактов, устаревших, что в очереди.\n\
 reindex — посчитать вектора для фактов, записанных без провайдера.\n\
@@ -43,7 +46,12 @@ fn main() {
         eprintln!("{HELP}");
         std::process::exit(2);
     };
-    if matches!(cmd, "--help" | "-h" | "help") {
+    // `--help` распознаётся ДО чтения stdin: раньше `memory retain --help` падало
+    // на «stdin не JSON», то есть справка была недоступна ровно тому, кто её
+    // искал (`2026-10-24-memory-retain-stdin-contract`).
+    if matches!(cmd, "--help" | "-h" | "help")
+        || argv.iter().skip(1).any(|a| a == "--help" || a == "-h")
+    {
         println!("{HELP}");
         return;
     }
@@ -99,7 +107,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Result<i32, Fail> {
     if matches!(cmd, "retain" | "forget" | "stats") {
         let store = Store::open(&cfg::db_path())?;
         return match cmd {
-            "retain" => retain(&store),
+            "retain" => retain(&store, args),
             "forget" => forget(&store, args),
             _ => stats(&store),
         }
@@ -264,14 +272,29 @@ fn recall(cfg: &Cfg, store: &Store, args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+/// Форма тела `retain`: текст ошибки без неё оставлял следующий ход гадать, а
+/// контракт добывался только через `run 'memory --help'`.
+const RETAIN_FORM: &str = "тело — JSON хода: {\"user\":\"вопрос\",\"assistant\":\"ответ\"} (необязательное \"context\" — тема). Пример: printf '%s' '{\"user\":\"…\",\"assistant\":\"…\"}' | memory retain";
+
 /// Ход в очередь. Ядро зовёт это после каждого ответа, поэтому здесь только
 /// локальная вставка: сеть и LLM — в `flush`, который живёт отдельно.
-fn retain(store: &Store) -> Result<i32, String> {
+fn retain(store: &Store, args: &[String]) -> Result<i32, String> {
+    // Аргументы раньше молча игнорировались: `memory retain \"текст\"` читал
+    // пустой stdin и падал на разборе JSON, а что записалось — видно не было.
+    if let Some(a) = args.first() {
+        return Err(format!(
+            "retain: текст аргументом не принимается ({a:?}) — {RETAIN_FORM}"
+        ));
+    }
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
         .map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&raw).map_err(|e| format!("stdin не JSON: {e}"))?;
+    if raw.trim().is_empty() {
+        return Err(format!("retain: пустой stdin — {RETAIN_FORM}"));
+    }
+    let v: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("stdin не JSON: {e} — {RETAIN_FORM}"))?;
     let field = |k: &str| {
         v.get(k)
             .and_then(Value::as_str)

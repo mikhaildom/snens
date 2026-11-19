@@ -101,6 +101,21 @@ fn expand(argv: &[String]) -> Vec<String> {
     out
 }
 
+/// От какой базы искали относительный путь: без этого отказ «файл не найден»
+/// не отличить от «файла правда нет» (`read-path-cwd-mismatch`).
+fn where_looked(path: &str) -> String {
+    if path.starts_with('/') || path.starts_with('~') {
+        return String::new();
+    }
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    format!(
+        "\n[искал от {cwd}: относительный путь разрешается от рабочего каталога сессии.\n \
+         Сменить его — `cd <каталог>` в run или поле cwd у вызова; абсолютный путь — всегда верно]"
+    )
+}
+
 /// `~/x` → `$HOME/x`: тул исполняется без оболочки, `~` доезжает буквально.
 fn tilde(path: &str) -> String {
     let rest = match path.strip_prefix("~") {
@@ -115,7 +130,9 @@ fn tilde(path: &str) -> String {
 
 fn run(path: &str, max_chars: usize) -> Result<String, String> {
     let meta = fs::metadata(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => format!("index: файл не найден: {path}"),
+        std::io::ErrorKind::NotFound => {
+            format!("index: файл не найден: {path}{}", where_looked(path))
+        }
         std::io::ErrorKind::PermissionDenied => format!("index: нет доступа: {path}"),
         _ => format!("index: {path} — {e}"),
     })?;
