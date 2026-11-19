@@ -1265,6 +1265,7 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
+            path: None,
             })?,
         )?;
         std::fs::write(

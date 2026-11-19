@@ -165,6 +165,7 @@ mod tests {
                 log: log.display().to_string(),
                 pid: std::process::id(),
                 started: 0,
+                path: None,
             })
             .unwrap(),
         )

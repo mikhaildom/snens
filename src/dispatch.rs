@@ -263,6 +263,7 @@ pub async fn dispatch(
                 command,
                 &cwd_owned.display().to_string(),
                 t,
+                Some(path),
             ) {
                 Ok(job) => {
                     let text = format!(

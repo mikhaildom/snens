@@ -298,7 +298,7 @@ async fn cmd_job_run(flags: &BTreeMap<String, String>) -> R<()> {
         .get("job")
         .ok_or("job-run: нужен --job <файл>")?;
     let job: jobs::Job = serde_json::from_slice(&std::fs::read(path)?)?;
-    let done = jobs::run_job(&job, &cfg.shell, cfg.max_process_chars).await?;
+    let done = jobs::run_job(&job, &cfg.shell, cfg.max_process_chars, job.path.as_deref()).await?;
     // `done` кладётся рядом с записью задания: будильник ищет его там (`jobs::done`).
     let done_path = std::path::Path::new(path).with_extension("done");
     std::fs::write(&done_path, serde_json::to_vec(&done)?)?;

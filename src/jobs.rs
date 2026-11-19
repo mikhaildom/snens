@@ -24,6 +24,11 @@ pub struct Job {
     pub log: String,
     pub pid: u32,
     pub started: u64,
+    /// PATH, который получит задание. Хранится в записи, а не берётся из
+    /// окружения `job-run`: тот спавнится диспетчером и системного PATH мало
+    /// (`~/.cargo/bin`, `~/.local/bin` в нём нет). `None` — старые записи.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,6 +60,7 @@ pub fn start(
     command: &str,
     cwd: &str,
     timeout_s: u64,
+    path: Option<&str>,
 ) -> R<String> {
     let id = format!("{}-{}", crate::log::now(), std::process::id() % 100000);
     let dir = dir(sess_path);
@@ -83,6 +89,7 @@ pub fn start(
         log,
         pid: child.id(),
         started: crate::log::now(),
+        path: path.map(str::to_string),
     };
     // Запись атомарно: `job-run` откроет её сразу после спавна.
     let bytes = serde_json::to_vec(&job)?;
@@ -112,9 +119,16 @@ pub fn done(sess_path: &Path, id: &str) -> Option<Done> {
 }
 
 /// Исполнение задания: это и есть отдельный процесс `snens job-run`.
-pub async fn run_job(job: &Job, shell: &[String], cap: usize) -> R<Done> {
+///
+/// PATH здесь тот же, что у обычного `run`: его собирает вызывающий и передаёт
+/// строкой. `job-run` — самостоятельный процесс со своим окружением (его
+/// спавнят из диспетчера, а не из шелла человека), поэтому без этого аргумента
+/// внутри задания не было ни `cargo`, ни тулов реестра: `cargo build` в фоне
+/// падал exit=127, хотя тот же вызов без `background` работал.
+pub async fn run_job(job: &Job, shell: &[String], cap: usize, path: Option<&str>) -> R<Done> {
     let mut sp = crate::exec::Spawn::sh(shell, &job.command, job.timeout_s, cap);
     sp.cwd = Some(&job.cwd);
+    sp.path = path;
     sp.dump_dir = None;
     let out = crate::exec::spawn(sp).await?;
     let done = Done {
@@ -307,6 +321,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+        path: None,
         };
         std::fs::write(
             jobs.join("7-1.json"),
@@ -335,6 +350,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// PATH из записи задания доезжает до процесса. Без него фоновое задание
+    /// не видело ни `cargo`, ни тулов реестра: `run --background "cargo build"`
+    /// падал exit=127, хотя тот же вызов без `background` работал.
+    #[tokio::test]
+    async fn job_runs_with_the_path_it_was_given() {
+        let root = std::env::temp_dir().join(format!("snens-job-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Свой каталог с «тулом»: если PATH доехал, оболочка найдёт его по имени.
+        let bin = root.join("probe-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let probe = bin.join("pathprobe");
+        std::fs::write(&probe, "#!/bin/sh\necho from-probe\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let job = Job {
+            id: "9-1".into(),
+            command: "pathprobe".into(),
+            cwd: root.display().to_string(),
+            timeout_s: 10,
+            log: root.join("9-1.log").display().to_string(),
+            pid: 0,
+            started: 0,
+            // Системные каталоги обязательны и в реальном PATH: `sh` ищется по
+            // нему же, чем и запускается команда.
+            path: Some(format!("{}:/usr/bin:/bin", bin.display())),
+        };
+        let done = run_job(
+            &job,
+            &["sh".into(), "-c".into()],
+            10_000,
+            job.path.as_deref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.exit, 0, "PATH не доехал: command not found");
+        let text = std::fs::read_to_string(&job.log).unwrap();
+        assert!(text.contains("from-probe"), "вывод: {text}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn report_carries_status_command_and_tail() {
         let dir = std::env::temp_dir().join(format!("snens-job-{}", std::process::id()));
@@ -350,6 +409,7 @@ mod tests {
             log: log.display().to_string(),
             pid: 0,
             started: 0,
+            path: None,
         };
         let text = report(
             &job,
