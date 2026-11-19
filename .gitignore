@@ -11,6 +11,7 @@ notes/
 # только на Windows-сборке: локально файл лежал на диске и в git не нужен был.
 # `**/` после слэша — чтобы шаблон не захватывал подкаталоги.
 tools/*/read
+tools/*/index
 tools/*/edit
 tools/*/write
 tools/*/audit
