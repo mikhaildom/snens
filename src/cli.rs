@@ -44,6 +44,7 @@ mod surface_facts;
 mod surface_runtime;
 mod surface_server;
 mod surface_tui;
+mod skills;
 mod tickets;
 mod tui;
 
@@ -64,6 +65,7 @@ snens — агент с инструментами
   snens disk [--older-than DAYS] [--dry-run] — снести брошенные сборочные каталоги
   snens tickets [--all] [--target T] [--kind K] — заведённые проблемы
   snens tickets show <имя> | grep <текст> | stats — посмотреть, найти, сводка
+  snens skills [install [--force] [<имя>…]] — встроенные скиллы поставки
   snens tools [--json] — список тулов; --json — определения для модели
   snens model [slug] — какая модель сейчас; со slug — сменить
   snens config [ключ=значение …] — показать значения; с аргументами — поправить на ходу
@@ -130,6 +132,7 @@ async fn legacy_main() -> R<()> {
             Ok(())
         }
         Some("tickets") => tickets::cmd(&flags, positional),
+        Some("skills") => skills::cmd(&flags, positional),
         Some("tools") => cmd_tools(&flags).await,
         Some("model") => cmd_model(&flags, positional),
         Some("config") => settings::cmd(&flags, positional),
@@ -167,6 +170,23 @@ fn parse_args(argv: &[String]) -> (Option<String>, BTreeMap<String, String>, Vec
     }
 }
 
+/// Первый запуск на чистой машине: разложить встроенные скиллы, если каталога
+/// ещё нет. Молча и один раз — установка не должна требовать отдельного шага,
+/// иначе знание «как разбирать тикеты» остаётся недоступным по умолчанию.
+/// Существующий каталог не трогается: инстанс ведёт его сам.
+fn seed_skills(cfg: &cfg::Config) {
+    // Ошибка здесь не должна ронять запуск: без скиллов агент работает.
+    if let Ok(written) = skills::seed_if_empty(cfg) {
+        if !written.is_empty() {
+            eprintln!(
+                "скиллы поставки установлены: {} (каталог {})",
+                written.join(", "),
+                cfg.skills_path().display()
+            );
+        }
+    }
+}
+
 fn session_id(cfg: &cfg::Config, flags: &BTreeMap<String, String>) -> R<String> {
     let dir = cfg.sessions_path();
     if let Some(s) = flags.get("session") {
@@ -180,6 +200,7 @@ fn session_id(cfg: &cfg::Config, flags: &BTreeMap<String, String>) -> R<String> 
 
 async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
     let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    seed_skills(&cfg);
     let prompt = positional.join(" ");
     if prompt.trim().is_empty() {
         return Err("нужен текст запроса".into());

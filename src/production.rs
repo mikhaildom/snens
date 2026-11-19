@@ -286,8 +286,15 @@ pub const CLI_SPEC: FlagSpec = FlagSpec {
         "--repo",
         "--endpoint",
         "--token-file",
+        // Фильтры `snens tickets` из USAGE. Без объявления здесь парсер считал
+        // значение позиционным аргументом: `tickets --target harness` отдавал
+        // positional ["harness"], и это читалось как неизвестная подкоманда.
+        "--target",
+        "--kind",
+        "--status",
+        "--family",
     ],
-    switches: &[],
+    switches: &["--all", "--weight", "--full"],
     strict: false,
 };
 
@@ -307,6 +314,23 @@ mod tests {
             PathBuf::from("/tmp/key")
         );
     }
+    /// Фильтры `snens tickets` из USAGE обязаны быть объявлены: иначе их значение
+    /// парсер считает позиционным аргументом, и `tickets --target harness` падает
+    /// «неизвестная подкоманда tickets: harness» — команда, описанная в справке,
+    /// не работает.
+    #[test]
+    fn ticket_filters_consume_their_value() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let (flags, positional) = parse_flags(&a(&["--target", "harness"]), &CLI_SPEC).unwrap();
+        assert_eq!(flags.get("target").map(String::as_str), Some("harness"));
+        assert!(positional.is_empty(), "значение уехало в positional: {positional:?}");
+        let (flags, positional) =
+            parse_flags(&a(&["--all", "--kind", "defect"]), &CLI_SPEC).unwrap();
+        assert_eq!(flags.get("all").map(String::as_str), Some("1"));
+        assert_eq!(flags.get("kind").map(String::as_str), Some("defect"));
+        assert!(positional.is_empty(), "{positional:?}");
+    }
+
     #[test]
     fn cli_flags_are_strict_and_unique() {
         // Перечни у команд разные: `--endpoint` — настройка `tui`, а не `serve`.
