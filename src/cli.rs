@@ -71,6 +71,7 @@ snens — агент с инструментами
   snens providers [list|activate <имя>|key <имя> <ключ>] — профили провайдеров
   snens memory [on|off] [recall always|session|off] [retain on|off] — долгая память
   snens build [<tool>…] — собрать тулы; без аргументов — все
+  snens path [--repo DIR] — где binарники сборки: debug, release, установленный в PATH
   snens review [--session ID] — разобрать сессию вторым проходом
   snens improve — поработать над самим ядром
   snens selftest — интеграционная проверка цикла
@@ -137,6 +138,7 @@ async fn legacy_main() -> R<()> {
         Some("pair") => cmd_pair(&flags).await,
         Some("clients") => cmd_clients(&flags, positional).await,
         Some("build") => cmd_build(&flags, positional),
+        Some("path") => cmd_path(&flags),
         Some("review") => review::cmd(&flags).await,
         Some("improve") => improve::cmd(&flags).await,
         Some("selftest") => selftest::selftest().await,
@@ -907,6 +909,49 @@ fn cmd_model(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()>
 /// харнессе, а не в sh-скрипте: на Windows sh нет.
 /// `snens build [<tool>…]` — без аргументов весь workspace, с аргументами только
 /// названные крейты (правка одного тула не должна линковать все, ~40 с → ~2 с).
+/// Где бинарники: спрашиваем cargo, а не угадываем путь.
+///
+/// `./target/debug/snens` есть не у каждой установки: target может быть
+/// вынесен на другой диск (`.cargo/config.toml`), а `snens` в PATH — симлинк на
+/// release-сборку или на каталог релиза. Сессия из четырёх hits искала
+/// «естественный» путь, получала exit=127 и добывала настоящий через
+/// `cargo metadata` python-ом.
+pub fn cmd_path(flags: &BTreeMap<String, String>) -> R<()> {
+    let cfg = cfg::Config::load(flags.get("config").map(|s| s.as_str()))?;
+    let repo = match flags.get("repo") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => cfg
+            .tools_path()
+            .parent()
+            .ok_or("у tools_dir нет родителя — негде искать cargo-проект")?
+            .to_path_buf(),
+    };
+    // Установленный в PATH — то, что реально исполняется; это не всегда link на
+    // debug-сборку, и именно на этом расхождении сессии и спотыкались.
+    match on_path("snens") {
+        Some(p) => {
+            let real = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            println!("в PATH: {}", p.display());
+            if real != p {
+                println!("  → {}", real.display());
+            }
+        }
+        None => println!("в PATH: нет"),
+    }
+    // target спрашиваем у cargo: перенос каталога — законный конфиг, а не ошибка.
+    match cargo_target_dir(&repo) {
+        Ok(dir) => {
+            for profile in ["debug", "release"] {
+                let bin = dir.join(profile).join(format!("snens{}", std::env::consts::EXE_SUFFIX));
+                let mark = if bin.is_file() { "" } else { " (не собран)" };
+                println!("{profile}: {}{mark}", bin.display());
+            }
+        }
+        Err(e) => println!("target: не спросить ({e})"),
+    }
+    Ok(())
+}
+
 fn cmd_build(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R<()> {
     if flags.contains_key("help") || flags.contains_key("h") {
         println!("snens build [<tool>…] — без аргументов весь workspace, с аргументами — только названные тулы");

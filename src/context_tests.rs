@@ -109,6 +109,11 @@ impl Drop for Fixture {
     }
 }
 
+/// Путь зеркала для фикстуры: тот же, что у `Mirror::open` (журнал с расширением .out).
+fn m_path(f: &Fixture) -> std::path::PathBuf {
+    f.sess.path().with_extension("out").join("LIVE_CONTEXT.json")
+}
+
 fn document(m: &Mirror) -> Document {
     serde_json::from_slice(&fs::read(m.path()).unwrap()).unwrap()
 }
@@ -232,16 +237,19 @@ fn first_and_last_user_blocks_are_protected_with_clear_diagnosis() {
     f.assistant("work");
     bulk(&f, 20_000);
     f.user("current instruction");
-    let mut m = Mirror::open(&f.sess, &f.cfg).unwrap();
     for (target, label) in [
         ("original objective", "first"),
         ("current instruction", "last"),
     ] {
-        let mut d = document(&m);
+        // После отказа черновик сохранён — начинаем шаг с канонического зеркала.
+        let path = m_path(&f);
+        Mirror::reset(&f.sess, &f.cfg, &path).unwrap();
+        let mut fresh = Mirror::open(&f.sess, &f.cfg).unwrap();
+        let mut d = document(&fresh);
         let id = block_with(&d, target);
         d.blocks.retain(|b| b.id != id);
-        save(&m, &d);
-        let outcome = f.apply(&mut m);
+        save(&fresh, &d);
+        let outcome = f.apply(&mut fresh);
         assert!(outcome.contains("context rejected:"), "{outcome}");
         assert!(outcome.contains(&id), "block id missing: {outcome}");
         assert!(outcome.contains(label), "policy missing: {outcome}");
@@ -254,6 +262,8 @@ fn first_and_last_user_blocks_are_protected_with_clear_diagnosis() {
         assert_eq!(f.revisions(), 0, "rejected draft left a revision");
     }
     // Правка защищённого блока тоже отвергается с внятным текстом.
+    Mirror::reset(&f.sess, &f.cfg, &m_path(&f)).unwrap();
+    let mut m = Mirror::open(&f.sess, &f.cfg).unwrap();
     let mut d = document(&m);
     let id = block_with(&d, "original objective");
     let block = d.blocks.iter_mut().find(|b| b.id == id).unwrap();
@@ -263,6 +273,8 @@ fn first_and_last_user_blocks_are_protected_with_clear_diagnosis() {
     assert!(outcome.contains("cannot be edited"), "{outcome}");
     assert!(outcome.contains("new-"), "{outcome}");
     // Перестановка первого запроса за последний — тоже отказ.
+    Mirror::reset(&f.sess, &f.cfg, &m_path(&f)).unwrap();
+    let mut m = Mirror::open(&f.sess, &f.cfg).unwrap();
     let mut d = document(&m);
     let first = block_with(&d, "original objective");
     let at = d.blocks.iter().position(|b| b.id == first).unwrap();
@@ -443,7 +455,53 @@ fn new_note_block_is_accepted() {
     assert!(outcome.contains("unknown block id"), "{outcome}");
 }
 
-/// (ж) Сбой записи журнала не оставляет активной ревизии и откатывает зеркало.
+/// Отказ не должен стирать работу правки: раньше каноническое зеркало
+/// переустанавливалось, и после одной виновной записи модель начинала уборку
+/// заново, повторяя те же ошибки (`context-cleanup-edit-contract`, до 5 отказов
+/// подряд в одном заходе). Сохранённый черновик сбрасывается только явно.
+#[test]
+fn rejection_keeps_the_draft_and_reset_drops_it() {
+    let f = Fixture::new();
+    f.user("objective");
+    bulk(&f, 30_000);
+    f.user("instruction");
+    let mut m = Mirror::open(&f.sess, &f.cfg).unwrap();
+    let mut d = document(&m);
+    // Одна правка по делу (сокращение) и одна виновная (удалён защищённый блок).
+    assert!(shrink_bulk(&mut d));
+    let protected = block_with(&d, "instruction");
+    d.blocks.retain(|b| b.id != protected);
+    save(&m, &d);
+    let outcome = m.apply(&f.sess, &f.cfg).unwrap().unwrap();
+    assert!(outcome.contains("context rejected:"), "{outcome}");
+    assert!(outcome.contains("черновик сохранён"), "{outcome}");
+    assert_eq!(f.revisions(), 0, "rejected draft left a revision");
+    // Сокращение пережило отказ: правка на месте, стёрта только виновная часть.
+    let kept = document(&Mirror::open(&f.sess, &f.cfg).unwrap());
+    assert!(
+        !kept
+            .blocks
+            .iter()
+            .any(|b| b.messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("BULK_PAYLOAD")))),
+        "сокращение потеряно вместе с отказом"
+    );
+    // Явный сброс возвращает каноническое зеркало.
+    Mirror::reset(&f.sess, &f.cfg, m.path()).unwrap();
+    let fresh = document(&Mirror::open(&f.sess, &f.cfg).unwrap());
+    assert!(
+        fresh
+            .blocks
+            .iter()
+            .any(|b| b.messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("BULK_PAYLOAD")))),
+        "reset не вернул исходные блоки"
+    );
+}
+
+/// (ж) Сбой записи журнала не оставляет активной ревизии и откатывает зеркало./// (ж) Сбой записи журнала не оставляет активной ревизии и откатывает зеркало.
 #[test]
 fn failed_revision_append_leaves_no_active_revision() {
     // Сессия со специальным id: сбой append привязан к ней, а не к глобальному
@@ -658,12 +716,20 @@ fn malformed_stale_and_invalid_arguments_are_rejected_without_log_changes() {
         .unwrap()
         .unwrap()
         .contains("malformed"));
+    // Битый файл — единственный случай, когда черновик переустанавливается:
+    // следующий шаг начинает с канонического документа.
+    let mut m = Mirror::open(&f.sess, &f.cfg).unwrap();
     let mut d = document(&m);
     d.revision = "old".into();
     save(&m, &d);
     let outcome = m.apply(&f.sess, &f.cfg).unwrap().unwrap();
     assert!(outcome.contains("stale"), "{outcome}");
     assert!(outcome.contains("reread LIVE_CONTEXT.json"), "{outcome}");
+    // Отказ в аргументах тоже сохраняет черновик, поэтому перед следующей
+    // проверкой зеркало сбрасываем явно: нужен канонический документ, а не
+    // черновик со старой ревизией.
+    Mirror::reset(&f.sess, &f.cfg, m.path()).unwrap();
+    let mut m = Mirror::open(&f.sess, &f.cfg).unwrap();
     let mut d = document(&m);
     d.blocks[1].messages[0]["tool_calls"][0]["function"]["arguments"] = json!("{broken");
     save(&m, &d);

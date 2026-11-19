@@ -498,14 +498,24 @@ impl Config {
     /// нулевые отбрасываются: ступень выше бюджета не сработает никогда, а
     /// нулевая требовала бы уборку на каждом ходу. Пустой список — одна ступень
     /// по бюджету, как было до ступеней.
+    ///
+    /// Ступень ниже цели отбрасывается. С бюджетом 500k и целью 350k дефолтные
+    /// 50%/75% давали взвод на 250k и 375k: первая просила уборку, когда до цели
+    /// снимать было нечего (в лучшем случае четверть той цели, что называлась в
+    /// требовании), вторая — уже после бюджета. Так выглядела жалоба «уведомление
+    /// приходит слишком рано»: условие стояло на 37% окна модели. Если после
+    /// фильтра не осталось ни одной ступени — взвод по бюджету: просить уборку
+    /// раньше цели бессмысленно, позже бюджета — дорого.
     pub fn context_pressure_tiers(&self) -> Vec<u64> {
         let budget = self.context_budget();
+        // Цель после уборки: взвод ниже неё не оставляет работы.
+        let target = self.context_target().min(budget);
         let mut tiers: Vec<u64> = self
             .context_pressure_tiers
             .iter()
             .filter(|percent| **percent > 0 && **percent <= 100)
             .map(|percent| (u128::from(budget) * u128::from(*percent) / 100) as u64)
-            .filter(|tier| *tier > 0)
+            .filter(|tier| *tier > target)
             .collect();
         tiers.sort_unstable();
         tiers.dedup();
@@ -1021,6 +1031,28 @@ mod tests {
         assert!(!reloaded.memory.enabled);
         std::fs::remove_dir_all(&dir).ok();
     }
+    /// Взвод ниже цели — ложное срабатывание: уборку просят, когда снимать
+    /// нечего (жалоба «уведомление слишком рано» при бюджете 500k и цели 350k).
+    #[test]
+    fn pressure_tiers_never_arm_below_the_target() {
+        let mut cfg = Config::default();
+        cfg.ctx_window = 1_000_000;
+        cfg.context_budget = 500_000;
+        cfg.context_pressure_tiers = vec![50, 75];
+        // Цель по умолчанию — 70% бюджета.
+        assert_eq!(cfg.context_target(), 350_000);
+        let tiers = cfg.context_pressure_tiers();
+        assert!(
+            tiers.iter().all(|t| *t > 350_000),
+            "ступень ниже цели взводит уборку без работы: {tiers:?}"
+        );
+        // 50% (250k) снята, 75% (375k) остаётся: она выше цели.
+        assert_eq!(tiers, vec![375_000]);
+        // Явная цель ниже тоже учитывается: 250k при цели 100k — законная ступень.
+        cfg.context_target = 100_000;
+        assert_eq!(cfg.context_pressure_tiers(), vec![250_000, 375_000]);
+    }
+
     #[test]
     fn context_defaults_and_auto_windows() {
         let cfg = Config::default();

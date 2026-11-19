@@ -282,10 +282,21 @@ impl View {
         let mut restored = Vec::new();
         for block in &edited.blocks {
             if !originals.contains(block.id.as_str()) && !block.id.starts_with("new-") {
+                // Список настоящих id рядом: без него модель перечитывает зеркало
+                // целиком ради одного опечатного идентификатора.
+                let mut ids: Vec<&str> = originals.iter().copied().collect();
+                ids.sort_unstable();
+                let shown: Vec<&str> = ids.iter().copied().take(24).collect();
+                let tail = if ids.len() > shown.len() {
+                    format!(" … ещё {} в зеркале", ids.len() - shown.len())
+                } else {
+                    String::new()
+                };
                 return Err(format!(
                     "unknown block id {}; use ids from the current mirror headers, or prefix a new \
-                     block's id with new-",
-                    describe(block)
+                     block's id with new-. Существующие id: {}{tail}",
+                    describe(block),
+                    shown.join(", "),
                 )
                 .into());
             }
@@ -298,9 +309,18 @@ impl View {
             }
             let messages = self.resolve(&block.messages)?;
             validate(&messages, false).map_err(|error| format!("block {}: {error}", block.id))?;
-            if block.id.starts_with("new-") && messages.iter().any(|m| m["role"] != "user") {
+            // Записка — текст, а не вызовы: роль не важна, поэтому assistant-текст
+            // тоже принимается (требование «только user» отправляло модели
+            // переписывать заметку, и вся правка откатывалась).
+            if block.id.starts_with("new-")
+                && messages.iter().any(|m| {
+                    m["role"] == "tool"
+                        || m.get("tool_calls").is_some_and(|c| !c.is_null())
+                        || m["role"] == "system"
+                })
+            {
                 return Err(format!(
-                    "block {} is a new note and must contain user messages only; \
+                    "block {} is a new note and must contain text only; \
                      notes carry text, not tool calls",
                     block.id
                 )

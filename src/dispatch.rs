@@ -107,9 +107,10 @@ pub fn builtin_defs(shell: &str) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "ctx",
-                "description": "Управление рабочим контекстом. commit — применить правку LIVE_CONTEXT.json (после всех результатов шага; статус придёт перед следующим запросом). status — путь и бюджет. clear — хирургически вырезать результаты инструментов, не трогая диалог: либо call_ids (точечно), либо before (всё строго до указанного), либо keep_last (все старше последних N), с масками tool и min_bytes.",
+                "description": "Управление рабочим контекстом. commit — применить правку LIVE_CONTEXT.json (после всех результатов шага; статус придёт перед следующим запросом). Отказ применения НЕ стирает твой черновик: исправь только виновное место и повтори commit. status — путь и бюджет; status с reset: true выбрасывает сохранённый черновик и переустанавливает зеркало по журналу. clear — хирургически вырезать результаты инструментов, не трогая диалог: либо call_ids (точечно), либо before (всё строго до указанного), либо keep_last (все старше последних N), с масками tool и min_bytes.",
                 "parameters": {"type":"object", "properties":{
                     "action":{"type":"string","enum":["commit","status","clear"]},
+                    "reset":{"type":"boolean","description":"status: выбросить сохранённый черновик и переустановить зеркало по журналу"},
                     "call_ids":{"type":"array","items":{"type":"string"},"description":"clear: какие результаты вырезать"},
                     "before":{"type":"string","description":"clear: вырезать всё строго до этого call_id"},
                     "keep_last":{"type":"integer","description":"clear: оставить N последних результатов"},
@@ -175,19 +176,42 @@ pub async fn dispatch(
                 "Draft отправлен. Следующее системное сообщение [Harness context status] содержит окончательный результат; не вызывай commit повторно ради подтверждения."
                     .to_string()
             }
-            "status" => format!(
-                "Зеркало: {}\nБюджет: {} токенов; цель уборки: {}\nТул ctx доступен: да (ты его вызвал — значит он в схеме; commit применит правку)\nПоследняя принятая ревизия: {}",
-                out_dir.join("LIVE_CONTEXT.json").display(),
-                cfg.context_budget(),
-                cfg.context_target(),
-                sess.read()
-                    .ok()
-                    .and_then(|rs| rs.into_iter().rev().find_map(|r| match r {
-                        crate::log::Rec::ContextRevision { anchor, .. } => Some(anchor.to_string()),
-                        _ => None,
-                    }))
-                    .unwrap_or_else(|| "нет".into())
-            ),
+            "status" => {
+                let path = out_dir.join("LIVE_CONTEXT.json");
+                // `reset: true` (или action=reset) выбрасывает сохранённый черновик:
+                // без этого сохранённый отказом черновик нечем было сбросить, и
+                // единственным выходом было править файл руками.
+                let reset = a.get("reset").and_then(Value::as_bool).unwrap_or(false)
+                    || a.get("action").and_then(Value::as_str) == Some("reset");
+                if reset {
+                    return match crate::context::Mirror::reset(sess, cfg, &path) {
+                        Ok(note) => exec::Out {
+                            bytes: note.len(),
+                            text: note,
+                            exit: 0,
+                            ms: 0,
+                            timed_out: false,
+                            parts: Vec::new(),
+                        },
+                        Err(e) => fail(format!("ctx reset: {e}")),
+                    };
+                }
+                format!(
+                    "Зеркало: {}\nБюджет: {} токенов; цель уборки: {}\nТул ctx доступен: да (ты его вызвал — значит он в схеме; commit применит правку)\nПоследняя принятая ревизия: {}",
+                    path.display(),
+                    cfg.context_budget(),
+                    cfg.context_target(),
+                    sess.read()
+                        .ok()
+                        .and_then(|rs| rs.into_iter().rev().find_map(|r| match r {
+                            crate::log::Rec::ContextRevision { anchor, .. } => {
+                                Some(anchor.to_string())
+                            }
+                            _ => None,
+                        }))
+                        .unwrap_or_else(|| "нет".into())
+                )
+            }
             _ => return fail(format!("ctx: неизвестное действие {action}")),
         };
         return exec::Out {

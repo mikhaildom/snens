@@ -223,6 +223,24 @@ impl Mirror {
         Ok(messages)
     }
 
+    /// Сбросить сохранённый черновик: переустановить каноническое зеркало по
+    /// журналу. Нужно после отказа, который черновик сохранил: иначе начать
+    /// уборку заново нечем, кроме ручной правки файла.
+    pub fn reset(sess: &Session, cfg: &Config, path: &Path) -> R<String> {
+        let raw = sess.read()?;
+        let mut mirror = Mirror {
+            path: path.to_path_buf(),
+            view: None,
+            anchor: 0,
+            digest: String::new(),
+        };
+        mirror.install(&raw, cfg, false)?;
+        Ok(format!(
+            "ctx reset: зеркало переустановлено по журналу: {} (правка черновика выброшена)",
+            path.display()
+        ))
+    }
+
     /// Итог `ctx commit`, когда в зеркале нет правки.
     ///
     /// Голое «unchanged» модель читает как «коммит не прошёл» и повторяет его
@@ -348,8 +366,33 @@ impl Mirror {
         )))
     }
 
+    /// Отказ НЕ стирает черновик. Прежний `reject` переустанавливал каноническое
+    /// зеркало, то есть выкидывал всю работу правки из-за одной виновной записи:
+    /// после отказа модель начинала уборку заново и повторяла те же ошибки
+    /// (`context-cleanup-edit-contract`, сессии 05b724f3 и da458556). Черновик
+    /// остаётся ровно таким, каким его сохранил автор правки: следующий `commit`
+    /// после исправления виновного места дойдёт до конца, а стереть его можно
+    /// явно — `ctx status --reset`.
+    ///
+    /// Исключение — нечитаемый/битый файл: там сохранять нечего, зеркало
+    /// переустанавливается, чтобы сессия не залипла навсегда.
     fn reject(&mut self, sess: &Session, cfg: &Config, reason: &str) -> R<Option<String>> {
-        self.install(&sess.read()?, cfg, false)?;
+        let reset = sess.read()?;
+        let broken = fs::read(&self.path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Document>(&b).ok())
+            .is_none();
+        if !broken && self.view.is_some() {
+            // Базовая линия не двигается: черновик соответствует тому префиксу, на
+            // котором он построен. Иначе повтор на другой базе тихо смешал бы
+            // две проекции.
+            return Ok(Some(format!(
+                "context rejected: {reason}\nчерновик сохранён — исправь только это место в {} и повтори ctx commit; \
+                 начать заново: ctx status --reset",
+                self.path.display()
+            )));
+        }
+        self.install(&reset, cfg, false)?;
         Ok(Some(format!("context rejected: {reason}")))
     }
 }
