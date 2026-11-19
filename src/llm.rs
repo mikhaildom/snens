@@ -68,6 +68,18 @@ pub trait Llm {
     ) -> R<Reply>;
 }
 
+/// Провайдер отверг запрос по размеру тела (`413 Payload Too Large`, у Nous —
+/// «Downloaded image content cannot exceed 30MB»). Это не сбой хода, а сигнал,
+/// что вложений в проекции больше, чем провайдер готов принять: повтор без
+/// картинок осмыслен, повтор с ними — нет.
+pub fn is_payload_too_large(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let text = error.to_string();
+    let text = text.as_str();
+    // Мы сами пишем `HTTP 413`, чужие обёртки могут писать `status: 413`.
+    let status = text.contains("HTTP 413") || text.contains(" 413:") || text.contains("status 413");
+    status || text.contains("cannot exceed 30MB") || text.contains("Payload Too Large")
+}
+
 // ---------- разбор SSE ----------
 
 /// Накопитель кадров SSE. Транспорт (`bytes_stream`) режет поток где угодно — в том

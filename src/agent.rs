@@ -410,11 +410,25 @@ async fn run_loop<L: Llm>(
         // Подменяем только модель — остальные поля конфига остаются снимком старта.
         // Модель уже подставлена `live()`; остальные поля — тоже из файла.
         let turn_cfg = cfg.clone();
-        let reply: Reply = if let Some(c) = cancel.as_mut() {
-            tokio::select! { biased; _ = wait_cancel(c) => return Err("cancelled".into()), r = stream_reply(&turn_cfg, msgs, defs.clone(), llm, ui, observe) => r? }
-        } else {
-            stream_reply(&turn_cfg, msgs, defs.clone(), llm, ui, observe).await?
-        };
+        let mut reply = ask_turn(&turn_cfg, msgs.clone(), defs.clone(), llm, ui, observe, &mut cancel).await;
+        // Отказ по размеру тела. Бюджет в `stream_reply` уже снял лишнее, но
+        // провайдер может считать иначе (у Nous свой счёт и своё «30MB»). Тогда
+        // один повтор вообще без картинок: лучше текстовый ход, чем сессия,
+        // которую нельзя продолжить — каждый следующий запрос упирался бы в тот
+        // же 413, потому что проекция собирается из тех же файлов.
+        if let Err(e) = &reply {
+            if crate::llm::is_payload_too_large(e.as_ref()) {
+                let dropped = project::fit_media(&mut msgs, 0);
+                let note = format!(
+                    "провайдер отверг запрос по размеру тела — вложения ({dropped} шт.) сняты, \
+                     ход повторяется текстом"
+                );
+                ui.notice(&note);
+                observe(SurfaceSignal::Notice(note));
+                reply = ask_turn(&turn_cfg, msgs, defs.clone(), llm, ui, observe, &mut cancel).await;
+            }
+        }
+        let reply = reply?;
 
         // Расход по ходу, а не только в `show` после сессии: в терминале видно,
         // какой ход чего стоил.
@@ -781,17 +795,49 @@ async fn final_answer<L: Llm>(
     Ok(())
 }
 
-/// Один запрос к модели с живым рендером: ответ и рассуждение стримятся через
-/// `Stream`, таблицы склеиваются в рамку. Здесь же — единственное место, где
-/// решение «показывать ли рассуждение» спрашивается у `Ui`.
-async fn stream_reply<L: Llm>(
+/// Один запрос хода с учётом отмены: селект живёт здесь, чтобы повтор после
+/// отказа провайдера по размеру тела шёл через ту же отмену, а не мимо неё.
+async fn ask_turn<L: Llm>(
     cfg: &Config,
     msgs: Vec<Value>,
     tools: Vec<Value>,
     llm: &L,
     ui: &crate::render::Ui,
     observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
+    cancel: &mut Option<watch::Receiver<bool>>,
 ) -> R<Reply> {
+    match cancel.as_mut() {
+        Some(c) => tokio::select! { biased; _ = wait_cancel(c) => Err("cancelled".into()), r = stream_reply(cfg, msgs, tools, llm, ui, observe) => r },
+        None => stream_reply(cfg, msgs, tools, llm, ui, observe).await,
+    }
+}
+
+/// Один запрос к модели с живым рендером: ответ и рассуждение стримятся через
+/// `Stream`, таблицы склеиваются в рамку. Здесь же — единственное место, где
+/// решение «показывать ли рассуждение» спрашивается у `Ui`.
+async fn stream_reply<L: Llm>(
+    cfg: &Config,
+    mut msgs: Vec<Value>,
+    tools: Vec<Value>,
+    llm: &L,
+    ui: &crate::render::Ui,
+    observe: &(dyn Fn(SurfaceSignal) + Send + Sync),
+) -> R<Reply> {
+    // Бюджет вложений на запрос. Проверяется здесь, а не на уровне тула: файлы
+    // не удаляются и журнал не портится, но старые картинки не едут, а на их
+    // месте остаётся пометка (файл на диске, смотри текстом). Иначе сессия,
+    // набравшая скриншотов, упиралась бы в 413 на каждом ходу до конца жизни.
+    let dropped = project::fit_media(&mut msgs, cfg.media_budget_bytes);
+    if dropped > 0 {
+        ui.notice(&format!(
+            "вложения: {dropped} старых картинок не едут — бюджет {} Б на запрос",
+            cfg.media_budget_bytes
+        ));
+        observe(SurfaceSignal::Notice(format!(
+            "вложения не отправлены: {dropped} шт. сверх бюджета {} Б на запрос",
+            cfg.media_budget_bytes
+        )));
+    }
     let mut stream = crate::render::Stream::new(ui.color, ui.sink());
     let show = ui.show_reasoning();
     let mut reason_on = false;
@@ -896,7 +942,7 @@ fn preview(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{Fake, Usage};
+    use crate::llm::{Delta, Fake, Usage};
     use crate::log::Call;
 
     #[tokio::test]
@@ -1030,6 +1076,77 @@ mod tests {
                     if tool_calls.is_empty() && t.contains("сделал половину")
             )),
             "промежуточный итог не записан"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 413 от провайдера — не конец сессии: ход повторяется без картинок, и
+    /// человек видит, почему. Раньше такой отказ рубил сессию навсегда: проекция
+    /// собиралась из тех же файлов и снова не влезала.
+    #[tokio::test]
+    async fn payload_too_large_retries_without_attachments() -> R<()> {
+        use std::sync::Mutex;
+        struct OversizedImage {
+            seen: Mutex<Vec<bool>>,
+        }
+        impl Llm for OversizedImage {
+            async fn reply(
+                &self,
+                _cfg: &Config,
+                msgs: Vec<Value>,
+                _tools: Vec<Value>,
+                on_delta: &mut (dyn FnMut(Delta) + Send),
+            ) -> R<Reply> {
+                let images = msgs
+                    .iter()
+                    .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+                    .filter(|p| p["type"] == "image_url")
+                    .count();
+                self.seen.lock().unwrap().push(images > 0);
+                if images > 0 {
+                    return Err("HTTP 413 Payload Too Large: {\"error\":{\"message\":\"Downloaded image content cannot exceed 30MB\"}}".into());
+                }
+                on_delta(Delta::Content("посмотрел текстом"));
+                Ok(text_reply("посмотрел текстом"))
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("snens-413-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let png = dir.join("shot.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 1, 2, 3, 4])?;
+        // Бюджет не ограничивает: проверяем именно дорогу 413 → повтор.
+        let cfg = Config {
+            media_budget_bytes: 1 << 30,
+            ..cfg_tmp(&dir)
+        };
+        let sess = Session::open(&dir, "t")?;
+        sess.append(Rec::User {
+            ts: log::now(),
+            text: "что на скриншоте?".into(),
+            source: "test".into(),
+            parts: vec![crate::log::Part {
+                kind: "image".into(),
+                path: png.to_string_lossy().into_owned(),
+                mime: "image/png".into(),
+                bytes: 8,
+                width: 1,
+                height: 1,
+            }],
+            ask: None,
+        })?;
+        let llm = OversizedImage { seen: Mutex::new(vec![]) };
+        run_agent(&sess, &cfg, &llm, &crate::render::Ui::plain()).await?;
+        let seen = llm.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![true, false], "должен быть ровно один повтор без картинок: {seen:?}");
+        let recs = sess.read()?;
+        assert!(
+            recs.iter().rev().any(|r| matches!(
+                r,
+                Rec::Assistant { text: Some(t), .. } if t.contains("посмотрел текстом")
+            )),
+            "ход не доведён до ответа"
         );
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

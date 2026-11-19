@@ -321,6 +321,65 @@ fn content_value(text: &str, parts: &[Part], cfg: &Config) -> Value {
 static B64_CACHE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 const B64_CACHE_MAX: usize = 16;
 
+/// Сколько байт тела занимает часть `image_url`. Меряем именно тело, а не файл:
+/// в data-URL base64 на треть больше исходника, и провайдер считает то, что
+/// приехало. У http-ссылки — сама ссылка.
+fn image_part_bytes(part: &Value) -> usize {
+    let url = part["image_url"]["url"].as_str().unwrap_or_default();
+    match url.split_once(',') {
+        Some((head, payload)) if head.starts_with("data:") => payload.len(),
+        _ => url.len(),
+    }
+}
+
+/// Уложить картинки запроса в бюджет провайдера (`media_budget_bytes`).
+///
+/// Провайдер ограничивает тело запроса: Nous на превышении отвечает 413
+/// «Downloaded image content cannot exceed 30MB», и отказ получает весь ход.
+/// Хуже того — сессию после этого не продолжить: проекция собирается заново из
+/// тех же файлов и снова не влезает. Поэтому бюджет применяется к **проекции**:
+/// файлы и журнал не трогаются, старые картинки просто не едут в этом запросе,
+/// а на их месте остаётся пометка с путём. Свежие важнее — модель работает
+/// именно с ними, поэтому набор идёт с конца разговора.
+///
+/// Возвращает число снятых частей: вызывающий решает, сказать ли об этом вслух.
+pub fn fit_media(messages: &mut [Value], budget_bytes: usize) -> usize {
+    let mut images: Vec<(usize, usize, usize)> = Vec::new();
+    for (m, message) in messages.iter().enumerate() {
+        for (p, part) in message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if part["type"] == "image_url" {
+                images.push((m, p, image_part_bytes(part)));
+            }
+        }
+    }
+    let mut left = budget_bytes;
+    let mut dropped = 0usize;
+    for (m, p, size) in images.into_iter().rev() {
+        if size <= left {
+            left -= size;
+            continue;
+        }
+        let Some(parts) = messages[m].get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        // Пометка с путём уже стоит прямо перед картинкой (`content_value`):
+        // заменяем саму часть, а подпись оставляем — по ней модель найдёт файл.
+        parts[p] = json!({"type": "text", "text": format!(
+            "[изображение не отправлено: бюджет вложений на запрос {budget_bytes} Б исчерпан, \
+             свежие картинки важнее. Файл остался на диске — смотри текстом (read/run) \
+             либо почисти контекст (ctx commit)]"
+        )});
+        dropped += 1;
+    }
+    dropped
+}
+
 fn data_url(path: &str, mime: &str) -> Option<String> {
     if let Ok(c) = B64_CACHE.lock() {
         if let Some((_, url)) = c.iter().find(|(p, _)| p == path) {
@@ -616,6 +675,106 @@ fn historical_arguments(args: &str) -> String {
 mod tests {
     use super::*;
     use crate::log::Rec;
+
+    /// Бюджет вложений: свежие картинки остаются, старые становятся пометками.
+    /// Это и есть защита от 413, который раньше убивал сессию навсегда.
+    #[test]
+    fn media_budget_keeps_freshest_images_and_marks_the_rest() {
+        let dir = std::env::temp_dir().join(format!("snens-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Каждая картинка — 40 КБ файла, то есть ~53 КБ base64 в теле. Хвост
+        // разный: иначе у всех четырёх одинаковый data-URL и тест не отличит
+        // свежую от старой.
+        let png = |tag: u8| -> Vec<u8> {
+            let mut v: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+            v.extend(std::iter::repeat_n(0, 40_000));
+            v.push(tag);
+            v
+        };
+        let mut log = vec![user("смотри", "cli")];
+        for i in 0..4u8 {
+            let path = dir.join(format!("img{i}.png"));
+            let body = png(i);
+            std::fs::write(&path, &body).unwrap();
+            log.push(Rec::Assistant {
+                reasoning: None,
+                ts: 0,
+                text: None,
+                tool_calls: vec![crate::log::Call {
+                    id: format!("c{i}"),
+                    name: "view".into(),
+                    args: "{}".into(),
+                }],
+            });
+            log.push(Rec::ToolResult {
+                ts: 0,
+                call_id: format!("c{i}"),
+                tool: "view".into(),
+                argv: vec![],
+                exit: 0,
+                bytes: body.len(),
+                ms: 1,
+                body: Body::Inline { text: format!("img{i}.png") },
+                parts: vec![Part {
+                    kind: "image".into(),
+                    path: path.to_string_lossy().into_owned(),
+                    mime: "image/png".into(),
+                    bytes: body.len(),
+                    width: 1,
+                    height: 1,
+                }],
+            });
+        }
+        let cfg = Config { media_budget_bytes: 120_000, ..Config::default() };
+        let mut wire = msgs(&log, &cfg);
+        let images = |m: &Vec<Value>| {
+            m.iter()
+                .flat_map(|x| x["content"].as_array().cloned().unwrap_or_default())
+                .filter(|p| p["type"] == "image_url")
+                .count()
+        };
+        assert_eq!(images(&wire), 4, "без бюджета едут все");
+
+        let dropped = fit_media(&mut wire, 120_000);
+        assert_eq!(dropped, 2, "в 120 КБ влезают две картинки по 53 КБ");
+        assert_eq!(images(&wire), 2);
+        // Свежие на месте, старые — пометками, и пометка говорит, что делать.
+        let text = serde_json::to_string(&wire).unwrap();
+        assert!(text.contains("не отправлено"), "нет пометки: {text}");
+        assert!(text.contains("ctx commit"), "пометка не говорит, как починить");
+        let sent: Vec<String> = wire
+            .iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .filter(|p| p["type"] == "image_url")
+            .map(|p| p["image_url"]["url"].as_str().unwrap().to_string())
+            .collect();
+        let fresh = data_url(&dir.join("img3.png").to_string_lossy(), "image/png").unwrap();
+        assert!(sent.contains(&fresh), "свежая картинка снята");
+        let stale = data_url(&dir.join("img0.png").to_string_lossy(), "image/png").unwrap();
+        assert!(!sent.contains(&stale), "старая картинка уехала");
+        // Детерминизм: та же проекция — тот же результат.
+        let again = fit_media(&mut msgs(&log, &cfg), 120_000);
+        assert_eq!(again, dropped);
+        // Ноль — картинки не едут вовсе (повтор после 413 именно это и делает).
+        let mut none = msgs(&log, &cfg);
+        assert_eq!(fit_media(&mut none, 0), 4);
+        assert_eq!(images(&none), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Провайдер меряет тело сам, поэтому 413 надо узнавать по тексту ошибки.
+    #[test]
+    fn payload_too_large_is_recognized() {
+        let real: Box<dyn std::error::Error + Send + Sync> =
+            "HTTP 413 Payload Too Large: {\"error\":{\"message\":\"Downloaded image content cannot exceed 30MB\"}}".into();
+        assert!(crate::llm::is_payload_too_large(real.as_ref()));
+        let other: Box<dyn std::error::Error + Send + Sync> =
+            "HTTP 400 Bad Request: bad image".into();
+        assert!(!crate::llm::is_payload_too_large(other.as_ref()));
+        let net: Box<dyn std::error::Error + Send + Sync> = "stream idle".into();
+        assert!(!crate::llm::is_payload_too_large(net.as_ref()));
+    }
 
     #[test]
     fn image_estimate_ignores_base64_length() {

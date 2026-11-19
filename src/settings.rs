@@ -26,6 +26,7 @@ pub const KEYS: &[&str] = &[
     "max_result_chars",
     "reduce_output",
     "attachments",
+    "media_budget_bytes",
     "ctx_window",
     "context_budget",
     "context_target",
@@ -59,6 +60,7 @@ pub fn values(cfg: &Config) -> Value {
         "max_result_chars": live.max_result_chars,
         "reduce_output": live.reduce_output,
         "attachments": live.attachments,
+        "media_budget_bytes": live.media_budget_bytes,
         "ctx_window": live.ctx_window,
         "context_budget": live.context_budget,
         "context_target": live.context_target,
@@ -168,6 +170,8 @@ pub fn prepare(cfg: &Config, patch: &Value) -> R<Vec<crate::cfg_edit::Edit>> {
             "max_result_chars" => edits.push(Edit::top(k, int(value, k, 200, 1_000_000)?)),
             "reduce_output" => edits.push(Edit::top(k, boolean(value, k)?)),
             "attachments" => edits.push(Edit::top(k, boolean(value, k)?)),
+            // 0 — картинки не отправляются вовсе (даже при attachments = true).
+            "media_budget_bytes" => edits.push(Edit::top(k, int(value, k, 0, 1_000_000_000)?)),
             "ctx_window" => edits.push(Edit::top(k, int(value, k, 1_000, 100_000_000)?)),
             "context_budget" | "context_target" => {
                 let n = value

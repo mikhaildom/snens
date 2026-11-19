@@ -26,6 +26,7 @@
     "max_result_chars": 24000,
     "reduce_output": true,
     "attachments": true,
+    "media_budget_bytes": 20971520,
     "ctx_window": 1000000,
     "context_budget": 0,
     "context_target": 0,

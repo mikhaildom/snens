@@ -69,10 +69,12 @@ context_target = 80000
 | `shell` | массив | `["sh","-c"]`, на Windows `["cmd","/C"]` | чем выполняется `run` |
 | `attachments` | bool | `true` | давать инструментам канал вложений |
 | `max_attachment_bytes` | целое | `33554432` | потолок одного вложения, байты |
+| `media_budget_bytes` | целое | `20971520` | бюджет картинок на один запрос, байты; `0` — не отправлять |
 | `approval_timeout_seconds` | целое | `300` | ожидание одобрения привилегированного действия; `0` — очередь выключена |
 
 Перечитываются на каждом ходу: `max_turns`, `timeout_seconds`, `max_process_chars`,
-`stream_idle_seconds`, `reduce_output`, `attachments`, `approval_timeout_seconds`.
+`stream_idle_seconds`, `reduce_output`, `attachments`, `media_budget_bytes`,
+`approval_timeout_seconds`.
 `shell` попадает в описания инструментов при старте цикла: его смена требует нового
 запуска `run`/`tui` или рестарта сервиса.
 
