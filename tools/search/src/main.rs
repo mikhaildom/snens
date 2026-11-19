@@ -319,7 +319,10 @@ fn fetch(base: &str, a: &Args) -> Result<SearchResults, String> {
         .map(|v| match v {
             Value::Array(a) => {
                 let name = a.first().and_then(Value::as_str).unwrap_or("?");
-                let why = a.get(1).and_then(Value::as_str).unwrap_or("причина не сказана");
+                let why = a
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .unwrap_or("причина не сказана");
                 format!("{name} ({why})")
             }
             other => other.as_str().unwrap_or("?").to_string(),

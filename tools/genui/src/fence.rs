@@ -42,8 +42,7 @@ fn valid_name(s: &str) -> bool {
 fn valid_net_host(s: &str) -> bool {
     !s.is_empty()
         && s.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '.' | '_' | '-' | ':' | '[' | ']' | '%')
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '[' | ']' | '%')
         })
 }
 
@@ -272,7 +271,11 @@ fn private_v4(n: [u8; 4]) -> bool {
 }
 
 fn ipv6_literal(h: &str) -> Option<std::net::Ipv6Addr> {
-    let s = h.strip_prefix('[').unwrap_or(h).strip_suffix(']').unwrap_or(h);
+    let s = h
+        .strip_prefix('[')
+        .unwrap_or(h)
+        .strip_suffix(']')
+        .unwrap_or(h);
     s.parse::<std::net::Ipv6Addr>().ok()
 }
 
@@ -286,9 +289,7 @@ fn private_v6(v6: std::net::Ipv6Addr) -> bool {
         return private_v4(v4.octets());
     }
     // ULA fc00::/7, link-local fe80::/10, site-local (устаревший) fec0::/10.
-    (seg[0] & 0xfe00) == 0xfc00
-        || (seg[0] & 0xffc0) == 0xfe80
-        || (seg[0] & 0xffc0) == 0xfec0
+    (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xffc0) == 0xfec0
 }
 
 #[cfg(test)]

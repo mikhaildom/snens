@@ -320,7 +320,11 @@ fn retain(store: &Store, args: &[String]) -> Result<i32, String> {
             .to_string()
     };
     // Тема хода: флаг сильнее тела — ядро знает сессию, а тело пишет вызывающий.
-    let context = if context.is_empty() { field("context") } else { context };
+    let context = if context.is_empty() {
+        field("context")
+    } else {
+        context
+    };
     let (user, assistant) = (field("user"), field("assistant"));
     // Нечего запоминать — не ошибка: ядро зовёт retain на каждом ответе.
     if user.is_empty() && assistant.is_empty() {

@@ -31,9 +31,9 @@ fn check_host(host: &str) -> Result<(), String> {
     let bad = host.is_empty()
         || host.starts_with('-')
         || host.chars().any(|c| c.is_whitespace() || c.is_control())
-        || !host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']'));
+        || !host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']')
+        });
     if bad {
         return Err(format!(
             "desk: недопустимый адрес машины `{host}` — нужен вид user@host"

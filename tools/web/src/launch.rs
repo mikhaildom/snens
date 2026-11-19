@@ -75,11 +75,7 @@ fn ssh<A: AsRef<str>>(host: &str, cmd: A) -> Result<String, String> {
         let err = String::from_utf8_lossy(&out.stderr).replace('\r', "");
         return Err(format!(
             "на {host} команда не прошла: {}",
-            err
-                .trim()
-                .lines()
-                .last()
-                .unwrap_or("причина не сказана")
+            err.trim().lines().last().unwrap_or("причина не сказана")
         ));
     }
     Ok(text)
@@ -267,10 +263,7 @@ fn write_remote_file(host: &str, name: &str, content: &str) -> Result<(), String
         .arg("-o")
         .arg("BatchMode=yes")
         .arg(host)
-        .arg(format!(
-            r#"cmd /c more > "C:\Users\%USERNAME%\{}""#,
-            name
-        ))
+        .arg(format!(r#"cmd /c more > "C:\Users\%USERNAME%\{}""#, name))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

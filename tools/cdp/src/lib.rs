@@ -375,7 +375,7 @@ impl Cdp {
                         (Some(_), Ok(_)) => format!("{TIMEOUT_PREFIX} ожидания события"),
                         (_, Err(e)) => e,
                         _ => "CDP: Chrome не ответил (страница держит открытый поток?)".into(),
-                    })
+                    });
                 }
                 Err(e) => return Err(format!("CDP: {e}")),
             }

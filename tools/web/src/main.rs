@@ -146,9 +146,7 @@ impl Args {
     pub fn num_checked(&self, name: &str, def: f64, lo: f64, hi: f64) -> Result<f64, String> {
         let v = self.num(name, def);
         if !v.is_finite() || v < lo || v > hi {
-            return Err(format!(
-                "web: --{name} ждёт число {lo}..{hi}, получено {v}"
-            ));
+            return Err(format!("web: --{name} ждёт число {lo}..{hi}, получено {v}"));
         }
         Ok(v)
     }
@@ -156,14 +154,7 @@ impl Args {
 
 /// Флаги-переключатели: значения не принимают.
 const BOOL_FLAGS: [&str; 8] = [
-    "new",
-    "visible",
-    "headless",
-    "full",
-    "all",
-    "no-snap",
-    "no-wait",
-    "fresh",
+    "new", "visible", "headless", "full", "all", "no-snap", "no-wait", "fresh",
 ];
 
 fn is_command(s: &str) -> bool {
@@ -477,10 +468,7 @@ fn cmd_tabs(args: &Args) -> Result<(), String> {
     let ours = state::load_target();
     for (i, t) in targets.iter().enumerate() {
         let id = t.get("id").and_then(Value::as_str).unwrap_or("");
-        let mine = ours
-            .as_ref()
-            .map(|(_, tab)| tab == id)
-            .unwrap_or(true);
+        let mine = ours.as_ref().map(|(_, tab)| tab == id).unwrap_or(true);
         if !mine && !args.on("all") {
             continue;
         }
@@ -489,9 +477,7 @@ fn cmd_tabs(args: &Args) -> Result<(), String> {
     if !args.on("all") {
         let hidden = targets.len();
         if hidden > 0 && ours.is_some() {
-            println!(
-                "(показаны вкладки текущей привязки; все — `web tabs --all`)"
-            );
+            println!("(показаны вкладки текущей привязки; все — `web tabs --all`)");
         }
     }
     Ok(())
@@ -622,14 +608,12 @@ fn cmd_snap(args: &Args) -> Result<(), String> {
     // Отрицательное/дробное значение раньше молча становилось 0: проверяем.
     let depth_raw = args.num("depth", 30.0);
     if !depth_raw.is_finite() || depth_raw < 1.0 {
-        return Err(format!("web: --depth ждёт положительное число, получено {depth_raw}"));
+        return Err(format!(
+            "web: --depth ждёт положительное число, получено {depth_raw}"
+        ));
     }
     let depth = depth_raw as usize;
-    let depth = if args.on("full") {
-        usize::MAX
-    } else {
-        depth
-    };
+    let depth = if args.on("full") { usize::MAX } else { depth };
     let s = snap::take_stable(&mut l.cdp, depth)?;
     let path = state::save_page(&l.tab, &s.text)?;
     state::save_url(&l.tab, &s.url);

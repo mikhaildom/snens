@@ -168,7 +168,13 @@ fn strip_comments(src: &str) -> String {
 pub fn hash(files: &[File]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for f in files {
-        for b in f.name.as_bytes().iter().chain(b"\0").chain(f.source.as_bytes()) {
+        for b in f
+            .name
+            .as_bytes()
+            .iter()
+            .chain(b"\0")
+            .chain(f.source.as_bytes())
+        {
             h ^= u64::from(*b);
             h = h.wrapping_mul(0x100_0000_01b3);
         }
@@ -324,13 +330,19 @@ mod tests {
         // Имя человеческое: файл — poll-card.js, тег — my-poll-card, класс —
         // PollCard. Раньше тег получался «my-Poll Card» (невалидное имя).
         let src = skeleton("Poll Card");
-        assert!(src.contains("customElements.define(\"my-poll-card\""), "{src}");
+        assert!(
+            src.contains("customElements.define(\"my-poll-card\""),
+            "{src}"
+        );
         assert!(src.contains("class PollCard extends HTMLElement"), "{src}");
         assert_eq!(file_name("Poll Card"), "poll-card.js");
         // Ведущая цифра: класс не может начинаться с неё.
         let src = skeleton("3d-card");
         assert!(src.contains("class C3dCard extends HTMLElement"), "{src}");
-        assert!(src.contains("customElements.define(\"my-3d-card\""), "{src}");
+        assert!(
+            src.contains("customElements.define(\"my-3d-card\""),
+            "{src}"
+        );
     }
 
     #[test]

@@ -185,9 +185,10 @@ impl Store {
                    where v.emb match vec_int8(?1) and v.k = ?2 and f.valid_to is null";
         let mut st = self.db.prepare(sql).map_err(|e| e.to_string())?;
         let rows = st
-            .query_map(params![emb, (k.saturating_mul(4) as i64).max(k as i64)], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-            })
+            .query_map(
+                params![emb, (k.saturating_mul(4) as i64).max(k as i64)],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
+            )
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for row in rows {
@@ -300,7 +301,10 @@ impl Store {
         turn: i64,
         items: &[(NewFact, Option<String>)],
     ) -> Result<(usize, usize), String> {
-        if let Some(dim) = items.iter().find_map(|(f, _)| f.emb.as_ref().map(|_| f.dim)) {
+        if let Some(dim) = items
+            .iter()
+            .find_map(|(f, _)| f.emb.as_ref().map(|_| f.dim))
+        {
             self.ensure_vec(dim)?;
         }
         let tx = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -401,7 +405,9 @@ impl Store {
                 )
                 .map_err(|e| e.to_string())?;
             if n == 0 {
-                return Err(format!("supersede: факта {new_uid} нет — ссылка не поставлена"));
+                return Err(format!(
+                    "supersede: факта {new_uid} нет — ссылка не поставлена"
+                ));
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -501,7 +507,9 @@ impl Store {
     pub fn stats(&self) -> Result<Stats, String> {
         // Ошибку базы не превращаем в ноль: «пусто» и «сломалось» — разные ответы.
         let count = |sql: &str| -> Result<i64, String> {
-            self.db.query_row(sql, [], |r| r.get(0)).map_err(|e| e.to_string())
+            self.db
+                .query_row(sql, [], |r| r.get(0))
+                .map_err(|e| e.to_string())
         };
         let facts = count("select count(*) from facts where valid_to is null")?;
         let stale = count("select count(*) from facts where valid_to is not null")?;
@@ -595,7 +603,11 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, f: &NewFact) -> Result<String, Str
 }
 
 /// Закрыть старый факт в пользу нового в уже открытой транзакции.
-fn supersede_row(tx: &rusqlite::Transaction<'_>, old_uid: &str, new_uid: &str) -> Result<bool, String> {
+fn supersede_row(
+    tx: &rusqlite::Transaction<'_>,
+    old_uid: &str,
+    new_uid: &str,
+) -> Result<bool, String> {
     let now = crate::now();
     let n = tx
         .execute(

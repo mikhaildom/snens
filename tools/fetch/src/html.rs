@@ -65,9 +65,9 @@ pub fn to_markdown(html: &str, raw: bool) -> String {
         }
     }
 
-    let root = root_id.and_then(|id| doc.tree.get(id)).map(|e| {
-        scraper::ElementRef::wrap(e).expect("корень — элемент")
-    });
+    let root = root_id
+        .and_then(|id| doc.tree.get(id))
+        .map(|e| scraper::ElementRef::wrap(e).expect("корень — элемент"));
 
     let inner = match root {
         Some(el) => el.inner_html(),
@@ -117,8 +117,8 @@ fn squeeze_table_padding(md: &str) -> String {
                 return line.to_string();
             }
             let was_row = prev_is_row;
-            prev_is_row = !(line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
-                && line.contains('-'));
+            prev_is_row =
+                !(line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) && line.contains('-'));
             // Строка-разделитель шапки состоит из „|“, „-“, „:“ и пробелов: длину
             // дефисов markdown не значит, а в инфобоксе она растянута на весь текст.
             if was_row && !prev_is_row {
@@ -242,7 +242,10 @@ mod tests {
         // только второй строкой таблицы.
         let md = "| a | b |\n| - | - |\n| - | - |";
         let out = squeeze_table_padding(md);
-        assert!(out.ends_with("| - | - |"), "строка данных переписана: {out}");
+        assert!(
+            out.ends_with("| - | - |"),
+            "строка данных переписана: {out}"
+        );
     }
 
     #[test]

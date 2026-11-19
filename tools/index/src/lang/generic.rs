@@ -48,7 +48,10 @@ fn walk(node: Node<'_>, src: &str, layout: &mut Layout, depth: usize) {
         if let Some((_, section)) = KINDS.iter().find(|(k, _)| *k == kind) {
             // Секции — &'static str: имена из таблицы, а не из файла.
             push_static(layout, section, plain(child, src));
-        } else if matches!(kind, "declaration_list" | "block" | "class_body" | "statement_block" | "export_statement") {
+        } else if matches!(
+            kind,
+            "declaration_list" | "block" | "class_body" | "statement_block" | "export_statement"
+        ) {
             walk(child, src, layout, depth + 1);
         }
     }
@@ -79,7 +82,7 @@ fn plain(node: Node<'_>, src: &str) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn generic_walks_into_containers() {
         // Модуль проверяем напрямую: дерево из rust-грамматики, обход — общий.

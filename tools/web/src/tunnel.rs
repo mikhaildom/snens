@@ -209,12 +209,9 @@ pub fn remote_browser_path(host: &str, local_port: u16, remote_port: u16) -> Opt
     // Host — с портом той стороны: Chrome сверяет его со своим и на чужой
     // отвечает 403, из-за чего быстрый путь молча не работал.
     let host_header = format!("127.0.0.1:{remote_port}");
-    if let Ok(raw) = crate::cdp::http_get_host(
-        "127.0.0.1",
-        local_port,
-        &host_header,
-        "/json/version",
-    ) {
+    if let Ok(raw) =
+        crate::cdp::http_get_host("127.0.0.1", local_port, &host_header, "/json/version")
+    {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(u) = v.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
                 if let Some(i) = u.find("/devtools/") {

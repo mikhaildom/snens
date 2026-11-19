@@ -122,9 +122,9 @@ impl Args {
     pub fn port(&self) -> Result<u16, String> {
         match self.flag("port") {
             None => Ok(9227),
-            Some(v) => v.parse::<u16>().map_err(|e| {
-                format!("desk: --port ждёт число 1..65535, получено {v} ({e})")
-            }),
+            Some(v) => v
+                .parse::<u16>()
+                .map_err(|e| format!("desk: --port ждёт число 1..65535, получено {v} ({e})")),
         }
     }
 }
@@ -195,8 +195,7 @@ fn call(args: &Args, req: Value) -> Result<Value, String> {
     let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
     // Сериализация может отказать: пустая строка вместо запроса давала бы
     // «ответ не пришёл»/«не JSON» вместо настоящей причины.
-    let body = serde_json::to_string(&req)
-        .map_err(|e| format!("запрос не сериализуется: {e}"))?;
+    let body = serde_json::to_string(&req).map_err(|e| format!("запрос не сериализуется: {e}"))?;
     s.write_all(format!("{body}\n").as_bytes())
         .map_err(|e| format!("{addr}: запрос не отправлен: {e}"))?;
     let mut reader = BufReader::new(s);
@@ -362,7 +361,11 @@ fn cmd_act(args: &Args) -> Result<(), String> {
     // Ядро собирает argv по схеме: массив из поля `json` превращается в
     // повторение флага, поэтому значений может быть несколько. Все части —
     // одна логическая пачка действий.
-    let mut raws: Vec<String> = args.values("json").into_iter().map(str::to_string).collect();
+    let mut raws: Vec<String> = args
+        .values("json")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     if raws.is_empty() {
         // Позиционные разбираются из argv[1..]: первый из них — это [0], а не [1].
         if let Some(p) = args.positional.first() {
@@ -382,8 +385,8 @@ fn cmd_act(args: &Args) -> Result<(), String> {
         // Один не-массив — ошибка формы: одиночное действие путает с пустым набором.
         [other] => {
             return Err(format!(
-                "desk act: ожидается массив действий, напр. [{{\"click\":\"e3\"}}], получено {other}"
-            ))
+            "desk act: ожидается массив действий, напр. [{{\"click\":\"e3\"}}], получено {other}"
+        ))
         }
         // Несколько аргументов (ядро развернуло массив схемы в повторение
         // флага) — каждый обязан быть объектом-действием.
@@ -406,8 +409,12 @@ fn cmd_act(args: &Args) -> Result<(), String> {
     // Пустая таблица адресов = все действия упадут в агенте с невнятной ошибкой.
     // Поэтому «снимка нет» и «снимок битый» различаем и говорим, что делать.
     let refs: Value = match std::fs::read_to_string(&rf) {
-        Ok(t) => serde_json::from_str(&t)
-            .map_err(|e| format!("desk act: {} испорчен ({e}) — сделай `desk snap` заново", rf.display()))?,
+        Ok(t) => serde_json::from_str(&t).map_err(|e| {
+            format!(
+                "desk act: {} испорчен ({e}) — сделай `desk snap` заново",
+                rf.display()
+            )
+        })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
                 "desk act: нет снимка {} — сначала `desk snap`, иначе адреса некуда сопоставить",

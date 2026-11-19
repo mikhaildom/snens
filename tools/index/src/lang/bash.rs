@@ -15,7 +15,11 @@ pub fn skeleton(root: Node<'_>, src: &str) -> Layout {
                     .child_by_field_name("name")
                     .map(|n| collapse(text(n, src)))
                     .unwrap_or_default();
-                push(&mut layout, "fns", Item::new(name, node.start_position().row + 1));
+                push(
+                    &mut layout,
+                    "fns",
+                    Item::new(name, node.start_position().row + 1),
+                );
             }
             "variable_assignment" => push(&mut layout, "vars", plain(node, src)),
             "command" => {
@@ -24,7 +28,11 @@ pub fn skeleton(root: Node<'_>, src: &str) -> Layout {
                 let t = collapse(text(node, src));
                 let word = t.split_whitespace().next().unwrap_or("").to_string();
                 if matches!(word.as_str(), "source" | "." | "export" | "set") {
-                    push(&mut layout, "vars", Item::new(t, node.start_position().row + 1));
+                    push(
+                        &mut layout,
+                        "vars",
+                        Item::new(t, node.start_position().row + 1),
+                    );
                 }
             }
             _ => {}

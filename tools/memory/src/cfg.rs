@@ -68,7 +68,10 @@ fn read_file() -> File {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return File::default(),
         Err(e) => {
-            eprintln!("memory: {}: {e} — беру настройки по умолчанию", path.display());
+            eprintln!(
+                "memory: {}: {e} — беру настройки по умолчанию",
+                path.display()
+            );
             return File::default();
         }
     };
@@ -101,7 +104,10 @@ fn default_db_path(f: &File) -> PathBuf {
 impl Cfg {
     pub fn load() -> Result<Cfg, String> {
         let f = read_file();
-        let key_env = f.api_key_env.clone().unwrap_or_else(|| "SNENS_API_KEY".into());
+        let key_env = f
+            .api_key_env
+            .clone()
+            .unwrap_or_else(|| "SNENS_API_KEY".into());
         let api_key = std::env::var(&key_env)
             .ok()
             .filter(|v| !v.trim().is_empty())

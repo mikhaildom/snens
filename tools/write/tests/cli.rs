@@ -140,7 +140,10 @@ fn symlink_target_is_updated_and_link_survives() {
     let (rc, _o, err) = run(&[link.name()], "новое\n".as_bytes());
     assert_eq!(rc, 0, "{err}");
     assert!(
-        std::fs::symlink_metadata(&*link).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&*link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "симлинк заменён обычным файлом"
     );
     assert_eq!(std::fs::read_to_string(&*target).unwrap(), "новое\n");

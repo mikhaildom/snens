@@ -184,7 +184,8 @@ pub fn load_refs(tab: &str) -> Result<Vec<Ref>, String> {
         }
         Err(e) => return Err(format!("{}: {e}", p.display())),
     };
-    serde_json::from_str(&text).map_err(|e| format!("{}: {e} — сделай `web snap` заново", p.display()))
+    serde_json::from_str(&text)
+        .map_err(|e| format!("{}: {e} — сделай `web snap` заново", p.display()))
 }
 
 /// URL, к которому относится последний снимок: по нему отличаем «страница та

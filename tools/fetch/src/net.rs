@@ -35,8 +35,7 @@ pub fn looks_blocked(md: &str) -> bool {
     let low = md.to_ascii_lowercase();
     // «security» — слишком частое слово: страница про права доступа на сайте про
     // безопасность не должна уезжать в jina. Признак стаба — «automation tools»/капча.
-    (low.contains("access denied")
-        && (low.contains("automation tools") || low.contains("captcha")))
+    (low.contains("access denied") && (low.contains("automation tools") || low.contains("captcha")))
         || low.contains("enable javascript and cookies")
         || low.contains("unusual traffic")
 }
@@ -141,7 +140,9 @@ fn jina_check(text: &str) -> Result<(), String> {
     }
     // Шапка — только до «Markdown Content:»: иначе страница, в тексте которой
     // встречается эта фраза, считалась бы ошибкой доставки.
-    let head = text.split_once("Markdown Content:").map_or(text, |(h, _)| h);
+    let head = text
+        .split_once("Markdown Content:")
+        .map_or(text, |(h, _)| h);
     if let Some(p) = head.find("Target URL returned error") {
         let tail = head[p..].lines().next().unwrap_or("").trim().to_string();
         return Err(format!("jina: {tail}"));
@@ -295,8 +296,8 @@ fn percent_decode(v: &str, charset: &str) -> String {
             bytes.push(b);
         }
     }
-    let enc = encoding_rs::Encoding::for_label(charset.trim().as_bytes())
-        .unwrap_or(encoding_rs::UTF_8);
+    let enc =
+        encoding_rs::Encoding::for_label(charset.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8);
     enc.decode(&bytes).0.into_owned()
 }
 

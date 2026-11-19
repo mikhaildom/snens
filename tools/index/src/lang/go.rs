@@ -16,7 +16,11 @@ pub fn skeleton(root: Node<'_>, src: &str) -> Layout {
                     push(&mut layout, "imports", plain(node, src));
                 }
                 for spec in specs {
-                    push(&mut layout, "imports", Item::new(collapse(text(spec, src)), spec.start_position().row + 1));
+                    push(
+                        &mut layout,
+                        "imports",
+                        Item::new(collapse(text(spec, src)), spec.start_position().row + 1),
+                    );
                 }
             }
             "type_declaration" => {

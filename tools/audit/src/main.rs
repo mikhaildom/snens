@@ -360,10 +360,7 @@ fn render(r: &Report, huge: usize) -> String {
     ));
     if r.unpaired > 0 {
         // Вызовы без результата: лог оборван или процесс снят — молчать нельзя.
-        s.push_str(&format!(
-            ", без результата {} (лог оборван?)",
-            r.unpaired
-        ));
+        s.push_str(&format!(", без результата {} (лог оборван?)", r.unpaired));
     }
     if r.broken > 0 {
         s.push_str(&format!(", битых строк {}", r.broken));

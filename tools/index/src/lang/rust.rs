@@ -122,7 +122,9 @@ fn enum_variants(node: Node<'_>, src: &str) -> Vec<Item> {
                 if child.kind() != "enum_variant" {
                     continue;
                 }
-                let name = child.child_by_field_name("name").map(|n| crate::render::text(n, src));
+                let name = child
+                    .child_by_field_name("name")
+                    .map(|n| crate::render::text(n, src));
                 if let Some(name) = name {
                     out.push(Item::new(name.to_string(), node_line(child)));
                 }

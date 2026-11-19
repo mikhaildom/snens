@@ -261,7 +261,10 @@ fn hits(line: &str, pattern: &str, ignore_case: bool, word: bool) -> bool {
     }
     // В общем случае (без --ignore-case) оба строковых среза уже есть — копии не нужны.
     let (hay, needle) = if ignore_case {
-        (Cow::Owned(line.to_lowercase()), Cow::Owned(pattern.to_lowercase()))
+        (
+            Cow::Owned(line.to_lowercase()),
+            Cow::Owned(pattern.to_lowercase()),
+        )
     } else {
         (Cow::Borrowed(line), Cow::Borrowed(pattern))
     };
@@ -327,11 +330,7 @@ fn scan_file(file: &str, path: &Path, args: &Args, budget: usize) -> Option<Foun
         let hi = m
             .saturating_add(args.context)
             .min(lines.len().saturating_sub(1));
-        for (i, line) in lines[lo..=hi]
-            .iter()
-            .enumerate()
-            .map(|(k, l)| (k + lo, l))
-        {
+        for (i, line) in lines[lo..=hi].iter().enumerate().map(|(k, l)| (k + lo, l)) {
             if let Some(prev) = last {
                 if i <= prev {
                     // Строка уже выведена; остаётся уточнить, что она совпадение.

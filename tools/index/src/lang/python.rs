@@ -60,7 +60,9 @@ fn with_methods(node: Node<'_>, src: &str, decorators: &[String]) -> Item {
             }
             let own = own_decorators(m, src);
             methods.push(Item::new(
-                format!("{} {}", own, head_until(m, src, ':')).trim().to_string(),
+                format!("{} {}", own, head_until(m, src, ':'))
+                    .trim()
+                    .to_string(),
                 m.start_position().row + 1,
             ));
         }

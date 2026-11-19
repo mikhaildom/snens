@@ -189,16 +189,17 @@ mod tests {
 
     #[test]
     fn collapse_squeezes_whitespace_runs() {
-        assert_eq!(collapse("  pub   fn  x(\n  a: u8,\n) -> u8"), "pub fn x( a: u8, ) -> u8");
+        assert_eq!(
+            collapse("  pub   fn  x(\n  a: u8,\n) -> u8"),
+            "pub fn x( a: u8, ) -> u8"
+        );
     }
 
     #[test]
     fn render_groups_by_section_and_counts_hidden() {
         let mut layout = Layout::new();
         let mut item = Item::new("pub struct A".into(), 3);
-        item.children = (0..10)
-            .map(|i| Item::new(format!("f{i}: u8"), 0))
-            .collect();
+        item.children = (0..10).map(|i| Item::new(format!("f{i}: u8"), 0)).collect();
         item.hidden = 5;
         push(&mut layout, "types", item);
         let out = render(&layout);

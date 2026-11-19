@@ -324,11 +324,7 @@ pub fn lint(art: &Artifact, lib_tags: &[String]) -> Report {
             Some(host) => {
                 // CSP перечисляет только https:// — `http://`-скрипт не загрузится.
                 src.starts_with("https://")
-                    && art
-                        .head
-                        .net
-                        .iter()
-                        .any(|n| n.eq_ignore_ascii_case(&host))
+                    && art.head.net.iter().any(|n| n.eq_ignore_ascii_case(&host))
             }
             // Относительный или протокол-относительный URL: у документа нет
             // origin, и `default-src 'none'` его не пустит.
@@ -351,7 +347,9 @@ fn script_srcs(body: &str) -> Vec<String> {
     let mut from = 0;
     while let Some(pos) = lower[from..].find("<script") {
         let at = from + pos;
-        let Some(close) = lower[at..].find('>') else { break };
+        let Some(close) = lower[at..].find('>') else {
+            break;
+        };
         let tag = &markup[at..at + close];
         if let Some(src) = attr_values(tag, "src").into_iter().next() {
             out.push(src);
@@ -698,8 +696,8 @@ pub fn check_in_browser(
     // from_secs_f64 паникует на NaN/отрицательном: это pub-функция, проверяем сами.
     let budget = Duration::try_from_secs_f64(timeout_s)
         .map_err(|e| format!("genui: таймаут {timeout_s} не годится: {e}"))?;
-    let observe_budget = Duration::try_from_secs_f64(timeout_s.min(8.0))
-        .unwrap_or(Duration::from_secs(0));
+    let observe_budget =
+        Duration::try_from_secs_f64(timeout_s.min(8.0)).unwrap_or(Duration::from_secs(0));
     let deadline = Instant::now() + budget;
     let mut br = cdp::open(chrome, deadline, timeout_s, out_dir, "genui")?;
     br.set_viewport(1000, 900)?;
@@ -797,8 +795,7 @@ pub fn check_in_browser(
         rect.get("h").and_then(Value::as_f64),
         rect.get("dpr").and_then(Value::as_f64),
     );
-    if !matches!(&rect_geo, (Some(_), Some(_), Some(w), Some(h), Some(_)) if *w > 0.0 && *h > 0.0)
-    {
+    if !matches!(&rect_geo, (Some(_), Some(_), Some(w), Some(h), Some(_)) if *w > 0.0 && *h > 0.0) {
         // Кадр не снят — модель должна знать почему, иначе правит вслепую.
         report.warn(format!(
             "снимок не снят: iframe артефакта не измерен (прямоугольник: {rect})"

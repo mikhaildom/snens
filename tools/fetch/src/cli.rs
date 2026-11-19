@@ -53,10 +53,9 @@ fn expand(argv: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for a in argv {
         match a.strip_prefix("--").and_then(|r| r.split_once('=')) {
-            Some((k, _)) if BOOL_FLAGS.contains(&k) => die(
-                &format!("fetch: --{k} значения не принимает\n{USAGE}"),
-                2,
-            ),
+            Some((k, _)) if BOOL_FLAGS.contains(&k) => {
+                die(&format!("fetch: --{k} значения не принимает\n{USAGE}"), 2)
+            }
             Some((k, v)) => {
                 out.push(format!("--{k}"));
                 out.push(v.to_string());
@@ -140,9 +139,7 @@ fn num(argv: &[String], i: usize, name: &str, lo: usize, hi: usize) -> usize {
     });
     if n < lo || n > hi {
         die(
-            &format!(
-                "fetch: {name} ждёт число {lo}..{hi}, получено {v}\n{USAGE}"
-            ),
+            &format!("fetch: {name} ждёт число {lo}..{hi}, получено {v}\n{USAGE}"),
             2,
         );
     }

@@ -29,10 +29,11 @@ fn visit(node: Node<'_>, src: &str, layout: &mut Layout) {
             }
         }
         "import_statement" => push(layout, "imports", plain(node, src)),
-        "interface_declaration" | "type_alias_declaration" | "enum_declaration"
-        | "class_declaration" | "abstract_class_declaration" => {
-            push(layout, "types", with_members(node, src))
-        }
+        "interface_declaration"
+        | "type_alias_declaration"
+        | "enum_declaration"
+        | "class_declaration"
+        | "abstract_class_declaration" => push(layout, "types", with_members(node, src)),
         "function_declaration" | "generator_function_declaration" => {
             push(layout, "fns", plain(node, src))
         }
@@ -81,7 +82,10 @@ fn bindings(node: Node<'_>, src: &str) -> Vec<Item> {
         // У стрелки показываем параметры: `const f = (a: T) => …` → `f = (a: T) =>`.
         let params = decl
             .child_by_field_name("value")
-            .and_then(|v| v.child_by_field_name("parameters").or_else(|| v.child_by_field_name("parameter")))
+            .and_then(|v| {
+                v.child_by_field_name("parameters")
+                    .or_else(|| v.child_by_field_name("parameter"))
+            })
             .map(|p| collapse(text(p, src)))
             .unwrap_or_default();
         let line = format!("{kind} {name}{params}");
@@ -96,7 +100,12 @@ fn bindings(node: Node<'_>, src: &str) -> Vec<Item> {
 fn with_members(node: Node<'_>, src: &str) -> Item {
     let mut item = plain(node, src);
     let mut members = Vec::new();
-    for kind in ["method_definition", "method_signature", "property_signature", "public_field_definition"] {
+    for kind in [
+        "method_definition",
+        "method_signature",
+        "property_signature",
+        "public_field_definition",
+    ] {
         for m in deep(node, kind) {
             members.push(Item::new(head(m, src), m.start_position().row + 1));
         }
@@ -117,7 +126,8 @@ mod tests {
 
     #[test]
     fn export_wrapper_is_unwrapped() {
-        let src = "import { a } from 'x';\nexport function f(x: number): void {}\nexport const y = 1;\n";
+        let src =
+            "import { a } from 'x';\nexport function f(x: number): void {}\nexport const y = 1;\n";
         let out = skeleton_of(src, "ts").unwrap();
         assert!(out.contains("imports:"), "{out}");
         assert!(out.contains("fns:"), "{out}");

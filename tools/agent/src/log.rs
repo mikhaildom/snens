@@ -272,7 +272,8 @@ pub fn snapshot(cfg: &Cfg, id: &str) -> String {
             Live::Unknown => "работает (лог молчит, pid неизвестен)".to_string(),
         },
     };
-    let mut out = format!("подагент {id}: {state}\nходов: {steps}; последний инструмент: {last_tool}");
+    let mut out =
+        format!("подагент {id}: {state}\nходов: {steps}; последний инструмент: {last_tool}");
     if !hint.is_empty() {
         let short: String = hint.chars().take(120).collect();
         out.push_str(&format!(" ({short})"));

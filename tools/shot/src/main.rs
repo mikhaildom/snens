@@ -68,14 +68,7 @@ struct Args {
 /// `--size=1440x900` разворачивается, а значение вида `--x=1.js`, пришедшее
 /// после `--script`, остаётся одним токеном.
 const VALUE_FLAGS: [&str; 8] = [
-    "size",
-    "selector",
-    "crop",
-    "script",
-    "wait-ms",
-    "timeout",
-    "chrome",
-    "out-dir",
+    "size", "selector", "crop", "script", "wait-ms", "timeout", "chrome", "out-dir",
 ];
 
 /// `--size=1440x900` → `["--size", "1440x900"]`: один разбор вместо двух.
@@ -348,9 +341,7 @@ fn measure(cdp: &mut cdp::Cdp, session: &str, selector: &str) -> Result<Option<R
     // из которого потом клепается PNG 1x1.
     let f = |k: &str| -> Result<f64, String> {
         v.get(k).and_then(Value::as_f64).ok_or_else(|| {
-            format!(
-                "--selector: в ответе браузера нет поля `{k}` для `{selector}`: {v}"
-            )
+            format!("--selector: в ответе браузера нет поля `{k}` для `{selector}`: {v}")
         })
     };
     let dpr = f("dpr")?;
