@@ -279,9 +279,26 @@ const RETAIN_FORM: &str = "тело — JSON хода: {\"user\":\"вопрос\
 /// Ход в очередь. Ядро зовёт это после каждого ответа, поэтому здесь только
 /// локальная вставка: сеть и LLM — в `flush`, который живёт отдельно.
 fn retain(store: &Store, args: &[String]) -> Result<i32, String> {
-    // Аргументы раньше молча игнорировались: `memory retain \"текст\"` читал
-    // пустой stdin и падал на разборе JSON, а что записалось — видно не было.
-    if let Some(a) = args.first() {
+    // Флаги ядра: `--context <тема>` и `--tag <метка>` (тег — канал в общий
+    // банк, здесь только принимается). Всё остальное аргументом — отказ: раньше
+    // такой вызов читал пустой stdin и падал на разборе JSON, а что записалось —
+    // видно не было.
+    let (mut context, mut rest) = (String::new(), Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--context" => match it.next() {
+                Some(v) => context = v.clone(),
+                None => return Err(format!("retain: --context без значения — {RETAIN_FORM}")),
+            },
+            "--tag" => match it.next() {
+                Some(_) => {}
+                None => return Err(format!("retain: --tag без значения — {RETAIN_FORM}")),
+            },
+            other => rest.push(other.to_string()),
+        }
+    }
+    if let Some(a) = rest.first() {
         return Err(format!(
             "retain: текст аргументом не принимается ({a:?}) — {RETAIN_FORM}"
         ));
@@ -302,7 +319,9 @@ fn retain(store: &Store, args: &[String]) -> Result<i32, String> {
             .trim()
             .to_string()
     };
-    let (user, assistant, context) = (field("user"), field("assistant"), field("context"));
+    // Тема хода: флаг сильнее тела — ядро знает сессию, а тело пишет вызывающий.
+    let context = if context.is_empty() { field("context") } else { context };
+    let (user, assistant) = (field("user"), field("assistant"));
     // Нечего запоминать — не ошибка: ядро зовёт retain на каждом ответе.
     if user.is_empty() && assistant.is_empty() {
         return Ok(0);
