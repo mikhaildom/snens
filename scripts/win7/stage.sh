@@ -10,6 +10,7 @@ WEB="${1:-$REPO/../snens-web/dist}"
 OUT="${2:-$REPO/target/dist-win7/snens}"
 BIN="$REPO/target/x86_64-win7-windows-gnu/release"
 [ -f "$WEB/index.html" ] || { echo "нет $WEB/index.html — собери клиент (SNENS_PROXY=0 npm run build)" >&2; exit 1; }
+case "$OUT" in */snens) ;; *) echo "выходной каталог должен кончаться на /snens: $OUT" >&2; exit 1 ;; esac
 rm -rf "$OUT"; mkdir -p "$OUT/tools" "$OUT/web"
 cp "$BIN/snens.exe" "$OUT/"
 for d in "$REPO"/tools/*/; do
