@@ -27,7 +27,9 @@ cp -r "$WEB"/. "$OUT/web/"
 # путь к его папке — в WEBVIEW2_DIR, без него окно возьмёт системный движок.
 DBIN="$REPO/target/desktop-win7/x86_64-win7-windows-gnu/release"
 if [ -f "$DBIN/snens-desktop.exe" ]; then
-  cp "$DBIN/snens-desktop.exe" "$DBIN/WebView2Loader.dll" "$HERE"/w7compat/out/*.dll "$OUT/"
+  cp "$DBIN/snens-desktop.exe" "$HERE"/w7compat/out/*.dll "$OUT/"
+  # Загрузчик — с правкой флага LoadLibraryExW: иначе без KB2533623 движок не находится.
+  python "$HERE/patch-loader.py" "$DBIN/WebView2Loader.dll" "$OUT/WebView2Loader.dll"
   if [ -n "${WEBVIEW2_DIR:-}" ]; then
     [ -f "$WEBVIEW2_DIR/msedgewebview2.exe" ] || { echo "нет $WEBVIEW2_DIR/msedgewebview2.exe" >&2; exit 1; }
     cp -r "$WEBVIEW2_DIR" "$OUT/WebView2"
