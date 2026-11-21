@@ -6,6 +6,15 @@ set "HERE=%~dp0"
 set "PORT=7420"
 if not "%~1"=="" set "PORT=%~1"
 
+rem Первый запуск: настройки (config.toml и .env с ключом) лежат в settings\
+rem рядом с exe - переносим их в %APPDATA%\snens, там их ищет snens.
+if not exist "%APPDATA%\snens\config.toml" if exist "%HERE%settings\config.toml" (
+  if not exist "%APPDATA%\snens" mkdir "%APPDATA%\snens"
+  copy /Y "%HERE%settings\config.toml" "%APPDATA%\snens\config.toml" >nul
+  if exist "%HERE%settings\.env" copy /Y "%HERE%settings\.env" "%APPDATA%\snens\.env" >nul
+  echo Настройки скопированы в %APPDATA%\snens
+)
+
 if not exist "%APPDATA%\snens\config.toml" (
   echo Нет настроек: %APPDATA%\snens\config.toml
   echo Смотри README.txt, раздел "Первый запуск".
