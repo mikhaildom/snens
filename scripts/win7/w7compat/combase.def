@@ -1,0 +1,7 @@
+; combase.dll для Windows 7: в Win7 этих функций нет в combase (её там нет вовсе),
+; но они есть в ole32 — просто переадресуем.
+LIBRARY combase.dll
+EXPORTS
+CoTaskMemAlloc=ole32.CoTaskMemAlloc
+CoTaskMemFree=ole32.CoTaskMemFree
+CoCreateFreeThreadedMarshaler=ole32.CoCreateFreeThreadedMarshaler

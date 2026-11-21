@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Раскладка поставки для Windows 7 после build.sh:
-#   <out>/snens.exe, snens-app.exe (окно-приложение), tools/<тул>/<тул>.exe (+schema.json), web/ (dist клиента),
+#   <out>/snens.exe, snens-app.exe (окно в браузере), snens-desktop.exe (настоящее окно, если собрано), tools/<тул>/<тул>.exe (+schema.json), web/ (dist клиента),
 #   start-snens.cmd (CP866 — кодировка консоли Win7), README.txt (UTF-8 с BOM).
 # Аргументы: [каталог dist snens-web] [выходной каталог]
 set -euo pipefail
@@ -22,6 +22,17 @@ for d in "$REPO"/tools/*/; do
   [ -f "$d/schema.json" ] && cp "$d/schema.json" "$OUT/tools/$n/"
 done
 cp -r "$WEB"/. "$OUT/web/"
+# Настоящее окно snens (если собрано build-desktop.sh): exe, загрузчик WebView2,
+# заменители DLL Windows 8. Сам движок WebView2 109 (~465 МБ) в git не лежит:
+# путь к его папке — в WEBVIEW2_DIR, без него окно возьмёт системный движок.
+DBIN="$REPO/target/desktop-win7/x86_64-win7-windows-gnu/release"
+if [ -f "$DBIN/snens-desktop.exe" ]; then
+  cp "$DBIN/snens-desktop.exe" "$DBIN/WebView2Loader.dll" "$HERE"/w7compat/out/*.dll "$OUT/"
+  if [ -n "${WEBVIEW2_DIR:-}" ]; then
+    [ -f "$WEBVIEW2_DIR/msedgewebview2.exe" ] || { echo "нет $WEBVIEW2_DIR/msedgewebview2.exe" >&2; exit 1; }
+    cp -r "$WEBVIEW2_DIR" "$OUT/WebView2"
+  fi
+fi
 iconv -f UTF-8 -t CP866 "$HERE/start-snens.cmd.utf8" | sed 's/$/\r/' > "$OUT/start-snens.cmd"
 { printf '\xEF\xBB\xBF'; sed 's/$/\r/' "$HERE/README.txt"; } > "$OUT/README.txt"
 echo "готово: $OUT ($(du -sh "$OUT" | cut -f1))"

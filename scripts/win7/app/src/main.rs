@@ -13,8 +13,11 @@
 //!    работает (журнал — %APPDATA%\snens\serve.log);
 //! 3. берёт у ядра код подключения и открывает окно уже с ним (`#pair=…`),
 //!    так что вводить ничего не надо;
-//! 4. выходит. Ядро остаётся в фоне (≈7 МБ памяти) и ждёт следующего окна;
-//!    без запросов оно ничего не тратит.
+//! 4. ждёт, пока окно закроют, и гасит ядро, если сама его поднимала: на
+//!    одном каталоге данных может работать только одно ядро, и брошенное
+//!    ядро не дало бы запустить настоящее окно snens (snens-desktop.exe).
+//!    Если окно уже было открыто (браузер передал вызов ему и сразу вышел),
+//!    ядро не трогаем — им пользуется то окно.
 //!
 //! Ошибки — окном сообщения: консоли у этой программы нет.
 #![windows_subsystem = "windows"]
@@ -26,7 +29,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     os::windows::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -34,6 +37,8 @@ use std::{
 const PORT: u16 = 7420;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CORE_START_TIMEOUT: Duration = Duration::from_secs(45);
+/// Браузер, отдавший окно уже работающему экземпляру, выходит за доли секунды.
+const HANDOFF: Duration = Duration::from_secs(5);
 
 fn main() {
     if let Err(e) = run() {
@@ -60,16 +65,25 @@ fn run() -> Result<(), String> {
     }
 
     let addr = SocketAddr::from(([127, 0, 0, 1], PORT));
-    if !listening(addr) {
-        start_core(&core, &data, addr)?;
-    }
+    let own_core = if listening(addr) { None } else { Some(start_core(&core, &data, addr)?) };
 
     let base = format!("http://127.0.0.1:{PORT}/");
     let url = match pair_code(&core) {
         Some(code) => format!("{base}#pair={code}"),
         None => base,
     };
-    open_window(&url)
+    let opened = Instant::now();
+    let mut window = open_window(&url)?;
+    let _ = window.wait();
+    // Быстрый выход браузера — он отдал окно уже открытому экземпляру со
+    // своим профилем: ядро нужно тому окну, не гасим.
+    if let Some(mut core) = own_core {
+        if opened.elapsed() > HANDOFF {
+            let _ = core.kill();
+            let _ = core.wait();
+        }
+    }
+    Ok(())
 }
 
 /// Каталог настроек ядра — тот же, что ищет `snens`: SNENS_CONFIG_DIR или %APPDATA%\snens.
@@ -106,7 +120,7 @@ fn listening(addr: SocketAddr) -> bool {
 
 /// Ядро без консольного окна; рабочий каталог — домашняя папка (там агент и
 /// работает с файлами, а не в C:\Windows\system32 или в папке программы).
-fn start_core(core: &Path, data: &Path, addr: SocketAddr) -> Result<(), String> {
+fn start_core(core: &Path, data: &Path, addr: SocketAddr) -> Result<Child, String> {
     let log_path = data.join("serve.log");
     let log = fs::File::create(&log_path).map_err(|e| format!("не создать {}: {e}", log_path.display()))?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
@@ -125,7 +139,7 @@ fn start_core(core: &Path, data: &Path, addr: SocketAddr) -> Result<(), String> 
     let start = Instant::now();
     while start.elapsed() < CORE_START_TIMEOUT {
         if listening(addr) {
-            return Ok(());
+            return Ok(child);
         }
         if let Ok(Some(st)) = child.try_wait() {
             return Err(format!(
@@ -136,6 +150,7 @@ fn start_core(core: &Path, data: &Path, addr: SocketAddr) -> Result<(), String> 
         }
         thread::sleep(Duration::from_millis(250));
     }
+    let _ = child.kill();
     Err(format!(
         "Ядро snens не открыло порт {} за {} с.\n\n{}\n\nЖурнал: {}",
         addr.port(),
@@ -195,7 +210,7 @@ fn find_browser() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn open_window(url: &str) -> Result<(), String> {
+fn open_window(url: &str) -> Result<Child, String> {
     let Some(browser) = find_browser() else {
         return Err(
             "Не найден браузер для окна snens: нужен Chrome 109, Supermium или Edge 109.\n\
@@ -214,7 +229,6 @@ fn open_window(url: &str) -> Result<(), String> {
         .arg(format!("--user-data-dir={}", profile.display()))
         .args(["--no-first-run", "--no-default-browser-check", "--start-maximized"])
         .spawn()
-        .map(|_| ())
         .map_err(|e| format!("не удалось открыть окно через {}: {e}", browser.display()))
 }
 

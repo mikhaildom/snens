@@ -30,6 +30,28 @@ use tauri::{Manager, RunEvent, WindowEvent};
 
 use daemon::{Daemon, Session};
 
+/// Движок окна из папки программы: `WebView2\msedgewebview2.exe` рядом с exe.
+///
+/// Так поставка для Windows 7 везёт WebView2 109 (последний для Win7) с собой:
+/// установщик Microsoft для Win7 больше не раздаётся. Если папки нет или
+/// переменную уже задали снаружи — ничего не трогаем, работает системный движок.
+fn use_bundled_webview2() {
+    const VAR: &str = "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER";
+    if std::env::var_os(VAR).is_some() {
+        return;
+    }
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("WebView2")))
+    else {
+        return;
+    };
+    if dir.join("msedgewebview2.exe").is_file() {
+        // До создания окон и потоков: менять окружение потом небезопасно.
+        std::env::set_var(VAR, &dir);
+    }
+}
+
 fn main() {
     // Второй экземпляр не должен поднимать второе ядро и воровать окно: он
     // поднимает окно первого и уходит. Без этого запуск по шорткату молча
@@ -37,6 +59,7 @@ fn main() {
     if single::already_running() {
         return;
     }
+    use_bundled_webview2();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
