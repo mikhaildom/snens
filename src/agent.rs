@@ -409,8 +409,49 @@ async fn run_loop<L: Llm>(
         // перечитки новый ход уходил бы моделью, снятой при старте процесса.
         // Подменяем только модель — остальные поля конфига остаются снимком старта.
         // Модель уже подставлена `live()`; остальные поля — тоже из файла.
-        let turn_cfg = cfg.clone();
-        let mut reply = ask_turn(&turn_cfg, msgs.clone(), defs.clone(), llm, ui, observe, &mut cancel).await;
+        let mut turn_cfg = cfg.clone();
+        // Пришло ли от модели хоть что-то: после первых данных повтор через
+        // другой профиль напечатал бы ответ второй раз.
+        let streamed = std::sync::atomic::AtomicBool::new(false);
+        let watch = |signal: SurfaceSignal| {
+            if matches!(signal, SurfaceSignal::Delta { .. }) {
+                streamed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            observe(signal)
+        };
+        let mut reply = ask_turn(&turn_cfg, msgs.clone(), defs.clone(), llm, ui, &watch, &mut cancel).await;
+        // Ключ активного профиля не работает — запасной профиль (второй ключ).
+        // Удалось — он становится активным, чтобы следующие ходы не стучались в
+        // мёртвый ключ, и человек об этом узнаёт; вернуть — в настройках.
+        if let Err(e) = &reply {
+            if crate::llm::is_provider_down(e.as_ref())
+                && !streamed.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Some((name, fallback)) = turn_cfg.fallback() {
+                    let from = turn_cfg.active_provider.trim().to_string();
+                    let note = format!(
+                        "провайдер «{from}» не отвечает ({}) — пробую запасной «{name}»",
+                        crate::reduce::truncate(&e.to_string(), 160)
+                    );
+                    ui.notice(&note);
+                    observe(SurfaceSignal::Notice(note));
+                    reply = ask_turn(&fallback, msgs.clone(), defs.clone(), llm, ui, observe, &mut cancel).await;
+                    if reply.is_ok() {
+                        let note = match crate::providers::activate(cfg, &name) {
+                            Ok(()) => format!(
+                                "переключено на запасной профиль «{name}»: ключ «{from}» не работает.                                  Вернуть — в настройках, раздел провайдеров"
+                            ),
+                            Err(err) => format!(
+                                "этот ход сделан через запасной «{name}», но сделать его активным                                  не вышло ({err}) — следующий ход снова пойдёт через «{from}»"
+                            ),
+                        };
+                        ui.notice(&note);
+                        observe(SurfaceSignal::Notice(note));
+                        turn_cfg = fallback;
+                    }
+                }
+            }
+        }
         // Отказ по размеру тела. Бюджет в `stream_reply` уже снял лишнее, но
         // провайдер может считать иначе (у Nous свой счёт и своё «30MB»). Тогда
         // один повтор вообще без картинок: лучше текстовый ход, чем сессия,
@@ -1148,6 +1189,89 @@ mod tests {
             )),
             "ход не доведён до ответа"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Ключ активного профиля не работает (401) — ход доводится через запасной
+    /// профиль, тот становится активным, и человек видит, что случилось.
+    #[tokio::test]
+    async fn dead_key_switches_to_fallback_profile() -> R<()> {
+        use std::sync::Mutex;
+        struct DeadMainKey {
+            asked: Mutex<Vec<String>>,
+        }
+        impl Llm for DeadMainKey {
+            async fn reply(
+                &self,
+                cfg: &Config,
+                _msgs: Vec<Value>,
+                _tools: Vec<Value>,
+                on_delta: &mut (dyn FnMut(Delta) + Send),
+            ) -> R<Reply> {
+                let key = cfg.key_value(&cfg.key_env).unwrap_or_default();
+                self.asked.lock().unwrap().push(format!("{}:{key}", cfg.base_url));
+                if key == "dead" {
+                    return Err("HTTP 401 Unauthorized: invalid x-api-key".into());
+                }
+                on_delta(Delta::Content("ответ через запасной"));
+                Ok(text_reply("ответ через запасной"))
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("snens-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "sessions_dir = {d:?}
+tools_dir = {t:?}
+active_provider = \"main\"
+
+                 [providers.main]
+base_url = \"https://main/v1\"
+model = \"m\"
+key_env = \"FB3_MAIN\"
+
+                 [providers.spare]
+base_url = \"https://spare/v1\"
+model = \"s\"
+key_env = \"FB3_SPARE\"
+",
+                d = dir.to_string_lossy(),
+                t = dir.join("tools").to_string_lossy(),
+            ),
+        )?;
+        std::fs::write(dir.join(".env"), "FB3_MAIN=dead
+FB3_SPARE=alive
+")?;
+        let cfg = Config::load(Some(&path.display().to_string()))?;
+        let sess = Session::open(&dir, "t")?;
+        sess.append(Rec::User {
+            ts: log::now(),
+            text: "привет".into(),
+            source: "test".into(),
+            parts: vec![],
+            ask: None,
+        })?;
+        let llm = DeadMainKey { asked: Mutex::new(vec![]) };
+        let notes = Mutex::new(Vec::<String>::new());
+        let observe = |signal: SurfaceSignal| {
+            if let SurfaceSignal::Notice(text) = signal {
+                notes.lock().unwrap().push(text);
+            }
+        };
+        let options = SurfaceRunOptions {
+            observe: &observe,
+            ..Default::default()
+        };
+        run_agent_surface(&sess, &cfg, &llm, &crate::render::Ui::plain(), options).await?;
+        let asked = llm.asked.lock().unwrap().clone();
+        assert_eq!(asked, vec!["https://main/v1:dead", "https://spare/v1:alive"], "{asked:?}");
+        assert_eq!(cfg.live().active_provider, "spare", "запасной не стал активным");
+        let notes = notes.lock().unwrap().clone();
+        assert!(notes.iter().any(|n| n.contains("переключено на запасной профиль «spare»")), "{notes:?}");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

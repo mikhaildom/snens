@@ -80,6 +80,27 @@ pub fn is_payload_too_large(error: &(dyn std::error::Error + Send + Sync)) -> bo
     status || text.contains("cannot exceed 30MB") || text.contains("Payload Too Large")
 }
 
+/// Ключ или провайдер не работает: отказ по ключу/оплате (401, 402, 403), лимит
+/// (429), сбой на стороне провайдера (5xx, у Anthropic 529 «перегружен»), сеть
+/// или молчащий стрим. Повтор тем же ключом тут не поможет, а запасной профиль —
+/// может. 400 и 413 сюда не входят: это вопрос к запросу, а не к ключу, и у
+/// другого провайдера он упал бы так же.
+pub fn is_provider_down(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let text = error.to_string();
+    let status = text
+        .strip_prefix("HTTP ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse::<u16>().ok());
+    match status {
+        Some(code) => matches!(code, 401 | 402 | 403 | 429) || (500..600).contains(&code),
+        None => {
+            text.contains("error sending request")
+                || text.contains("стрим молчит")
+                || text.contains("стрим оборван после 0 символов")
+        }
+    }
+}
+
 // ---------- разбор SSE ----------
 
 /// Накопитель кадров SSE. Транспорт (`bytes_stream`) режет поток где угодно — в том
@@ -279,7 +300,11 @@ impl OpenAi {
             return Err("не задана модель — укажи model в конфиге или `snens model <slug>`".into());
         }
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-        let mut req = self.client.post(&url).bearer_auth(&self.key).json(&body);
+        // Ключ — по профилю этого запроса: поверхность живёт днями, а профиль
+        // переключают на ходу (меню настроек, запасной профиль). Ключ снимка
+        // старта — только если у профиля своего нет нигде.
+        let key = cfg.key_value(&cfg.key_env).unwrap_or_else(|| self.key.clone());
+        let mut req = self.client.post(&url).bearer_auth(&key).json(&body);
         // Подпись идут первыми: заголовки из конфига человека важнее дефолтов
         // (reqwest добавляет повторы, и побеждает последнее значение).
         for (k, v) in attribution_headers(&cfg.base_url) {
@@ -566,6 +591,35 @@ impl Llm for Fake {
 
 #[cfg(test)]
 mod tests {
+    use super::is_provider_down;
+    #[test]
+    fn provider_down_is_key_billing_limit_server_or_network() {
+        let down = |t: &str| {
+            let e: Box<dyn std::error::Error + Send + Sync> = t.into();
+            is_provider_down(e.as_ref())
+        };
+        for t in [
+            "HTTP 401 Unauthorized: invalid x-api-key",
+            "HTTP 402 Payment Required: insufficient credits",
+            "HTTP 403 Forbidden: ",
+            "HTTP 429 Too Many Requests: ",
+            "HTTP 529 <unknown status code>: overloaded",
+            "HTTP 503 Service Unavailable: ",
+            "error sending request for url (https://api.anthropic.com/v1/chat/completions)",
+            "стрим молчит дольше 120 с после 0 символов",
+        ] {
+            assert!(down(t), "{t}");
+        }
+        for t in [
+            "HTTP 400 Bad Request: bad tool schema",
+            "HTTP 413 Payload Too Large: ",
+            "cancelled",
+            "не задана модель",
+        ] {
+            assert!(!down(t), "{t}");
+        }
+    }
+
     #[test]
     fn anthropic_gets_tool_schema_without_top_level_combinators() {
         use super::*;

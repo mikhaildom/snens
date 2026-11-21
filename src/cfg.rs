@@ -35,6 +35,11 @@ pub struct Config {
     /// на top-level ключах.
     #[serde(default)]
     pub active_provider: String,
+    /// Запасной профиль на случай, когда ключ активного не работает (отказ
+    /// 401/402/403, лимит, провайдер или сеть не отвечают). Пусто — первый
+    /// другой полный профиль с заданным ключом; `none` — не переключаться.
+    #[serde(default)]
+    pub fallback_provider: String,
     /// Произвольные поля в тело запроса (quirks конкретного провайдера).
     #[serde(default)]
     pub body_patch: BTreeMap<String, serde_json::Value>,
@@ -575,6 +580,42 @@ impl Config {
         if !profile.key_env.trim().is_empty() {
             self.key_env = profile.key_env.trim().to_string();
         }
+    }
+
+    /// Запасной профиль и конфиг запроса через него: имя и копия этого конфига
+    /// с адресом, моделью и ключом запасного профиля. `None` — запасного нет:
+    /// профилей не заведено, переключение выключено (`fallback_provider = "none"`)
+    /// или у другого профиля нет ключа (переключаться на верный 401 незачем).
+    ///
+    /// Модель берётся из профиля даже у подагента с закреплённой моделью: у
+    /// провайдеров разные имена одних и тех же моделей, и чужой slug дал бы 400.
+    pub fn fallback(&self) -> Option<(String, Config)> {
+        let active = self.active_provider.trim();
+        let wanted = self.fallback_provider.trim();
+        if active.is_empty() || wanted.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        let pick = |name: &str| -> Option<(String, Config)> {
+            let profile = self.providers.get(name).filter(|p| p.is_complete())?;
+            if name == active {
+                return None;
+            }
+            let key_env = match profile.key_env.trim() {
+                "" => d_key_env(),
+                var => var.to_string(),
+            };
+            self.key_value(&key_env)?;
+            let mut cfg = self.clone();
+            cfg.active_provider = name.to_string();
+            cfg.base_url = profile.base_url.trim().to_string();
+            cfg.model = profile.model.trim().to_string();
+            cfg.key_env = key_env;
+            Some((name.to_string(), cfg))
+        };
+        if !wanted.is_empty() {
+            return pick(wanted);
+        }
+        self.providers.keys().find_map(|name| pick(name))
     }
 
     pub fn load(override_path: Option<&str>) -> R<Config> {

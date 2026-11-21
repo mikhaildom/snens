@@ -213,3 +213,47 @@ fn preset_fills_base_url_and_model() {
     assert_eq!(draft.base_url.as_deref(), Some("https://mine/v1"));
     assert_eq!(preset("Open-Router").map(|p| p.0), Some("https://openrouter.ai/api/v1"));
 }
+
+#[test]
+fn fallback_is_another_complete_profile_with_a_key() {
+    let text = "active_provider = \"main\"\n\n\
+         [providers.main]\nbase_url = \"https://main/v1\"\nmodel = \"main-model\"\nkey_env = \"FB_TEST_MAIN_KEY\"\n\n\
+         [providers.nokey]\nbase_url = \"https://nokey/v1\"\nmodel = \"x\"\nkey_env = \"FB_TEST_NOKEY_KEY\"\n\n\
+         [providers.spare]\nbase_url = \"https://spare/v1\"\nmodel = \"vendor/spare-model\"\nkey_env = \"FB_TEST_SPARE_KEY\"\n";
+    let (cfg, path) = cfg_at(text, "fallback-pick");
+    let env = path.parent().unwrap().join(".env");
+    // Без ключа у запасного переключаться некуда: верный 401 ничего не даст.
+    std::fs::write(&env, "FB_TEST_MAIN_KEY=main\n").unwrap();
+    assert!(cfg.fallback().is_none());
+    // Ключ есть — запасной найден, профиль без ключа пропущен.
+    std::fs::write(&env, "FB_TEST_MAIN_KEY=main\nFB_TEST_SPARE_KEY=spare\n").unwrap();
+    let (name, spare) = cfg.fallback().expect("запасной профиль");
+    assert_eq!(name, "spare");
+    assert_eq!(spare.base_url, "https://spare/v1");
+    assert_eq!(spare.model, "vendor/spare-model");
+    assert_eq!(spare.key_value(&spare.key_env).as_deref(), Some("spare"));
+    // У запасного самого запасной — исходный профиль: можно вернуться тем же путём.
+    activate(&cfg, "spare").unwrap();
+    let live = cfg.live();
+    assert_eq!(live.active_provider, "spare");
+    assert_eq!(live.fallback().map(|(n, _)| n).as_deref(), Some("main"));
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}
+
+#[test]
+fn fallback_can_be_named_or_switched_off() {
+    let base = "[providers.main]\nbase_url = \"https://main/v1\"\nmodel = \"m\"\nkey_env = \"FB2_MAIN\"\n\n\
+         [providers.a]\nbase_url = \"https://a/v1\"\nmodel = \"a\"\nkey_env = \"FB2_A\"\n\n\
+         [providers.b]\nbase_url = \"https://b/v1\"\nmodel = \"b\"\nkey_env = \"FB2_B\"\n";
+    let named = format!("active_provider = \"main\"\nfallback_provider = \"b\"\n\n{base}");
+    let (cfg, path) = cfg_at(&named, "fallback-named");
+    std::fs::write(path.parent().unwrap().join(".env"), "FB2_A=a\nFB2_B=b\n").unwrap();
+    assert_eq!(cfg.fallback().map(|(n, _)| n).as_deref(), Some("b"));
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+    let off = format!("active_provider = \"main\"\nfallback_provider = \"none\"\n\n{base}");
+    let (cfg, path) = cfg_at(&off, "fallback-off");
+    std::fs::write(path.parent().unwrap().join(".env"), "FB2_A=a\nFB2_B=b\n").unwrap();
+    assert!(cfg.fallback().is_none());
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}
