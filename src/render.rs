@@ -36,11 +36,52 @@ pub struct Ui {
 impl Default for Ui {
     fn default() -> Self {
         Ui {
-            color: std::io::stdout().is_terminal(),
+            color: std::io::stdout().is_terminal() && ansi_supported(),
             show_reasoning: AtomicBool::new(true),
             sink: Arc::new(Mutex::new(Box::new(Stdout) as Box<dyn Sink>)),
         }
     }
+}
+
+/// Понимает ли консоль ANSI-цвета. На unix — да. На Windows консоль разбирает
+/// escape-последовательности только с флагом ENABLE_VIRTUAL_TERMINAL_PROCESSING
+/// (Windows 10+); на Windows 7 его нет, `SetConsoleMode` отказывает, и тогда
+/// печатаем без цвета — иначе вместо цвета в тексте мусор вида `←[36m`.
+#[cfg(not(windows))]
+fn ansi_supported() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn ansi_supported() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        use std::ffi::c_void;
+        // Только kernel32: функции есть во всех Windows начиная с XP,
+        // новых зависимостей ради трёх вызовов не тянем.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(n: u32) -> *mut c_void;
+            fn GetConsoleMode(h: *mut c_void, mode: *mut u32) -> i32;
+            fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+        }
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            if h.is_null() || h as isize == -1 {
+                return false;
+            }
+            let mut mode = 0u32;
+            if GetConsoleMode(h, &mut mode) == 0 {
+                return false;
+            }
+            if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+                return true;
+            }
+            SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+        }
+    })
 }
 
 impl Ui {
