@@ -37,6 +37,7 @@ use std::{
 const PORT: u16 = 7420;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CORE_START_TIMEOUT: Duration = Duration::from_secs(45);
+const PAIR_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() {
     if let Err(e) = run() {
@@ -71,6 +72,10 @@ fn run() -> Result<(), String> {
         None => base,
     };
     let profile = window_profile()?;
+    // Хвосты прошлого запуска (окно могли закрыть снятием процесса).
+    if !profile_in_use(&profile) {
+        forget_history(&profile);
+    }
     let mut window = match open_window(&url, &profile) {
         Ok(w) => w,
         Err(e) => {
@@ -85,8 +90,36 @@ fn run() -> Result<(), String> {
     // которому наш браузер отдал окно: ядро нужно ему, не гасим.
     if !profile_in_use(&profile) {
         stop(own_core);
+        forget_history(&profile);
     }
     Ok(())
+}
+
+/// Стереть историю окна. Окно открывается адресом с кодом подключения
+/// (`#pair=…`), и браузер успевает записать его в историю и в файлы сеанса до
+/// того, как клиент сотрёт код из адреса. Код одноразовый и живёт 5 минут, но
+/// лежать на диске ему незачем. Окну история не нужна: адресной строки нет.
+/// Профиль с настройками и подключением к ядру (Local Storage) не трогаем.
+fn forget_history(profile: &Path) {
+    let default = profile.join("Default");
+    for name in [
+        "History",
+        "History-journal",
+        "Visited Links",
+        "Top Sites",
+        "Top Sites-journal",
+        "Shortcuts",
+        "Shortcuts-journal",
+        "Network Action Predictor",
+        "Network Action Predictor-journal",
+        "Current Session",
+        "Current Tabs",
+        "Last Session",
+        "Last Tabs",
+    ] {
+        let _ = fs::remove_file(default.join(name));
+    }
+    let _ = fs::remove_dir_all(default.join("Sessions"));
 }
 
 fn stop(core: Option<Child>) {
@@ -196,14 +229,30 @@ fn log_tail(path: &Path) -> String {
 /// Код подключения окна к ядру (`snens pair`): ищем в выводе «ddd-ddd».
 /// Не вышло — окно откроется без кода и само спросит.
 fn pair_code(core: &Path) -> Option<String> {
-    let out = Command::new(core)
+    let mut child = Command::new(core)
         .args(["pair", "--endpoint", &format!("http://127.0.0.1:{PORT}")])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .spawn()
         .ok()?;
-    find_code(&String::from_utf8_lossy(&out.stdout))
+    // Ядро не ответило за 15 с — открываем окно без кода, оно само спросит.
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() < PAIR_TIMEOUT => thread::sleep(Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+    find_code(&out)
 }
 
 fn find_code(text: &str) -> Option<String> {
