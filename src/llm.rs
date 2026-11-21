@@ -150,6 +150,34 @@ pub fn attribution_headers(base_url: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// Anthropic (OpenAI-совместимый `api.anthropic.com/v1`) отвергает схему
+/// параметров с `oneOf`/`anyOf`/`allOf` на верхнем уровне (HTTP 400 на весь
+/// запрос). У `edit` и `desk` там лежат межполевые правила («либо old_string,
+/// либо edits»); тулы проверяют их сами, модели это лишь подсказка. Поэтому
+/// для этого провайдера правила срезаются, остальным схема уходит как есть.
+fn needs_flat_tool_schema(base_url: &str) -> bool {
+    base_url.trim().to_ascii_lowercase().contains("api.anthropic.com")
+}
+
+fn flatten_tool_schemas(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            if let Some(p) = t
+                .get_mut("function")
+                .and_then(|f| f.get_mut("parameters"))
+                .and_then(Value::as_object_mut)
+            {
+                for k in ["oneOf", "anyOf", "allOf"] {
+                    p.remove(k);
+                }
+            }
+            t
+        })
+        .collect()
+}
+
 // ---------- openai-compatible ----------
 
 pub struct OpenAi {
@@ -222,6 +250,13 @@ impl OpenAi {
         on_delta: &mut (dyn FnMut(Delta) + Send),
         seen: &mut bool,
     ) -> R<Reply> {
+        let flat;
+        let tools = if needs_flat_tool_schema(&cfg.base_url) {
+            flat = flatten_tool_schemas(tools);
+            &flat[..]
+        } else {
+            tools
+        };
         let mut body = json!({
             "model": cfg.model,
             "messages": msgs,
@@ -531,6 +566,22 @@ impl Llm for Fake {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anthropic_gets_tool_schema_without_top_level_combinators() {
+        use super::*;
+        let tools = vec![json!({"type":"function","function":{"name":"edit","parameters":{
+            "type":"object","properties":{"a":{"type":"string"}},
+            "anyOf":[{"required":["a"]}],"allOf":[{}],"oneOf":[{}]}}})];
+        assert!(needs_flat_tool_schema("https://api.anthropic.com/v1"));
+        assert!(!needs_flat_tool_schema("https://openrouter.ai/api/v1"));
+        let flat = flatten_tool_schemas(&tools);
+        let p = &flat[0]["function"]["parameters"];
+        assert!(p.get("anyOf").is_none() && p.get("allOf").is_none() && p.get("oneOf").is_none());
+        assert_eq!(p["properties"]["a"]["type"], "string");
+        // исходник не тронут: другим провайдерам схема уходит целиком
+        assert!(tools[0]["function"]["parameters"].get("anyOf").is_some());
+    }
+
     use super::*;
 
     /// Кадр стрима с аргументами вызова, как их присылает провайдер.
