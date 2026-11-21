@@ -1,0 +1,16 @@
+[package]
+name = "snens-app"
+version = "0.1.0"
+edition = "2021"
+description = "snens на Windows 7: окно приложения без браузерной обвязки, ядро в фоне"
+build = "build.rs"
+
+# Свой workspace: запускалка собирается отдельно (scripts/win7/build.sh),
+# в основной workspace ядра её не тянем.
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

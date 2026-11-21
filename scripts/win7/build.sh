@@ -28,3 +28,7 @@ export CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_RUSTFLAGS="-C target-cpu=x86-64 -C l
 cd "$REPO"
 cargo +nightly-x86_64-pc-windows-gnu build -Z build-std=std,panic_abort \
   --release --target x86_64-win7-windows-gnu --workspace "$@"
+# Запускалка-окно snens-app.exe (свой workspace, см. scripts/win7/app).
+cargo +nightly-x86_64-pc-windows-gnu build -Z build-std=std,panic_abort \
+  --release --target x86_64-win7-windows-gnu \
+  --manifest-path "$REPO/scripts/win7/app/Cargo.toml" --target-dir "$REPO/target"

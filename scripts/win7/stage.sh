@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Раскладка поставки для Windows 7 после build.sh:
-#   <out>/snens.exe, tools/<тул>/<тул>.exe (+schema.json), web/ (dist клиента),
+#   <out>/snens.exe, snens-app.exe (окно-приложение), tools/<тул>/<тул>.exe (+schema.json), web/ (dist клиента),
 #   start-snens.cmd (CP866 — кодировка консоли Win7), README.txt (UTF-8 с BOM).
 # Аргументы: [каталог dist snens-web] [выходной каталог]
 set -euo pipefail
@@ -12,7 +12,7 @@ BIN="$REPO/target/x86_64-win7-windows-gnu/release"
 [ -f "$WEB/index.html" ] || { echo "нет $WEB/index.html — собери клиент (SNENS_PROXY=0 npm run build)" >&2; exit 1; }
 case "$OUT" in */snens) ;; *) echo "выходной каталог должен кончаться на /snens: $OUT" >&2; exit 1 ;; esac
 rm -rf "$OUT"; mkdir -p "$OUT/tools" "$OUT/web"
-cp "$BIN/snens.exe" "$OUT/"
+cp "$BIN/snens.exe" "$BIN/snens-app.exe" "$OUT/"
 for d in "$REPO"/tools/*/; do
   n="$(basename "$d")"
   [ -f "$d/Cargo.toml" ] || continue
