@@ -1,0 +1,41 @@
+@echo off
+rem Запуск snens на Windows 7: ядро + веб-клиент в браузере.
+rem Файл в кодировке CP866 (консоль Win7), не пересохранять в UTF-8.
+setlocal
+set "HERE=%~dp0"
+set "PORT=7420"
+if not "%~1"=="" set "PORT=%~1"
+
+if not exist "%APPDATA%\snens\config.toml" (
+  echo Нет настроек: %APPDATA%\snens\config.toml
+  echo Смотри README.txt, раздел "Первый запуск".
+  pause
+  exit /b 1
+)
+
+echo Запускаю ядро snens на 127.0.0.1:%PORT% ...
+start "snens serve" "%HERE%snens.exe" serve --listen 127.0.0.1:%PORT%
+
+rem timeout на Win7 не работает без консольного ввода, ping ждёт надёжно
+ping -n 4 127.0.0.1 >nul
+
+echo.
+echo Код для первого подключения браузера (если браузер спросит адрес и код):
+"%HERE%snens.exe" pair --endpoint http://127.0.0.1:%PORT%
+echo.
+
+set "URL=http://127.0.0.1:%PORT%/"
+set "BROWSER="
+if exist "%LOCALAPPDATA%\Supermium\supermium.exe" set "BROWSER=%LOCALAPPDATA%\Supermium\supermium.exe"
+if not defined BROWSER if exist "%ProgramFiles%\Supermium\supermium.exe" set "BROWSER=%ProgramFiles%\Supermium\supermium.exe"
+if not defined BROWSER if exist "%ProgramFiles%\Mozilla Firefox\firefox.exe" set "BROWSER=%ProgramFiles%\Mozilla Firefox\firefox.exe"
+if not defined BROWSER if exist "%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe" set "BROWSER=%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe"
+
+if defined BROWSER (
+  start "" "%BROWSER%" "%URL%"
+) else (
+  start "" "%URL%"
+)
+echo Браузер открыт: %URL%
+echo Ядро работает в окне "snens serve". Закрыть его = остановить snens.
+pause
