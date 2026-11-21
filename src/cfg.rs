@@ -40,6 +40,10 @@ pub struct Config {
     /// другой полный профиль с заданным ключом; `none` — не переключаться.
     #[serde(default)]
     pub fallback_provider: String,
+    /// `key_env` из файла до наложения активного профиля: профиль с пустым
+    /// `key_env` наследует именно его (и в `fallback`, и в `resolve_providers`).
+    #[serde(skip)]
+    pub file_key_env: String,
     /// Произвольные поля в тело запроса (quirks конкретного провайдера).
     #[serde(default)]
     pub body_patch: BTreeMap<String, serde_json::Value>,
@@ -570,6 +574,7 @@ impl Config {
     /// `subagent_model`), профилем не перебивается: модель этого процесса, а не
     /// настройка инстанса.
     fn resolve_providers(&mut self) {
+        self.file_key_env = self.key_env.clone();
         let Some(profile) = self.active_profile().cloned() else {
             return;
         };
@@ -601,9 +606,14 @@ impl Config {
                 return None;
             }
             let key_env = match profile.key_env.trim() {
-                "" => d_key_env(),
+                "" => self.file_key_env.trim().to_string(),
                 var => var.to_string(),
             };
+            // Тот же ключ, что у активного, на другой адрес не шлём: он там
+            // чужой, а мёртвым он уже оказался.
+            if key_env == self.key_env.trim() {
+                return None;
+            }
             self.key_value(&key_env)?;
             let mut cfg = self.clone();
             cfg.active_provider = name.to_string();

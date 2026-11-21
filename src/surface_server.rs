@@ -89,7 +89,7 @@ async fn serve_inner(
     // человеку ввести провайдера (онбординг, `PUT /v1/providers`). Без ключа
     // первый ход ответит понятной ошибкой, а не «сервер не запустился».
     let llm = Arc::new(match cfg.api_key() {
-        Ok(key) => crate::llm::OpenAi::new(key)?,
+        Ok(key) => crate::llm::OpenAi::new(key)?.with_key_env(&cfg.key_env),
         Err(_) => crate::llm::OpenAi::without_key()?,
     });
     let dir = cfg.data_path().join("surface-api");

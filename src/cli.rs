@@ -231,7 +231,7 @@ async fn cmd_run(flags: &BTreeMap<String, String>, positional: Vec<String>) -> R
     })?;
 
     let key = cfg.api_key()?;
-    let llm = llm::OpenAi::new(key)?;
+    let llm = llm::OpenAi::new(key)?.with_key_env(&cfg.key_env);
     eprintln!("[snens] {id} → {} ({})", cfg.base_url, cfg.model);
     agent::run_agent(&sess, &cfg, &llm, &render::Ui::default()).await?;
     autopilot(&cfg, &id).await
@@ -279,7 +279,7 @@ async fn cmd_run_child(flags: &BTreeMap<String, String>) -> R<()> {
         ask: None,
     })?;
     let key = cfg.api_key()?;
-    let llm = llm::OpenAi::new(key)?;
+    let llm = llm::OpenAi::new(key)?.with_key_env(&cfg.key_env);
     let ui = render::Ui::plain();
     // Своей SSE-шины у подагента нет (её держит поверхность), поэтому его
     // сигналы уезжают в неё по `POST /v1/sessions/{id}/ingest` — иначе работа

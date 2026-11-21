@@ -421,14 +421,18 @@ async fn run_loop<L: Llm>(
         };
         let mut reply = ask_turn(&turn_cfg, msgs.clone(), defs.clone(), llm, ui, &watch, &mut cancel).await;
         // Ключ активного профиля не работает — запасной профиль (второй ключ).
-        // Удалось — он становится активным, чтобы следующие ходы не стучались в
-        // мёртвый ключ, и человек об этом узнаёт; вернуть — в настройках.
+        // Ключ мёртв (401/402/403) и запасной ответил — запасной становится
+        // активным, чтобы следующие ходы не стучались в мёртвый ключ. Временный
+        // сбой (лимит, 5xx, сеть) — запасной только на этот ход: переводить
+        // человека насовсем на другой, возможно платный, профиль из-за минутного
+        // обрыва нельзя. Человек видит оба случая; вернуть — в настройках.
         if let Err(e) = &reply {
             if crate::llm::is_provider_down(e.as_ref())
                 && !streamed.load(std::sync::atomic::Ordering::Relaxed)
             {
                 if let Some((name, fallback)) = turn_cfg.fallback() {
                     let from = turn_cfg.active_provider.trim().to_string();
+                    let dead = crate::llm::is_key_dead(e.as_ref());
                     let note = format!(
                         "провайдер «{from}» не отвечает ({}) — пробую запасной «{name}»",
                         crate::reduce::truncate(&e.to_string(), 160)
@@ -437,18 +441,29 @@ async fn run_loop<L: Llm>(
                     observe(SurfaceSignal::Notice(note));
                     reply = ask_turn(&fallback, msgs.clone(), defs.clone(), llm, ui, observe, &mut cancel).await;
                     if reply.is_ok() {
-                        let note = match crate::providers::activate(cfg, &name) {
-                            Ok(()) => format!(
-                                "переключено на запасной профиль «{name}»: ключ «{from}» не работает.                                  Вернуть — в настройках, раздел провайдеров"
-                            ),
-                            Err(err) => format!(
-                                "этот ход сделан через запасной «{name}», но сделать его активным                                  не вышло ({err}) — следующий ход снова пойдёт через «{from}»"
-                            ),
+                        let note = if !dead {
+                            format!(
+                                "этот ход сделан через запасной «{name}»: «{from}» временно \
+                                 не отвечает, следующий ход снова пойдёт через него"
+                            )
+                        } else {
+                            match crate::providers::activate(cfg, &name) {
+                                Ok(()) => format!(
+                                    "переключено на запасной профиль «{name}»: ключ «{from}» \
+                                     не работает. Вернуть — в настройках, раздел провайдеров"
+                                ),
+                                Err(err) => format!(
+                                    "этот ход сделан через запасной «{name}», но сделать его \
+                                     активным не вышло ({err}) — следующий ход снова пойдёт через «{from}»"
+                                ),
+                            }
                         };
                         ui.notice(&note);
                         observe(SurfaceSignal::Notice(note));
-                        turn_cfg = fallback;
                     }
+                    // Дальше ход (повтор без картинок) — через запасной при любом
+                    // исходе: основной только что отказал.
+                    turn_cfg = fallback;
                 }
             }
         }
@@ -1197,6 +1212,24 @@ mod tests {
     /// профиль, тот становится активным, и человек видит, что случилось.
     #[tokio::test]
     async fn dead_key_switches_to_fallback_profile() -> R<()> {
+        let (active, notes) = fallback_run("dead", "dead").await?;
+        assert_eq!(active, "spare", "запасной не стал активным");
+        assert!(notes.iter().any(|n| n.contains("переключено на запасной профиль «spare»")), "{notes:?}");
+        Ok(())
+    }
+
+    /// Временный сбой (529 «перегружен») — запасной только на этот ход.
+    #[tokio::test]
+    async fn busy_provider_uses_fallback_for_one_turn() -> R<()> {
+        let (active, notes) = fallback_run("busy", "busy").await?;
+        assert_eq!(active, "main", "из-за временного сбоя профиль не меняется");
+        assert!(notes.iter().any(|n| n.contains("временно")), "{notes:?}");
+        Ok(())
+    }
+
+    /// Ход с основным ключом `main_key` («dead» → 401, «busy» → 529) и
+    /// запасным «alive». Возвращает активный профиль после хода и уведомления.
+    async fn fallback_run(main_key: &str, tag: &str) -> R<(String, Vec<String>)> {
         use std::sync::Mutex;
         struct DeadMainKey {
             asked: Mutex<Vec<String>>,
@@ -1214,38 +1247,28 @@ mod tests {
                 if key == "dead" {
                     return Err("HTTP 401 Unauthorized: invalid x-api-key".into());
                 }
+                if key == "busy" {
+                    return Err("HTTP 529 <unknown status code>: overloaded".into());
+                }
                 on_delta(Delta::Content("ответ через запасной"));
                 Ok(text_reply("ответ через запасной"))
             }
         }
-        let dir = std::env::temp_dir().join(format!("snens-fallback-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("snens-fallback-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
             format!(
-                "sessions_dir = {d:?}
-tools_dir = {t:?}
-active_provider = \"main\"
-
-                 [providers.main]
-base_url = \"https://main/v1\"
-model = \"m\"
-key_env = \"FB3_MAIN\"
-
-                 [providers.spare]
-base_url = \"https://spare/v1\"
-model = \"s\"
-key_env = \"FB3_SPARE\"
-",
+                "sessions_dir = {d:?}\ntools_dir = {t:?}\nactive_provider = \"main\"\n\n\
+                 [providers.main]\nbase_url = \"https://main/v1\"\nmodel = \"m\"\nkey_env = \"FB3_MAIN\"\n\n\
+                 [providers.spare]\nbase_url = \"https://spare/v1\"\nmodel = \"s\"\nkey_env = \"FB3_SPARE\"\n",
                 d = dir.to_string_lossy(),
                 t = dir.join("tools").to_string_lossy(),
             ),
         )?;
-        std::fs::write(dir.join(".env"), "FB3_MAIN=dead
-FB3_SPARE=alive
-")?;
+        std::fs::write(dir.join(".env"), format!("FB3_MAIN={main_key}\nFB3_SPARE=alive\n"))?;
         let cfg = Config::load(Some(&path.display().to_string()))?;
         let sess = Session::open(&dir, "t")?;
         sess.append(Rec::User {
@@ -1268,12 +1291,15 @@ FB3_SPARE=alive
         };
         run_agent_surface(&sess, &cfg, &llm, &crate::render::Ui::plain(), options).await?;
         let asked = llm.asked.lock().unwrap().clone();
-        assert_eq!(asked, vec!["https://main/v1:dead", "https://spare/v1:alive"], "{asked:?}");
-        assert_eq!(cfg.live().active_provider, "spare", "запасной не стал активным");
+        assert_eq!(
+            asked,
+            vec![format!("https://main/v1:{main_key}"), "https://spare/v1:alive".to_string()],
+            "{asked:?}"
+        );
+        let active = cfg.live().active_provider;
         let notes = notes.lock().unwrap().clone();
-        assert!(notes.iter().any(|n| n.contains("переключено на запасной профиль «spare»")), "{notes:?}");
         let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
+        Ok((active, notes))
     }
 
     fn cfg_tmp(dir: &std::path::Path) -> Config {

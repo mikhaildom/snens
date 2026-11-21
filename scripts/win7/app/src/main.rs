@@ -16,8 +16,8 @@
 //! 4. ждёт, пока окно закроют, и гасит ядро, если сама его поднимала: на
 //!    одном каталоге данных может работать только одно ядро, и брошенное
 //!    ядро не дало бы запустить настоящее окно snens (snens-desktop.exe).
-//!    Если окно уже было открыто (браузер передал вызов ему и сразу вышел),
-//!    ядро не трогаем — им пользуется то окно.
+//!    Если окно уже было открыто (браузер передал вызов ему и сразу вышел,
+//!    а профиль окна занят), ядро не трогаем — им пользуется то окно.
 //!
 //! Ошибки — окном сообщения: консоли у этой программы нет.
 #![windows_subsystem = "windows"]
@@ -37,8 +37,6 @@ use std::{
 const PORT: u16 = 7420;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CORE_START_TIMEOUT: Duration = Duration::from_secs(45);
-/// Браузер, отдавший окно уже работающему экземпляру, выходит за доли секунды.
-const HANDOFF: Duration = Duration::from_secs(5);
 
 fn main() {
     if let Err(e) = run() {
@@ -72,18 +70,47 @@ fn run() -> Result<(), String> {
         Some(code) => format!("{base}#pair={code}"),
         None => base,
     };
-    let opened = Instant::now();
-    let mut window = open_window(&url)?;
-    let _ = window.wait();
-    // Быстрый выход браузера — он отдал окно уже открытому экземпляру со
-    // своим профилем: ядро нужно тому окну, не гасим.
-    if let Some(mut core) = own_core {
-        if opened.elapsed() > HANDOFF {
-            let _ = core.kill();
-            let _ = core.wait();
+    let profile = window_profile()?;
+    let mut window = match open_window(&url, &profile) {
+        Ok(w) => w,
+        Err(e) => {
+            // Окна нет — своё ядро гасим, иначе оно осталось бы невидимым
+            // (без консоли) и держало бы порт и каталог данных.
+            stop(own_core);
+            return Err(e);
         }
+    };
+    let _ = window.wait();
+    // Браузер вышел. Если профиль окна всё ещё занят — это другой экземпляр,
+    // которому наш браузер отдал окно: ядро нужно ему, не гасим.
+    if !profile_in_use(&profile) {
+        stop(own_core);
     }
     Ok(())
+}
+
+fn stop(core: Option<Child>) {
+    if let Some(mut core) = core {
+        let _ = core.kill();
+        let _ = core.wait();
+    }
+}
+
+/// Свой профиль окна: подключение к ядру и настройки окна живут отдельно от
+/// обычного браузера, а окно не смешивается с его вкладками.
+fn window_profile() -> Result<PathBuf, String> {
+    let profile = env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("snens").join("window"))
+        .ok_or("не задана переменная LOCALAPPDATA")?;
+    let _ = fs::create_dir_all(&profile);
+    Ok(profile)
+}
+
+/// Профилем пользуется работающий браузер: Chromium держит `lockfile` в
+/// каталоге профиля открытым без общего доступа, пока жив.
+fn profile_in_use(profile: &Path) -> bool {
+    let lock = profile.join("lockfile");
+    lock.exists() && fs::OpenOptions::new().write(true).open(&lock).is_err()
 }
 
 /// Каталог настроек ядра — тот же, что ищет `snens`: SNENS_CONFIG_DIR или %APPDATA%\snens.
@@ -210,7 +237,7 @@ fn find_browser() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn open_window(url: &str) -> Result<Child, String> {
+fn open_window(url: &str, profile: &Path) -> Result<Child, String> {
     let Some(browser) = find_browser() else {
         return Err(
             "Не найден браузер для окна snens: нужен Chrome 109, Supermium или Edge 109.\n\
@@ -218,12 +245,6 @@ fn open_window(url: &str) -> Result<Child, String> {
                 .into(),
         );
     };
-    // Свой профиль окна: подключение к ядру и настройки окна живут отдельно от
-    // обычного браузера, а окно не смешивается с его вкладками.
-    let profile = env::var_os("LOCALAPPDATA")
-        .map(|d| PathBuf::from(d).join("snens").join("window"))
-        .ok_or("не задана переменная LOCALAPPDATA")?;
-    let _ = fs::create_dir_all(&profile);
     Command::new(&browser)
         .arg(format!("--app={url}"))
         .arg(format!("--user-data-dir={}", profile.display()))

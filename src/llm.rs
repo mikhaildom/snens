@@ -94,11 +94,21 @@ pub fn is_provider_down(error: &(dyn std::error::Error + Send + Sync)) -> bool {
     match status {
         Some(code) => matches!(code, 401 | 402 | 403 | 429) || (500..600).contains(&code),
         None => {
+            // Только «ничего не пришло»: после части ответа (в т.ч. аргументов
+            // вызова, которые не идут дельтами) повтор через другой профиль
+            // переиграл бы уже начатый ход.
             text.contains("error sending request")
-                || text.contains("стрим молчит")
-                || text.contains("стрим оборван после 0 символов")
+                || (text.contains("стрим молчит") || text.contains("стрим оборван"))
+                    && text.contains("после 0 символов")
         }
     }
+}
+
+/// Ключ мёртв, а не провайдер прилёг: отказ по ключу или оплате (401, 402,
+/// 403). Только в этом случае запасной профиль делается активным насовсем.
+pub fn is_key_dead(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let text = error.to_string();
+    ["HTTP 401", "HTTP 402", "HTTP 403"].iter().any(|p| text.starts_with(p))
 }
 
 // ---------- разбор SSE ----------
@@ -204,6 +214,9 @@ fn flatten_tool_schemas(tools: &[Value]) -> Vec<Value> {
 pub struct OpenAi {
     client: reqwest::Client,
     key: String,
+    /// Из какой переменной взят `key`. `None` — неизвестно (тесты, разовые
+    /// вызовы): ключ годится для любого профиля, как было раньше.
+    key_env: Option<String>,
 }
 
 impl OpenAi {
@@ -226,7 +239,14 @@ impl OpenAi {
                 .connect_timeout(std::time::Duration::from_secs(15))
                 .build()?,
             key,
+            key_env: None,
         })
+    }
+
+    /// Запомнить, из какой переменной взят ключ (см. `stream_once`).
+    pub fn with_key_env(mut self, var: &str) -> Self {
+        self.key_env = Some(var.trim().to_string());
+        self
     }
 }
 
@@ -303,7 +323,16 @@ impl OpenAi {
         // Ключ — по профилю этого запроса: поверхность живёт днями, а профиль
         // переключают на ходу (меню настроек, запасной профиль). Ключ снимка
         // старта — только если у профиля своего нет нигде.
-        let key = cfg.key_value(&cfg.key_env).unwrap_or_else(|| self.key.clone());
+        let key = match cfg.key_value(&cfg.key_env) {
+            Some(key) => key,
+            // Ключ снимка старта — только для той же переменной: иначе после
+            // переключения профиля ключ одного провайдера ушёл бы на адрес
+            // другого. У профиля ключа нет — честный 401, а не утечка.
+            None if self.key_env.as_deref().map_or(true, |v| v == cfg.key_env.trim()) => {
+                self.key.clone()
+            }
+            None => String::new(),
+        };
         let mut req = self.client.post(&url).bearer_auth(&key).json(&body);
         // Подпись идут первыми: заголовки из конфига человека важнее дефолтов
         // (reqwest добавляет повторы, и побеждает последнее значение).
@@ -591,7 +620,7 @@ impl Llm for Fake {
 
 #[cfg(test)]
 mod tests {
-    use super::is_provider_down;
+    use super::{is_key_dead, is_provider_down};
     #[test]
     fn provider_down_is_key_billing_limit_server_or_network() {
         let down = |t: &str| {
@@ -607,17 +636,25 @@ mod tests {
             "HTTP 503 Service Unavailable: ",
             "error sending request for url (https://api.anthropic.com/v1/chat/completions)",
             "стрим молчит дольше 120 с после 0 символов",
+            "стрим оборван после 0 символов: connection reset",
         ] {
             assert!(down(t), "{t}");
         }
         for t in [
             "HTTP 400 Bad Request: bad tool schema",
             "HTTP 413 Payload Too Large: ",
+            "стрим молчит дольше 120 с после 4096 символов",
             "cancelled",
             "не задана модель",
         ] {
             assert!(!down(t), "{t}");
         }
+        let dead = |t: &str| {
+            let e: Box<dyn std::error::Error + Send + Sync> = t.into();
+            is_key_dead(e.as_ref())
+        };
+        assert!(dead("HTTP 401 Unauthorized: ") && dead("HTTP 402 Payment Required: "));
+        assert!(!dead("HTTP 429 Too Many Requests: ") && !dead("HTTP 529 <unknown status code>: "));
     }
 
     #[test]
