@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 pub mod act;
 pub mod cdp;
 pub mod launch;
+pub mod local;
 pub mod snap;
 pub mod state;
 pub mod tunnel;
@@ -47,9 +48,12 @@ web text [--limit N]                   видимый текст страниц�
 web probe                              проверить, что ввод реально доставляется (клик/клавиша/вставка)
 web close                              закрыть текущую вкладку и снять привязку
 web disconnect                         закрыть ssh-туннель (Chrome и вкладки не трогаем)
-web launch [--profile путь] [--port N] [--visible]  запустить ОТДЕЛЬНЫЙ профиль Chrome
-                                       на машине пользователя: без подтверждений, переживает ssh.
-                                       --visible — в сессии пользователя, чтобы окно было видно
+web launch [--profile путь] [--port N] запустить ОТДЕЛЬНЫЙ профиль Chrome на этой машине
+                                       с портом отладки и подключиться (без ssh, Chrome 109+;
+                                       браузер: SNENS_CHROME или Chrome/Supermium/Chromium/Edge)
+web launch --tunnel user@machine [--profile путь] [--port N] [--visible]
+                                       то же на машине пользователя по ssh: без подтверждений,
+                                       переживает ssh. --visible — окно в сессии пользователя
 web show                               вывести окно агентского Chrome на экран (Windows)
 
 --tunnel user@machine                  говорить с Chrome на той машине через ssh-туннель:
@@ -71,7 +75,8 @@ web show                               вывести окно агентско�
 
 Порты/соединение: --port, SNENS_CDP_PORT, иначе 9222. Chrome 136+ игнорирует
 --remote-debugging-port на дефолтном профиле: нужен тумблер в chrome://inspect
-или отдельный профиль агента.
+или отдельный профиль агента. В Chrome до 144 тумблера нет (Windows 7: Chrome 109) —
+там `web launch`.
 
 Коды: 0 — успех, 2 — неверные аргументы, 1 — ошибка выполнения (включая таймаут).";
 
@@ -262,7 +267,8 @@ pub fn live(args: &Args) -> Result<Live, String> {
         Some(t) => t,
         None => {
             return Err(
-                "не подключено: сначала `web connect` (Chrome с тумблером в chrome://inspect/#remote-debugging) \
+                "не подключено: сначала `web launch` (свой Chrome агента на этой машине), \
+                 `web connect` (Chrome с тумблером в chrome://inspect/#remote-debugging) \
                  или `web connect --tunnel user@machine`"
                     .into(),
             )
@@ -394,8 +400,8 @@ fn cmd_connect(args: &Args) -> Result<(), String> {
     // или отдаёт 403 — тул должен сказать об этом прямо, а не падать на WS.
     let targets = page_targets(&ep).map_err(|e| {
         format!(
-            "{e}\n\nОтдельный профиль агента (если тумблер не подходит):\n  \
-             chrome --remote-debugging-port={port} --user-data-dir=~/.local/share/snens/web-profile &"
+            "{e}\n\nОтдельный профиль агента (если тумблера нет — Chrome до 144 — или он не подходит):\n  \
+             web launch   (сам запустит Chrome с отладкой на этой машине; порт {port} занят — возьмёт соседний)"
         )
     })?;
     if targets.is_empty() {
@@ -741,10 +747,9 @@ fn cmd_probe(args: &Args) -> Result<(), String> {
 /// подключение к нему. Это ответ на «подтверждать тумблер каждый раз»: с
 /// собственным `--user-data-dir` Chrome отдаёт отладку без согласия.
 fn cmd_launch(args: &Args) -> Result<(), String> {
-    let host = args
-        .flag("tunnel")
-        .ok_or("web launch: нужен --tunnel user@machine (где поднимать Chrome)")?
-        .to_string();
+    let Some(host) = args.flag("tunnel").map(str::to_string) else {
+        return launch_here(args);
+    };
     // Порт подбираем сами: занятый порт означал бы, что Chrome прилип к уже
     // запущенному процессу с чужим профилем.
     let want = port_from(args)?;
@@ -790,6 +795,69 @@ fn cmd_launch(args: &Args) -> Result<(), String> {
     connect_to(&host, port)
 }
 
+/// `web launch` без `--tunnel`: браузер на этой же машине, без ssh.
+fn launch_here(args: &Args) -> Result<(), String> {
+    let want = port_from(args)?;
+    let profile = args
+        .flag("profile")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(local::default_profile);
+    if args.flag("port").is_none() {
+        if let Some((h, p)) = state::load_launch() {
+            if h == local::HOST && local::alive(p) {
+                println!("Chrome агента уже работает здесь, порт {p} — переиспользую");
+                return connect_here(p);
+            }
+        }
+    }
+    // Профиль уже открыт (запись о запуске потерялась или порт задан руками):
+    // второй процесс отдал бы окно первому и отладку не поднял.
+    if let Some(p) = local::running_port(&profile) {
+        if args.flag("port").is_none() || p == want {
+            println!("Chrome агента уже открыт с этим профилем, порт {p} — переиспользую");
+            state::save_launch(local::HOST, p);
+            return connect_here(p);
+        }
+        return Err(format!(
+            "профиль {} уже открыт с отладкой на порту {p}: возьми --port {p} или закрой то окно",
+            profile.display()
+        ));
+    }
+    let port = if args.flag("port").is_some() {
+        if !local::port_free(want) {
+            return Err(format!(
+                "порт {want} занят — скорее всего там уже другой Chrome. Возьми другой: --port {}",
+                want.saturating_add(2)
+            ));
+        }
+        want
+    } else {
+        local::pick_port(want)?
+    };
+    let exe = local::find_browser()?;
+    local::start(&exe, port, &profile)?;
+    state::save_launch(local::HOST, port);
+    println!(
+        "запущен {} (профиль {}, порт {port})",
+        exe.display(),
+        profile.display()
+    );
+    connect_here(port)
+}
+
+fn connect_here(port: u16) -> Result<(), String> {
+    // Локальный порт сильнее старого туннеля: иначе привязка ушла бы в ssh.
+    if let Some(t) = tunnel::load() {
+        tunnel::stop(&t);
+    }
+    let args2 = Args {
+        positional: vec!["connect".to_string()],
+        flags: [("port".to_string(), port.to_string())].into_iter().collect(),
+        has: Vec::new(),
+    };
+    cmd_connect(&args2)
+}
+
 fn connect_to(host: &str, port: u16) -> Result<(), String> {
     let args2 = Args {
         positional: vec!["connect".to_string()],
@@ -809,6 +877,10 @@ fn cmd_show(args: &Args) -> Result<(), String> {
     let host = match args.flag("tunnel") {
         Some(h) => h.to_string(),
         None => match state::load_launch() {
+            Some((h, _)) if h == local::HOST => {
+                println!("Chrome агента запущен на этой машине — его окно и так на экране");
+                return Ok(());
+            }
             Some((h, _)) => h,
             None => {
                 return Err("web show: нужен --tunnel user@machine или сначала `web launch`".into())

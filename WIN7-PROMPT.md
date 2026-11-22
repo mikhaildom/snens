@@ -61,7 +61,21 @@
 - **Вход по коду.** Код подключения можно передать в адресе `#pair=…` (`src/pair/launchCode.ts`). Код забирается и сразу стирается из адресной строки.
 - **Слабые машины.** Если `navigator.hardwareConcurrency <= 2`, `reducedMotion()` в `src/ui/dither.ts` возвращает true, и пиксельные поля рисуются одним неподвижным кадром. Живое поле на E-300 в простое занимало ~80% процессора.
 
-## 5. Поставка и проверка
+## 5. Инструменты, которым на Win7-машине не хватало окружения
+
+- **`search`** ходит в локальный SearXNG, а на обычной машине его нет. Добавь запасной путь — HTML-выдачу DuckDuckGo (`tools/search/src/ddg.rs`, разбор строками, без новых зависимостей).
+  - Выбор через `SNENS_SEARCH` или `backend` в `search.toml`: `auto` (по умолчанию), `searxng`, `duckduckgo`.
+  - В режиме `auto` запасной путь включается только если SearXNG **не отвечает**. Если он ответил ошибкой — это ошибка, а не повод уйти.
+- **`web`** подключался к Chrome либо тумблером в `chrome://inspect` (только Chrome 144+), либо по ssh. В Chrome 109 тумблера нет.
+  - Добавь `web launch` без `--tunnel` (`tools/web/src/local.rs`): находит Chrome / Supermium / Chromium / Edge (или `SNENS_CHROME`), запускает отдельный профиль с `--remote-debugging-port` на свободном порту, ждёт `/json/version` и подключается.
+  - Повторный вызов переиспользует уже запущенный.
+  - Каталог состояния (`tools/web/src/state.rs`, `base_dir`): на Windows — `%LOCALAPPDATA%\snens\web`, важнее HOME. Раньше без HOME у каждого процесса был свой каталог по pid, и привязка из `launch` терялась к следующему вызову.
+- **Ревью кода.** Встроенный скилл `code-review` (`skills/code-review/SKILL.md`, в `BUNDLED` в `src/skills.rs`): методика open-code-review.
+  - Если есть `ocr`, файлы и правила берутся из `ocr delegate preview/rule`; иначе из git.
+  - Охват каждого файла обязателен, находки идут по тяжести.
+  - На инстансе, где скиллы уже есть: `snens skills install code-review`.
+
+## 6. Поставка и проверка
 
 - `scripts/win7/stage.sh [dist snens-web] [выход]` собирает папку `snens/`:
   - exe и тулы, `web/`;

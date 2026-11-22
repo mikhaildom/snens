@@ -24,10 +24,17 @@ pub struct Bundled {
 ///
 /// Держим список коротким и по делу: оглавление едет в префикс на каждом ходу,
 /// поэтому лишний скилл — это налог на все сессии, а не «на всякий случай».
-pub const BUNDLED: &[Bundled] = &[Bundled {
-    name: "tickets",
-    body: include_str!("../skills/tickets/SKILL.md"),
-}];
+pub const BUNDLED: &[Bundled] = &[
+    Bundled {
+        name: "tickets",
+        body: include_str!("../skills/tickets/SKILL.md"),
+    },
+    // Ревью кода по методике open-code-review: с `ocr`, если он есть, иначе git.
+    Bundled {
+        name: "code-review",
+        body: include_str!("../skills/code-review/SKILL.md"),
+    },
+];
 
 /// `name` и `description` из YAML front-matter — для справки и для теста,
 /// что у встроенного скилла они есть.

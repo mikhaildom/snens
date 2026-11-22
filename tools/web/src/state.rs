@@ -15,22 +15,59 @@ pub fn dir() -> PathBuf {
             return PathBuf::from(d);
         }
     }
-    let base = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            // Без HOME состояние уезжало в /tmp/.local/state — общий каталог, где
-            // чужой пользователь мог подложить target.json и увести привязку.
-            // В таком случае берём каталог, принадлежащий только нам.
-            match std::env::var("HOME") {
-                Ok(h) if !h.trim().is_empty() => PathBuf::from(h).join(".local/state"),
-                _ => PathBuf::from(format!(
-                    "{}/snens-web-{}",
-                    std::env::temp_dir().display(),
-                    std::process::id()
-                )),
-            }
-        });
-    base.join("snens/web")
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let local = if cfg!(windows) { var("LOCALAPPDATA") } else { None };
+    base_dir(var("XDG_STATE_HOME"), var("HOME"), local).join("snens/web")
+}
+
+/// Где лежит состояние, по уже прочитанным переменным (пустые — `None`).
+///
+/// Без HOME состояние уезжало в /tmp/.local/state — общий каталог, где чужой
+/// пользователь мог подложить target.json и увести привязку. В таком случае
+/// берём каталог, принадлежащий только нам.
+///
+/// На Windows HOME обычно нет вовсе, и каждый вызов `web` получал свой каталог
+/// по pid — привязка из `connect`/`launch` терялась уже к следующему вызову.
+/// Там каталог пользователя — LOCALAPPDATA (его передают только на Windows), и он
+/// важнее HOME: ssh и Git Bash HOME задают, обычное окно — нет, а привязка должна
+/// быть одна на оба пути.
+fn base_dir(xdg: Option<String>, home: Option<String>, local: Option<String>) -> PathBuf {
+    if let Some(x) = xdg {
+        return PathBuf::from(x);
+    }
+    if let Some(l) = local {
+        return PathBuf::from(l);
+    }
+    if let Some(h) = home {
+        return PathBuf::from(h).join(".local/state");
+    }
+    PathBuf::from(format!(
+        "{}/snens-web-{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn base_dir_order_and_stable_without_home() {
+        assert_eq!(base_dir(s("/x"), s("/h"), s("C:/l")), PathBuf::from("/x"));
+        assert_eq!(base_dir(None, s("/h"), None), PathBuf::from("/h").join(".local/state"));
+        // Windows: каталог пользователя, с HOME и без — один и тот же.
+        assert_eq!(base_dir(None, s("/h"), s("C:/l")), PathBuf::from("C:/l"));
+        assert_eq!(base_dir(None, None, s("C:/l")), PathBuf::from("C:/l"));
+        assert_eq!(base_dir(None, None, s("C:/l")), base_dir(None, None, s("C:/l")));
+        // Совсем ничего — свой каталог процесса, не общий /tmp/.local/state.
+        let p = base_dir(None, None, None);
+        assert!(p.to_string_lossy().contains(&format!("snens-web-{}", std::process::id())));
+    }
 }
 
 /// Атомарная запись: читатель не увидит половину файла, а падение посреди

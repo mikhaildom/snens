@@ -2,6 +2,11 @@
 // в интернет нечем и незачем, модель зовёт этот бинарник как обычный процесс.
 //
 // Адрес инстанса: SEARXNG_URL → ~/.config/snens/search.toml (url) → 127.0.0.1:8888.
+// Если SearXNG не отвечает (на машине его нет), поиск идёт через HTML-выдачу
+// DuckDuckGo (`ddg.rs`). Выбор: SNENS_SEARCH / `backend` в search.toml —
+// auto (по умолчанию), searxng, duckduckgo.
+mod ddg;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -11,7 +16,9 @@ search <запрос> [--n N] [--page P] [--lang L] [--fresh day|week|month|year
 
 По умолчанию 10 результатов (максимум 30), вывод человекочитаемый: три строки
 на результат и футер со счётчиками. --json — нормализованный JSON одной строкой.
-Адрес: SEARXNG_URL или url в ~/.config/snens/search.toml (дефолт http://127.0.0.1:8888).";
+Адрес: SEARXNG_URL или url в ~/.config/snens/search.toml (дефолт http://127.0.0.1:8888).
+Нет SearXNG — ищет через DuckDuckGo. Выбор: SNENS_SEARCH или backend в search.toml
+(auto | searxng | duckduckgo).";
 
 const USAGE: &str =
     "search <запрос> [--n N] [--page P] [--lang L] [--fresh day|week|month|year] [--category general|news|it] [--site домен] [--json]";
@@ -157,20 +164,51 @@ fn parse(argv: &[String]) -> Args {
 #[derive(Deserialize, Default)]
 struct File {
     url: Option<String>,
+    backend: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Backend {
+    /// SearXNG, а если он недоступен — DuckDuckGo.
+    Auto,
+    SearXng,
+    DuckDuckGo,
+}
+
+/// env → файл → auto. Неизвестное значение — ошибка, а не тихий auto.
+fn backend(file: &File) -> Result<Backend, String> {
+    let raw = std::env::var("SNENS_SEARCH")
+        .ok()
+        .or_else(|| file.backend.clone())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    match raw.as_deref() {
+        None | Some("auto") => Ok(Backend::Auto),
+        Some("searxng") => Ok(Backend::SearXng),
+        Some("duckduckgo") | Some("ddg") => Ok(Backend::DuckDuckGo),
+        Some(other) => Err(format!(
+            "search: неизвестный backend «{other}» — auto, searxng или duckduckgo"
+        )),
+    }
+}
+
+/// Ошибка SearXNG: «не достучались» (можно уйти на запасной) или «ответил плохо».
+enum Fail {
+    Unreachable(String),
+    Other(String),
 }
 
 /// env → файл → дефолт. Раскладка та же, что у конфига харнесса и memory.
-fn base_url() -> String {
+fn base_url(file: &File) -> String {
     // Значение из env нормализуем: пробелы по краям давали URL с пробелом внутри,
     // а reqwest такой отвергает с непонятной ошибкой.
     let env = std::env::var("SEARXNG_URL")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
-    let file = read_file();
     // Пустой `url = ""` в конфиге — не адрес: иначе запрос шёл бы на `/search`.
     let pick = env
-        .or(file.url.map(|u| u.trim().to_string()))
+        .or(file.url.as_ref().map(|u| u.trim().to_string()))
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| "http://127.0.0.1:8888".into());
     pick.trim_end_matches('/').to_string()
@@ -259,7 +297,7 @@ struct Answer {
 
 type SearchResults = (usize, Vec<Value>, Vec<String>);
 
-fn fetch(base: &str, a: &Args) -> Result<SearchResults, String> {
+fn fetch(base: &str, a: &Args) -> Result<SearchResults, Fail> {
     let mut q = a.query.clone();
     if let Some(site) = &a.site {
         q.push_str(&format!(" site:{site}"));
@@ -279,24 +317,24 @@ fn fetch(base: &str, a: &Args) -> Result<SearchResults, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("search: не собрать HTTP-клиент: {e}"))?;
+        .map_err(|e| Fail::Other(format!("search: не собрать HTTP-клиент: {e}")))?;
     let resp = client
         .get(&url)
         .query(&query)
         .send()
-        .map_err(|e| format!("search: SearXNG недоступен ({url}): {e}"))?;
+        .map_err(|e| Fail::Unreachable(format!("search: SearXNG недоступен ({url}): {e}")))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!(
+        return Err(Fail::Other(format!(
             "search: SearXNG ответил HTTP {} ({url})",
             status.as_u16()
-        ));
+        )));
     }
     let body = resp
         .text()
-        .map_err(|e| format!("search: не прочитать ответ ({url}): {e}"))?;
+        .map_err(|e| Fail::Other(format!("search: не прочитать ответ ({url}): {e}")))?;
     let ans: Answer = serde_json::from_str(&body)
-        .map_err(|e| format!("search: SearXNG вернул не JSON ({url}): {e}"))?;
+        .map_err(|e| Fail::Other(format!("search: SearXNG вернул не JSON ({url}): {e}")))?;
     let total = ans.results.len();
     let results = ans
         .results
@@ -342,11 +380,22 @@ fn main() {
         std::process::exit(0);
     }
     let a = parse(&argv);
-    let base = base_url();
-    let (total, results, unresponsive) = match fetch(&base, &a) {
-        Ok(v) => v,
-        Err(e) => die(1, e),
+    let file = read_file();
+    let backend = backend(&file).unwrap_or_else(|e| die(2, e));
+    let base = base_url(&file);
+    let found = match backend {
+        Backend::DuckDuckGo => ddg::fetch(&a),
+        Backend::SearXng => fetch(&base, &a).map_err(|f| match f {
+            Fail::Unreachable(e) | Fail::Other(e) => e,
+        }),
+        Backend::Auto => match fetch(&base, &a) {
+            Ok(v) => Ok(v),
+            Err(Fail::Other(e)) => Err(e),
+            // SearXNG на машине нет — не повод остаться без поиска.
+            Err(Fail::Unreachable(_)) => ddg::fetch(&a),
+        },
     };
+    let (total, results, unresponsive) = found.unwrap_or_else(|e| die(1, e));
     let dead: Vec<String> = unresponsive;
 
     if a.json {
@@ -396,6 +445,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_from_file_and_unknown_is_an_error() {
+        // env не трогаем: тесты идут параллельно.
+        if std::env::var_os("SNENS_SEARCH").is_some() {
+            return;
+        }
+        let f = |b: Option<&str>| File { url: None, backend: b.map(String::from) };
+        assert_eq!(backend(&f(None)).unwrap(), Backend::Auto);
+        assert_eq!(backend(&f(Some("DuckDuckGo"))).unwrap(), Backend::DuckDuckGo);
+        assert_eq!(backend(&f(Some("ddg"))).unwrap(), Backend::DuckDuckGo);
+        assert_eq!(backend(&f(Some("searxng"))).unwrap(), Backend::SearXng);
+        assert!(backend(&f(Some("google"))).is_err());
+    }
 
     #[test]
     fn clip_cuts_by_chars_not_bytes() {
