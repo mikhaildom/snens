@@ -130,7 +130,9 @@ fn parse_active_port(text: &str) -> Option<u16> {
 }
 
 /// Запустить браузер с отладкой и дождаться, пока CDP ответит.
-pub fn start(exe: &std::path::Path, port: u16, profile: &std::path::Path) -> Result<(), String> {
+/// Возвращает pid запущенного процесса: по нему следующий `launch` отличит свой
+/// Chrome от чужого, вставшего на тот же порт.
+pub fn start(exe: &std::path::Path, port: u16, profile: &std::path::Path) -> Result<u32, String> {
     std::fs::create_dir_all(profile)
         .map_err(|e| format!("web: профиль {}: {e}", profile.display()))?;
     let mut cmd = Command::new(exe);
@@ -146,20 +148,64 @@ pub fn start(exe: &std::path::Path, port: u16, profile: &std::path::Path) -> Res
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     detach(&mut cmd);
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("web: не запустить {}: {e}", exe.display()))?;
     let until = Instant::now() + Duration::from_secs(30);
     while Instant::now() < until {
         if alive(port) {
-            return Ok(());
+            return Ok(child.id());
         }
         std::thread::sleep(Duration::from_millis(400));
     }
+    // Не оставлять висеть окно без отладки: следующий запуск с этим профилем
+    // отдал бы ему управление и снова не поднял порт.
+    let _ = child.kill();
+    let _ = child.wait();
     Err(format!(
         "web: {} не поднял отладку на порту {port} за 30 с. Если этот профиль уже открыт \
          другим окном без отладки — закрой его и повтори",
         exe.display()
     ))
+}
+
+/// Жив ли процесс с таким pid.
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+pub fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Один ли это путь профиля (на Windows — без учёта регистра и вида слэшей).
+pub fn same_path(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let s = s.trim().trim_end_matches(['/', '\\']).replace('\\', "/");
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    norm(a) == norm(b)
 }
 
 /// Браузер не должен умереть вместе с тулом: отдельная группа процессов.
@@ -203,6 +249,19 @@ mod tests {
 "), None);
         assert_eq!(parse_active_port("мусор"), None);
         assert_eq!(parse_active_port(""), None);
+    }
+
+    #[test]
+    fn same_profile_path() {
+        assert!(same_path("/a/b", "/a/b/"));
+        assert!(!same_path("/a/b", "/a/c"));
+        #[cfg(windows)]
+        assert!(same_path(r"C:\Users\X\snens", "c:/users/x/snens"));
+    }
+
+    #[test]
+    fn own_pid_is_alive() {
+        assert!(pid_alive(std::process::id()));
     }
 
     #[test]

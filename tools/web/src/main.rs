@@ -802,11 +802,20 @@ fn launch_here(args: &Args) -> Result<(), String> {
         .flag("profile")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(local::default_profile);
+    let profile_s = profile.display().to_string();
     if args.flag("port").is_none() {
-        if let Some((h, p)) = state::load_launch() {
-            if h == local::HOST && local::alive(p) {
-                println!("Chrome агента уже работает здесь, порт {p} — переиспользую");
-                return connect_here(p);
+        // Переиспользуем только свой Chrome: тот же профиль и тот же живой процесс.
+        // Иначе на освободившийся 9222 мог встать чужой Chrome с отладкой
+        // (например обычный Chrome пользователя), и мы подключились бы к нему.
+        if let Some(l) = state::load_local_launch() {
+            let same_profile = l.profile.as_deref().is_some_and(|x| local::same_path(x, &profile_s));
+            let ours = match l.pid {
+                Some(pid) => local::pid_alive(pid),
+                None => local::running_port(&profile) == Some(l.port),
+            };
+            if same_profile && ours && local::alive(l.port) {
+                println!("Chrome агента уже работает здесь, порт {} — переиспользую", l.port);
+                return connect_here(l.port);
             }
         }
     }
@@ -815,7 +824,7 @@ fn launch_here(args: &Args) -> Result<(), String> {
     if let Some(p) = local::running_port(&profile) {
         if args.flag("port").is_none() || p == want {
             println!("Chrome агента уже открыт с этим профилем, порт {p} — переиспользую");
-            state::save_launch(local::HOST, p);
+            state::save_local_launch(p, None, &profile_s);
             return connect_here(p);
         }
         return Err(format!(
@@ -835,8 +844,8 @@ fn launch_here(args: &Args) -> Result<(), String> {
         local::pick_port(want)?
     };
     let exe = local::find_browser()?;
-    local::start(&exe, port, &profile)?;
-    state::save_launch(local::HOST, port);
+    let pid = local::start(&exe, port, &profile)?;
+    state::save_local_launch(port, Some(pid), &profile_s);
     println!(
         "запущен {} (профиль {}, порт {port})",
         exe.display(),

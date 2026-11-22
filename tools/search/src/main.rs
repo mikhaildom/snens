@@ -214,6 +214,12 @@ fn base_url(file: &File) -> String {
     pick.trim_end_matches('/').to_string()
 }
 
+/// Задан ли адрес SearXNG руками (env или `url` в конфиге), а не взят по умолчанию.
+fn url_is_explicit(file: &File) -> bool {
+    let set = |v: Option<String>| v.is_some_and(|v| !v.trim().is_empty());
+    set(std::env::var("SEARXNG_URL").ok()) || set(file.url.clone())
+}
+
 /// Разбор `search.toml`. Ошибку не глотаем: опечатка в конфиге иначе неотличима
 /// от отсутствия файла, и запрос молча уходил бы на дефолтный инстанс.
 fn read_file() -> File {
@@ -391,8 +397,14 @@ fn main() {
         Backend::Auto => match fetch(&base, &a) {
             Ok(v) => Ok(v),
             Err(Fail::Other(e)) => Err(e),
+            // Адрес SearXNG задан явно — значит, он должен работать: молча уводить
+            // запрос в DuckDuckGo нельзя, сбой своего сервера так и не заметят.
+            Err(Fail::Unreachable(e)) if url_is_explicit(&file) => Err(e),
             // SearXNG на машине нет — не повод остаться без поиска.
-            Err(Fail::Unreachable(_)) => ddg::fetch(&a),
+            Err(Fail::Unreachable(e)) => {
+                eprintln!("search: {e} — ищу через DuckDuckGo");
+                ddg::fetch(&a)
+            }
         },
     };
     let (total, results, unresponsive) = found.unwrap_or_else(|e| die(1, e));

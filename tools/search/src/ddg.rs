@@ -13,6 +13,7 @@ const ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 /// Обычный браузерный UA: на «пустой» DuckDuckGo чаще отвечает капчей.
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const MAX_BODY: u64 = 5 * 1024 * 1024;
 
 pub fn fetch(a: &Args) -> Result<SearchResults, String> {
     let mut q = a.query.clone();
@@ -26,7 +27,7 @@ pub fn fetch(a: &Args) -> Result<SearchResults, String> {
     }
     if a.page > 1 {
         // Страница выдачи — 30 результатов (без рекламы чуть меньше).
-        query.push(("s", ((a.page - 1) * 30).to_string()));
+        query.push(("s", (a.page - 1).saturating_mul(30).to_string()));
     }
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -42,9 +43,12 @@ pub fn fetch(a: &Args) -> Result<SearchResults, String> {
     if !status.is_success() {
         return Err(format!("search: DuckDuckGo ответил HTTP {}", status.as_u16()));
     }
-    let body = resp
-        .text()
+    // Страница выдачи — сотни килобайт; больше 5 МБ не читаем, чтобы странный
+    // ответ не съел память на ноутбуке с 4 ГБ.
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(resp, MAX_BODY), &mut raw)
         .map_err(|e| format!("search: не прочитать ответ DuckDuckGo: {e}"))?;
+    let body = String::from_utf8_lossy(&raw);
     let hits = parse(&body);
     if hits.is_empty() && is_challenge(&body) {
         return Err("search: DuckDuckGo попросил капчу (слишком часто) — повторить позже".into());
@@ -70,12 +74,41 @@ pub fn fetch(a: &Args) -> Result<SearchResults, String> {
 fn region(lang: &str) -> String {
     match lang.to_ascii_lowercase().as_str() {
         "" | "all" | "auto" => "wt-wt".into(),
-        "en" => "us-en".into(),
         l if l.contains('-') => {
             // ru-RU → ru-ru; DuckDuckGo пишет регион как «страна-язык», но и так понимает.
             l.to_string()
         }
-        l => format!("{l}-{l}"),
+        // DuckDuckGo пишет «страна-язык»; там, где коды страны и языка расходятся,
+        // `{l}-{l}` давал несуществующий регион (uk-uk, ja-ja).
+        l => match l {
+            "en" => "us-en",
+            "ru" => "ru-ru",
+            "de" => "de-de",
+            "fr" => "fr-fr",
+            "es" => "es-es",
+            "it" => "it-it",
+            "nl" => "nl-nl",
+            "pl" => "pl-pl",
+            "pt" => "pt-pt",
+            "tr" => "tr-tr",
+            "fi" => "fi-fi",
+            "uk" => "ua-uk",
+            "be" => "by-ru",
+            "kk" => "kz-ru",
+            "hy" => "wt-wt",
+            "ja" => "jp-jp",
+            "zh" => "cn-zh",
+            "ko" => "kr-kr",
+            "sv" => "se-sv",
+            "da" => "dk-da",
+            "cs" => "cz-cs",
+            "el" => "gr-el",
+            "he" => "il-he",
+            "ar" => "xa-ar",
+            "vi" => "vn-vi",
+            _ => "wt-wt",
+        }
+        .into(),
     }
 }
 
@@ -92,7 +125,12 @@ pub struct Hit {
 
 pub fn parse(html: &str) -> Vec<Hit> {
     let mut out = Vec::new();
-    let marks: Vec<usize> = html.match_indices("class=\"result__a\"").map(|(i, _)| i).collect();
+    // Блок начинается с самого тега `<a …>`, а не с `class=`: иначе `href`,
+    // стоящий в теге раньше `class`, не находился и выдача была пустой.
+    let marks: Vec<usize> = html
+        .match_indices("class=\"result__a\"")
+        .map(|(i, _)| html[..i].rfind('<').unwrap_or(i))
+        .collect();
     for (k, &at) in marks.iter().enumerate() {
         let end = marks.get(k + 1).copied().unwrap_or(html.len());
         let block = &html[at..end];
@@ -190,7 +228,11 @@ fn entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
-        let Some(semi) = tail[..tail.len().min(12)].find(';') else {
+        // Ищем `;` по байтам: срез строки `tail[..12]` падал, если 12-й байт
+        // попадал внутрь русской буквы («Рога &amp;Копыта», «AT&T — …»).
+        // `;` — ASCII, поэтому найденная позиция всегда на границе символа.
+        let semi = tail.as_bytes()[..tail.len().min(12)].iter().position(|&b| b == b';');
+        let Some(semi) = semi else {
             out.push('&');
             rest = &tail[1..];
             continue;
@@ -262,6 +304,26 @@ mod tests {
         assert_eq!(region("all"), "wt-wt");
         assert_eq!(region("ru"), "ru-ru");
         assert_eq!(region("en"), "us-en");
+        assert_eq!(region("uk"), "ua-uk");
+        assert_eq!(region("ja"), "jp-jp");
+        assert_eq!(region("xx"), "wt-wt");
+    }
+
+    #[test]
+    fn entities_near_cyrillic_do_not_panic() {
+        assert_eq!(entities("Рога &amp;Копыта"), "Рога &Копыта");
+        assert_eq!(entities("AT&T — компания связи"), "AT&T — компания связи");
+        assert_eq!(entities("&Ж"), "&Ж");
+        assert_eq!(text("<b>Рога</b> &amp;&amp; Копыта&#33;"), "Рога && Копыта!");
+    }
+
+    #[test]
+    fn href_before_class_is_found() {
+        let page = r#"<h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2F&amp;rut=1" rel="nofollow" class="result__a">Пример</a></h2>"#;
+        let hits = parse(page);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].url, "https://example.org/");
+        assert_eq!(hits[0].title, "Пример");
     }
 
     #[test]
